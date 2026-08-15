@@ -71,6 +71,8 @@ corbienest [options] [-p PROMPT]
   -c, --ctx N          context window (num_ctx, default 32768; accepts 64k, 128k, default)
   -s, --system TEXT    extra system instructions
   -p, --prompt TEXT    non-interactive: run one prompt and exit (add --yolo to allow tools)
+      --output-format text|json   with -p: plain reply (default) or one JSON object
+                       {result, session_id, model, prompt_tokens, eval_tokens, model_calls, tool_calls, duration_s}
   -y, --yolo           auto-approve tool calls (same as --mode auto)
       --mode NAME      permission mode: manual, accept-edits, plan, auto
   -T, --no-tools       disable tool calling

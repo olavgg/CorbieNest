@@ -439,7 +439,7 @@ static void cmd_diff(const char *arg) {
     if (system("git rev-parse --is-inside-work-tree >/dev/null 2>&1") != 0) { printf(C_DIM "not inside a git repository" C_RESET "\n"); return; }
     sbuf cmd; sb_init(&cmd);
     sb_printf(&cmd, "git --no-pager diff --stat %s 2>&1; echo; git --no-pager diff %s 2>&1", arg && *arg ? arg : "", arg && *arg ? arg : "");
-    if (!arg || !*arg) sb_puts(&cmd, "; git status --short --untracked-files=all 2>/dev/null | grep '^??' | sed 's/^?? /untracked: /'");
+    if (!arg || !*arg) sb_puts(&cmd, "; git status --short --untracked-files=all 2>/dev/null | grep '^?\?' | sed 's/^?? /untracked: /'");
     FILE *f = popen(cmd.data, "r");
     sb_free(&cmd);
     if (!f) { printf(C_RED "✗ cannot run git" C_RESET "\n"); return; }
@@ -1309,6 +1309,8 @@ static void usage(void) {
            "  -c, --ctx N          context window (num_ctx), e.g. 32768, 64k, 128k\n"
            "  -s, --system TEXT    extra system instructions\n"
            "  -p, --prompt TEXT    non-interactive: run one prompt and exit (implies tools need --yolo)\n"
+           "      --output-format text|json   with -p: print the reply as text (default) or one JSON object\n"
+           "                       {result, session_id, model, prompt_tokens, eval_tokens, model_calls, tool_calls, duration_s}\n"
            "  -y, --yolo           auto-approve tool calls (same as --mode auto)\n"
            "      --mode NAME      permission mode: manual, accept-edits, plan, auto\n"
            "  -T, --no-tools       disable tool calling\n"
@@ -1333,7 +1335,7 @@ int main(int argc, char **argv) {
     const char *env_model = getenv("CORBIENEST_MODEL");
     if (env_model && *env_model) { free(g_cfg.model); g_cfg.model = xstrdup(env_model); }
 
-    const char *oneshot = NULL, *resume_id = NULL; bool resume_latest = false;
+    const char *oneshot = NULL, *resume_id = NULL; bool resume_latest = false, json_out = false;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         #define NEEDARG() (i + 1 < argc ? argv[++i] : (usage(), exit(2), (char*)NULL))
@@ -1347,6 +1349,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "-T") || !strcmp(a, "--no-tools")) g_cfg.no_tools = true;
         else if (!strcmp(a, "--no-memory")) g_cfg.memory = false;
         else if (!strcmp(a, "--continue")) resume_latest = true;
+        else if (!strcmp(a, "--output-format")) { const char *f = NEEDARG(); if (!strcmp(f, "json")) json_out = true; else if (strcmp(f, "text")) { fprintf(stderr, "unknown output format %s (text|json)\n", f); return 2; } }
         else if (!strcmp(a, "-r") || !strcmp(a, "--resume")) { resume_id = (i + 1 < argc && argv[i+1][0] != '-') ? argv[++i] : ""; }
         else if (!strcmp(a, "--think")) g_cfg.think = 1;
         else if (!strcmp(a, "--no-think")) g_cfg.think = 0;
@@ -1378,6 +1381,15 @@ int main(int argc, char **argv) {
         cmd_resume(NULL);
     }
 
+    if (json_out && !oneshot) { fprintf(stderr, "corbienest: --output-format json needs -p PROMPT\n"); return 2; }
+    int json_fd = -1;
+    if (json_out) {   /* everything the run prints goes to /dev/null; the JSON goes to the real stdout */
+        fflush(stdout);
+        json_fd = dup(STDOUT_FILENO);
+        if (!freopen("/dev/null", "w", stdout)) { fprintf(stderr, "corbienest: cannot redirect stdout\n"); return 1; }
+        g_cfg.color = false;
+    }
+
     if (oneshot) {
         char *msg;
         const skill_t *sk = NULL;
@@ -1386,11 +1398,34 @@ int main(int argc, char **argv) {
         else msg = expand_mentions(oneshot);
         int first = cJSON_GetArraySize(g_messages);
         add_message("user", msg); free(msg);
+        time_t t0 = time(NULL);
         bool aborted = run_turn();
         session_save();
         memory_update(first, aborted);
         term_restore();
-        return 0;
+        if (json_out) {
+            cJSON *o = cJSON_CreateObject();
+            const char *last = "";
+            for (int i = cJSON_GetArraySize(g_messages) - 1; i >= 0; i--) {
+                cJSON *m = cJSON_GetArrayItem(g_messages, i);
+                cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+                if (cJSON_IsString(r) && !strcmp(r->valuestring, "assistant")) { if (cJSON_IsString(c)) last = c->valuestring; break; }
+            }
+            cJSON_AddStringToObject(o, "result", last);
+            cJSON_AddBoolToObject(o, "interrupted", aborted);
+            cJSON_AddStringToObject(o, "session_id", g_session_id);
+            cJSON_AddStringToObject(o, "model", g_cfg.model);
+            cJSON_AddNumberToObject(o, "prompt_tokens", (double)g_session.prompt_tokens);
+            cJSON_AddNumberToObject(o, "eval_tokens", (double)g_session.eval_tokens);
+            cJSON_AddNumberToObject(o, "model_calls", g_session.calls);
+            cJSON_AddNumberToObject(o, "tool_calls", g_session.tool_calls);
+            cJSON_AddNumberToObject(o, "duration_s", difftime(time(NULL), t0));
+            cJSON_AddNumberToObject(o, "num_messages", cJSON_GetArraySize(g_messages) - first);
+            char *txt = cJSON_PrintUnformatted(o);
+            if (json_fd >= 0) { if (write(json_fd, txt, strlen(txt)) < 0 || write(json_fd, "\n", 1) < 0) {} }
+            free(txt); cJSON_Delete(o);
+        }
+        return aborted ? 130 : 0;
     }
 
     banner();

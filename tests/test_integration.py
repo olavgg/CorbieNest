@@ -132,6 +132,16 @@ check(rc == 1, "--resume with unknown id fails")
 out, rc = run(["-m", "fake-coder:latest", "-p", "session two"])
 check(len(os.listdir(SESS)) == 2, "new run = new session file")
 
+print("test -p --output-format json")
+out, rc = run(["-m", "fake-coder:latest", "-p", "json please", "--output-format", "json"])
+lines = [l for l in out.splitlines() if l.strip()]
+check(len(lines) == 1, f"exactly one line of output: {out!r}")
+j = json.loads(lines[0])
+check(j["result"] == "Echo: json please" and j["model"] == "fake-coder:latest" and j["prompt_tokens"] == 123 and j["eval_tokens"] == 45 and j["model_calls"] == 1 and j["interrupted"] is False and j["session_id"], f"json fields: {j}")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_BASH", "--output-format", "json"])
+j = json.loads(out.strip()); check(j["tool_calls"] == 1 and j["result"].startswith("Tool said:"), f"tool run in json mode: {j}")
+out, rc = run(["-m", "fake-coder:latest", "-p", "x", "--output-format", "yaml"]); check(rc == 2, "bad format rejected")
+
 # ---------- interactive via pty ----------
 class Session:
     def __init__(self, args=(), cols=100, rows=40):
