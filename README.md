@@ -74,6 +74,8 @@ corbienest [options] [-p PROMPT]
   -y, --yolo           auto-approve tool calls (same as --mode auto)
       --mode NAME      permission mode: manual, accept-edits, plan, auto
   -T, --no-tools       disable tool calling
+      --continue       resume the latest session started in this directory
+  -r, --resume [ID]    resume a session: by ID, or pick one from a menu
       --think / --no-think / --show-thinking
 ```
 
@@ -96,6 +98,7 @@ corbienest [options] [-p PROMPT]
 | `/ctx [N\|Nk\|max\|default]` | context window: no argument opens a size picker (up to the model's trained maximum), `/ctx 64k`, `/ctx max` … set it directly |
 | `/temp X`, `/host URL` | tuning |
 | `/save [file]` | save transcript as markdown |
+| `/resume [ID\|all]` | pick an earlier session to continue (this directory; `all` for every directory), or load one by ID |
 | `/history [N]` | show the last N queries (default 20; the latest 100 are kept across sessions, ↑/↓ recalls them) |
 | `/cd DIR`, `/pwd` | change working directory |
 | `/quit` | exit (also Ctrl-D) |
@@ -193,6 +196,14 @@ picker of sizes up to the model's trained maximum (read from `ollama show`), or 
 Larger windows need more RAM/VRAM and take effect on the next request; `/compact` is the other
 way out when a long session fills up. Once a request has used 95% or more of the window,
 corbienest compacts automatically before the next model call (also mid-task, between tool rounds).
+
+### Sessions
+
+Every conversation is saved after each request to `~/.config/corbienest/sessions/<id>.json`
+(the latest 100 are kept). `corbienest --continue` picks up the most recent session started in
+the current directory, `--resume` opens a picker (or `--resume ID`), and `/resume` does the same
+from inside a session — the recap shows the first request and the last reply. `/clear` starts a
+new session; `/status` shows the current id, which is also printed when you quit.
 
 ### Project memory
 

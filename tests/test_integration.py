@@ -111,6 +111,27 @@ sysmsg = requests()[-1]["messages"][0]["content"]
 check("ALWAYS-SAY-MOO" in sysmsg and "EXTRA-SYS" in sysmsg, "project + extra system prompt")
 os.remove(os.path.join(WORK, "CORBIENEST.md"))
 
+print("test sessions: saved after each request, --continue / --resume")
+SESS = os.path.join(CFG, "corbienest", "sessions")
+shutil.rmtree(SESS, ignore_errors=True)   # earlier one-shot runs saved sessions too
+out, rc = run(["-m", "fake-coder:latest", "-p", "session one"])
+files = sorted(os.listdir(SESS)); check(len(files) == 1, f"one session file after a one-shot run: {files}")
+sess = json.load(open(os.path.join(SESS, files[0])))
+check(sess["title"] == "session one" and sess["cwd"] == WORK and [m["role"] for m in sess["messages"]] == ["user", "assistant"], f"session file content: {sess}")
+out, rc = run(["-m", "fake-coder:latest", "--continue", "-p", "and two"])
+check("resumed session" in out and "session one" in out, f"--continue recap: {out!r}")
+msgs = requests()[-1]["messages"]
+check([m["content"] for m in msgs if m["role"] == "user"] == ["session one", "and two"], "continued conversation sent")
+check(len(os.listdir(SESS)) == 1, "continuing appends to the same session file")
+sid = files[0][:-5]
+out, rc = run(["-m", "fake-coder:latest", "--resume", sid, "-p", "three"])
+check("resumed session " + sid in out, "--resume ID")
+check(len(json.load(open(os.path.join(SESS, files[0])))["messages"]) == 6, "6 messages after three requests")
+out, rc = run(["-m", "fake-coder:latest", "--resume", "nope-nope", "-p", "x"])
+check(rc == 1, "--resume with unknown id fails")
+out, rc = run(["-m", "fake-coder:latest", "-p", "session two"])
+check(len(os.listdir(SESS)) == 2, "new run = new session file")
+
 # ---------- interactive via pty ----------
 class Session:
     def __init__(self, args=(), cols=100, rows=40):
@@ -276,6 +297,20 @@ msgs = requests()[-1]["messages"]
 check(any("This conversation was compacted" in (m.get("content") or "") for m in msgs), "next request carries the summary")
 check(not any("HUGE_CTX" in (m.get("content") or "") for m in msgs if m["role"] == "user" and "compacted" not in m["content"]), "old messages dropped")
 check(s.text().count("auto-compacting") == 1, "did not compact again (usage figure unchanged)")
+
+print("test interactive: /resume picker")
+s.send("/resume\r"); check(s.expect("Resume a session"), "picker opens")
+check(s.expect("session two") and s.expect("session one"), "earlier sessions listed, this directory")
+s.send("\x1b"); check(s.expect("cancelled"), "esc cancels")
+s.send("/resume " + sid + "\r"); check(s.expect("resumed session " + sid), "/resume ID loads it")
+check(s.expect("last reply:") and s.expect("Echo: three"), "recap shows the last reply")
+s.send("four\r"); check(s.expect("Echo: four"), "continues")
+msgs = requests()[-1]["messages"]
+check([m["content"] for m in msgs if m["role"] == "user"] == ["session one", "and two", "three", "four"], "resumed history sent")
+s.send("/status\r"); check(s.expect("session    " + sid), "/status shows the session id")
+s.send("/clear\r"); s.expect("new conversation")
+s.send("fresh start\r"); check(s.expect("Echo: fresh start"), "reply")
+check(any(json.load(open(os.path.join(SESS, f)))["title"] == "fresh start" for f in os.listdir(SESS)), "/clear starts a new session file")
 
 print("test interactive: /ctx picker and sizes")
 s.send("/ctx 64k\r"); check(s.expect("context window: 64k (num_ctx 65536)"), "/ctx 64k")

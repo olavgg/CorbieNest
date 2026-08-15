@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
@@ -21,9 +23,11 @@ static char   g_cwd[PATH_MAX];
 static char  *g_project_instructions = NULL;
 static char  *g_memory = NULL;                    /* contents of MEMORY_PATH (see memory_*) */
 
+static char   g_session_id[64];                  /* current session (file stem under config_dir()/sessions) */
+
 static const char *SLASH_CMDS[] = {
     "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think",
-    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/quit", "/exit"
+    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/quit", "/exit"
 };
 
 /* slash completion list = built-in commands + /skill names (rebuilt when skills reload) */
@@ -178,6 +182,187 @@ static void cmd_memory(const char *arg) {
     if (!g_memory) { printf(C_DIM "(no memory yet — nothing durable has been recorded)" C_RESET "\n"); return; }
     fputs(g_memory, stdout);
     if (g_memory[strlen(g_memory) - 1] != '\n') printf("\n");
+}
+
+/* ---------- sessions (--continue / --resume / /resume) ----------
+ * Every conversation is persisted as JSON under config_dir()/sessions/<id>.json after each
+ * request (id = start time + pid). --continue reloads the latest session started in this
+ * working directory, --resume [ID] / /resume [ID] pick one from a menu (or by id). The
+ * latest SESSIONS_KEEP files are kept. */
+#define SESSIONS_KEEP 100
+static void print_result_preview(const char *text, int lines);
+
+static const char *sessions_dir(void) {
+    static char d[1200];
+    if (!d[0]) { snprintf(d, sizeof d, "%s/sessions", config_dir()); mkdir_p(d); }
+    return d;
+}
+
+static void session_path(const char *id, char *out, size_t n) { snprintf(out, n, "%s/%s.json", sessions_dir(), id); }
+
+/* first line of the first user message, for menus */
+static char *session_title_of(cJSON *messages) {
+    cJSON *m;
+    cJSON_ArrayForEach(m, messages) {
+        cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+        if (cJSON_IsString(r) && !strcmp(r->valuestring, "user") && cJSON_IsString(c) && c->valuestring[0]) {
+            const char *t = c->valuestring; while (*t == ' ' || *t == '\n') t++;
+            size_t n = strcspn(t, "\n"); if (n > 70) n = 70;
+            while (n > 0 && ((unsigned char)t[n] & 0xC0) == 0x80) n--;
+            char *out = xmalloc(n + 4); memcpy(out, t, n); out[n] = 0;
+            if (t[n]) strcat(out, "…");
+            return out;
+        }
+    }
+    return xstrdup("(empty)");
+}
+
+static void sessions_prune(void) {
+    DIR *d = opendir(sessions_dir()); if (!d) return;
+    struct { char name[128]; time_t mt; } *ents = NULL; int n = 0, cap = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t l = strlen(e->d_name);
+        if (l < 6 || strcmp(e->d_name + l - 5, ".json")) continue;
+        char p[1400]; snprintf(p, sizeof p, "%s/%s", sessions_dir(), e->d_name);
+        struct stat st; if (stat(p, &st) != 0) continue;
+        if (n == cap) { cap = cap ? cap * 2 : 64; ents = xrealloc(ents, sizeof *ents * (size_t)cap); }
+        snprintf(ents[n].name, sizeof ents[n].name, "%s", e->d_name); ents[n].mt = st.st_mtime; n++;
+    }
+    closedir(d);
+    while (n > SESSIONS_KEEP) {   /* drop the oldest one at a time (n is small) */
+        int oldest = 0; for (int i = 1; i < n; i++) if (ents[i].mt < ents[oldest].mt) oldest = i;
+        char p[1400]; snprintf(p, sizeof p, "%s/%s", sessions_dir(), ents[oldest].name); unlink(p);
+        ents[oldest] = ents[--n];
+    }
+    free(ents);
+}
+
+static void session_new_id(void) {
+    time_t t = time(NULL); char ts[32]; strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", localtime(&t));
+    snprintf(g_session_id, sizeof g_session_id, "%s-%d", ts, (int)getpid());
+}
+
+static void session_save(void) {
+    if (!g_messages || cJSON_GetArraySize(g_messages) == 0) return;
+    if (!g_session_id[0]) session_new_id();
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "id", g_session_id);
+    cJSON_AddStringToObject(o, "cwd", g_cwd);
+    cJSON_AddStringToObject(o, "model", g_cfg.model ? g_cfg.model : "");
+    cJSON_AddNumberToObject(o, "updated", (double)time(NULL));
+    char *title = session_title_of(g_messages); cJSON_AddStringToObject(o, "title", title); free(title);
+    cJSON_AddNumberToObject(o, "prompt_tokens", (double)g_session.prompt_tokens);
+    cJSON_AddNumberToObject(o, "eval_tokens", (double)g_session.eval_tokens);
+    cJSON_AddItemReferenceToObject(o, "messages", g_messages);
+    char *txt = cJSON_PrintUnformatted(o);
+    cJSON_Delete(o);
+    char path[1400]; session_path(g_session_id, path, sizeof path);
+    write_whole_file(path, txt, strlen(txt));
+    free(txt);
+    sessions_prune();
+}
+
+typedef struct { char id[128]; char *title; char *cwd; char *model; int nmsg; time_t updated; } session_info;
+
+static int session_cmp(const void *a, const void *b) {
+    const session_info *x = a, *y = b;
+    return x->updated < y->updated ? 1 : x->updated > y->updated ? -1 : 0;
+}
+
+/* newest first; if only_cwd, just the sessions started in the current directory */
+static session_info *sessions_list(bool only_cwd, int *count) {
+    session_info *v = NULL; int n = 0, cap = 0;
+    DIR *d = opendir(sessions_dir());
+    struct dirent *e;
+    while (d && (e = readdir(d))) {
+        size_t l = strlen(e->d_name);
+        if (l < 6 || l >= 128 || strcmp(e->d_name + l - 5, ".json")) continue;
+        char p[1400]; snprintf(p, sizeof p, "%s/%s", sessions_dir(), e->d_name);
+        size_t sz; char *txt = read_whole_file(p, &sz, 64 * 1024 * 1024);
+        if (!txt) continue;
+        cJSON *o = cJSON_Parse(txt); free(txt);
+        if (!o) continue;
+        cJSON *cwd = cJSON_GetObjectItemCaseSensitive(o, "cwd");
+        if (only_cwd && !(cJSON_IsString(cwd) && !strcmp(cwd->valuestring, g_cwd))) { cJSON_Delete(o); continue; }
+        if (n == cap) { cap = cap ? cap * 2 : 32; v = xrealloc(v, sizeof *v * (size_t)cap); }
+        session_info *si = &v[n++]; memset(si, 0, sizeof *si);
+        snprintf(si->id, sizeof si->id, "%.*s", (int)(l - 5), e->d_name);
+        cJSON *t = cJSON_GetObjectItemCaseSensitive(o, "title"), *m = cJSON_GetObjectItemCaseSensitive(o, "model"), *u = cJSON_GetObjectItemCaseSensitive(o, "updated");
+        si->title = xstrdup(cJSON_IsString(t) ? t->valuestring : "?");
+        si->cwd = xstrdup(cJSON_IsString(cwd) ? cwd->valuestring : "?");
+        si->model = xstrdup(cJSON_IsString(m) ? m->valuestring : "?");
+        si->updated = cJSON_IsNumber(u) ? (time_t)u->valuedouble : 0;
+        si->nmsg = cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(o, "messages"));
+        cJSON_Delete(o);
+    }
+    if (d) closedir(d);
+    if (n) qsort(v, (size_t)n, sizeof *v, session_cmp);
+    *count = n;
+    return v;
+}
+static void sessions_free(session_info *v, int n) { for (int i = 0; i < n; i++) { free(v[i].title); free(v[i].cwd); free(v[i].model); } free(v); }
+
+/* Load a session into g_messages; returns false if not found / unreadable. */
+static bool session_load(const char *id) {
+    char path[1400]; session_path(id, path, sizeof path);
+    size_t sz; char *txt = read_whole_file(path, &sz, 64 * 1024 * 1024);
+    if (!txt) return false;
+    cJSON *o = cJSON_Parse(txt); free(txt);
+    if (!o) return false;
+    cJSON *msgs = cJSON_DetachItemFromObjectCaseSensitive(o, "messages");
+    if (!cJSON_IsArray(msgs)) { if (msgs) cJSON_Delete(msgs); cJSON_Delete(o); return false; }
+    cJSON_Delete(g_messages); g_messages = msgs;
+    tools_reset_permissions();
+    snprintf(g_session_id, sizeof g_session_id, "%s", id);
+    cJSON *pt = cJSON_GetObjectItemCaseSensitive(o, "prompt_tokens"), *et = cJSON_GetObjectItemCaseSensitive(o, "eval_tokens");
+    g_session.prompt_tokens = cJSON_IsNumber(pt) ? (long)pt->valuedouble : 0;
+    g_session.eval_tokens = cJSON_IsNumber(et) ? (long)et->valuedouble : 0;
+    g_session.last_prompt_tokens = 0;
+    cJSON *cwd = cJSON_GetObjectItemCaseSensitive(o, "cwd");
+    /* recap: title, size, and how the last exchange ended */
+    char *title = session_title_of(g_messages);
+    int n = cJSON_GetArraySize(g_messages);
+    printf(C_GREEN "✓ resumed session %s" C_RESET C_DIM " · %d message%s · %s%s%s" C_RESET "\n", id, n, n == 1 ? "" : "s", title,
+           cJSON_IsString(cwd) && strcmp(cwd->valuestring, g_cwd) ? " · started in " : "", cJSON_IsString(cwd) && strcmp(cwd->valuestring, g_cwd) ? cwd->valuestring : "");
+    free(title);
+    for (int i = n - 1; i >= 0; i--) {
+        cJSON *m = cJSON_GetArrayItem(g_messages, i);
+        cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+        if (cJSON_IsString(r) && !strcmp(r->valuestring, "assistant") && cJSON_IsString(c) && c->valuestring[0]) {
+            printf(C_DIM "  last reply:" C_RESET "\n");
+            print_result_preview(c->valuestring, 6);
+            break;
+        }
+    }
+    cJSON_Delete(o);
+    term_status_refresh();
+    return true;
+}
+
+/* /resume [ID|all]: menu of sessions (this directory first; "all" for every directory) */
+static void cmd_resume(const char *arg) {
+    if (arg && *arg && strcmp(arg, "all")) { if (!session_load(arg)) printf(C_RED "no session %s" C_RESET " — /resume lists them\n", arg); return; }
+    bool all = arg && !strcmp(arg, "all");
+    int n; session_info *v = sessions_list(!all, &n);
+    if (!n && !all) { sessions_free(v, n); v = sessions_list(false, &n); all = true; }
+    if (!n) { printf(C_DIM "no saved sessions yet" C_RESET "\n"); sessions_free(v, n); return; }
+    if (!g_cfg.interactive) { for (int i = 0; i < n; i++) printf("%s  %s\n", v[i].id, v[i].title); sessions_free(v, n); return; }
+    const char **items = xmalloc(sizeof(char*) * (size_t)n), **descs = xmalloc(sizeof(char*) * (size_t)n);
+    char **bufs = xmalloc(sizeof(char*) * (size_t)n * 2);
+    for (int i = 0; i < n; i++) {
+        char when[32]; strftime(when, sizeof when, "%Y-%m-%d %H:%M", localtime(&v[i].updated));
+        sbuf a; sb_init(&a); sb_printf(&a, "%s  %s", when, v[i].title); bufs[2*i] = sb_detach(&a); items[i] = bufs[2*i];
+        sbuf b; sb_init(&b); sb_printf(&b, "%d messages · %s", v[i].nmsg, v[i].model);
+        if (strcmp(v[i].cwd, g_cwd)) sb_printf(&b, " · %s", v[i].cwd);
+        if (!strcmp(v[i].id, g_session_id)) sb_puts(&b, " · current");
+        bufs[2*i+1] = sb_detach(&b); descs[i] = bufs[2*i+1];
+    }
+    int r = term_select(all ? "Resume a session (all directories)" : "Resume a session (this directory; /resume all for every directory)", items, descs, n, 0);
+    if (r >= 0) session_load(v[r].id);
+    else printf(C_DIM "cancelled" C_RESET "\n");
+    for (int i = 0; i < 2 * n; i++) free(bufs[i]);
+    free(bufs); free(items); free(descs); sessions_free(v, n);
 }
 
 /* ---------- system prompt ---------- */
@@ -651,6 +836,7 @@ static void cmd_help(void) {
            "  /temp X               set temperature (-1 = server default)\n"
            "  /host URL             set ollama host (default http://127.0.0.1:11434)\n"
            "  /save [file]          save transcript as markdown\n"
+           "  /resume [ID|all]      pick an earlier session to continue (sessions are saved after every request; also --continue / --resume)\n"
            "  /history [N]          show the last N queries (default 20; the latest 100 are kept across sessions)\n"
            "  /cd DIR, /pwd         change / show working directory\n"
            "  /quit, /exit          leave (also Ctrl-D)\n\n"
@@ -730,6 +916,8 @@ static void cmd_status(void) {
     printf(C_BOLD "temp       " C_RESET "%s", g_cfg.temperature < 0 ? "default\n" : ""); if (g_cfg.temperature >= 0) printf("%g\n", g_cfg.temperature);
     if (g_project_instructions) printf(C_BOLD "project    " C_RESET "instructions file loaded\n");
     printf(C_BOLD "memory     " C_RESET "%s%s\n", g_cfg.memory ? "on" : "off", g_memory ? " · " MEMORY_PATH " loaded" : "");
+    if (g_session_id[0]) printf(C_BOLD "session    " C_RESET "%s · resume later with: corbienest --resume %s\n", g_session_id, g_session_id);
+    else printf(C_BOLD "session    " C_RESET "(nothing saved yet)\n");
 }
 
 /* Returns true when the conversation was compacted. */
@@ -822,8 +1010,9 @@ static int handle_slash(char *line) {
         if (!arg) cmd_model_picker();
         else { free(g_cfg.model); g_cfg.model = xstrdup(arg); refresh_model_caps(false); config_save(); printf(C_GREEN "✓ model set to %s" C_RESET "\n", g_cfg.model); }
     }
-    else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); tools_reset_permissions(); g_session.last_prompt_tokens = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
-    else if (!strcmp(cmd, "/compact")) cmd_compact();
+    else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); tools_reset_permissions(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
+    else if (!strcmp(cmd, "/compact")) { if (cmd_compact()) session_save(); }
+    else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/status") || !strcmp(cmd, "/cost")) cmd_status();
     else if (!strcmp(cmd, "/system")) {
         if (!arg) printf("extra system prompt: %s\n", g_cfg.system_prompt ? g_cfg.system_prompt : C_DIM "(none)" C_RESET);
@@ -886,6 +1075,7 @@ static int handle_slash(char *line) {
         add_message("user", msg);
         free(msg); free(prompt);
         bool aborted = run_turn();
+        session_save();
         memory_update(first, aborted);
         if (aborted) return -1;
     }
@@ -938,6 +1128,7 @@ static int process_input(char *line) {
     add_message("user", msg);
     free(msg);
     bool aborted = run_turn();
+    session_save();
     memory_update(first, aborted);
     printf("\n");
     fflush(stdout);
@@ -954,6 +1145,8 @@ static void usage(void) {
            "  -y, --yolo           auto-approve tool calls (same as --mode auto)\n"
            "      --mode NAME      permission mode: manual, accept-edits, plan, auto\n"
            "  -T, --no-tools       disable tool calling\n"
+           "      --continue       resume the latest session started in this directory\n"
+           "  -r, --resume [ID]    resume a session: by ID, or pick one from a menu\n"
            "      --no-memory      don't update " MEMORY_PATH " after requests\n"
            "      --think          ask model to think; --no-think to disable; --show-thinking to display\n"
            "  -h, --help           this help\n");
@@ -973,7 +1166,7 @@ int main(int argc, char **argv) {
     const char *env_model = getenv("CORBIENEST_MODEL");
     if (env_model && *env_model) { free(g_cfg.model); g_cfg.model = xstrdup(env_model); }
 
-    const char *oneshot = NULL;
+    const char *oneshot = NULL, *resume_id = NULL; bool resume_latest = false;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         #define NEEDARG() (i + 1 < argc ? argv[++i] : (usage(), exit(2), (char*)NULL))
@@ -986,6 +1179,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--mode")) { const char *mn = NEEDARG(); int m = mode_parse(mn); if (m < 0) { fprintf(stderr, "unknown mode %s\n", mn); return 2; } g_cfg.mode = m; }
         else if (!strcmp(a, "-T") || !strcmp(a, "--no-tools")) g_cfg.no_tools = true;
         else if (!strcmp(a, "--no-memory")) g_cfg.memory = false;
+        else if (!strcmp(a, "--continue")) resume_latest = true;
+        else if (!strcmp(a, "-r") || !strcmp(a, "--resume")) { resume_id = (i + 1 < argc && argv[i+1][0] != '-') ? argv[++i] : ""; }
         else if (!strcmp(a, "--think")) g_cfg.think = 1;
         else if (!strcmp(a, "--no-think")) g_cfg.think = 0;
         else if (!strcmp(a, "--show-thinking")) g_cfg.show_thinking = true;
@@ -1002,6 +1197,17 @@ int main(int argc, char **argv) {
     skills_load();
     refresh_model_caps(oneshot != NULL);
     if (!g_cfg.model) { fprintf(stderr, "corbienest: no models found on %s (run `ollama pull <model>`)\n", g_cfg.host); return 1; }
+    if (g_cfg.interactive && !oneshot) term_fullscreen(true);   /* alternate screen + bottom status bar */
+    if (resume_latest) {
+        int n; session_info *v = sessions_list(true, &n);
+        if (n) session_load(v[0].id); else printf(C_DIM "no earlier session in this directory — starting fresh" C_RESET "\n");
+        sessions_free(v, n);
+    } else if (resume_id && *resume_id) {
+        if (!session_load(resume_id)) { fprintf(stderr, "corbienest: no session %s\n", resume_id); term_restore(); return 1; }
+    } else if (resume_id) {
+        if (oneshot) { fprintf(stderr, "corbienest: --resume needs a session ID with -p\n"); return 2; }
+        cmd_resume(NULL);
+    }
 
     if (oneshot) {
         char *msg;
@@ -1012,12 +1218,12 @@ int main(int argc, char **argv) {
         int first = cJSON_GetArraySize(g_messages);
         add_message("user", msg); free(msg);
         bool aborted = run_turn();
+        session_save();
         memory_update(first, aborted);
         term_restore();
         return 0;
     }
 
-    if (g_cfg.interactive) term_fullscreen(true);   /* alternate screen + bottom status bar */
     banner();
     hist_load();
     refresh_slash_completion();
@@ -1039,8 +1245,10 @@ int main(int argc, char **argv) {
         if (rc == -1) term_queue_to_editor();
     }
     hist_save();
+    session_save();
     term_restore();   /* leaves the alternate screen: say goodbye on the normal one */
     printf(C_DIM "bye" C_RESET " · corbienest used %ld tokens this session (%ld in · %ld out) with %s\n",
            g_session.prompt_tokens + g_session.eval_tokens, g_session.prompt_tokens, g_session.eval_tokens, g_cfg.model);
+    if (g_session_id[0]) printf(C_DIM "  continue it later with: corbienest --continue   (or --resume %s)" C_RESET "\n", g_session_id);
     return 0;
 }

@@ -30,7 +30,7 @@ build must be warning-free with `-Wall -Wextra`.
 | `src/tools.c` | tool definitions + implementations, `confirm()` (mode-aware), shell runner |
 | `src/ollama.c` | `/api/chat` streaming, tool-call accumulation, text tool-call recovery |
 | `src/skills.c` | SKILL.md discovery, frontmatter parsing, `/NAME` expansion, scaffolding |
-| `src/main.c` | REPL (`process_input`), slash commands, system prompt, agent loop (`run_turn`, which injects queued messages between tool rounds via `inject_queued()` and auto-compacts at ≥`AUTO_COMPACT_PCT` context via `maybe_auto_compact()`), `/ctx` picker (model max from `/api/show`), project memory (`.corbienest/memory.md`: `load_memory()` into the system prompt, `memory_update()` = quiet model call after each request via `ollama_quiet`, `/memory`), banner |
+| `src/main.c` | REPL (`process_input`), slash commands, system prompt, agent loop (`run_turn`, which injects queued messages between tool rounds via `inject_queued()` and auto-compacts at ≥`AUTO_COMPACT_PCT` context via `maybe_auto_compact()`), `/ctx` picker (model max from `/api/show`), sessions (`session_save()` after each request to `config_dir()/sessions/<id>.json`, `--continue`/`--resume`/`/resume`), project memory (`.corbienest/memory.md`: `load_memory()` into the system prompt, `memory_update()` = quiet model call after each request via `ollama_quiet`, `/memory`), banner |
 
 ## Conventions
 
