@@ -109,6 +109,8 @@ corbienest [options] [-p PROMPT]
 
 - `!cmd` — run a shell command yourself; its output is added to the conversation.
 - `@path` — attach a file (or a directory listing) to your message.
+- `# fact` — remember something: a menu asks which section of `.corbienest/memory.md` it belongs
+  to (Project / User / Feedback / Reference) and the line is appended, no model call involved.
 - Enter sends; Alt+Enter, Ctrl+J or a trailing `\` inserts a newline. Bracketed paste works.
 - Ctrl-C (or Esc) cancels a running generation / clears the line (twice on an empty line quits).
 - **You can keep typing while the model works.** What you type shows up in the status bar as
@@ -220,7 +222,8 @@ end of each request a quiet extraction call asks whether the exchange revealed a
 (who you are and how you like to work, feedback you gave, project goals/decisions/constraints
 that aren't in the code, references such as URLs or tickets) and, if so, rewrites the file;
 otherwise nothing is written. Facts the repository already records, and anything only relevant
-to the current conversation, are deliberately not saved. You can also ask the model to remember
+to the current conversation, are deliberately not saved. Type `# fact` to add something yourself
+in one keystroke, ask the model to remember
 or forget something (it edits the file with `edit_file`), or edit the file by hand. `/memory`
 prints it, `/memory off` (saved to config) or `--no-memory` disables the update, `/memory clear`
 deletes it. One-shot runs (`-p`) only touch the file if `.corbienest/` already exists.

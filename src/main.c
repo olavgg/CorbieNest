@@ -166,6 +166,39 @@ static void memory_update(int first, bool aborted) {
     free(text);
 }
 
+/* "# fact" typed at the prompt: append a bullet to a section of the memory file without a
+ * model call (like Claude Code's # shortcut). Interactive: pick the section from a menu;
+ * otherwise it goes under Project. */
+static void memory_quick_add(const char *fact) {
+    static const char *secs[] = { "Project", "User", "Feedback", "Reference" };
+    static const char *descs[] = { "goals, decisions, constraints, ongoing work", "who you are, how you like to work", "how the assistant should work (corrections, confirmed approaches)", "URLs, tickets, dashboards, hosts" };
+    int sec = 0;
+    if (g_cfg.interactive) {
+        char title[200]; snprintf(title, sizeof title, "Remember \"%.60s%s\" under which section?", fact, strlen(fact) > 60 ? "…" : "");
+        sec = term_select(title, secs, descs, 4, 0);
+        if (sec < 0) { printf(C_DIM "not saved" C_RESET "\n"); return; }
+    }
+    size_t n = 0; char *old = is_file(MEMORY_PATH) ? read_whole_file(MEMORY_PATH, &n, 4 * 1024 * 1024) : NULL;
+    sbuf f; sb_init(&f);
+    sb_puts(&f, old && *old ? old : MEMORY_TEMPLATE);
+    free(old);
+    char head[32]; snprintf(head, sizeof head, "## %s", secs[sec]);
+    char *h = strstr(f.data, head);
+    if (!h) { if (f.data[f.len-1] != '\n') sb_putc(&f, '\n'); sb_printf(&f, "\n%s\n", head); h = strstr(f.data, head); }
+    /* insert after the last non-blank line of that section (before the next "## " or EOF) */
+    char *next = strstr(h + 3, "\n## "); size_t sec_end = next ? (size_t)(next - f.data) + 1 : f.len;
+    size_t ins = sec_end; while (ins > (size_t)(h - f.data) && f.data[ins-1] == '\n') ins--;
+    sbuf line; sb_init(&line); sb_printf(&line, "\n- %s", fact);
+    sbuf out; sb_init(&out); sb_append(&out, f.data, ins); sb_append(&out, line.data, line.len);
+    if (ins < f.len) sb_append(&out, f.data + ins, f.len - ins); else sb_putc(&out, '\n');
+    if (out.data[out.len-1] != '\n') sb_putc(&out, '\n');
+    if (mkdir_p(".corbienest") == 0 && write_whole_file(MEMORY_PATH, out.data, out.len) == 0) {
+        load_memory();
+        printf(C_GREEN "✓ remembered under %s" C_RESET C_DIM " (%s)" C_RESET "\n", secs[sec], MEMORY_PATH);
+    } else printf(C_RED "✗ cannot write %s: %s" C_RESET "\n", MEMORY_PATH, strerror(errno));
+    sb_free(&f); sb_free(&line); sb_free(&out);
+}
+
 static void cmd_memory(const char *arg) {
     if (arg && (!strcmp(arg, "on") || !strcmp(arg, "off"))) {
         g_cfg.memory = !strcmp(arg, "on"); config_save();
@@ -897,6 +930,7 @@ static void cmd_help(void) {
            C_BOLD "Input\n" C_RESET
            "  !cmd                  run a shell command yourself; output is added to the conversation\n"
            "  @path                 attach a file (or directory listing) to your message\n"
+           "  # fact                remember something: appended to " MEMORY_PATH " (pick the section from a menu), no model call\n"
            "  Enter                 send  ·  Alt+Enter / Ctrl+J / trailing \\ : newline\n"
            "  Enter while busy      queue a message for the model (added between tool rounds or after the turn; Ctrl-C hands it back)\n"
            "  Ctrl-C                cancel generation / clear line (twice: quit)  ·  Ctrl-L clear screen\n"
@@ -1179,6 +1213,10 @@ static int process_input(char *line) {
     hist_add(s); hist_save();   /* persist as we go, so a crash or kill loses nothing */
     if (*s == '/') { int q = handle_slash(s); if (q == 1) return 1; printf("\n"); term_status_refresh(); return q; }
     if (*s == '!') { handle_bang(s + 1); printf("\n"); return 0; }
+    if (*s == '#' && s[1] && s[1] != '#') {   /* "# fact" -> memory (a lone "#" or "##…" is sent as text) */
+        const char *f = s + 1; while (*f == ' ') f++;
+        if (*f) { memory_quick_add(f); printf("\n"); return 0; }
+    }
     char *msg = expand_mentions(s);
     int first = cJSON_GetArraySize(g_messages);
     add_message("user", msg);
