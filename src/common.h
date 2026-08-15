@@ -214,6 +214,10 @@ void tools_checkpoint_turn(int turn);              /* main.c: a request starts *
 int  tools_checkpoint_files(int turn, sbuf *names);/* files changed in that request or later */
 int  tools_checkpoint_restore(int turn);           /* put them back; returns files restored */
 void tools_checkpoint_clear(void);
+/* The `task` tool runs a sub-agent; main.c provides the implementation (it owns the agent
+ * loop). Writes the report into out; returns 0 ok, nonzero error. */
+typedef int (*tools_subagent_fn)(const char *description, const char *prompt, sbuf *out);
+extern tools_subagent_fn tools_subagent;
 extern bool tools_no_confirm;   /* while true, tools run without asking (user-typed "!cmd") */
 const char *tools_summary_line(void);   /* short list for help */
 

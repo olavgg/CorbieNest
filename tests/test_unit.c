@@ -172,7 +172,7 @@ static void test_tools_body(void *ud) {
 
     /* tool definitions are well-formed */
     cJSON *defs = tools_definitions();
-    CHECK(cJSON_GetArraySize(defs) == 6);
+    CHECK(cJSON_GetArraySize(defs) == 7);
     cJSON *t; cJSON_ArrayForEach(t, defs) {
         cJSON *f = cJSON_GetObjectItem(t, "function");
         CHECK(cJSON_IsString(cJSON_GetObjectItem(f, "name")));

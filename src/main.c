@@ -590,7 +590,7 @@ static char *build_system_prompt(void) {
               g_cwd, u.sysname, u.machine, date, git ? "yes" : "no");
     if (g_model_tools && !g_cfg.no_tools) {
         sb_puts(&b,
-            "\n# Tools\nYou have these tools: read_file, write_file, edit_file, list_dir, grep, bash. Use them proactively "
+            "\n# Tools\nYou have these tools: read_file, write_file, edit_file, list_dir, grep, bash, task. Use them proactively "
             "instead of asking the user to paste files or run commands for you.\n"
             "- Explore first: use list_dir / grep / read_file to understand relevant code before changing it.\n"
             "- Always read a file before editing it. Use edit_file for targeted changes (old_string must match exactly); "
@@ -601,6 +601,8 @@ static char *build_system_prompt(void) {
             "- The user must approve each write, edit and shell command, so proceed and call the tool rather than asking permission in text.\n"
             "- After making code changes, verify them when practical (compile, run tests, or run the program).\n"
             "- Do not fabricate tool results. If a tool errors, read the error and adjust.\n"
+            "- Use task to hand a broad, self-contained investigation (\"find all places that…\", \"how does X work across the code\") to a read-only sub-agent "
+            "and get back a report, keeping the noise out of this conversation; give it a complete prompt, it knows nothing of this chat.\n"
             "- When a task is done, briefly summarise what you changed and how you verified it.\n");
     } else {
         sb_puts(&b, "\n(No tools are available in this session; if you need file contents or command output, ask the user to provide them.)\n");
@@ -848,6 +850,88 @@ static cJSON *tools_for_mode(void) {
         cJSON_AddItemReferenceToArray(arr, t);
     }
     return arr;
+}
+
+/* ---------- sub-agents (the `task` tool) ----------
+ * A fresh, read-only agent loop: own message list, own short system prompt (plus the project
+ * instructions), tools limited to read_file / list_dir / grep / bash, at most SUBAGENT_ITERS
+ * tool rounds. Its streaming output is not shown; each tool call is echoed as one line and
+ * the final report is previewed and returned to the parent as the tool result. */
+#define SUBAGENT_ITERS 25
+static int run_subagent(const char *description, const char *prompt, sbuf *out) {
+    printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", description);
+    cJSON *msgs = cJSON_CreateArray();
+    cJSON *sys = cJSON_CreateObject();
+    cJSON_AddStringToObject(sys, "role", "system");
+    sbuf sp; sb_init(&sp);
+    sb_printf(&sp, "You are a sub-agent of Corbie Nest (corbienest), a terminal coding agent. The main agent delegated one self-contained task to you.\n"
+                   "Working directory: %s\n"
+                   "You have read-only tools: read_file, list_dir, grep, bash (for read-only shell commands such as git log, find, wc; do not modify files, do not run interactive programs). "
+                   "Do the research thoroughly, then finish with ONE final message: a clear, complete report with concrete file paths, line numbers and code snippets where useful — "
+                   "the main agent sees only that final message, nothing else you did. Do not ask questions; make reasonable assumptions and state them.", g_cwd);
+    if (g_project_instructions) sb_puts(&sp, g_project_instructions);
+    cJSON_AddStringToObject(sys, "content", sp.data); sb_free(&sp);
+    cJSON_AddItemToArray(msgs, sys);
+    cJSON *u = cJSON_CreateObject(); cJSON_AddStringToObject(u, "role", "user"); cJSON_AddStringToObject(u, "content", prompt);
+    cJSON_AddItemToArray(msgs, u);
+    cJSON *tools = cJSON_CreateArray(), *t;
+    cJSON_ArrayForEach(t, g_tools) {
+        cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
+        cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+        const char *name = cJSON_IsString(nm) ? nm->valuestring : "";
+        if (!strcmp(name, "read_file") || !strcmp(name, "list_dir") || !strcmp(name, "grep") || !strcmp(name, "bash")) cJSON_AddItemReferenceToArray(tools, t);
+    }
+    int rc = 1, tool_rounds = 0;
+    const char *final = NULL;
+    for (int iter = 0; iter <= SUBAGENT_ITERS; iter++) {
+        chat_stats st; bool aborted = false;
+        ollama_quiet = true;
+        cJSON *reply = ollama_chat(msgs, g_model_tools ? tools : NULL, &st, &aborted);
+        ollama_quiet = false;
+        account(&st);
+        term_status_refresh();
+        if (!reply) { sb_puts(out, aborted ? "error: sub-agent interrupted by the user" : "error: sub-agent model call failed"); break; }
+        cJSON_AddItemToArray(msgs, reply);
+        cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
+        cJSON *content = cJSON_GetObjectItemCaseSensitive(reply, "content");
+        if (aborted) { sb_puts(out, "error: sub-agent interrupted by the user"); break; }
+        if (!calls || cJSON_GetArraySize(calls) == 0) { final = cJSON_IsString(content) ? content->valuestring : ""; rc = 0; break; }
+        if (iter == SUBAGENT_ITERS) { sb_printf(out, "error: sub-agent stopped after %d tool rounds without a report", SUBAGENT_ITERS); if (cJSON_IsString(content) && content->valuestring[0]) sb_printf(out, "\nIts last message:\n%s", content->valuestring); break; }
+        cJSON *call;
+        cJSON_ArrayForEach(call, calls) {
+            cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
+            cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+            cJSON *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+            const char *name = cJSON_IsString(nm) ? nm->valuestring : "?";
+            cJSON *parsed = NULL;
+            if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
+            char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
+            printf("    " C_DIM "⎿ %s%s%s%s" C_RESET "\n", name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
+            sbuf o; sb_init(&o);
+            g_session.tool_calls++;
+            tool_status ts;
+            if (!strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "task")) { sb_printf(&o, "error: %s is not available to a sub-agent (read-only)", name); ts = TOOL_ERROR; }
+            else ts = tools_execute(name, args, &o);
+            (void)ts;
+            cJSON *tm = cJSON_CreateObject();
+            cJSON_AddStringToObject(tm, "role", "tool");
+            cJSON_AddStringToObject(tm, "tool_name", name);
+            cJSON_AddStringToObject(tm, "content", o.data ? o.data : "");
+            cJSON_AddItemToArray(msgs, tm);
+            sb_free(&o);
+            if (parsed) cJSON_Delete(parsed);
+        }
+        tool_rounds++;
+        if (term_poll_interrupt()) { sb_puts(out, "error: sub-agent interrupted by the user"); break; }
+    }
+    if (rc == 0) {
+        sb_printf(out, "%s", final && *final ? final : "(the sub-agent returned an empty report)");
+        printf("    " C_DIM "⎿ report after %d tool round%s:" C_RESET "\n", tool_rounds, tool_rounds == 1 ? "" : "s");
+        print_result_preview(final && *final ? final : "(empty)", 8);
+    } else printf("    " C_RED "⎿ %s" C_RESET "\n", out->data ? out->data : "sub-agent failed");
+    cJSON_Delete(tools);
+    cJSON_Delete(msgs);
+    return rc;
 }
 
 static char *expand_mentions(const char *input);
@@ -1432,6 +1516,7 @@ int main(int argc, char **argv) {
     term_init();
     g_messages = cJSON_CreateArray();
     g_tools = tools_definitions();
+    tools_subagent = run_subagent;
     load_project_instructions();
     load_memory();
     tools_permissions_load();

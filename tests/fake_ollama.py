@@ -43,10 +43,23 @@ def script(model, messages, req):
             yield chunk(model, "NO_CHANGE")
         yield chunk(model, done=True)
         return
+    if messages[0]["role"] == "system" and "You are a sub-agent" in messages[0]["content"]:
+        # sub-agent: one grep round, then a report
+        if last["role"] == "tool":
+            yield chunk(model, "REPORT: found it in " + last["content"].strip().splitlines()[0][:40])
+            yield chunk(model, done=True)
+            return
+        yield chunk(model, tool_calls=[{"function": {"name": "grep", "arguments": {"pattern": "needle", "path": "."}}}])
+        yield chunk(model, done=True)
+        return
     if last["role"] == "tool":
         # after a tool result: summarise it
         yield chunk(model, "Tool said: ")
         yield chunk(model, last["content"].strip().splitlines()[0][:60])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_TASK" in text:
+        yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "find the needle", "prompt": "Search for needle and report where it is."}}}])
         yield chunk(model, done=True)
         return
     if "TOOL_BASH" in text:

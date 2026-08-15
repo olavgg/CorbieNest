@@ -405,6 +405,17 @@ check(users[-1] == "after rewind" and users[-2] != "TOOL_WRITE" and len(users) =
 s.send("\x1b"); s.send("\x1b"); s.expect("Rewind to before which request?"); s.send("\x1b"); check(s.expect("cancelled"), "esc cancels the picker")
 os.remove(os.path.join(WORK, "made.txt")); s.send("/mode manual\r"); s.expect("mode: manual")
 
+print("test interactive: task tool runs a read-only sub-agent")
+open(os.path.join(WORK, "hay.txt"), "w").write("nothing\nneedle here\n")
+s.send("TOOL_TASK\r"); check(s.expect("⤷ sub-agent find the needle", 15), "sub-agent header")
+check(s.expect("⎿ grep("), "its tool calls are echoed")
+check(s.expect("report after 1 tool round"), f"report preview: {s.text()[-300:]!r}")
+check(s.expect("Tool said: REPORT: found it in", 15), "parent model received the report as the tool result")
+sub = [r for r in requests() if r["messages"][0]["role"] == "system" and "You are a sub-agent" in r["messages"][0]["content"]]
+check(sub and all(t["function"]["name"] in ("read_file", "list_dir", "grep", "bash") for t in sub[-1]["tools"]), "sub-agent got read-only tools only")
+check("hay.txt" in sub[-1]["messages"][-1]["content"], "grep ran for real inside the sub-agent")
+os.remove(os.path.join(WORK, "hay.txt"))
+
 print("test interactive: /ctx picker and sizes")
 s.send("/ctx 64k\r"); check(s.expect("context window: 64k (num_ctx 65536)"), "/ctx 64k")
 s.send("hi ctx\r"); check(s.expect("Echo: hi ctx"), "reply"); check(requests()[-1]["options"]["num_ctx"] == 65536, "num_ctx sent")

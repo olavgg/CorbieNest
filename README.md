@@ -155,6 +155,7 @@ Cycle with **Shift+Tab** at the prompt, or set one with `/mode NAME`, `--mode NA
 | `write_file(path, content)` | yes — shows a preview |
 | `edit_file(path, old_string, new_string, replace_all?)` | yes — shows a diff |
 | `bash(command, timeout?)` | yes — shows the command; output/exit code returned to the model |
+| `task(description, prompt)` | none for the call itself — runs a **sub-agent**: a fresh, read-only agent loop (read_file, list_dir, grep, bash — with the usual confirmations) that investigates and returns a report as the tool result, keeping the noise out of the main context. Its tool calls are echoed as `⎿ grep(…)` lines and the report is previewed. Sub-agents cannot edit files or start further sub-agents |
 
 Each confirmation is a small menu:
 
