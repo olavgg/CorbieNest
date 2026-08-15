@@ -89,6 +89,7 @@ corbienest [options] [-p PROMPT]
 | `/compact` | have the model summarise the conversation to free context |
 | `/memory [on\|off\|clear]` | show the project memory (`.corbienest/memory.md`), toggle its automatic update, or delete it |
 | `/status` | model, context usage, settings |
+| `/diff [git args]` | show `git diff` of the working tree (stat, patch, untracked files) for you only — nothing is added to the conversation; `/diff --staged`, `/diff HEAD~1` … pass through |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
 | `/system [text\|clear]` | extra system instructions |
 | `/think on\|off\|auto`, `/think show\|hide` | control thinking on thinking-capable models |

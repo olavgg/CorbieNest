@@ -27,7 +27,7 @@ static char   g_session_id[64];                  /* current session (file stem u
 
 static const char *SLASH_CMDS[] = {
     "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think",
-    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/quit", "/exit"
+    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/diff", "/quit", "/exit"
 };
 
 /* slash completion list = built-in commands + /skill names (rebuilt when skills reload) */
@@ -431,6 +431,39 @@ static void cmd_cost(void) {
     if (g_cfg.num_ctx > 0 && g_session.last_prompt_tokens > 0)
         printf("  context       %d of %d tokens (%d%%)\n", g_session.last_prompt_tokens, g_cfg.num_ctx, (int)(100.0 * g_session.last_prompt_tokens / g_cfg.num_ctx));
     printf("  model         %s\n", g_cfg.model ? g_cfg.model : "(none)");
+}
+
+/* ---------- /diff: what changed in the working tree (not sent to the model) ---------- */
+#define DIFF_MAX_LINES 400
+static void cmd_diff(const char *arg) {
+    if (system("git rev-parse --is-inside-work-tree >/dev/null 2>&1") != 0) { printf(C_DIM "not inside a git repository" C_RESET "\n"); return; }
+    sbuf cmd; sb_init(&cmd);
+    sb_printf(&cmd, "git --no-pager diff --stat %s 2>&1; echo; git --no-pager diff %s 2>&1", arg && *arg ? arg : "", arg && *arg ? arg : "");
+    if (!arg || !*arg) sb_puts(&cmd, "; git status --short --untracked-files=all 2>/dev/null | grep '^??' | sed 's/^?? /untracked: /'");
+    FILE *f = popen(cmd.data, "r");
+    sb_free(&cmd);
+    if (!f) { printf(C_RED "✗ cannot run git" C_RESET "\n"); return; }
+    char line[4096]; int n = 0, hidden = 0; bool any = false;
+    int w = term_width();
+    while (fgets(line, sizeof line, f)) {
+        size_t l = strlen(line); if (l && line[l-1] == '\n') line[--l] = 0;
+        if (!l && !any) continue;
+        any = true;
+        if (++n > DIFF_MAX_LINES) { hidden++; continue; }
+        const char *col = "";
+        if (!strncmp(line, "+++", 3) || !strncmp(line, "---", 3)) col = C_BOLD;
+        else if (line[0] == '+') col = C_GREEN;
+        else if (line[0] == '-') col = C_RED;
+        else if (!strncmp(line, "@@", 2)) col = C_CYAN;
+        else if (!strncmp(line, "diff --git", 10)) col = C_BOLD C_YELLOW;
+        else if (!strncmp(line, "untracked:", 10)) col = C_MAGENTA;
+        /* truncate to the terminal width on a UTF-8 boundary */
+        int vis = 0; size_t i = 0; while (line[i] && vis < w - 1) { i++; while (((unsigned char)line[i] & 0xC0) == 0x80) i++; vis++; }
+        printf("%s%.*s%s" C_RESET "\n", col, (int)i, line, line[i] ? "…" : "");
+    }
+    pclose(f);
+    if (!any) printf(C_DIM "no changes%s" C_RESET "\n", arg && *arg ? "" : " (working tree clean)");
+    if (hidden) printf(C_DIM "… %d more lines (run !git diff %s for everything)" C_RESET "\n", hidden, arg && *arg ? arg : "");
 }
 
 /* ---------- /permissions ---------- */
@@ -947,6 +980,7 @@ static void cmd_help(void) {
            "  /memory [on|off|clear] show the project memory (" MEMORY_PATH ", curated by the model after each request), toggle or delete it\n"
            "  /status               show model, context usage, settings\n"
            "  /cost                 tokens, model calls, model time and wall time of this session\n"
+           "  /diff [git args]      show the working-tree diff (stat + patch + untracked), without sending it to the model; e.g. /diff --staged\n"
            "  /system [text|clear]  show/set extra system instructions\n"
            "  /think on|off|auto    ask the model to think (thinking-capable models)\n"
            "  /think show|hide      show or hide thinking tokens\n"
@@ -1140,6 +1174,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
     else if (!strcmp(cmd, "/cost")) cmd_cost();
+    else if (!strcmp(cmd, "/diff")) cmd_diff(arg);
     else if (!strcmp(cmd, "/init")) return cmd_init();
     else if (!strcmp(cmd, "/status") || !strcmp(cmd, "/cost")) cmd_status();
     else if (!strcmp(cmd, "/system")) {
