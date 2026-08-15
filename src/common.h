@@ -163,6 +163,7 @@ char       *term_queue_pop(void);         /* malloc'd, or NULL */
 void        term_queue_push(const char *msg);
 void        term_queue_clear(void);
 void        term_queue_to_editor(void);   /* after an interrupt: hand queued text back to the editor */
+void        term_editor_prefill(const char *text);   /* text appears in the editor at the next prompt (e.g. after /rewind) */
 char       *term_keys_to_text(const unsigned char *keys, size_t n);   /* raw keystrokes -> trimmed text (malloc'd) */
 /* Simple prompt for a single line. malloc'd or NULL */
 char *term_ask_line(const char *prompt);
@@ -207,6 +208,12 @@ const char *tools_permissions_get(int i);
 bool        tools_permissions_add(const char *rule);      /* returns false if it exists already; saves */
 bool        tools_permissions_remove(int i);              /* saves */
 void        tools_permissions_clear(void);                /* removes the file */
+/* Checkpoints for /rewind: file states before write_file/edit_file, tagged with the request
+ * ("turn" = index into the conversation) they happened in. */
+void tools_checkpoint_turn(int turn);              /* main.c: a request starts */
+int  tools_checkpoint_files(int turn, sbuf *names);/* files changed in that request or later */
+int  tools_checkpoint_restore(int turn);           /* put them back; returns files restored */
+void tools_checkpoint_clear(void);
 extern bool tools_no_confirm;   /* while true, tools run without asking (user-typed "!cmd") */
 const char *tools_summary_line(void);   /* short list for help */
 

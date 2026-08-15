@@ -118,6 +118,54 @@ static const char *perm_match(int kind, const char *cmd) {
     return NULL;
 }
 
+/* ---------- checkpoints (for /rewind) ----------
+ * Before write_file/edit_file touch a file, its previous content (or "did not exist") is
+ * kept together with the request ("turn") it happened in. tools_checkpoint_restore(turn)
+ * puts every file changed in that request or later back the way it was — newest change
+ * first, so a file edited several times ends up at its oldest saved state. In memory
+ * only (per process), capped at CKPT_MAX_BYTES. */
+#define CKPT_MAX_BYTES (64u * 1024 * 1024)
+typedef struct { int turn; char *path; char *content; size_t len; bool existed; } ckpt_t;
+static ckpt_t *g_ckpt; static int g_ckpt_n, g_ckpt_cap; static size_t g_ckpt_bytes; static int g_ckpt_turn = -1;
+
+void tools_checkpoint_turn(int turn) { g_ckpt_turn = turn; }
+static void ckpt_free(ckpt_t *c) { free(c->path); free(c->content); g_ckpt_bytes -= c->len; }
+void tools_checkpoint_clear(void) { for (int i = 0; i < g_ckpt_n; i++) ckpt_free(&g_ckpt[i]); g_ckpt_n = 0; }
+static void ckpt_save(const char *path) {
+    if (g_ckpt_turn < 0) return;
+    for (int i = 0; i < g_ckpt_n; i++) if (g_ckpt[i].turn == g_ckpt_turn && !strcmp(g_ckpt[i].path, path)) return;   /* first state in this turn wins */
+    ckpt_t c = { g_ckpt_turn, xstrdup(path), NULL, 0, false };
+    if (is_file(path)) { c.content = read_whole_file(path, &c.len, CKPT_MAX_BYTES); if (!c.content) { free(c.path); return; } c.existed = true; }
+    while (g_ckpt_n && g_ckpt_bytes + c.len > CKPT_MAX_BYTES) { ckpt_free(&g_ckpt[0]); memmove(g_ckpt, g_ckpt + 1, sizeof *g_ckpt * (size_t)(g_ckpt_n - 1)); g_ckpt_n--; }
+    if (g_ckpt_n == g_ckpt_cap) { g_ckpt_cap = g_ckpt_cap ? g_ckpt_cap * 2 : 32; g_ckpt = xrealloc(g_ckpt, sizeof *g_ckpt * (size_t)g_ckpt_cap); }
+    g_ckpt[g_ckpt_n++] = c; g_ckpt_bytes += c.len;
+}
+/* files changed in `turn` or later: distinct paths, appended comma-separated to `names` (may be NULL); returns the count */
+int tools_checkpoint_files(int turn, sbuf *names) {
+    int n = 0;
+    for (int i = 0; i < g_ckpt_n; i++) {
+        if (g_ckpt[i].turn < turn) continue;
+        bool seen = false; for (int j = 0; j < i; j++) if (g_ckpt[j].turn >= turn && !strcmp(g_ckpt[j].path, g_ckpt[i].path)) { seen = true; break; }
+        if (seen) continue;
+        if (names) sb_printf(names, "%s%s", n ? ", " : "", g_ckpt[i].path);
+        n++;
+    }
+    return n;
+}
+int tools_checkpoint_restore(int turn) {
+    int n = 0;
+    for (int i = g_ckpt_n - 1; i >= 0; i--) {
+        ckpt_t *c = &g_ckpt[i];
+        if (c->turn < turn) continue;
+        if (c->existed) write_whole_file(c->path, c->content, c->len); else unlink(c->path);
+        n++;
+    }
+    /* drop the used records (they are ≥ turn; all such sit at the tail because turns only grow) */
+    int keep = 0; for (int i = 0; i < g_ckpt_n; i++) { if (g_ckpt[i].turn >= turn) ckpt_free(&g_ckpt[i]); else g_ckpt[keep++] = g_ckpt[i]; }
+    g_ckpt_n = keep;
+    return n;
+}
+
 /* ---------- tool definitions ---------- */
 static cJSON *mk_tool(const char *name, const char *desc, cJSON *props, const char *required[]) {
     cJSON *t = cJSON_CreateObject();
@@ -333,6 +381,7 @@ static tool_status t_write_file(cJSON *args, sbuf *out) {
     char *dir = xstrdup(p); char *sl = strrchr(dir, '/');
     if (sl && sl != dir) { *sl = 0; mkdir_p(dir); }
     free(dir);
+    ckpt_save(p);
     if (write_whole_file(p, content, strlen(content)) != 0) { sb_printf(out, "error: cannot write %s: %s", path, strerror(errno)); free(p); return TOOL_ERROR; }
     int lines = 0; for (const char *c = content; *c; c++) if (*c == '\n') lines++;
     sb_printf(out, "Wrote %zu bytes (%d lines) to %s", strlen(content), lines, path);
@@ -381,6 +430,7 @@ static tool_status t_edit_file(cJSON *args, sbuf *out) {
         sb_printf(out, "User denied editing %s.%s%s", path, reason ? " Reason: " : "", reason ? reason : "");
         free(reason); sb_free(&nb); free(d); free(p); return TOOL_DENIED;
     }
+    ckpt_save(p);
     if (write_whole_file(p, nb.data ? nb.data : "", nb.len) != 0) { sb_printf(out, "error: cannot write %s: %s", path, strerror(errno)); sb_free(&nb); free(d); free(p); return TOOL_ERROR; }
     sb_printf(out, "Edited %s: %d replacement%s made.", path, occ, occ == 1 ? "" : "s");
     sb_free(&nb); free(d); free(p);

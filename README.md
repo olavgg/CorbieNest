@@ -92,6 +92,7 @@ corbienest [options] [-p PROMPT]
 | `/memory [on\|off\|clear]` | show the project memory (`.corbienest/memory.md`), toggle its automatic update, or delete it |
 | `/status` | model, context usage, settings |
 | `/diff [git args]` | show `git diff` of the working tree (stat, patch, untracked files) for you only — nothing is added to the conversation; `/diff --staged`, `/diff HEAD~1` … pass through |
+| `/rewind` | (or **Esc Esc** at an empty prompt) pick an earlier request and go back: undo the file changes the model made since (files are checkpointed before every `write_file`/`edit_file`), truncate the conversation to just before it (the request text returns to the editor), or both |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
 | `/system [text\|clear]` | extra system instructions |
 | `/think on\|off\|auto`, `/think show\|hide` | control thinking on thinking-capable models |
@@ -117,6 +118,7 @@ corbienest [options] [-p PROMPT]
   to (Project / User / Feedback / Reference) and the line is appended, no model call involved.
 - Enter sends; Alt+Enter, Ctrl+J or a trailing `\` inserts a newline. Bracketed paste works.
 - Ctrl-C (or Esc) cancels a running generation / clears the line (twice on an empty line quits).
+  Esc twice at an empty prompt opens `/rewind`.
 - **You can keep typing while the model works.** What you type shows up in the status bar as
   you go (`› …▏`); press Enter to queue it as a message — add details,
   narrow the request, change the spec — the status bar shows `N queued`, and the message is

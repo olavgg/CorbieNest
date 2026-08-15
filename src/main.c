@@ -27,7 +27,7 @@ static char   g_session_id[64];                  /* current session (file stem u
 
 static const char *SLASH_CMDS[] = {
     "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think",
-    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/diff", "/quit", "/exit"
+    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/diff", "/rewind", "/quit", "/exit"
 };
 
 /* slash completion list = built-in commands + /skill names (rebuilt when skills reload) */
@@ -54,6 +54,13 @@ static void account(const chat_stats *st) {
     g_session.model_seconds += st->total_seconds;
     g_session.eval_seconds += st->eval_seconds;
     g_session.calls++;
+}
+
+/* a user request starts: remember where it begins in the conversation (for /rewind, memory) */
+static int begin_request(void) {
+    int first = cJSON_GetArraySize(g_messages);
+    tools_checkpoint_turn(first);
+    return first;
 }
 
 /* ---------- project memory ----------
@@ -355,7 +362,7 @@ static bool session_load(const char *id) {
     cJSON *msgs = cJSON_DetachItemFromObjectCaseSensitive(o, "messages");
     if (!cJSON_IsArray(msgs)) { if (msgs) cJSON_Delete(msgs); cJSON_Delete(o); return false; }
     cJSON_Delete(g_messages); g_messages = msgs;
-    tools_reset_permissions();
+    tools_reset_permissions(); tools_checkpoint_clear();
     snprintf(g_session_id, sizeof g_session_id, "%s", id);
     cJSON *pt = cJSON_GetObjectItemCaseSensitive(o, "prompt_tokens"), *et = cJSON_GetObjectItemCaseSensitive(o, "eval_tokens");
     g_session.prompt_tokens = cJSON_IsNumber(pt) ? (long)pt->valuedouble : 0;
@@ -464,6 +471,66 @@ static void cmd_diff(const char *arg) {
     pclose(f);
     if (!any) printf(C_DIM "no changes%s" C_RESET "\n", arg && *arg ? "" : " (working tree clean)");
     if (hidden) printf(C_DIM "… %d more lines (run !git diff %s for everything)" C_RESET "\n", hidden, arg && *arg ? arg : "");
+}
+
+/* ---------- /rewind (also Esc Esc at an empty prompt) ----------
+ * Pick an earlier request; then restore the files changed since it, truncate the
+ * conversation to just before it (the request text comes back into the editor), or both. */
+static int cmd_rewind(void) {
+    int total = cJSON_GetArraySize(g_messages);
+    int idx[256]; int n = 0;
+    for (int i = 0; i < total && n < 256; i++) {
+        cJSON *m = cJSON_GetArrayItem(g_messages, i);
+        cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role");
+        if (cJSON_IsString(r) && !strcmp(r->valuestring, "user")) idx[n++] = i;
+    }
+    if (!n) { printf(C_DIM "nothing to rewind: the conversation is empty" C_RESET "\n"); return 0; }
+    if (!g_cfg.interactive) { printf(C_DIM "/rewind needs an interactive session" C_RESET "\n"); return 0; }
+    const char **items = xmalloc(sizeof(char*) * (size_t)n), **descs = xmalloc(sizeof(char*) * (size_t)n);
+    char **bufs = xmalloc(sizeof(char*) * (size_t)n * 2);
+    for (int i = 0; i < n; i++) {
+        cJSON *c = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(g_messages, idx[i]), "content");
+        const char *t = cJSON_IsString(c) ? c->valuestring : ""; while (*t == ' ' || *t == '\n') t++;
+        size_t l = strcspn(t, "\n"); if (l > 60) { l = 60; while (l && ((unsigned char)t[l] & 0xC0) == 0x80) l--; }
+        sbuf a; sb_init(&a); sb_printf(&a, "%d. %.*s%s", i + 1, (int)l, t, t[l] ? "…" : ""); bufs[2*i] = sb_detach(&a); items[i] = bufs[2*i];
+        sbuf names; sb_init(&names); sb_append(&names, "", 0);
+        int nf = tools_checkpoint_files(idx[i], &names);
+        sbuf b; sb_init(&b);
+        if (nf) sb_printf(&b, "%d file%s changed since: %.80s%s", nf, nf == 1 ? "" : "s", names.data, strlen(names.data) > 80 ? "…" : ""); else sb_puts(&b, "no file changes since");
+        bufs[2*i+1] = sb_detach(&b); descs[i] = bufs[2*i+1]; sb_free(&names);
+    }
+    int r = term_select("Rewind to before which request?", items, descs, n, n - 1);
+    int rc = 0;
+    if (r >= 0) {
+        int at = idx[r];
+        int nf = tools_checkpoint_files(at, NULL);
+        const char *what[] = { "Restore conversation and files", "Restore conversation only", "Restore files only" };
+        const char *wdesc[3]; char d0[96], d2[96];
+        snprintf(d0, sizeof d0, "forget %d message%s and undo %d file change%s", total - at, total - at == 1 ? "" : "s", nf, nf == 1 ? "" : "s");
+        snprintf(d2, sizeof d2, "undo %d file change%s, keep the conversation", nf, nf == 1 ? "" : "s");
+        wdesc[0] = d0; wdesc[1] = "the request comes back into the editor for you to change"; wdesc[2] = d2;
+        int w = term_select(items[r], what, wdesc, 3, 0);
+        if (w >= 0) {
+            int restored = 0;
+            if (w == 0 || w == 2) restored = tools_checkpoint_restore(at);
+            if (w == 0 || w == 1) {
+                cJSON *c = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(g_messages, at), "content");
+                char *text = cJSON_IsString(c) ? xstrdup(c->valuestring) : NULL;
+                while (cJSON_GetArraySize(g_messages) > at) cJSON_DeleteItemFromArray(g_messages, cJSON_GetArraySize(g_messages) - 1);
+                g_session.last_prompt_tokens = 0;
+                if (text && !strchr(text, '<')) term_editor_prefill(text);   /* (skip prompts with attached files/skills) */
+                free(text);
+                session_save();
+            }
+            printf(C_GREEN "↩ rewound to before request %d" C_RESET C_DIM " · %s%d file%s restored%s" C_RESET "\n", r + 1,
+                   (w == 0 || w == 1) ? "conversation truncated · " : "", restored, restored == 1 ? "" : "s",
+                   (w == 0 || w == 1) ? " · the request is back in the editor" : "");
+            term_status_refresh();
+        } else printf(C_DIM "cancelled" C_RESET "\n");
+    } else printf(C_DIM "cancelled" C_RESET "\n");
+    for (int i = 0; i < 2 * n; i++) free(bufs[i]);
+    free(bufs); free(items); free(descs);
+    return rc;
 }
 
 /* ---------- /permissions ---------- */
@@ -928,7 +995,7 @@ static int cmd_init(void) {
                 "- Write the file with write_file, then summarise what you put in it in one short paragraph.\n");
     if (existing) sb_printf(&b, "\nNote: a %s already exists in this directory. Read it first and improve it in place (keep what is right, fix what is wrong, fill the gaps) — write CORBIENEST.md only if you would otherwise clobber a hand-written %s.\n", existing, existing);
     printf(C_DIM "  /init: analysing the project and writing CORBIENEST.md…" C_RESET "\n");
-    int first = cJSON_GetArraySize(g_messages);
+    int first = begin_request();
     add_message("user", b.data); sb_free(&b);
     bool aborted = run_turn();
     session_save();
@@ -981,6 +1048,7 @@ static void cmd_help(void) {
            "  /status               show model, context usage, settings\n"
            "  /cost                 tokens, model calls, model time and wall time of this session\n"
            "  /diff [git args]      show the working-tree diff (stat + patch + untracked), without sending it to the model; e.g. /diff --staged\n"
+           "  /rewind               (or Esc Esc at an empty prompt) go back to an earlier request: undo the file changes since, the conversation, or both\n"
            "  /system [text|clear]  show/set extra system instructions\n"
            "  /think on|off|auto    ask the model to think (thinking-capable models)\n"
            "  /think show|hide      show or hide thinking tokens\n"
@@ -1169,12 +1237,13 @@ static int handle_slash(char *line) {
         if (!arg) cmd_model_picker();
         else { free(g_cfg.model); g_cfg.model = xstrdup(arg); refresh_model_caps(false); config_save(); printf(C_GREEN "✓ model set to %s" C_RESET "\n", g_cfg.model); }
     }
-    else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); tools_reset_permissions(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
+    else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); tools_reset_permissions(); tools_checkpoint_clear(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
     else if (!strcmp(cmd, "/compact")) { if (cmd_compact()) session_save(); }
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
     else if (!strcmp(cmd, "/cost")) cmd_cost();
     else if (!strcmp(cmd, "/diff")) cmd_diff(arg);
+    else if (!strcmp(cmd, "/rewind")) return cmd_rewind();
     else if (!strcmp(cmd, "/init")) return cmd_init();
     else if (!strcmp(cmd, "/status") || !strcmp(cmd, "/cost")) cmd_status();
     else if (!strcmp(cmd, "/system")) {
@@ -1234,7 +1303,7 @@ static int handle_slash(char *line) {
         printf(C_DIM "  skill %s: %s" C_RESET "\n", sk->name, *sk->desc ? sk->desc : sk->path);
         char *prompt = skill_expand(sk, arg);
         char *msg = expand_mentions(prompt);
-        int first = cJSON_GetArraySize(g_messages);
+        int first = begin_request();
         add_message("user", msg);
         free(msg); free(prompt);
         bool aborted = run_turn();
@@ -1283,7 +1352,7 @@ static int process_input(char *line) {
     char *s = line; while (*s == ' ' || *s == '\t' || *s == '\n') s++;
     size_t n = strlen(s); while (n && (s[n-1] == ' ' || s[n-1] == '\n' || s[n-1] == '\t')) s[--n] = 0;
     if (!*s) return 0;
-    hist_add(s); hist_save();   /* persist as we go, so a crash or kill loses nothing */
+    if (strcmp(s, "/rewind")) { hist_add(s); hist_save(); }   /* persist as we go, so a crash or kill loses nothing */
     if (*s == '/') { int q = handle_slash(s); if (q == 1) return 1; printf("\n"); term_status_refresh(); return q; }
     if (*s == '!') { handle_bang(s + 1); printf("\n"); return 0; }
     if (*s == '#' && s[1] && s[1] != '#') {   /* "# fact" -> memory (a lone "#" or "##…" is sent as text) */
@@ -1291,7 +1360,7 @@ static int process_input(char *line) {
         if (*f) { memory_quick_add(f); printf("\n"); return 0; }
     }
     char *msg = expand_mentions(s);
-    int first = cJSON_GetArraySize(g_messages);
+    int first = begin_request();
     add_message("user", msg);
     free(msg);
     bool aborted = run_turn();
@@ -1396,7 +1465,7 @@ int main(int argc, char **argv) {
         if (oneshot[0] == '/') { char *nm = xstrndup(oneshot, strcspn(oneshot, " ")); sk = skill_find(nm); free(nm); }
         if (sk) { const char *a = strchr(oneshot, ' '); char *pr = skill_expand(sk, a ? a + 1 : ""); msg = expand_mentions(pr); free(pr); }
         else msg = expand_mentions(oneshot);
-        int first = cJSON_GetArraySize(g_messages);
+        int first = begin_request();
         add_message("user", msg); free(msg);
         time_t t0 = time(NULL);
         bool aborted = run_turn();

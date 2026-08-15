@@ -466,6 +466,11 @@ void term_queue_to_editor(void) {
     term_status_refresh();
 }
 
+void term_editor_prefill(const char *text) {
+    if (!text) return;
+    for (const char *p = text; *p; p++) ta_put((unsigned char)*p);
+}
+
 int term_poll_interrupt(void) {
     unsigned char kb[256];
     for (;;) {
@@ -798,11 +803,21 @@ static char *readline_impl(const char *prompt) {
     char *result = NULL;
     bool done = false;
     int ctrlc_count = 0;
+    bool esc_pending = false;   /* Esc Esc on an empty line = /rewind (like Claude Code) */
     while (!done) {
         int k = read_key();
         if (k == -2) { if (g_winch) { g_winch = 0; ed_refresh(&e); } continue; }
         if (k == -1) { result = NULL; break; }
         if (k != 3) ctrlc_count = 0;
+        if (k == K_ESC && e.buf.len == 0) {
+            if (esc_pending) { result = xstrdup("/rewind"); done = true; break; }
+            esc_pending = true;
+            printf("\n" C_DIM "(press Esc again to rewind the conversation / files)" C_RESET "\n");
+            e.prev_cursor_row = 0;
+            ed_refresh(&e);
+            continue;
+        }
+        esc_pending = false;
         switch (k) {
             case '\r':
                 if (e.buf.len && e.buf.data[e.buf.len - 1] == '\\') {   /* trailing backslash = newline */
