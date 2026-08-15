@@ -1,6 +1,7 @@
 /* Skills: reusable instruction files (SKILL.md with a small YAML-ish
  * frontmatter), invoked as /name [args] from the prompt. Looked up in
  *   ./.corbienest/skills/<name>/SKILL.md   ./.corbienest/skills/<name>.md
+ *   ./.corbienest/commands/<name>.md       ./.claude/commands/<name>.md   ~/.claude/commands/<name>.md
  *   ./.claude/skills/<name>/SKILL.md     (Claude Code layout, for sharing)
  *   $XDG_CONFIG_HOME/corbienest/skills/<name>/SKILL.md   (and <name>.md)
  * Project skills shadow user skills of the same name. */
@@ -117,9 +118,14 @@ static void scan_dir(const char *root, const char *source) {
 int skills_load(void) {
     skills_clear();
     scan_dir(".corbienest/skills", "project");
+    scan_dir(".corbienest/commands", "project");   /* Claude-Code-style flat NAME.md custom commands */
     scan_dir(".claude/skills", "project");
+    scan_dir(".claude/commands", "project");
     char user[1200]; snprintf(user, sizeof user, "%s/skills", config_dir());
     scan_dir(user, "user");
+    snprintf(user, sizeof user, "%s/commands", config_dir());
+    scan_dir(user, "user");
+    char *home = expand_home("~/.claude/commands"); scan_dir(home, "user"); free(home);
     return g_nskills;
 }
 

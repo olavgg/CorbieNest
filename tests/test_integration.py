@@ -271,6 +271,12 @@ s.send("/rev\t"); time.sleep(0.2); s.send("a.c\r"); check(s.expect("skill review
 check(s.expect("Echo: <skill name=\"review\""), "skill prompt sent")
 check("Review a.c now." in requests()[-1]["messages"][-1]["content"], "$ARGUMENTS substituted")
 check("# Skills" in requests()[-1]["messages"][0]["content"] and "/review" in requests()[-1]["messages"][0]["content"], "skills listed in system prompt")
+os.makedirs(os.path.join(WORK, ".claude", "commands"), exist_ok=True)
+open(os.path.join(WORK, ".claude", "commands", "fix-issue.md"), "w").write("Fix issue $ARGUMENTS following our conventions.\n")
+s.send("/skills reload\r"); check(s.expect("/fix-issue"), "Claude-Code-style .claude/commands/NAME.md picked up as a skill")
+s.send("/fix-issue 42\r"); check(s.expect("skill fix-issue"), "custom command runs"); s.expect("tok/s")
+check("Fix issue 42 following" in requests()[-1]["messages"][-1]["content"], "$ARGUMENTS substituted in a command file")
+shutil.rmtree(os.path.join(WORK, ".claude"))
 s.send("/skills new deploy\r"); check(s.expect("created .corbienest/skills/deploy/SKILL.md"), "/skills new")
 check(os.path.exists(os.path.join(WORK, ".corbienest", "skills", "deploy", "SKILL.md")), "scaffold written")
 

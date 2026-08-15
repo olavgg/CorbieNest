@@ -192,7 +192,9 @@ Report findings as a list.
 ```
 
 Put project skills in `.corbienest/skills/NAME/SKILL.md` (or `NAME.md`; `.claude/skills/` is
-read too), personal ones in `~/.config/corbienest/skills/`. Run one with `/NAME args` —
+read too), personal ones in `~/.config/corbienest/skills/`. Claude Code's flat custom
+commands are picked up as well: `.corbienest/commands/NAME.md`, `.claude/commands/NAME.md`,
+`~/.claude/commands/NAME.md` (frontmatter optional — the file body is the prompt). Run one with `/NAME args` —
 `$ARGUMENTS` is replaced by the arguments — or from the shell with `-p "/NAME args"`.
 `/skills` lists them, `/skills reload` rescans, `/skills new NAME` scaffolds one. The
 available skills are also listed in the system prompt so the model can pick one up itself.
