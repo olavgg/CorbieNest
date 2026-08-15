@@ -935,7 +935,7 @@ static void cmd_help(void) {
            "  Enter while busy      queue a message for the model (added between tool rounds or after the turn; Ctrl-C hands it back)\n"
            "  Ctrl-C                cancel generation / clear line (twice: quit)  ·  Ctrl-L clear screen\n"
            "  status bar            bottom row shows the permission mode, model, session tokens and context usage\n"
-           "  Tab                   complete slash commands  ·  ↑/↓ history\n\n"
+           "  Tab                   complete slash commands  ·  ↑/↓ history  ·  Ctrl-R search history\n\n"
            C_BOLD "Tools the model can call\n" C_RESET "  %s\n"
            "  write/edit/bash ask for confirmation: pick with ↑/↓ + enter, or press y (once), a (always this session), p (always in this project), n (deny, with optional reason)\n"
            "  modes: manual asks for everything · accept-edits auto-approves file edits · plan is read-only (model proposes a plan) · auto approves all\n",

@@ -182,6 +182,16 @@ check(requests()[-1]["messages"][-1]["content"] == "first line\nsecond", "newlin
 s.send("\x1b[200~pasted\nlines\x1b[201~"); s.send("\r")
 check(s.expect("Echo: pasted"), "bracketed paste")
 check(requests()[-1]["messages"][-1]["content"] == "pasted\nlines", "paste newlines kept")
+s.send("\x12"); check(s.expect("(reverse-i-search)`':"), "ctrl-r opens the search prompt")
+s.send("HELLO"); check(s.expect("(reverse-i-search)`HELLO': hello world"), f"incremental, case-insensitive match: {s.text()[-120:]!r}")
+s.send("\x1b"); check(s.expect("› "), "esc cancels"); time.sleep(0.2)
+check("hello world" not in clean(s.out[-200:].decode("utf-8", "replace")), "line restored (empty) after cancel")
+s.send("\x12"); s.send("line"); check(s.expect("`line': pasted"), "newest match first")
+s.send("\x12"); check(s.expect("`line': first line"), "ctrl-r again: next older match (multi-line entry)")
+s.send("\r"); time.sleep(0.2)   # keep the match in the editor
+check(s.expect("› first line"), "enter keeps the match in the editor without sending")
+s.send("\r"); check(s.expect("Echo: first line"), "sent on the second enter")
+s.send("\x12"); s.send("zzz-none"); check(s.expect("`zzz-none': "), "no match shows an empty line"); s.send("\x07"); s.expect("› ")
 
 print("test interactive: confirmation menu — deny with reason, arrow keys, then always")
 s.send("TOOL_BASH\r")

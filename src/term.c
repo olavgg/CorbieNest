@@ -739,6 +739,54 @@ static void ed_complete(editor *e) {
     sb_free(&all);
 }
 
+/* Ctrl-R: incremental reverse search through the history, like bash/fish. The prompt
+ * turns into (reverse-i-search)`query`: and the newest matching entry is shown; typing
+ * refines, Ctrl-R again finds the next older match, Enter/→/End keeps the match in the
+ * editor, Esc/Ctrl-G/Ctrl-C restores what was typed before. */
+static bool ci_contains(const char *hay, const char *needle) {
+    if (!*needle) return true;
+    size_t n = strlen(needle);
+    for (const char *p = hay; *p; p++) if (!strncasecmp(p, needle, n)) return true;
+    return false;
+}
+static void ed_hist_search(editor *e) {
+    char query[128] = {0}; size_t ql = 0;
+    char *orig = xstrndup(e->buf.data, e->buf.len);
+    const char *saved_prompt = e->prompt; int saved_plen = e->plen;
+    char pbuf[200];
+    int idx = g_hist_n;          /* current match, g_hist_n = none */
+    bool keep = false;
+    for (;;) {
+        /* newest match at or below `idx` (when the query changed, from the newest entry again) */
+        snprintf(pbuf, sizeof pbuf, C_DIM "(reverse-i-search)" C_RESET "`%s': ", query);
+        e->prompt = pbuf; e->plen = vis_width(pbuf);
+        if (idx >= 0 && idx < g_hist_n) ed_set(e, g_hist[idx]); else if (ql) ed_set(e, ""); else ed_set(e, orig);
+        ed_refresh(e);
+        int k = read_key();
+        if (k == -2) continue;
+        if (k == -1 || k == 3 || k == 7 || k == K_ESC) { ed_set(e, orig); break; }          /* cancel */
+        if (k == '\r' || k == '\n' || k == K_RIGHT || k == K_LEFT || k == K_END || k == K_HOME || k == '\t') { keep = true; break; }
+        if (k == 18) {                                                                    /* next older */
+            int i = (idx < g_hist_n ? idx : g_hist_n) - 1;
+            while (i >= 0 && !ci_contains(g_hist[i], query)) i--;
+            if (i >= 0) idx = i;
+            continue;
+        }
+        if (k == 127 || k == 8) { if (ql) { ql--; while (ql && ((unsigned char)query[ql] & 0xC0) == 0x80) ql--; query[ql] = 0; } }
+        else if (k >= 32 && k < 256 && ql < sizeof query - 8) {
+            query[ql++] = (char)k; int need = u8_len((unsigned char)k);
+            while (need > 1 && ql < sizeof query - 1) { int c = read_byte_timeout(50); if (c < 0) break; query[ql++] = (char)c; need--; }
+            query[ql] = 0;
+        } else continue;
+        int i = g_hist_n - 1;                                                             /* re-search from the newest */
+        while (i >= 0 && !ci_contains(g_hist[i], query)) i--;
+        idx = i >= 0 ? i : g_hist_n;
+    }
+    e->prompt = saved_prompt; e->plen = saved_plen;
+    if (keep && idx < g_hist_n) e->hist_idx = idx;
+    free(orig);
+}
+
 static char *readline_impl(const char *prompt) {
     editor e; memset(&e, 0, sizeof e);
     sb_init(&e.buf); sb_append(&e.buf, "", 0);
@@ -791,6 +839,7 @@ static char *readline_impl(const char *prompt) {
             case 11: ed_delete_range(&e, e.cur, e.buf.len); break;   /* Ctrl-K */
             case 21: ed_delete_range(&e, 0, e.cur); e.cur = 0; break;   /* Ctrl-U */
             case 12: term_clear_screen(); e.prev_cursor_row = 0; break;   /* Ctrl-L */
+            case 18: ed_hist_search(&e); break;                             /* Ctrl-R */
             case '\t': ed_complete(&e); break;
             case K_SHIFT_TAB: g_cfg.mode = (g_cfg.mode + 1) % MODE_COUNT; break;
             case K_UP: case 16: {   /* history prev (only if single line or at first line) */

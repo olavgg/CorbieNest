@@ -121,7 +121,9 @@ corbienest [options] [-p PROMPT]
   many as you like; they are sent in order. Ctrl-C hands queued text back to the editor instead
   of sending it. Text without Enter simply reappears in the prompt afterwards.
 - Tab completes slash commands and skill names; ↑/↓ browse history — the latest 100 queries are
-  kept in `~/.config/corbienest/history` (`/history` lists them).
+  kept in `~/.config/corbienest/history` (`/history` lists them). Ctrl-R searches it
+  incrementally (`(reverse-i-search)`, like bash): type to refine, Ctrl-R again for an older
+  match, Enter keeps the match in the editor, Esc restores what you had.
 - Shift+Tab cycles the permission mode, also while the model is working (it applies to the
   remaining tool confirmations of that turn); the current mode is shown in the bottom status bar.
 
