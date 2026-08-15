@@ -27,7 +27,7 @@ static char   g_session_id[64];                  /* current session (file stem u
 
 static const char *SLASH_CMDS[] = {
     "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think",
-    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/quit", "/exit"
+    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/quit", "/exit"
 };
 
 /* slash completion list = built-in commands + /skill names (rebuilt when skills reload) */
@@ -810,6 +810,32 @@ static char *expand_mentions(const char *input) {
     return sb_detach(&r);
 }
 
+/* ---------- /init: have the model write CORBIENEST.md ---------- */
+static int cmd_init(void) {
+    const char *existing = is_file("CORBIENEST.md") ? "CORBIENEST.md" : is_file("CLAUDE.md") ? "CLAUDE.md" : is_file("AGENTS.md") ? "AGENTS.md" : NULL;
+    sbuf b; sb_init(&b);
+    sb_puts(&b, "Please analyze this codebase and create a CORBIENEST.md file, which will be given to you (and future instances of you) as project instructions at the start of every session in this directory.\n\n"
+                "What to add:\n"
+                "1. Commands that will be commonly used, such as how to build, lint, and run tests — including how to run a single test.\n"
+                "2. High-level code architecture and structure that requires reading multiple files to understand: the main components, how they fit together, where things live. Do not list every file.\n"
+                "3. Project conventions worth knowing (style, naming, patterns, things to avoid).\n\n"
+                "Usage notes:\n"
+                "- Explore first: list the directory, read the README, build files (Makefile, package.json, Cargo.toml, pyproject.toml, go.mod …), CI config and the main entry points before writing anything.\n"
+                "- Keep it concise (aim for well under 100 lines); prefer facts that are not obvious from a glance at the tree.\n"
+                "- Do not repeat instructions that are already covered by an existing rules file, and do not make things up: only include commands you have verified exist.\n"
+                "- Write the file with write_file, then summarise what you put in it in one short paragraph.\n");
+    if (existing) sb_printf(&b, "\nNote: a %s already exists in this directory. Read it first and improve it in place (keep what is right, fix what is wrong, fill the gaps) — write CORBIENEST.md only if you would otherwise clobber a hand-written %s.\n", existing, existing);
+    printf(C_DIM "  /init: analysing the project and writing CORBIENEST.md…" C_RESET "\n");
+    int first = cJSON_GetArraySize(g_messages);
+    add_message("user", b.data); sb_free(&b);
+    bool aborted = run_turn();
+    session_save();
+    memory_update(first, aborted);
+    load_project_instructions();   /* pick up the new file right away */
+    if (!aborted && g_project_instructions) printf(C_GREEN "✓ project instructions loaded" C_RESET "\n");
+    return aborted ? -1 : 0;
+}
+
 /* ---------- /skills ---------- */
 static void cmd_skills(const char *arg) {
     if (arg && !strncmp(arg, "new", 3) && (arg[3] == ' ' || arg[3] == 0)) {
@@ -855,6 +881,7 @@ static void cmd_help(void) {
            "  /think on|off|auto    ask the model to think (thinking-capable models)\n"
            "  /think show|hide      show or hide thinking tokens\n"
            "  /skills [reload|new NAME]  list skills (SKILL.md files); run one with /NAME [args]\n"
+           "  /init                 have the model explore the project and write a CORBIENEST.md (project instructions)\n"
            "  /mode [name]          permission mode: manual · accept-edits · plan · auto (or press shift+tab to cycle)\n"
            "  /permissions [...]    list the project's saved \"always allow\" rules (.corbienest/permissions); add/remove/clear\n"
            "  /yolo [on|off]        shortcut for /mode auto / /mode manual (dangerous!)\n"
@@ -1041,6 +1068,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/compact")) { if (cmd_compact()) session_save(); }
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
+    else if (!strcmp(cmd, "/init")) return cmd_init();
     else if (!strcmp(cmd, "/status") || !strcmp(cmd, "/cost")) cmd_status();
     else if (!strcmp(cmd, "/system")) {
         if (!arg) printf("extra system prompt: %s\n", g_cfg.system_prompt ? g_cfg.system_prompt : C_DIM "(none)" C_RESET);

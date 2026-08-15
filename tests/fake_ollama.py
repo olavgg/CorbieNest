@@ -59,6 +59,11 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "sleep 1.5; echo slept"}}}])
         yield chunk(model, done=True)
         return
+    if "create a CORBIENEST.md file" in text:
+        # /init: pretend to have explored, then write the file
+        yield chunk(model, tool_calls=[{"function": {"name": "write_file", "arguments": {"path": "CORBIENEST.md", "content": "# Project\nBuild with make.\n"}}}])
+        yield chunk(model, done=True)
+        return
     if "TOOL_WRITE" in text:
         yield chunk(model, tool_calls=[{"function": {"name": "write_file", "arguments": {"path": "made.txt", "content": "made by fake\n"}}}])
         yield chunk(model, done=True)
