@@ -350,6 +350,12 @@ s.send("after init\r"); check(s.expect("Echo: after init"), "reply")
 check("Build with make." in requests()[-1]["messages"][0]["content"], "new instructions in the system prompt")
 os.remove(os.path.join(WORK, "CORBIENEST.md")); s.send("/mode manual\r"); s.expect("mode: manual")
 
+print("test interactive: /cost")
+s.send("/cost\r"); check(s.expect("session cost"), "/cost header")
+check(s.expect("model calls") and re.search(r"model calls   \d+  \(\d+ requests", s.text()) is not None, f"calls and requests counted: {s.text()[-400:]!r}")
+check(re.search(r"tokens        [\d.]+k?  \(↑", s.text()) is not None, "token totals shown")
+check(re.search(r"wall time     \d", s.text()) is not None and "tok/s" in s.text(), "wall time and tok/s shown")
+
 print("test interactive: /ctx picker and sizes")
 s.send("/ctx 64k\r"); check(s.expect("context window: 64k (num_ctx 65536)"), "/ctx 64k")
 s.send("hi ctx\r"); check(s.expect("Echo: hi ctx"), "reply"); check(requests()[-1]["options"]["num_ctx"] == 65536, "num_ctx sent")

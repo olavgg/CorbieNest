@@ -27,7 +27,7 @@ static char   g_session_id[64];                  /* current session (file stem u
 
 static const char *SLASH_CMDS[] = {
     "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think",
-    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/quit", "/exit"
+    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/quit", "/exit"
 };
 
 /* slash completion list = built-in commands + /skill names (rebuilt when skills reload) */
@@ -45,6 +45,15 @@ static void refresh_slash_completion(void) {
         owned[i] = sb_detach(&b); g_slash_all[nb + i] = owned[i];
     }
     term_set_slash_commands(g_slash_all, nb + ns);
+}
+
+/* one model call finished: fold its stats into the session totals */
+static void account(const chat_stats *st) {
+    g_session.prompt_tokens += st->prompt_tokens;
+    g_session.eval_tokens += st->eval_tokens;
+    g_session.model_seconds += st->total_seconds;
+    g_session.eval_seconds += st->eval_seconds;
+    g_session.calls++;
 }
 
 /* ---------- project memory ----------
@@ -148,7 +157,7 @@ static void memory_update(int first, bool aborted) {
     cJSON *reply = ollama_chat(msgs, NULL, &st, &ab);
     ollama_quiet = false;
     cJSON_Delete(msgs);
-    g_session.prompt_tokens += st.prompt_tokens; g_session.eval_tokens += st.eval_tokens;
+    account(&st);
     if (g_cfg.interactive) { fputs("\r\x1b[2K", stdout); term_status_refresh(); }
     if (!reply) return;
     cJSON *c = cJSON_GetObjectItemCaseSensitive(reply, "content");
@@ -396,6 +405,32 @@ static void cmd_resume(const char *arg) {
     else printf(C_DIM "cancelled" C_RESET "\n");
     for (int i = 0; i < 2 * n; i++) free(bufs[i]);
     free(bufs); free(items); free(descs); sessions_free(v, n);
+}
+
+/* ---------- /cost ---------- */
+static void fmt_dur(double sec, char *out, size_t n) {
+    if (sec < 60) snprintf(out, n, "%.1fs", sec);
+    else if (sec < 3600) snprintf(out, n, "%dm %ds", (int)sec / 60, (int)sec % 60);
+    else snprintf(out, n, "%dh %dm", (int)sec / 3600, ((int)sec % 3600) / 60);
+}
+static void cmd_cost(void) {
+    char tin[32], tout[32], ttot[32], wall[32], model[32], gen[32];
+    fmt_tokens(g_session.prompt_tokens, tin, sizeof tin);
+    fmt_tokens(g_session.eval_tokens, tout, sizeof tout);
+    fmt_tokens(g_session.prompt_tokens + g_session.eval_tokens, ttot, sizeof ttot);
+    fmt_dur(difftime(time(NULL), g_session.started), wall, sizeof wall);
+    fmt_dur(g_session.model_seconds, model, sizeof model);
+    fmt_dur(g_session.eval_seconds, gen, sizeof gen);
+    printf(C_BOLD "session cost" C_RESET C_DIM " (local model: no money, just tokens and time)" C_RESET "\n");
+    printf("  tokens        %s  " C_DIM "(↑%s in · ↓%s out)" C_RESET "\n", ttot, tin, tout);
+    printf("  model calls   %d  " C_DIM "(%d request%s · %d tool call%s)" C_RESET "\n", g_session.calls, g_session.turns, g_session.turns == 1 ? "" : "s", g_session.tool_calls, g_session.tool_calls == 1 ? "" : "s");
+    printf("  model time    %s  " C_DIM "(%s generating", model, gen);
+    if (g_session.eval_seconds > 0) printf(" · %.1f tok/s", g_session.eval_tokens / g_session.eval_seconds);
+    printf(")" C_RESET "\n");
+    printf("  wall time     %s\n", wall);
+    if (g_cfg.num_ctx > 0 && g_session.last_prompt_tokens > 0)
+        printf("  context       %d of %d tokens (%d%%)\n", g_session.last_prompt_tokens, g_cfg.num_ctx, (int)(100.0 * g_session.last_prompt_tokens / g_cfg.num_ctx));
+    printf("  model         %s\n", g_cfg.model ? g_cfg.model : "(none)");
 }
 
 /* ---------- /permissions ---------- */
@@ -748,6 +783,7 @@ static bool maybe_auto_compact(void);
 /* Returns true if the user interrupted the turn. */
 static bool run_turn(void) {
     int iters = 0;
+    g_session.turns++;
     for (;;) {
         maybe_auto_compact();   /* context nearly full: summarise before the next model call */
         cJSON *msgs = messages_with_system();
@@ -757,8 +793,7 @@ static bool run_turn(void) {
         if (tools && tools != g_tools) cJSON_Delete(tools);
         cJSON_Delete(msgs);
         if (st.prompt_tokens) g_session.last_prompt_tokens = st.prompt_tokens;
-        g_session.prompt_tokens += st.prompt_tokens;
-        g_session.eval_tokens += st.eval_tokens;
+        account(&st);
         term_status_refresh();
         if (!reply) {
             /* On failure, keep the conversation as is; the user can retry. */
@@ -788,6 +823,7 @@ static bool run_turn(void) {
             if (summ[0]) printf(C_DIM "(%s)" C_RESET, summ);
             printf("\n");
             sbuf out; sb_init(&out);
+            g_session.tool_calls++;
             tool_status ts = tools_execute(name, args, &out);
             const char *res = out.data ? out.data : "";
             if (ts == TOOL_DENIED) printf("  ⎿  " C_RED "denied" C_RESET "\n");
@@ -910,6 +946,7 @@ static void cmd_help(void) {
            "  /compact              summarise the conversation to free context\n"
            "  /memory [on|off|clear] show the project memory (" MEMORY_PATH ", curated by the model after each request), toggle or delete it\n"
            "  /status               show model, context usage, settings\n"
+           "  /cost                 tokens, model calls, model time and wall time of this session\n"
            "  /system [text|clear]  show/set extra system instructions\n"
            "  /think on|off|auto    ask the model to think (thinking-capable models)\n"
            "  /think show|hide      show or hide thinking tokens\n"
@@ -1023,7 +1060,7 @@ static bool cmd_compact(void) {
     chat_stats st; bool aborted;
     cJSON *reply = ollama_chat(msgs, NULL, &st, &aborted);
     cJSON_Delete(msgs);
-    g_session.prompt_tokens += st.prompt_tokens; g_session.eval_tokens += st.eval_tokens;
+    account(&st);
     term_status_refresh();
     if (!reply || aborted) { if (reply) cJSON_Delete(reply); printf(C_YELLOW "compact cancelled" C_RESET "\n"); return false; }
     const char *summary = cJSON_GetObjectItemCaseSensitive(reply, "content")->valuestring;
@@ -1102,6 +1139,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/compact")) { if (cmd_compact()) session_save(); }
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
+    else if (!strcmp(cmd, "/cost")) cmd_cost();
     else if (!strcmp(cmd, "/init")) return cmd_init();
     else if (!strcmp(cmd, "/status") || !strcmp(cmd, "/cost")) cmd_status();
     else if (!strcmp(cmd, "/system")) {
@@ -1283,6 +1321,7 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "unknown option %s\n", a); usage(); return 2; }
     }
     if (!getcwd(g_cwd, sizeof g_cwd)) snprintf(g_cwd, sizeof g_cwd, ".");
+    g_session.started = time(NULL);
     term_init();
     g_messages = cJSON_CreateArray();
     g_tools = tools_definitions();

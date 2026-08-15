@@ -78,7 +78,7 @@ static int g_queue_n;                       /* messages queued while busy (see t
 
 static char *ta_pending_text(void);         /* text typed while busy, not yet submitted (malloc'd or NULL) */
 
-static void fmt_tokens(long n, char *out, size_t sz) {
+void fmt_tokens(long n, char *out, size_t sz) {
     if (n < 1000) snprintf(out, sz, "%ld", n);
     else if (n < 10000) snprintf(out, sz, "%.1fk", n / 1000.0);
     else if (n < 1000000) snprintf(out, sz, "%ldk", n / 1000);

@@ -89,6 +89,7 @@ corbienest [options] [-p PROMPT]
 | `/compact` | have the model summarise the conversation to free context |
 | `/memory [on\|off\|clear]` | show the project memory (`.corbienest/memory.md`), toggle its automatic update, or delete it |
 | `/status` | model, context usage, settings |
+| `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
 | `/system [text\|clear]` | extra system instructions |
 | `/think on\|off\|auto`, `/think show\|hide` | control thinking on thinking-capable models |
 | `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (`.corbienest/permissions`) |

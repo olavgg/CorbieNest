@@ -4,6 +4,7 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
+#include <time.h>
 #include <stddef.h>
 #include <cjson/cJSON.h>
 
@@ -76,6 +77,12 @@ typedef struct {
     long prompt_tokens;      /* sum of prompt (input) tokens over all calls */
     long eval_tokens;        /* sum of generated (output) tokens over all calls */
     int  last_prompt_tokens; /* prompt size of the most recent call (context usage) */
+    int  calls;              /* model calls made (turns, tool rounds, compaction, memory) */
+    int  turns;              /* user requests answered */
+    int  tool_calls;         /* tools executed */
+    double model_seconds;    /* wall time spent waiting on the model (from Ollama's total_duration) */
+    double eval_seconds;     /* generation time (Ollama's eval_duration) */
+    time_t started;          /* session start (for /cost) */
 } session_stats;
 extern session_stats g_session;
 
@@ -127,6 +134,7 @@ void term_clear_screen(void);
 void term_fullscreen(bool on);
 void term_status_refresh(void);
 void term_status_live(long out_tokens);
+void fmt_tokens(long n, char *out, size_t sz);   /* 950, 1.2k, 45k, 1.1M */
 /* Activity indicator in the bar: term_busy("label") shows an animated spinner with the
  * label until term_busy(NULL); call term_busy_tick() regularly (≥10 Hz) while waiting. */
 void term_busy(const char *label);
