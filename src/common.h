@@ -158,11 +158,12 @@ void        term_queue_to_editor(void);   /* after an interrupt: hand queued tex
 char       *term_keys_to_text(const unsigned char *keys, size_t n);   /* raw keystrokes -> trimmed text (malloc'd) */
 /* Simple prompt for a single line. malloc'd or NULL */
 char *term_ask_line(const char *prompt);
-/* Interactive yes / always / no question rendered as a small menu.
- * Returns 1 = yes, 2 = yes-always, 0 = no. On "no" the user may type a
+/* Interactive yes / always (session) / [always (project)] / no question rendered as a
+ * small menu. Returns 1 = yes, 2 = yes-always-this-session, 3 = yes-always-in-project
+ * (only offered when project_label != NULL), 0 = no. On "no" the user may type a
  * reason, returned malloc'd in *reason (or NULL). Keys typed before the
  * question appeared are never taken as the answer. */
-int term_confirm(const char *question, const char *always_label, char **reason);
+int term_confirm(const char *question, const char *always_label, const char *project_label, char **reason);
 
 void term_set_slash_commands(const char **cmds, int n);   /* tab completion */
 /* Interactive list picker: returns chosen index or -1 if cancelled. */
@@ -189,7 +190,15 @@ typedef enum { TOOL_OK = 0, TOOL_DENIED = 1, TOOL_ERROR = 2 } tool_status;
 cJSON *tools_definitions(void);   /* array of tool defs (Ollama/OpenAI format), caller owns */
 /* Executes tool. Returns status; writes result text into out. */
 tool_status tools_execute(const char *name, cJSON *args, sbuf *out);
-void tools_reset_permissions(void);
+void tools_reset_permissions(void);       /* forget the "always this session" answers */
+/* Persistent per-project permission rules (.corbienest/permissions, one per line:
+ * "bash <prefix words>" or "edit"), like Claude Code's project allow-list. */
+void        tools_permissions_load(void);          /* (re)read the file for the current directory */
+int         tools_permissions_count(void);
+const char *tools_permissions_get(int i);
+bool        tools_permissions_add(const char *rule);      /* returns false if it exists already; saves */
+bool        tools_permissions_remove(int i);              /* saves */
+void        tools_permissions_clear(void);                /* removes the file */
 extern bool tools_no_confirm;   /* while true, tools run without asking (user-typed "!cmd") */
 const char *tools_summary_line(void);   /* short list for help */
 

@@ -16,6 +16,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#define CONF_EDIT_K 0
+#define CONF_BASH_K 1
 #define READ_CAP   (256 * 1024)
 #define OUT_CAP    (64 * 1024)
 #define MAX_ENTRIES 400
@@ -24,6 +26,97 @@ static bool g_always_write = false, g_always_edit = false, g_always_bash = false
 bool tools_no_confirm = false;   /* set by the caller for user-typed "!cmd": no prompt, no plan-mode veto */
 void tools_reset_permissions(void) { g_always_write = g_always_edit = g_always_bash = false; }
 const char *tools_summary_line(void) { return "read_file, write_file, edit_file, list_dir, grep, bash"; }
+
+/* ---------- persistent project permissions ----------
+ * .corbienest/permissions holds one rule per line: "edit" (file writes/edits are fine in
+ * this project) or "bash <words>" (shell commands whose leading words match, e.g. "bash git
+ * status", "bash make"). Commands with shell metacharacters (; | & $ ` > < newline) never
+ * match a rule — a chained command is not "just git status". */
+#define PERM_PATH ".corbienest/permissions"
+#define PERM_MAX  200
+static char *g_perm[PERM_MAX]; static int g_perm_n = 0;
+
+void tools_permissions_load(void) {
+    for (int i = 0; i < g_perm_n; i++) free(g_perm[i]);
+    g_perm_n = 0;
+    size_t n; char *d = read_whole_file(PERM_PATH, &n, 64 * 1024);
+    if (!d) return;
+    char *save = NULL;
+    for (char *l = strtok_r(d, "\n", &save); l && g_perm_n < PERM_MAX; l = strtok_r(NULL, "\n", &save)) {
+        while (*l == ' ' || *l == '\t') l++;
+        size_t k = strlen(l); while (k && (l[k-1] == ' ' || l[k-1] == '\r' || l[k-1] == '\t')) l[--k] = 0;
+        if (!*l || *l == '#') continue;
+        g_perm[g_perm_n++] = xstrdup(l);
+    }
+    free(d);
+}
+static void perm_save(void) {
+    if (!g_perm_n) { unlink(PERM_PATH); return; }
+    sbuf b; sb_init(&b);
+    sb_puts(&b, "# corbienest project permissions — one rule per line: \"edit\" or \"bash <leading words>\" (see /permissions)\n");
+    for (int i = 0; i < g_perm_n; i++) sb_printf(&b, "%s\n", g_perm[i]);
+    mkdir_p(".corbienest");
+    write_whole_file(PERM_PATH, b.data, b.len);
+    sb_free(&b);
+}
+int tools_permissions_count(void) { return g_perm_n; }
+const char *tools_permissions_get(int i) { return i >= 0 && i < g_perm_n ? g_perm[i] : NULL; }
+bool tools_permissions_add(const char *rule) {
+    for (int i = 0; i < g_perm_n; i++) if (!strcmp(g_perm[i], rule)) return false;
+    if (g_perm_n >= PERM_MAX) { free(g_perm[0]); memmove(g_perm, g_perm + 1, sizeof(char*) * (PERM_MAX - 1)); g_perm_n--; }
+    g_perm[g_perm_n++] = xstrdup(rule);
+    perm_save();
+    return true;
+}
+bool tools_permissions_remove(int i) {
+    if (i < 0 || i >= g_perm_n) return false;
+    free(g_perm[i]); memmove(g_perm + i, g_perm + i + 1, sizeof(char*) * (size_t)(g_perm_n - i - 1)); g_perm_n--;
+    perm_save();
+    return true;
+}
+void tools_permissions_clear(void) { for (int i = 0; i < g_perm_n; i++) free(g_perm[i]); g_perm_n = 0; unlink(PERM_PATH); }
+
+/* Rule text a command would be remembered under: its first word, plus the subcommand for
+ * tools that have them (git, npm, cargo, docker …). Empty if the command is not "simple". */
+static void bash_rule_for(const char *cmd, char *out, size_t n) {
+    out[0] = 0;
+    if (strpbrk(cmd, ";|&$`<>\n")) return;
+    static const char *sub[] = { "git", "npm", "npx", "pnpm", "yarn", "cargo", "go", "docker", "kubectl", "gh", "pip", "pip3", "python", "python3", "uv", "poetry", NULL };
+    const char *p = cmd; while (*p == ' ') p++;
+    const char *e = p; while (*e && *e != ' ') e++;
+    if (e == p) return;
+    size_t l = (size_t)(e - p);
+    snprintf(out, n, "bash %.*s", (int)l, p);
+    for (int i = 0; sub[i]; i++) if (strlen(sub[i]) == l && !strncmp(sub[i], p, l)) {
+        const char *q = e; while (*q == ' ') q++;
+        const char *qe = q; while (*qe && *qe != ' ') qe++;
+        if (qe > q && *q != '-') { size_t used = strlen(out); snprintf(out + used, n - used, " %.*s", (int)(qe - q), q); }
+        break;
+    }
+}
+/* does a saved rule cover this command? (rule words are a prefix of the command's words) */
+static bool bash_rule_matches(const char *rule, const char *cmd) {
+    if (strncmp(rule, "bash ", 5)) return false;
+    if (strpbrk(cmd, ";|&$`<>\n")) return false;
+    const char *r = rule + 5, *c = cmd;
+    while (*c == ' ') c++;
+    for (;;) {
+        while (*r == ' ') r++;
+        if (!*r) return true;
+        const char *re = r; while (*re && *re != ' ') re++;
+        while (*c == ' ') c++;
+        const char *ce = c; while (*ce && *ce != ' ') ce++;
+        if (ce - c != re - r || strncmp(r, c, (size_t)(re - r))) return false;
+        r = re; c = ce;
+    }
+}
+static const char *perm_match(int kind, const char *cmd) {
+    for (int i = 0; i < g_perm_n; i++) {
+        if (kind == CONF_EDIT_K && !strcmp(g_perm[i], "edit")) return g_perm[i];
+        if (kind == CONF_BASH_K && cmd && bash_rule_matches(g_perm[i], cmd)) return g_perm[i];
+    }
+    return NULL;
+}
 
 /* ---------- tool definitions ---------- */
 static cJSON *mk_tool(const char *name, const char *desc, cJSON *props, const char *required[]) {
@@ -148,9 +241,10 @@ static void preview_lines(const char *text, int max_lines, const char *color) {
 }
 
 /* Confirmation prompt. Returns 1 allow, 0 deny. On deny, *reason may be set (malloc'd).
- * kind: CONF_EDIT for write/edit, CONF_BASH for shell commands. */
-enum { CONF_EDIT, CONF_BASH };
-static int confirm(const char *what, int kind, bool *always_flag, char **reason) {
+ * kind: CONF_EDIT for write/edit, CONF_BASH for shell commands; `cmd` is the shell command
+ * (for the project rules), NULL for edits. */
+enum { CONF_EDIT = CONF_EDIT_K, CONF_BASH = CONF_BASH_K };
+static int confirm(const char *what, int kind, bool *always_flag, const char *cmd, char **reason) {
     *reason = NULL;
     if (always_flag && *always_flag) return 1;
     if (tools_no_confirm) return 1;
@@ -163,6 +257,11 @@ static int confirm(const char *what, int kind, bool *always_flag, char **reason)
         *reason = xstrdup("corbienest is in plan mode (read-only): do not modify files. Present your plan as text; the user will switch modes (shift+tab) when they want it implemented.");
         return 0;
     }
+    const char *rule = perm_match(kind, cmd);
+    if (rule) {
+        printf("  " C_YELLOW "%s" C_RESET "  " C_DIM "auto-approved (project rule: %s)" C_RESET "\n", what, rule);
+        return 1;
+    }
     if (!g_cfg.interactive) {
         printf("  " C_YELLOW "%s" C_RESET " " C_RED "denied (non-interactive; use --yolo or --mode to allow)" C_RESET "\n", what);
         *reason = xstrdup("corbienest is running non-interactively and cannot ask for confirmation. Continue without this action.");
@@ -170,8 +269,12 @@ static int confirm(const char *what, int kind, bool *always_flag, char **reason)
     }
     const char *always = kind == CONF_BASH ? "Yes, and don't ask again for shell commands this session"
                                            : "Yes, and don't ask again for file edits this session";
-    int r = term_confirm(what, always, reason);
+    char newrule[256] = "", plabel[320] = "";
+    if (kind == CONF_BASH) { bash_rule_for(cmd, newrule, sizeof newrule); if (newrule[0]) snprintf(plabel, sizeof plabel, "Yes, and always allow `%s …` in this project", newrule + 5); }
+    else { snprintf(newrule, sizeof newrule, "edit"); snprintf(plabel, sizeof plabel, "Yes, and always allow file edits in this project"); }
+    int r = term_confirm(what, always, newrule[0] ? plabel : NULL, reason);
     if (r == 2 && always_flag) *always_flag = true;
+    if (r == 3 && newrule[0]) { tools_permissions_add(newrule); printf("  " C_DIM "saved to " PERM_PATH ": %s" C_RESET "\n", newrule); }
     return r > 0;
 }
 
@@ -222,7 +325,7 @@ static tool_status t_write_file(cJSON *args, sbuf *out) {
     printf("  " C_DIM "%s %s (%zu bytes)" C_RESET "\n", exists ? "overwrite" : "create", path, strlen(content));
     preview_lines(content, 12, C_GREEN);
     char *reason = NULL;
-    if (!confirm(exists ? "Overwrite this file?" : "Create this file?", CONF_EDIT, &g_always_write, &reason)) {
+    if (!confirm(exists ? "Overwrite this file?" : "Create this file?", CONF_EDIT, &g_always_write, NULL, &reason)) {
         sb_printf(out, "User denied writing %s.%s%s", path, reason ? " Reason: " : "", reason ? reason : "");
         free(reason); free(p); return TOOL_DENIED;
     }
@@ -274,7 +377,7 @@ static tool_status t_edit_file(cJSON *args, sbuf *out) {
     { sbuf t; sb_init(&t); const char *q = olds; while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "- %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_RED); sb_free(&t); }
     { sbuf t; sb_init(&t); const char *q = news; if (!*q) sb_puts(&t, "+ (deleted)\n"); while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "+ %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_GREEN); sb_free(&t); }
     char *reason = NULL;
-    if (!confirm("Apply this edit?", CONF_EDIT, &g_always_edit, &reason)) {
+    if (!confirm("Apply this edit?", CONF_EDIT, &g_always_edit, NULL, &reason)) {
         sb_printf(out, "User denied editing %s.%s%s", path, reason ? " Reason: " : "", reason ? reason : "");
         free(reason); sb_free(&nb); free(d); free(p); return TOOL_DENIED;
     }
@@ -396,7 +499,7 @@ static tool_status t_bash(cJSON *args, sbuf *out) {
     if (timeout > 600) timeout = 600;
     printf("  " C_DIM "$ " C_RESET C_BOLD "%s" C_RESET "\n", cmd);
     char *reason = NULL;
-    if (!confirm("Run this command?", CONF_BASH, &g_always_bash, &reason)) {
+    if (!confirm("Run this command?", CONF_BASH, &g_always_bash, cmd, &reason)) {
         sb_printf(out, "User denied running the command.%s%s", reason ? " Reason: " : "", reason ? reason : "");
         free(reason); return TOOL_DENIED;
     }

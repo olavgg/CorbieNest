@@ -27,7 +27,7 @@ static char   g_session_id[64];                  /* current session (file stem u
 
 static const char *SLASH_CMDS[] = {
     "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think",
-    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/quit", "/exit"
+    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/quit", "/exit"
 };
 
 /* slash completion list = built-in commands + /skill names (rebuilt when skills reload) */
@@ -363,6 +363,32 @@ static void cmd_resume(const char *arg) {
     else printf(C_DIM "cancelled" C_RESET "\n");
     for (int i = 0; i < 2 * n; i++) free(bufs[i]);
     free(bufs); free(items); free(descs); sessions_free(v, n);
+}
+
+/* ---------- /permissions ---------- */
+static void cmd_permissions(const char *arg) {
+    if (arg && !strncmp(arg, "add ", 4)) {
+        const char *r = arg + 4; while (*r == ' ') r++;
+        if (strcmp(r, "edit") && strncmp(r, "bash ", 5)) { printf("usage: /permissions add edit | add bash <leading words>\n"); return; }
+        printf(tools_permissions_add(r) ? C_GREEN "✓ added: %s" C_RESET "\n" : C_DIM "already there: %s" C_RESET "\n", r);
+        return;
+    }
+    if (arg && !strncmp(arg, "remove ", 7)) {
+        int i = atoi(arg + 7);
+        if (tools_permissions_remove(i - 1)) printf(C_GREEN "✓ removed rule %d" C_RESET "\n", i); else printf(C_RED "no rule %d" C_RESET "\n", i);
+        return;
+    }
+    if (arg && !strcmp(arg, "clear")) { tools_permissions_clear(); printf(C_GREEN "✓ project permissions cleared" C_RESET "\n"); return; }
+    if (arg && *arg) { printf("usage: /permissions [add edit|add bash <words>|remove N|clear]\n"); return; }
+    int n = tools_permissions_count();
+    printf(C_BOLD "project permissions" C_RESET C_DIM " (.corbienest/permissions — answers of \"always allow … in this project\")" C_RESET "\n");
+    if (!n) printf(C_DIM "  none — pick \"always allow … in this project\" (p) at a confirmation, or /permissions add bash git status" C_RESET "\n");
+    for (int i = 0; i < n; i++) {
+        const char *r = tools_permissions_get(i);
+        if (!strcmp(r, "edit")) printf("  %2d. file writes and edits\n", i + 1);
+        else printf("  %2d. shell commands starting with " C_BOLD "%s" C_RESET "\n", i + 1, r + 5);
+    }
+    if (n) printf(C_DIM "  /permissions remove N · /permissions clear" C_RESET "\n");
 }
 
 /* ---------- system prompt ---------- */
@@ -830,6 +856,7 @@ static void cmd_help(void) {
            "  /think show|hide      show or hide thinking tokens\n"
            "  /skills [reload|new NAME]  list skills (SKILL.md files); run one with /NAME [args]\n"
            "  /mode [name]          permission mode: manual · accept-edits · plan · auto (or press shift+tab to cycle)\n"
+           "  /permissions [...]    list the project's saved \"always allow\" rules (.corbienest/permissions); add/remove/clear\n"
            "  /yolo [on|off]        shortcut for /mode auto / /mode manual (dangerous!)\n"
            "  /tools on|off         enable/disable tool calling\n"
            "  /ctx [N|Nk|max]       context window: no argument opens a size picker; N/64k/max/default set it\n"
@@ -849,7 +876,7 @@ static void cmd_help(void) {
            "  status bar            bottom row shows the permission mode, model, session tokens and context usage\n"
            "  Tab                   complete slash commands  ·  ↑/↓ history\n\n"
            C_BOLD "Tools the model can call\n" C_RESET "  %s\n"
-           "  write/edit/bash ask for confirmation: pick with ↑/↓ + enter, or press y (once), a (always this session), n (deny, with optional reason)\n"
+           "  write/edit/bash ask for confirmation: pick with ↑/↓ + enter, or press y (once), a (always this session), p (always in this project), n (deny, with optional reason)\n"
            "  modes: manual asks for everything · accept-edits auto-approves file edits · plan is read-only (model proposes a plan) · auto approves all\n",
            tools_summary_line());
 }
@@ -1013,6 +1040,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); tools_reset_permissions(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
     else if (!strcmp(cmd, "/compact")) { if (cmd_compact()) session_save(); }
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
+    else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
     else if (!strcmp(cmd, "/status") || !strcmp(cmd, "/cost")) cmd_status();
     else if (!strcmp(cmd, "/system")) {
         if (!arg) printf("extra system prompt: %s\n", g_cfg.system_prompt ? g_cfg.system_prompt : C_DIM "(none)" C_RESET);
@@ -1059,7 +1087,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/pwd")) printf("%s\n", g_cwd);
     else if (!strcmp(cmd, "/cd")) {
         char *d = expand_home(arg ? arg : "~");
-        if (chdir(d) == 0) { if (getcwd(g_cwd, sizeof g_cwd)) {} load_project_instructions(); load_memory(); skills_load(); refresh_slash_completion(); printf(C_GREEN "✓ %s" C_RESET "\n", g_cwd); }
+        if (chdir(d) == 0) { if (getcwd(g_cwd, sizeof g_cwd)) {} load_project_instructions(); load_memory(); tools_permissions_load(); skills_load(); refresh_slash_completion(); printf(C_GREEN "✓ %s" C_RESET "\n", g_cwd); }
         else printf(C_RED "✗ cd %s: %s" C_RESET "\n", d, strerror(errno));
         free(d);
     }
@@ -1194,6 +1222,7 @@ int main(int argc, char **argv) {
     g_tools = tools_definitions();
     load_project_instructions();
     load_memory();
+    tools_permissions_load();
     skills_load();
     refresh_model_caps(oneshot != NULL);
     if (!g_cfg.model) { fprintf(stderr, "corbienest: no models found on %s (run `ollama pull <model>`)\n", g_cfg.host); return 1; }

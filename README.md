@@ -91,6 +91,7 @@ corbienest [options] [-p PROMPT]
 | `/status` | model, context usage, settings |
 | `/system [text\|clear]` | extra system instructions |
 | `/think on\|off\|auto`, `/think show\|hide` | control thinking on thinking-capable models |
+| `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (`.corbienest/permissions`) |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
 | `/skills [reload\|new NAME]` | list skills; run one with `/NAME [args]` |
@@ -150,12 +151,17 @@ Each confirmation is a small menu:
   Run this command?
   ❯ 1. Yes  (y)
     2. Yes, and don't ask again for shell commands this session  (a)
-    3. No, and tell the model what to do instead  (n)
-  ↑/↓ or j/k move · enter select · 1-3 / y / a / n · esc = no
+    3. Yes, and always allow `git status …` in this project  (p)
+    4. No, and tell the model what to do instead  (n)
+  ↑/↓ or j/k move · enter select · 1-4 / y / a / p / n · esc = no
 ```
 
-Move with ↑/↓ (or j/k) and press Enter, or hit `1`/`2`/`3` or the `y`/`a`/`n` shortcuts;
-Esc or Ctrl-C means no. On "no" you can type what the model should do instead (Enter to skip)
+Move with ↑/↓ (or j/k) and press Enter, or hit `1`–`4` or the `y`/`a`/`p`/`n` shortcuts;
+Esc or Ctrl-C means no. `p` saves a rule to `.corbienest/permissions` (like Claude Code's
+project allow-list): `edit` allows file writes/edits, `bash git status` allows shell commands
+that start with those words (`git status --short` yes, `git status; rm -rf /` no — commands
+with `; | & $ \` < >` never match a rule). `/permissions` lists the rules; `/permissions add
+bash make`, `/permissions remove N`, `/permissions clear` manage them by hand. On "no" you can type what the model should do instead (Enter to skip)
 and it is sent back as the tool result. Anything you typed while the model was still generating
 is never taken as an answer — it is kept for your next prompt. Ctrl-C while a command runs kills it.
 

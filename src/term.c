@@ -877,13 +877,15 @@ char *term_readline(const char *prompt) { return readline_impl(prompt); }
 char *term_ask_line(const char *prompt) { return readline_impl(prompt); }
 
 /* ---------- confirmation menu ---------- */
-int term_confirm(const char *question, const char *always_label, char **reason) {
+int term_confirm(const char *question, const char *always_label, const char *project_label, char **reason) {
     if (reason) *reason = NULL;
     term_raw(true);
     ta_stash stash = ta_take();
-    const char *labels[3] = { "Yes", always_label ? always_label : "Yes, and don't ask again this session",
+    const char *labels[4] = { "Yes", always_label ? always_label : "Yes, and don't ask again this session",
+                              project_label ? project_label : "No, and tell the model what to do instead",
                               "No, and tell the model what to do instead" };
-    const char *keys[3] = { "y", "a", "n" };
+    const char *keys[4] = { "y", "a", project_label ? "p" : "n", "n" };
+    int nopt = project_label ? 4 : 3, no_i = nopt - 1;
     int sel = 0, drawn = 0, choice = -1;
     for (;;) {
         layout_sync();
@@ -893,7 +895,7 @@ int term_confirm(const char *question, const char *always_label, char **reason) 
         sb_puts(&o, "\r\x1b[J");
         int lines = 0;
         sb_printf(&o, "  " C_YELLOW C_BOLD "%s" C_RESET "\n", question); lines++;
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < nopt; i++) {
             char line[256];
             snprintf(line, sizeof line, "%d. %s", i + 1, labels[i]);
             int room = width - 4 - 5 - 1;   /* "  ❯ " prefix, "  (x)" suffix, never touch the last column */
@@ -904,8 +906,12 @@ int term_confirm(const char *question, const char *always_label, char **reason) 
             lines++;
         }
         sb_puts(&o, "  " C_GRAY);
-        sb_puts(&o, width >= 72 ? "↑/↓ or j/k move · enter select · 1-3 / y / a / n · esc = no"
-                  : width >= 44 ? "↑/↓ · enter · 1-3 / y / a / n · esc = no" : "↑/↓ enter y/a/n esc");
+        if (nopt == 4)
+            sb_puts(&o, width >= 72 ? "↑/↓ or j/k move · enter select · 1-4 / y / a / p / n · esc = no"
+                      : width >= 44 ? "↑/↓ · enter · 1-4 / y / a / p / n · esc = no" : "↑/↓ enter y/a/p/n esc");
+        else
+            sb_puts(&o, width >= 72 ? "↑/↓ or j/k move · enter select · 1-3 / y / a / n · esc = no"
+                      : width >= 44 ? "↑/↓ · enter · 1-3 / y / a / n · esc = no" : "↑/↓ enter y/a/n esc");
         sb_puts(&o, C_RESET);
         drawn = lines;   /* cursor sits on the hint line, `lines` rows below the question */
         bar_append(&o);
@@ -914,26 +920,28 @@ int term_confirm(const char *question, const char *always_label, char **reason) 
         int k = read_key();
         if (k == -2) continue;                                   /* resize: redraw */
         if (k == -1 || k == 3) { choice = 0; break; }             /* EOF / Ctrl-C */
-        if (k == K_ESC) { choice = 2; break; }
+        if (k == K_ESC) { choice = no_i; break; }
         if (k == '\r' || k == '\n') { choice = sel; break; }
         if (k == '1' || k == 'y' || k == 'Y') { choice = 0; break; }
         if (k == '2' || k == 'a' || k == 'A') { choice = 1; break; }
-        if (k == '3' || k == 'n' || k == 'N') { choice = 2; break; }
+        if (nopt == 4 && (k == '3' || k == 'p' || k == 'P')) { choice = 2; break; }
+        if (k == '0' + nopt || k == 'n' || k == 'N') { choice = no_i; break; }
         if (k == K_UP || k == 'k' || k == 16) { if (sel > 0) sel--; continue; }
-        if (k == K_DOWN || k == 'j' || k == 14) { if (sel < 2) sel++; continue; }
-        if (k == '\t') { sel = (sel + 1) % 3; continue; }
+        if (k == K_DOWN || k == 'j' || k == 14) { if (sel < nopt - 1) sel++; continue; }
+        if (k == '\t') { sel = (sel + 1) % nopt; continue; }
         if (k == K_HOME) { sel = 0; continue; }
-        if (k == K_END) { sel = 2; continue; }
+        if (k == K_END) { sel = no_i; continue; }
         /* anything else: ignore, keep the menu up */
     }
     /* collapse the menu into a single line */
     if (drawn) printf("\x1b[%dA", drawn);
     printf("\r\x1b[J  " C_YELLOW "%s" C_RESET "  %s\n", question,
-           choice == 0 ? C_GREEN "yes" C_RESET : choice == 1 ? C_GREEN "yes, always" C_RESET : C_RED "no" C_RESET);
+           choice == 0 ? C_GREEN "yes" C_RESET : choice == 1 ? C_GREEN "yes, always this session" C_RESET
+           : (nopt == 4 && choice == 2) ? C_GREEN "yes, always in this project" C_RESET : C_RED "no" C_RESET);
     term_status_refresh();
     fflush(stdout);
-    int rc = choice == 0 ? 1 : choice == 1 ? 2 : 0;
-    if (rc == 0 && reason && choice == 2) {   /* (Ctrl-C / EOF skip the reason prompt) */
+    int rc = choice == 0 ? 1 : choice == 1 ? 2 : (nopt == 4 && choice == 2) ? 3 : 0;
+    if (rc == 0 && reason && choice == no_i) {   /* (Ctrl-C / EOF skip the reason prompt) */
         char *r = term_ask_line(C_DIM "  tell the model why / what to do instead (enter to skip): " C_RESET);
         if (r && *r) *reason = r; else free(r);
     }
