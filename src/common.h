@@ -1,0 +1,230 @@
+/* corbienest - a Claude-Code-style TUI for local Ollama models, in C. */
+#ifndef CORBIE_COMMON_H
+#define CORBIE_COMMON_H
+
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <cjson/cJSON.h>
+
+#define CORBIE_VERSION "0.1.0"
+
+/* ---------- ANSI colours ---------- */
+#define C_RESET   "\x1b[0m"
+#define C_BOLD    "\x1b[1m"
+#define C_DIM     "\x1b[2m"
+#define C_ITALIC  "\x1b[3m"
+#define C_RED     "\x1b[31m"
+#define C_GREEN   "\x1b[32m"
+#define C_YELLOW  "\x1b[33m"
+#define C_BLUE    "\x1b[34m"
+#define C_MAGENTA "\x1b[35m"
+#define C_CYAN    "\x1b[36m"
+#define C_GRAY    "\x1b[90m"
+#define C_ORANGE  "\x1b[38;5;208m"
+
+/* ---------- growable string buffer ---------- */
+typedef struct {
+    char *data;
+    size_t len, cap;
+} sbuf;
+
+void  sb_init(sbuf *b);
+void  sb_free(sbuf *b);
+void  sb_clear(sbuf *b);
+void  sb_append(sbuf *b, const char *s, size_t n);
+void  sb_puts(sbuf *b, const char *s);
+void  sb_putc(sbuf *b, char c);
+void  sb_printf(sbuf *b, const char *fmt, ...);
+char *sb_detach(sbuf *b);            /* returns malloc'd string, resets buffer */
+
+void *xmalloc(size_t n);
+void *xrealloc(void *p, size_t n);
+char *xstrdup(const char *s);
+char *xstrndup(const char *s, size_t n);
+void  die(const char *fmt, ...);
+
+/* file helpers */
+char *read_whole_file(const char *path, size_t *len_out, size_t cap);   /* NULL on error */
+int   write_whole_file(const char *path, const char *data, size_t len);
+int   mkdir_p(const char *path);
+char *expand_home(const char *path);   /* "~/x" -> "/home/u/x", malloc'd */
+int   is_dir(const char *path);
+int   is_file(const char *path);
+
+/* ---------- global config ---------- */
+typedef struct {
+    char *host;          /* e.g. http://127.0.0.1:11434 */
+    char *model;
+    char *system_prompt; /* extra system prompt from CLI/config */
+    int   num_ctx;       /* 0 = leave to server default */
+    double temperature;  /* <0 = unset */
+    int   think;         /* -1 unset, 0 off, 1 on */
+    bool  show_thinking; /* print thinking tokens */
+    int   mode;          /* permission mode, see MODE_* */
+    bool  no_tools;      /* don't send tools at all */
+    bool  color;
+    int   max_iters;     /* tool loop guard */
+    bool  interactive;   /* stdin is a tty */
+    bool  memory;        /* keep .corbienest/memory.md up to date after each request */
+} config_t;
+
+extern config_t g_cfg;
+
+/* per-session token accounting (shown in the status bar and /status) */
+typedef struct {
+    long prompt_tokens;      /* sum of prompt (input) tokens over all calls */
+    long eval_tokens;        /* sum of generated (output) tokens over all calls */
+    int  last_prompt_tokens; /* prompt size of the most recent call (context usage) */
+} session_stats;
+extern session_stats g_session;
+
+/* permission modes (cycle with shift+tab, or /mode) */
+enum { MODE_MANUAL = 0, MODE_ACCEPT_EDITS, MODE_PLAN, MODE_AUTO, MODE_COUNT };
+#define YOLO() (g_cfg.mode == MODE_AUTO)
+const char *mode_name(int mode);          /* "manual", "accept-edits", "plan", "auto" */
+const char *mode_label(int mode);         /* short human description */
+int         mode_parse(const char *s);    /* -1 if unknown */
+
+const char *config_dir(void);        /* ~/.config/corbienest (created) */
+void config_load(void);
+void config_save(void);
+
+/* ---------- http.h ---------- */
+/* Line callback for streamed NDJSON. Return nonzero to abort the request. */
+typedef int (*http_line_cb)(const char *line, size_t len, void *ud);
+typedef void (*http_idle_cb)(void *ud);   /* called ~every 100ms while waiting */
+
+typedef struct {
+    int   status;         /* HTTP status, 0 if none */
+    bool  aborted;        /* aborted by callback / interrupt key */
+    char  err[512];       /* error text if return < 0 */
+} http_result;
+
+extern int http_interrupt_fd;   /* fd to watch for user input while waiting; -1 to disable */
+extern int (*http_interrupt_check)(void);   /* called when that fd is readable; nonzero = abort */
+extern http_idle_cb http_idle;
+extern void *http_idle_ud;
+
+/* Performs request. If line_cb != NULL body is delivered line by line to it,
+ * otherwise appended to `out` (may be NULL to discard). Returns 0 ok, <0 error. */
+int http_request(const char *base_url, const char *method, const char *path,
+                 const char *body, sbuf *out, http_line_cb line_cb, void *ud,
+                 http_result *res);
+
+/* ---------- term.h ---------- */
+void term_init(void);
+void term_restore(void);
+void term_raw(bool on);
+int  term_width(void);
+void term_size(int *rows, int *cols);
+void term_clear_screen(void);
+
+/* Full-screen mode: alternate screen with the bottom row reserved for a status
+ * bar (permission mode · model · session tokens · context usage), like Claude Code.
+ * term_status_refresh() redraws the bar; call it after mode/model/token changes.
+ * term_status_live() shows output tokens of an in-flight generation (0 = none). */
+void term_fullscreen(bool on);
+void term_status_refresh(void);
+void term_status_live(long out_tokens);
+/* Activity indicator in the bar: term_busy("label") shows an animated spinner with the
+ * label until term_busy(NULL); call term_busy_tick() regularly (≥10 Hz) while waiting. */
+void term_busy(const char *label);
+void term_busy_tick(void);
+
+/* prompt history: the latest 100 queries, persisted in ~/.config/corbienest/history */
+void hist_load(void);
+void hist_save(void);
+void hist_add(const char *line);
+int  hist_count(void);
+const char *hist_get(int i);   /* 0 = oldest kept … hist_count()-1 = most recent */
+
+/* Interactive line editor. Returns malloc'd string, or NULL on EOF (Ctrl-D). */
+char *term_readline(const char *prompt);
+
+/* Read a single key while in raw mode. Returns the byte or -1. */
+int term_getkey(void);
+/* Non-blocking: drain pending stdin into the type-ahead buffer; returns 1 if Ctrl-C/Esc was pressed.
+ * Enter while busy turns the pending text into a queued message (see below). */
+int term_poll_interrupt(void);
+/* Messages queued with Enter while the model was generating or a tool was running
+ * (like Claude Code). main.c delivers them between tool rounds / after the turn. */
+int         term_queue_count(void);
+const char *term_queue_peek(void);        /* oldest queued message, or NULL */
+char       *term_queue_pop(void);         /* malloc'd, or NULL */
+void        term_queue_push(const char *msg);
+void        term_queue_clear(void);
+void        term_queue_to_editor(void);   /* after an interrupt: hand queued text back to the editor */
+char       *term_keys_to_text(const unsigned char *keys, size_t n);   /* raw keystrokes -> trimmed text (malloc'd) */
+/* Simple prompt for a single line. malloc'd or NULL */
+char *term_ask_line(const char *prompt);
+/* Interactive yes / always / no question rendered as a small menu.
+ * Returns 1 = yes, 2 = yes-always, 0 = no. On "no" the user may type a
+ * reason, returned malloc'd in *reason (or NULL). Keys typed before the
+ * question appeared are never taken as the answer. */
+int term_confirm(const char *question, const char *always_label, char **reason);
+
+void term_set_slash_commands(const char **cmds, int n);   /* tab completion */
+/* Interactive list picker: returns chosen index or -1 if cancelled. */
+int term_select(const char *title, const char **items, const char **descs, int n, int current);
+
+/* ---------- markdown-ish streaming printer ---------- */
+typedef struct {
+    bool in_fence;
+    bool in_code;
+    bool in_bold;
+    bool at_line_start;
+    int  pending_ticks;
+    bool pending_star;
+    int  fence_ticks;   /* ticks in the run at line start */
+} md_state;
+
+void md_init(md_state *m);
+void md_feed(md_state *m, const char *s, size_t n);
+void md_finish(md_state *m);
+
+/* ---------- tools.h ---------- */
+typedef enum { TOOL_OK = 0, TOOL_DENIED = 1, TOOL_ERROR = 2 } tool_status;
+
+cJSON *tools_definitions(void);   /* array of tool defs (Ollama/OpenAI format), caller owns */
+/* Executes tool. Returns status; writes result text into out. */
+tool_status tools_execute(const char *name, cJSON *args, sbuf *out);
+void tools_reset_permissions(void);
+extern bool tools_no_confirm;   /* while true, tools run without asking (user-typed "!cmd") */
+const char *tools_summary_line(void);   /* short list for help */
+
+/* ---------- skills.h ---------- */
+typedef struct {
+    char *name, *desc, *path, *dir, *body;
+    const char *source;   /* "project" or "user" */
+} skill_t;
+int   skills_load(void);                 /* (re)scan skill directories, returns count */
+int   skills_count(void);
+const skill_t *skill_get(int i);
+const skill_t *skill_find(const char *name);   /* with or without leading '/' */
+char *skill_expand(const skill_t *s, const char *args);   /* prompt text, malloc'd */
+char *skills_prompt_section(void);       /* system prompt section, malloc'd or NULL */
+int   skill_scaffold(const char *name, char *path_out, size_t n);   /* 0 ok, 1 exists, -1 error */
+
+/* ---------- ollama.h ---------- */
+typedef struct {
+    int    prompt_tokens;
+    int    eval_tokens;
+    double eval_seconds;
+    double total_seconds;
+} chat_stats;
+
+/* Streams a chat completion. `messages` is a cJSON array (borrowed).
+ * On success returns a new cJSON assistant message object (caller owns).
+ * On error/abort returns NULL and sets *aborted / prints error. */
+cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted);
+extern bool ollama_quiet;   /* when set, ollama_chat() does not print the streamed reply (background calls) */
+/* Fetch model names. Returns cJSON array of strings (caller owns) or NULL. */
+cJSON *ollama_list_models(void);
+int    ollama_ping(char *ver, size_t verlen);
+/* Context length the model was trained for (from /api/show), 0 if unknown. */
+int    ollama_model_context_length(const char *model);
+/* Recover tool calls that a model emitted as text (exposed for tests). */
+cJSON *parse_text_tool_calls(const char *content);
+
+#endif

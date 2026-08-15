@@ -1,0 +1,5 @@
+*.o
+corbienest
+tests/test_unit
+tests/__pycache__/
+.corbienest/memory.md
