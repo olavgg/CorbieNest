@@ -322,3 +322,24 @@ tests/         unit tests, fake Ollama server, pty integration tests
   context; the model is told to page with `offset`/`limit`.
 - Models without tool support still work as a plain chat (`/models` shows which is which).
 - Only `http://` hosts are supported (Ollama's local API is plain HTTP).
+
+## Safety
+
+Corbie Nest writes files and runs shell commands in the directory you start it in. In the
+default `manual` mode every mutating action is shown and confirmed first, and `plan` mode is
+read-only — but `--yolo` / `/mode auto` approves everything, and rules saved to
+`.corbienest/permissions` stay approved for that project. Run it on code you can restore
+(a git working tree), and remember that a local model is still a model: it can be talked into
+things by the content of the files it reads.
+
+## Contributing
+
+Bug reports and patches are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the build,
+test and style rules, and [AGENTS.md](AGENTS.md) for how the code is laid out. The short
+version: no new dependencies, `make test` must pass, and the build must be warning-free.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+Copyright 2026 The Corbie Nest authors, Olav Gjerde.
