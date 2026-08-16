@@ -31,8 +31,9 @@ CFG = tempfile.mkdtemp(prefix="crowcfg_")
 ENV = dict(os.environ, XDG_CONFIG_HOME=CFG, OLLAMA_HOST=HOST, TERM="xterm-256color", HOME=WORK)
 ENV.pop("CORBIENEST_MODEL", None)
 # memory extraction adds a background model call after every request; keep it off for the
-# general tests (they assert on requests()[-1]) and exercise it explicitly at the end
-os.makedirs(os.path.join(CFG, "corbienest")); open(os.path.join(CFG, "corbienest", "config"), "w").write("memory=0\n")
+# general tests (they assert on requests()[-1]) and exercise it explicitly at the end.
+# memory_idle=0 too, so a pending extraction never fires from a slow expect() mid-test.
+os.makedirs(os.path.join(CFG, "corbienest")); open(os.path.join(CFG, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\n")
 
 passed = failed = 0
 def check(cond, msg):
@@ -569,12 +570,27 @@ s.send("REMEMBER_ME batched fact\r"); check(s.expect("memory updated"), f"extrac
 memreq = requests()[-1]
 check(memreq["messages"][0]["content"].startswith("You maintain the persistent memory file") and any("first of two" in m["content"] for m in memreq["messages"]), "the batched call covers both requests")
 check("batched fact" in open(os.path.join(WORK, ".corbienest", "memory.md")).read(), "batched fact written")
+# idle flush: a request left pending is folded in while the prompt sits untouched, so that
+# quitting (or the next /clear) does not have to wait for the extraction call
+s.send("/memory idle 1\r"); check(s.expect("after 1s idle at the prompt"), "/memory idle 1")
+s.send("/memory\r"); check(s.expect("after 1s idle"), "cadence mentions the idle flush")
+s.send("REMEMBER_ME idle fact\r"); check(s.expect("Echo: REMEMBER_ME idle fact"), "reply")
+check(s.expect("memory updated", 10), f"the pending extraction ran at the idle prompt: {s.text()[-200:]!r}")
+check("idle fact" in open(os.path.join(WORK, ".corbienest", "memory.md")).read(), "idle-flushed fact written")
+s.expect("(no such text)", 1)   # drain: the prompt is redrawn just after the extraction prints
+check(re.search(r"\x1b\[38;1H[^\n]*❯", s.out[s.mark:].decode("utf-8", "replace")) is not None, "the input field is redrawn after the idle flush")
+s.send("/memory\r"); check(not s.expect("pending extraction", 2), "nothing left pending after the idle flush")
+s.send("still here\r"); check(s.expect("Echo: still here"), "the prompt still works after the idle flush")
+s.send("/memory idle off\r"); check(s.expect("memory idle update off"), "/memory idle off")
+s.send("/memory every 5\r"); s.expect("every 5 requests")
 s.send("pending one\r"); check(s.expect("Echo: pending one"), "reply")
+time.sleep(2); check(not s.expect("updating memory", 1), "idle off: the pending extraction stays pending")
 s.send("/clear\r"); check(s.expect("new conversation"), "/clear")
 check(requests()[-1]["messages"][0]["content"].startswith("You maintain the persistent memory file") and any("pending one" in m["content"] for m in requests()[-1]["messages"]), "/clear flushes the pending extraction first")
 s.send("/memory update\r"); check(s.expect("nothing pending"), "/memory update with nothing pending")
 s.send("REMEMBER_ME at exit\r"); check(s.expect("Echo: REMEMBER_ME at exit"), "reply")
-s.send("\x04"); check(s.expect("bye"), "exit"); s.close()
+s.send("\x04"); check(s.expect("updating memory…  (Ctrl-C skips it)"), "the exit flush says it can be skipped")
+check(s.expect("bye"), "exit"); s.close()
 check("at exit" in open(os.path.join(WORK, ".corbienest", "memory.md")).read(), "exit flushes the pending extraction (Ctrl-D)")
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
 s.send("/memory off\r"); s.expect("memory off")

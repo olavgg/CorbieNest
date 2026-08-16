@@ -163,6 +163,7 @@ void config_load(void) {
         else if (!strcmp(k, "mode")) { int m = mode_parse(v); if (m >= 0) g_cfg.mode = m; }
         else if (!strcmp(k, "memory")) g_cfg.memory = atoi(v) != 0;
         else if (!strcmp(k, "memory_every")) { int n = atoi(v); if (n > 0) g_cfg.memory_every = n; }
+        else if (!strcmp(k, "memory_idle")) { int n = atoi(v); if (n >= 0) g_cfg.memory_idle = n; }
         else if (!strcmp(k, "keep_alive")) { free(g_cfg.keep_alive); g_cfg.keep_alive = *v ? xstrdup(v) : NULL; }
     }
     fclose(f);
@@ -184,6 +185,7 @@ void config_save(void) {
     fprintf(f, "mode=%s\n", mode_name(g_cfg.mode));
     fprintf(f, "memory=%d\n", g_cfg.memory ? 1 : 0);
     fprintf(f, "memory_every=%d\n", g_cfg.memory_every);
+    fprintf(f, "memory_idle=%d\n", g_cfg.memory_idle);
     fprintf(f, "keep_alive=%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "");
     fclose(f);
 }

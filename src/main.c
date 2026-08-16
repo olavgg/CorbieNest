@@ -165,6 +165,7 @@ static char *unfence(const char *t) {
  * (exit, /clear, /compact, /cd, /resume). */
 static int g_mem_first = -1;      /* index of the first message not yet folded into memory (-1 = none pending) */
 static int g_mem_pending = 0;     /* finished requests since the last flush */
+static bool g_mem_exiting = false;/* the last flush, on the way out: say that Ctrl-C skips it */
 
 static void memory_extract(int first) {
     if (!g_cfg.interactive && !is_dir(".corbienest")) return;
@@ -208,7 +209,7 @@ static void memory_extract(int first) {
         "in markdown, keeping the existing headings, and nothing else.");
     cJSON_AddItemToArray(msgs, u);
 
-    if (g_cfg.interactive) { printf(C_DIM "✎ updating memory…" C_RESET); fflush(stdout); }
+    if (g_cfg.interactive) { printf(C_DIM "✎ updating memory…%s" C_RESET, g_mem_exiting ? "  (Ctrl-C skips it)" : ""); fflush(stdout); }
     chat_stats st; bool ab = false;
     /* a background call: no thinking (it only adds latency here), a hard cap on the reply so a
      * runaway generation cannot hang the prompt, and an honest status-bar label */
@@ -249,6 +250,19 @@ static void memory_flush(void) {
     g_mem_first = -1; g_mem_pending = 0;
     if (first >= cJSON_GetArraySize(g_messages)) return;   /* rewound past it: nothing left to learn */
     memory_extract(first);
+}
+
+/* Called by the editor once the prompt has been idle for memory_idle seconds (see
+ * term_idle_hook): the extraction happens while the reply is being read instead of on the way
+ * out, so quitting is not held up by a model call. Typing cancels it, and the batch simply
+ * waits for the next chance — so a user who keeps working still gets the batched cadence and
+ * a warm prompt cache. */
+static void memory_idle_hook(void) { memory_flush(); }
+
+/* How long the next prompt should wait before folding a finished request into memory
+ * (0 = not at all: nothing pending, or the idle flush is switched off). */
+static void memory_arm_idle(void) {
+    term_idle_ms = (g_cfg.memory && g_cfg.memory_idle > 0 && g_mem_first >= 0) ? g_cfg.memory_idle * 1000 : 0;
 }
 
 /* A request finished (it started at g_messages[first]): remember it for the next flush,
@@ -298,9 +312,11 @@ static void memory_quick_add(const char *fact) {
 }
 
 static const char *memory_cadence(void) {
-    static char b[96];
-    if (g_cfg.memory_every <= 1) return "after each request";
-    snprintf(b, sizeof b, "every %d requests (and at exit, /clear, /compact)", g_cfg.memory_every);
+    static char b[160];
+    char idle[64] = "";
+    if (g_cfg.memory_idle > 0) snprintf(idle, sizeof idle, ", after %ds idle at the prompt", g_cfg.memory_idle);
+    if (g_cfg.memory_every <= 1) snprintf(b, sizeof b, "after each request");
+    else snprintf(b, sizeof b, "every %d requests%s (and at exit, /clear, /compact)", g_cfg.memory_every, idle);
     return b;
 }
 static void cmd_memory(const char *arg) {
@@ -318,14 +334,23 @@ static void cmd_memory(const char *arg) {
         if (g_mem_pending >= n) memory_flush();
         return;
     }
+    if (arg && !strncmp(arg, "idle", 4)) {
+        const char *v = arg + 4; while (*v == ' ') v++;
+        int n = !strcmp(v, "off") ? 0 : atoi(v);
+        if (n < 0 || (!n && strcmp(v, "off") && strcmp(v, "0"))) { printf("usage: /memory idle N   (seconds idle at the prompt before a pending update runs; 'off' waits for exit)\n"); return; }
+        g_cfg.memory_idle = n; config_save();
+        if (n) printf(C_GREEN "✓ pending memory update runs after %ds idle at the prompt" C_RESET "\n", n);
+        else printf(C_GREEN "✓ memory idle update off" C_RESET C_DIM " — pending updates wait for %d requests or exit" C_RESET "\n", g_cfg.memory_every);
+        return;
+    }
     if (arg && !strcmp(arg, "update")) { if (g_mem_first < 0) printf(C_DIM "nothing pending" C_RESET "\n"); else memory_flush(); return; }
     if (arg && !strcmp(arg, "clear")) {
         if (is_file(MEMORY_PATH) && unlink(MEMORY_PATH) == 0) { load_memory(); printf(C_GREEN "✓ removed %s" C_RESET "\n", MEMORY_PATH); }
         else printf(C_DIM "no memory file" C_RESET "\n");
         return;
     }
-    if (arg && *arg) { printf("usage: /memory [on|off|clear|update|every N]\n"); return; }
-    printf(C_DIM "%s — %s; loaded into the system prompt · /memory on|off|clear|update|every N" C_RESET "\n", MEMORY_PATH, g_cfg.memory ? memory_cadence() : "auto-update is off");
+    if (arg && *arg) { printf("usage: /memory [on|off|clear|update|every N|idle N]\n"); return; }
+    printf(C_DIM "%s — %s; loaded into the system prompt · /memory on|off|clear|update|every N|idle N" C_RESET "\n", MEMORY_PATH, g_cfg.memory ? memory_cadence() : "auto-update is off");
     if (g_cfg.memory && g_mem_pending > 0) printf(C_DIM "(%d request%s pending extraction — /memory update runs it now)" C_RESET "\n", g_mem_pending, g_mem_pending == 1 ? "" : "s");
     if (!g_memory) { printf(C_DIM "(no memory yet — nothing durable has been recorded)" C_RESET "\n"); return; }
     fputs(g_memory, stdout);
@@ -1258,7 +1283,7 @@ static void cmd_help(void) {
            "  /models               list models available in ollama\n"
            "  /clear                start a new conversation\n"
            "  /compact              summarise the conversation to free context\n"
-           "  /memory [on|off|clear|update|every N]  show the project memory (" MEMORY_PATH ", curated by the model every N requests and at exit; default 5), toggle it, run the update now, set the cadence, or delete it\n"
+           "  /memory [on|off|clear|update|every N|idle N]  show the project memory (" MEMORY_PATH ", curated by the model every N requests, after N seconds idle at the prompt, and at exit; default every 5 / 15s idle), toggle it, run the update now, set the cadence, or delete it\n"
            "  /status               show model, context usage, settings\n"
            "  /cost                 tokens, model calls, model time and wall time of this session\n"
            "  /diff [git args]      show the working-tree diff (stat + patch + untracked), without sending it to the model; e.g. /diff --staged\n"
@@ -1564,8 +1589,10 @@ static bool slash_runs_while_busy(const char *cmd, const char *arg) {
     static const char *ok[] = {
         "/help", "/?", "/status", "/cost", "/diff", "/history", "/pwd", "/skills",
         "/mode", "/yolo", "/permissions", "/tools", "/think", "/temp", "/keepalive", "/keep-alive", "/memory", NULL };
-    /* /memory update — and "every N" once N requests are pending — runs the extraction call */
-    if (!strcmp(cmd, "/memory") && arg && strcmp(arg, "on") && strcmp(arg, "off") && strcmp(arg, "clear")) return false;
+    /* /memory update — and "every N" once N requests are pending — runs the extraction call;
+     * "idle N" only sets the delay for the next prompt, so it is safe mid-turn */
+    if (!strcmp(cmd, "/memory") && arg && strcmp(arg, "on") && strcmp(arg, "off") && strcmp(arg, "clear")
+        && strncmp(arg, "idle", 4)) return false;
     for (int i = 0; ok[i]; i++) if (!strcmp(cmd, ok[i])) return true;
     return false;
 }
@@ -1672,7 +1699,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 60; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.memory_every = 5;
+    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 60; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15;
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();
@@ -1782,7 +1809,9 @@ int main(int argc, char **argv) {
     banner();
     hist_load();
     refresh_slash_completion();
+    term_idle_hook = memory_idle_hook;
     for (;;) {
+        memory_arm_idle();   /* a finished request folds itself into memory while the prompt sits idle */
         char *line = term_readline(C_BOLD C_ORANGE "› " C_RESET);
         if (!line) break;
         int rc = process_input(line);
@@ -1800,7 +1829,8 @@ int main(int argc, char **argv) {
         if (rc == -1) term_queue_to_editor();
     }
     hist_save();
-    memory_flush();   /* pending memory extraction runs before we leave (Ctrl-C skips it) */
+    g_mem_exiting = true;
+    memory_flush();   /* whatever the idle flush did not get to runs before we leave (Ctrl-C skips it) */
     session_save();
     term_restore();   /* leaves the alternate screen: say goodbye on the normal one */
     printf(C_DIM "bye" C_RESET " · corbienest used %ld tokens this session (%ld in · %ld out) with %s\n",

@@ -70,6 +70,7 @@ typedef struct {
     bool  interactive;   /* stdin is a tty */
     bool  memory;        /* keep .corbienest/memory.md up to date (see memory_every) */
     int   memory_every;  /* run the memory-extraction call after this many requests (also at exit, /clear, /compact, /cd) */
+    int   memory_idle;   /* seconds idle at the prompt after which a pending extraction runs anyway (0 = only at memory_every / exit) */
     char *keep_alive;    /* ollama keep_alive for the model ("30m", "-1" = forever, "0" = unload); NULL = server default */
 } config_t;
 
@@ -160,6 +161,14 @@ int term_getkey(void);
 /* Non-blocking: drain pending stdin into the type-ahead buffer; returns 1 if Ctrl-C/Esc was pressed.
  * Enter while busy turns the pending text into a queued message (see below). */
 int term_poll_interrupt(void);
+/* Background work at an idle prompt. When term_idle_ms > 0, the editor runs term_idle_hook()
+ * once per prompt after that many milliseconds without a keystroke on an empty line, with the
+ * terminal put back the way it is during a turn (input field released, cursor where the
+ * transcript ended) so the hook can print normally. main.c uses it to fold a finished request
+ * into the memory file while the user reads the reply, instead of on the way out. Set
+ * term_idle_ms before each term_readline(); typing anything cancels it for that prompt. */
+extern void (*term_idle_hook)(void);
+extern int term_idle_ms;
 /* Messages queued with Enter while the model was generating or a tool was running
  * (like Claude Code). main.c delivers them between tool rounds / after the turn. */
 int         term_queue_count(void);

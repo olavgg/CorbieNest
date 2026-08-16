@@ -114,7 +114,7 @@ corbienest [options] [-p PROMPT]
 | `/models` | list installed models with tool/thinking capabilities |
 | `/clear` | new conversation |
 | `/compact` | have the model summarise the conversation to free context |
-| `/memory [on\|off\|clear\|update\|every N]` | show the project memory (`.corbienest/memory.md`), toggle its automatic update, run the pending update now, set how often it runs (default every 5 requests, plus at exit/`/clear`/`/compact`), or delete it |
+| `/memory [on\|off\|clear\|update\|every N\|idle N]` | show the project memory (`.corbienest/memory.md`), toggle its automatic update, run the pending update now, set how often it runs (default every 5 requests, plus after 15s idle at the prompt and at exit/`/clear`/`/compact`), how long the prompt must sit idle before a pending update runs (`idle off` waits for exit), or delete it |
 | `/status` | model, context usage, settings |
 | `/diff [git args]` | show `git diff` of the working tree (stat, patch, untracked files) for you only — nothing is added to the conversation; `/diff --staged`, `/diff HEAD~1` … pass through |
 | `/rewind` | (or **Esc Esc** at an empty prompt) pick an earlier request and go back: undo the file changes the model made since (files are checkpointed before every `write_file`/`edit_file`), truncate the conversation to just before it (the request text returns to the editor), or both |
@@ -265,7 +265,8 @@ new session; `/status` shows the current id, which is also printed when you quit
 
 Like Claude Code's auto-memory: corbienest keeps `.corbienest/memory.md` in the working
 directory and loads it into the system prompt of every request. The model curates it — every
-few requests (default 5, `/memory every N`; also at exit, `/clear`, `/compact`, `/cd`) a quiet
+few requests (default 5, `/memory every N`; after 15s idle at the prompt, `/memory idle N`;
+also at exit, `/clear`, `/compact`, `/cd`) a quiet
 extraction call asks whether the exchanges since the last update revealed anything durable
 (who you are and how you like to work, feedback you gave, project goals/decisions/constraints
 that aren't in the code, references such as URLs or tickets) and, if so, rewrites the file;
@@ -284,6 +285,13 @@ re-evaluates the whole context — which is why it is batched rather than run af
 request (`/memory every 1` restores that; `/memory update` runs a pending one now; `/memory`
 shows how many requests are pending). On slow machines `/memory off` removes it entirely.
 
+So that a pending update never holds up the way out, it also runs on its own once the prompt
+has been idle for 15 seconds (`/memory idle N`, `/memory idle off`, saved to config): the call
+happens while you read the reply, and by the time you quit there is usually nothing left to
+write. Typing anything cancels it for that prompt — a request you start right away still finds
+a warm prompt cache, and the batch simply waits for the next pause. If you do quit with an
+update still pending, the flush on the way out says so and Ctrl-C skips it.
+
 ### Project instructions
 
 If a `CORBIENEST.md`, `CLAUDE.md` or `AGENTS.md` exists in the working directory it is
@@ -291,7 +299,7 @@ appended to the system prompt, so you can give the model project-specific guidan
 
 ### Config
 
-Settings changed with `/model`, `/ctx`, `/think`, `/mode`, `/yolo`, `/host`, `/keepalive`, `/memory on|off` are saved to
+Settings changed with `/model`, `/ctx`, `/think`, `/mode`, `/yolo`, `/host`, `/keepalive`, `/memory on|off|every N|idle N` are saved to
 `~/.config/corbienest/config`. Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`.
 
 ## Tests

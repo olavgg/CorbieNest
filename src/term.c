@@ -960,6 +960,10 @@ int term_poll_interrupt(void) {
     }
 }
 
+/* Idle work at the prompt (see common.h): main.c sets these before each term_readline(). */
+void (*term_idle_hook)(void) = NULL;
+int term_idle_ms = 0;
+
 static int read_byte_timeout(int ms) {
     int t = ta_get(); if (t >= 0) return t;
     fd_set rf; FD_ZERO(&rf); FD_SET(STDIN_FILENO, &rf);
@@ -1021,6 +1025,19 @@ static int read_key(void) {
             return K_ESC;
         default: return K_ESC;
     }
+}
+
+/* read_key(), but gives up after `ms` without a byte: -3 = nothing was typed. */
+#define K_IDLE (-3)
+static int read_key_wait(int ms) {
+    if (g_ta_pos >= g_ta_len) {   /* type-ahead counts as typed */
+        fd_set rf; FD_ZERO(&rf); FD_SET(STDIN_FILENO, &rf);
+        struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+        int r = select(STDIN_FILENO + 1, &rf, NULL, NULL, &tv);
+        if (r == 0) return K_IDLE;
+        if (r < 0) return errno == EINTR ? -2 : -1;
+    }
+    return read_key();
 }
 
 int term_getkey(void) {
@@ -1139,6 +1156,34 @@ static void ed_conv_out(editor *e, const char *text) {
     fputs(text, stdout);
     fflush(stdout);
     conv_pos(fs_region(), &g_conv_row, &g_conv_col);
+}
+
+static void ed_refresh(editor *e);
+
+/* Run term_idle_hook() with the terminal in the state a turn runs in: the field released and
+ * the cursor back where the transcript ended, so the hook's own output (and the status bar it
+ * refreshes) lands like any other conversation output. The prompt is redrawn afterwards. */
+static void ed_idle_run(editor *e) {
+    void (*hook)(void) = term_idle_hook;
+    if (!hook) return;
+    if (e->in_field) {
+        g_field_focus = false;
+        g_field_text = ""; g_field_len = g_field_cur = 0; g_field_view = 0;
+        sb_pause(true);
+        printf("\x1b[%d;%dH", g_conv_row, g_conv_col);
+        fflush(stdout);
+        sb_pause(false);
+        term_status_refresh();
+        hook();
+        conv_pos(fs_region(), &g_conv_row, &g_conv_col);
+        layout_sync();
+        g_field_focus = true; g_field_view = 0;
+    } else {
+        fputs("\r\x1b[J", stdout); fflush(stdout);   /* wipe the prompt line; it is redrawn below */
+        e->prev_cursor_row = 0;
+        hook();
+    }
+    ed_refresh(e);
 }
 
 static void ed_refresh(editor *e) {
@@ -1301,8 +1346,13 @@ static char *readline_impl(const char *prompt, bool in_field) {
     bool done = false;
     int ctrlc_count = 0;
     bool esc_pending = false;   /* Esc Esc on an empty line = /rewind (like Claude Code) */
+    /* Pending background work (main.c: the memory extraction) runs once, if the prompt is
+     * still untouched after term_idle_ms — typing anything at all cancels it for this prompt. */
+    bool idle_armed = term_idle_hook && term_idle_ms > 0;
     while (!done) {
-        int k = read_key();
+        int k = idle_armed && e.buf.len == 0 ? read_key_wait(term_idle_ms) : read_key();
+        if (k == K_IDLE) { idle_armed = false; ed_idle_run(&e); continue; }
+        if (k != -2) idle_armed = false;
         if (k == -2) { if (g_winch) { g_winch = 0; ed_refresh(&e); } continue; }
         if (k == -1) { result = NULL; break; }
         if (k != 3) ctrlc_count = 0;
