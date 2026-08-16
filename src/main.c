@@ -19,6 +19,7 @@ static cJSON *g_messages = NULL;    /* conversation, without system prompt */
 static cJSON *g_tools = NULL;       /* tool definitions */
 static bool   g_model_tools = true; /* current model supports tools */
 static bool   g_placement_checked = false; /* /api/ps warning about a partly-CPU model shown once per model */
+static bool   g_while_busy = false;        /* a slash command is running inside the turn (see run_slash_while_busy) */
 static int    g_model_max_ctx = 0;  /* context length the model was trained for (0 = unknown) */
 static char   g_cwd[PATH_MAX];
 static char  *g_project_instructions = NULL;
@@ -921,6 +922,8 @@ static void print_stats(chat_stats *st) {
  * `verbose` also reports a fully-GPU model (for /status). */
 static void check_model_placement(bool verbose) {
     if (!g_cfg.interactive || (g_placement_checked && !verbose)) return;
+    /* a request is in flight and ollama.c's streaming callbacks are global: no second HTTP call */
+    if (g_while_busy) { if (verbose) printf(C_BOLD "placement  " C_RESET C_DIM "(not checked while the model is working)" C_RESET "\n"); return; }
     g_placement_checked = true;
     double size, vram;
     if (ollama_model_placement(g_cfg.model, &size, &vram) != 0 || size <= 0) { if (verbose) printf(C_BOLD "placement  " C_RESET "(model not loaded)\n"); return; }
@@ -1285,6 +1288,8 @@ static void cmd_help(void) {
            "  # fact                remember something: appended to " MEMORY_PATH " (pick the section from a menu), no model call\n"
            "  Enter                 send  ·  Alt+Enter / Ctrl+J / trailing \\ : newline\n"
            "  Enter while busy      queue a message for the model (added between tool rounds or after the turn; Ctrl-C hands it back)\n"
+           "                        commands that only report or set something run at once instead: /help /status /cost /diff /history /pwd\n"
+           "                        /skills /memory /mode /yolo /permissions /tools /think /temp /keepalive\n"
            "  Ctrl-C                cancel generation / clear line (twice: quit)  ·  Ctrl-L clear screen\n"
            "  PgUp / PgDn           scroll back through the conversation (↑/↓, Home/End inside; Esc/Enter return)\n"
            "  status bar            bottom row shows the permission mode, model, session tokens and context usage\n"
@@ -1546,6 +1551,46 @@ static int handle_slash(char *line) {
     return 0;
 }
 
+/* ---------- slash commands that do not have to wait for the turn ----------
+ * Enter while the model works normally queues a message. A command that only reports
+ * state or flips a setting can just as well run there and then — that is what the user
+ * expects from /status, and a permission or mode change is only useful if it lands
+ * before the next tool call (Shift+Tab already works that way). To qualify a command
+ * must not: touch the conversation (/clear, /compact, /rewind, /resume, /save, /system,
+ * /init and skills do), start an HTTP request while one is streaming — ollama.c's
+ * callbacks are global (/model, /models, /ctx, /host, /memory update), ask the user
+ * anything (the pickers), or change the ground under the running turn (/cd). */
+static bool slash_runs_while_busy(const char *cmd, const char *arg) {
+    static const char *ok[] = {
+        "/help", "/?", "/status", "/cost", "/diff", "/history", "/pwd", "/skills",
+        "/mode", "/yolo", "/permissions", "/tools", "/think", "/temp", "/keepalive", "/keep-alive", "/memory", NULL };
+    /* /memory update — and "every N" once N requests are pending — runs the extraction call */
+    if (!strcmp(cmd, "/memory") && arg && strcmp(arg, "on") && strcmp(arg, "off") && strcmp(arg, "clear")) return false;
+    for (int i = 0; ok[i]; i++) if (!strcmp(cmd, ok[i])) return true;
+    return false;
+}
+
+/* term.c hands us the line typed while busy: 1 = handled here, 0 = queue it as a message.
+ * Runs from inside term_poll_interrupt(), i.e. in the middle of a stream or a tool. */
+static int run_slash_while_busy(const char *line) {
+    char *cmd = xstrndup(line, strcspn(line, " "));
+    const char *arg = line + strlen(cmd); while (*arg == ' ') arg++;
+    bool ok = slash_runs_while_busy(cmd, *arg ? arg : NULL);
+    free(cmd);
+    if (!ok) return 0;
+    hist_add(line); hist_save();
+    term_line_break();   /* the model may be mid-sentence */
+    echo_queued(line);
+    char *copy = xstrdup(line);
+    g_while_busy = true;
+    handle_slash(copy);
+    g_while_busy = false;
+    free(copy);
+    printf("\n");
+    term_status_refresh();
+    return 1;
+}
+
 /* !cmd : run shell command directly, add to context */
 static void handle_bang(const char *cmd) {
     cJSON *a = cJSON_CreateObject(); cJSON_AddStringToObject(a, "command", cmd);
@@ -1668,6 +1713,7 @@ int main(int argc, char **argv) {
     g_messages = cJSON_CreateArray();
     g_tools = tools_definitions();
     tools_subagent = run_subagent;
+    term_run_while_busy = run_slash_while_busy;
     load_project_instructions();
     load_memory();
     tools_permissions_load();

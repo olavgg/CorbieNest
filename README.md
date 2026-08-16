@@ -157,6 +157,13 @@ corbienest [options] [-p PROMPT]
   match, Enter keeps the match in the editor, Esc restores what you had.
 - Shift+Tab cycles the permission mode, also while the model is working (it applies to the
   remaining tool confirmations of that turn); the current mode is shown in the bottom status bar.
+- **Slash commands that only report or set something answer straight away while the model
+  works** — they never become a queued message: `/help`, `/status`, `/cost`, `/diff`, `/history`,
+  `/pwd`, `/skills`, `/memory`, `/mode`, `/yolo`, `/permissions`, `/tools`, `/think`, `/temp`,
+  `/keepalive`. A `/permissions add` or `/mode` typed mid-turn applies to the tool confirmations
+  still to come, like Shift+Tab. Everything that touches the conversation (`/clear`, `/compact`,
+  `/rewind`, `/resume`, `/save`, `/system`, `/init`, skills), needs the server (`/model`,
+  `/models`, `/ctx`, `/host`, `/memory update`) or asks a question stays queued until the turn ends.
 
 ### Permission modes
 

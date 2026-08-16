@@ -52,6 +52,12 @@ build must be warning-free with `-Wall -Wextra`.
   consumed by `main.c` — between tool rounds (`inject_queued()`, plain messages only) and after
   the turn (`process_input` loop); after an interrupt they go back to the editor
   (`term_queue_to_editor()`), never silently dropped.
+- Enter while busy on a slash command first goes to `term_run_while_busy` (main.c's
+  `run_slash_while_busy` / `slash_runs_while_busy`), which runs it there and then when it only
+  reports state or flips a setting. Such a command runs *inside* the poll of a live request:
+  it must not touch `g_messages`, start an HTTP request (ollama.c's callbacks are global — guard
+  with `g_while_busy`, as `check_model_placement()` does), ask the user anything, or `chdir`.
+  Anything printed from there calls `term_line_break()` first (the model may be mid-sentence).
 - Tool confirmations obey `g_cfg.mode` (`MODE_MANUAL`, `MODE_ACCEPT_EDITS`, `MODE_PLAN`,
   `MODE_AUTO`); route new mutating tools through `confirm(what, CONF_EDIT|CONF_BASH, ...)` in
   `tools.c`. Plan mode must stay read-only: `tools_for_mode()` in `main.c` drops

@@ -168,6 +168,11 @@ char       *term_queue_pop(void);         /* malloc'd, or NULL */
 void        term_queue_push(const char *msg);
 void        term_queue_clear(void);
 void        term_queue_to_editor(void);   /* after an interrupt: hand queued text back to the editor */
+/* Slash commands that only look at state or flip a setting do not have to wait for the turn
+ * to end: when Enter is pressed while busy, term.c offers the line to this hook first and
+ * only queues it as a message when the hook returns 0. Set by main.c. */
+extern int (*term_run_while_busy)(const char *line);
+void        term_line_break(void);        /* start a fresh line if output is mid-line (the model may be mid-sentence) */
 void        term_editor_prefill(const char *text);   /* text appears in the editor at the next prompt (e.g. after /rewind) */
 char       *term_keys_to_text(const unsigned char *keys, size_t n);   /* raw keystrokes -> trimmed text (malloc'd) */
 /* Simple prompt for a single line. malloc'd or NULL */

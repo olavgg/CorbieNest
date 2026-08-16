@@ -497,6 +497,14 @@ static void sb_pause(bool on) { if (!g_sb_active) return; fflush(stdout); g_sb_p
 /* record text that was drawn while paused (the editor's submitted line) */
 static void sb_note(const char *text) { if (g_sb_active) { fflush(stdout); sb_feed(text, strlen(text)); } }
 
+/* The scrollback model knows which column the conversation output sits in, so anything
+ * that has to start on its own line (a command run while the model is mid-sentence) can
+ * ask for the break here instead of guessing. */
+void term_line_break(void) {
+    fflush(stdout);
+    if (!g_sb_active || g_sb_col > 0) fputs("\n", stdout);
+}
+
 /* visual rows of the buffer at the given width: (line, byte offset, byte length) triples */
 typedef struct { int line; size_t off, len; } sb_row;
 static sb_row *sb_rows(int width, int *count) {
@@ -612,9 +620,11 @@ static void ta_restore(ta_stash st) {
  * kept, and pressing Enter queues it as a message. Queued messages are shown in
  * the status bar and delivered by main.c at the next opportunity (between tool
  * rounds, or right after the turn ends). Text without Enter stays type-ahead and
- * simply reappears in the editor. */
+ * simply reappears in the editor. Slash commands that main.c can answer without
+ * touching the conversation run right away instead (term_run_while_busy). */
 #define QUEUE_MAX 32
 static char *g_queue[QUEUE_MAX];
+int (*term_run_while_busy)(const char *line) = NULL;   /* set by main.c; see common.h */
 static bool  g_ta_paste = false;     /* inside a bracketed paste (ESC[200~ … ESC[201~) */
 static unsigned char g_ta_tail[6];   /* last bytes appended, to spot the paste brackets */
 
@@ -677,12 +687,16 @@ static char *ta_pending_text(void) {
     return t;
 }
 
-/* Enter pressed while busy: the pending type-ahead becomes a queued message. */
+/* Enter pressed while busy: the pending type-ahead becomes a queued message — unless it
+ * is a slash command main.c can run right there and then (/status, /mode, …). */
 static void ta_submit(void) {
     size_t n = g_ta_len - g_ta_pos;
     char *text = term_keys_to_text(g_ta + g_ta_pos, n);
     g_ta_pos = g_ta_len = 0;
-    if (*text) { term_queue_push(text); term_status_refresh(); }
+    if (*text) {
+        if (!(*text == '/' && term_run_while_busy && term_run_while_busy(text))) term_queue_push(text);
+        term_status_refresh();
+    }
     free(text);
 }
 
