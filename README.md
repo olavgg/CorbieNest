@@ -5,36 +5,7 @@ A Claude-Code-style terminal coding agent written in plain C that talks to
 files, grep the codebase, and run shell and git commands — each mutating action
 is shown to you and confirmed before it runs.
 
-```ansi
-[38;5;208m╭──────────────────────────────────────────────────────────────╮[0m
-[38;5;208m│[0m [1m🐦‍⬛ Corbie Nest[0m v0.1.0 — local coding agent for Ollama
-[38;5;208m│[0m [2mmodel:[0m qwen3-coder:30b
-[38;5;208m│[0m [2mhost: [0m http://127.0.0.1:11434 [32m● connected[0m
-[38;5;208m│[0m [2mcwd:  [0m ~/projects/myapp
-[38;5;208m╰──────────────────────────────────────────────────────────────╯[0m
-[1m[38;5;208m› [0m[2mfix the failing test in tests/test_parser.py[0m
-
-[32m●[0m [1mbash[0m[2m(python3 -m pytest tests/test_parser.py -q)[0m
-  [2m$ [0m[1mpython3 -m pytest tests/test_parser.py -q[0m
-  [33mRun this command?[0m  [32myes[0m
-  ⎿  [2mF.[0m
-     [2m… +12 lines[0m
-[32m●[0m [1mread_file[0m[2m(src/parser.py)[0m
-[32m●[0m [1medit_file[0m[2m(src/parser.py)[0m
-  [31m- if tok == "":[0m
-  [32m+ if tok == "" or tok is None:[0m
-  [33mApply this edit?[0m  [32myes[0m
-[32m●[0m [1mbash[0m[2m(python3 -m pytest tests/test_parser.py -q)[0m
-  ⎿  [2m..[0m
-     [2mexit code: 0[0m
-[32m●[0m Fixed the None handling in [36m`src/parser.py:42`[0m; both tests pass.
-  [90m↳ 4120 in · 210 out · 62.3 tok/s · 4.1s · ctx 12%[0m
-
-[2m────────────────────────────────────────────────────────────────────────────────────────[0m
-[1m[38;5;208m❯ [0mand now make it handle the empty file case
-[2m────────────────────────────────────────────────────────────────────────────────────────[0m
- [2m⏵  manual mode[0m[2m (shift+tab to cycle)[0m[2m │ [0mqwen2.5-coder:7b[2m │ [0m4.3k tokens (↑4.1k ↓210)[2m │ [0mctx 12%
-```
+![A corbienest session: the agent runs pytest, reads and edits src/parser.py, re-runs the tests and reports back, with the input field and status bar pinned to the bottom of the screen.](docs/demo.svg)
 
 corbienest takes over the terminal (alternate screen) while it runs, like Claude Code: the
 conversation scrolls in the upper part, and the bottom of the screen is the app's: an input
@@ -197,14 +168,7 @@ Cycle with **Shift+Tab** at the prompt, or set one with `/mode NAME`, `--mode NA
 
 Each confirmation is a small menu:
 
-```ansi
-  [33m[1mRun this command?[0m
-  [38;5;208m❯ [1m1. Yes[0m[2m  (y)[0m
-    2. Yes, and don't ask again for shell commands this session[2m  (a)[0m
-    3. Yes, and always allow `git status …` in this project[2m  (p)[0m
-    4. No, and tell the model what to do instead[2m  (n)[0m
-  [90m↑/↓ or j/k move · enter select · 1-4 / y / a / p / n · esc = no[0m
-```
+![The confirmation menu: a yellow question, four numbered options with the selected one marked by an orange arrow, and a line of key hints underneath.](docs/confirm.svg)
 
 Move with ↑/↓ (or j/k) and press Enter, or hit `1`–`4` or the `y`/`a`/`p`/`n` shortcuts;
 Esc or Ctrl-C means no. `p` saves a rule to `.corbienest/permissions` (like Claude Code's

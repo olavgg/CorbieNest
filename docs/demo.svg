@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="809" height="596" viewBox="0 0 809 596" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="14">
+<rect width="809" height="596" rx="8" fill="#0d1117" stroke="#30363d"/>
+<text y="32" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#ff8700">╭──────────────────────────────────────────────────────────────╮</tspan>
+</text>
+<text y="52" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#ff8700">│</tspan>
+<tspan x="26.4"> </tspan>
+<tspan x="34.8" font-weight="600">🐦‍⬛ Corbie Nest</tspan>
+<tspan x="160.8"> v0.1.0 — local coding agent for Ollama</tspan>
+</text>
+<text y="72" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#ff8700">│</tspan>
+<tspan x="26.4"> </tspan>
+<tspan x="34.8" fill-opacity="0.62">model:</tspan>
+<tspan x="85.2"> qwen3-coder:30b</tspan>
+</text>
+<text y="92" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#ff8700">│</tspan>
+<tspan x="26.4"> </tspan>
+<tspan x="34.8" fill-opacity="0.62">host: </tspan>
+<tspan x="85.2"> http://127.0.0.1:11434 </tspan>
+<tspan x="286.8" fill="#3fb950">● connected</tspan>
+</text>
+<text y="112" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#ff8700">│</tspan>
+<tspan x="26.4"> </tspan>
+<tspan x="34.8" fill-opacity="0.62">cwd:  </tspan>
+<tspan x="85.2"> ~/projects/myapp</tspan>
+</text>
+<text y="132" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#ff8700">╰──────────────────────────────────────────────────────────────╯</tspan>
+</text>
+<text y="152" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#ff8700" font-weight="600">› </tspan>
+<tspan x="34.8" fill-opacity="0.62">fix the failing test in tests/test_parser.py</tspan>
+</text>
+<text y="172" xml:space="preserve" fill="#c9d1d9">
+</text>
+<text y="192" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#3fb950">●</tspan>
+<tspan x="26.4"> </tspan>
+<tspan x="34.8" font-weight="600">bash</tspan>
+<tspan x="68.4" fill-opacity="0.62">(python3 -m pytest tests/test_parser.py -q)</tspan>
+</text>
+<text y="212" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">  </tspan>
+<tspan x="34.8" fill-opacity="0.62">$ </tspan>
+<tspan x="51.6" font-weight="600">python3 -m pytest tests/test_parser.py -q</tspan>
+</text>
+<text y="232" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">  </tspan>
+<tspan x="34.8" fill="#d29922">Run this command?</tspan>
+<tspan x="177.6">  </tspan>
+<tspan x="194.4" fill="#3fb950">yes</tspan>
+</text>
+<text y="252" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">  ⎿  </tspan>
+<tspan x="60" fill-opacity="0.62">F.</tspan>
+</text>
+<text y="272" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">     </tspan>
+<tspan x="60" fill-opacity="0.62">… +12 lines</tspan>
+</text>
+<text y="292" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#3fb950">●</tspan>
+<tspan x="26.4"> </tspan>
+<tspan x="34.8" font-weight="600">read_file</tspan>
+<tspan x="110.4" fill-opacity="0.62">(src/parser.py)</tspan>
+</text>
+<text y="312" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#3fb950">●</tspan>
+<tspan x="26.4"> </tspan>
+<tspan x="34.8" font-weight="600">edit_file</tspan>
+<tspan x="110.4" fill-opacity="0.62">(src/parser.py)</tspan>
+</text>
+<text y="332" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">  </tspan>
+<tspan x="34.8" fill="#ff7b72">- if tok == "":</tspan>
+</text>
+<text y="352" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">  </tspan>
+<tspan x="34.8" fill="#3fb950">+ if tok == "" or tok is None:</tspan>
+</text>
+<text y="372" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">  </tspan>
+<tspan x="34.8" fill="#d29922">Apply this edit?</tspan>
+<tspan x="169.2">  </tspan>
+<tspan x="186" fill="#3fb950">yes</tspan>
+</text>
+<text y="392" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#3fb950">●</tspan>
+<tspan x="26.4"> </tspan>
+<tspan x="34.8" font-weight="600">bash</tspan>
+<tspan x="68.4" fill-opacity="0.62">(python3 -m pytest tests/test_parser.py -q)</tspan>
+</text>
+<text y="412" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">  ⎿  </tspan>
+<tspan x="60" fill-opacity="0.62">..</tspan>
+</text>
+<text y="432" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">     </tspan>
+<tspan x="60" fill-opacity="0.62">exit code: 0</tspan>
+</text>
+<text y="452" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#3fb950">●</tspan>
+<tspan x="26.4"> Fixed the None handling in </tspan>
+<tspan x="261.6" fill="#39c5cf">`src/parser.py:42`</tspan>
+<tspan x="412.8">; both tests pass.</tspan>
+</text>
+<text y="472" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">  </tspan>
+<tspan x="34.8" fill="#8b949e">↳ 4120 in · 210 out · 62.3 tok/s · 4.1s · ctx 12%</tspan>
+</text>
+<text y="492" xml:space="preserve" fill="#c9d1d9">
+</text>
+<text y="512" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill-opacity="0.62">────────────────────────────────────────────────────────────────────────────────────────</tspan>
+</text>
+<text y="532" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#ff8700" font-weight="600">❯ </tspan>
+<tspan x="34.8">and now make it handle the empty file case</tspan>
+</text>
+<text y="552" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill-opacity="0.62">────────────────────────────────────────────────────────────────────────────────────────</tspan>
+</text>
+<text y="572" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18"> </tspan>
+<tspan x="26.4" fill-opacity="0.62">⏵  manual mode</tspan>
+<tspan x="144" fill-opacity="0.62"> (shift+tab to cycle)</tspan>
+<tspan x="320.4" fill-opacity="0.62"> │ </tspan>
+<tspan x="345.6">qwen2.5-coder:7b</tspan>
+<tspan x="480" fill-opacity="0.62"> │ </tspan>
+<tspan x="505.2">4.3k tokens (↑4.1k ↓210)</tspan>
+<tspan x="706.8" fill-opacity="0.62"> │ </tspan>
+<tspan x="732">ctx 12%</tspan>
+</text>
+</svg>
