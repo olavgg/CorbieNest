@@ -17,6 +17,8 @@ typedef struct {
     bool thinking_header;   /* printed thinking header */
     bool spinner_shown;
     int  think_tokens;
+    struct timeval t_think; /* first thinking chunk */
+    double think_secs;      /* thinking time once the first visible chunk arrived (or at the end) */
     int  out_chunks;        /* streamed chunks so far (≈ tokens), for the live status bar */
     char error[512];
     struct timeval t0;
@@ -31,6 +33,12 @@ static double elapsed(struct timeval *t0) {
 static const char *SPIN[] = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
 bool ollama_quiet = false;
+ollama_call_opts ollama_call = { -1, 0, NULL };
+bool g_model_think = false;   /* set by main.c from the model's capabilities */
+void ollama_call_reset(void) { ollama_call.think = -1; ollama_call.num_predict = 0; ollama_call.busy = NULL; }
+/* status-bar label: a per-call override (e.g. "updating memory") replaces every phase label */
+static const char *busy_or(const char *def) { return ollama_call.busy ? ollama_call.busy : def; }
+static const char *busy_label(void) { return busy_or("generating"); }
 
 static void spinner_clear(chat_ctx *c) {
     if (c->spinner_shown) { fputs("\r\x1b[2K", stdout); fflush(stdout); c->spinner_shown = false; }
@@ -64,7 +72,7 @@ static int on_line(const char *line, size_t len, void *ud) {
         term_busy_tick();
         cJSON *th = cJSON_GetObjectItemCaseSensitive(msg, "thinking");
         if (cJSON_IsString(th) && th->valuestring[0]) {
-            if (c->think_tokens == 0) term_busy("thinking");
+            if (c->think_tokens == 0) { term_busy(busy_or("thinking")); gettimeofday(&c->t_think, NULL); }
             c->think_tokens++;
             sb_puts(&c->thinking, th->valuestring);
             if (g_cfg.show_thinking && !ollama_quiet) {
@@ -74,11 +82,14 @@ static int on_line(const char *line, size_t len, void *ud) {
             } else if (!c->thinking_header) c->thinking_header = true;
         }
         cJSON *ct = cJSON_GetObjectItemCaseSensitive(msg, "content");
+        cJSON *tc0 = cJSON_GetObjectItemCaseSensitive(msg, "tool_calls");
+        if (c->think_tokens && c->think_secs == 0 && ((cJSON_IsString(ct) && ct->valuestring[0]) || cJSON_IsArray(tc0)))
+            c->think_secs = elapsed(&c->t_think);   /* thinking is over: the first visible output arrived */
         if (cJSON_IsString(ct) && ct->valuestring[0]) {
-            if (ollama_quiet) { sb_puts(&c->content, ct->valuestring); term_busy("generating"); }
+            if (ollama_quiet) { sb_puts(&c->content, ct->valuestring); term_busy(busy_label()); }
             else if (!c->got_content) {
                 spinner_clear(c);
-                term_busy("generating");
+                term_busy(busy_label());
                 if (c->thinking_header && g_cfg.show_thinking) printf(C_RESET "\n\n");
                 /* skip leading whitespace-only starts */
                 fputs(C_ORANGE "●" C_RESET " ", stdout);
@@ -93,7 +104,7 @@ static int on_line(const char *line, size_t len, void *ud) {
         }
         cJSON *tc = cJSON_GetObjectItemCaseSensitive(msg, "tool_calls");
         if (cJSON_IsArray(tc)) {
-            if (!c->tool_calls) { c->tool_calls = cJSON_CreateArray(); term_busy("calling tools"); }
+            if (!c->tool_calls) { c->tool_calls = cJSON_CreateArray(); term_busy(busy_or("calling tools")); }
             cJSON *it;
             cJSON_ArrayForEach(it, tc) cJSON_AddItemToArray(c->tool_calls, cJSON_Duplicate(it, 1));
         }
@@ -104,7 +115,10 @@ static int on_line(const char *line, size_t len, void *ud) {
         if ((v = cJSON_GetObjectItemCaseSensitive(j, "prompt_eval_count"))) c->stats->prompt_tokens = (int)v->valuedouble;
         if ((v = cJSON_GetObjectItemCaseSensitive(j, "eval_count"))) c->stats->eval_tokens = (int)v->valuedouble;
         if ((v = cJSON_GetObjectItemCaseSensitive(j, "eval_duration"))) c->stats->eval_seconds = v->valuedouble / 1e9;
+        if ((v = cJSON_GetObjectItemCaseSensitive(j, "prompt_eval_duration"))) c->stats->prompt_seconds = v->valuedouble / 1e9;
         if ((v = cJSON_GetObjectItemCaseSensitive(j, "total_duration"))) c->stats->total_seconds = v->valuedouble / 1e9;
+        if ((v = cJSON_GetObjectItemCaseSensitive(j, "done_reason")) && cJSON_IsString(v)) snprintf(c->stats->done_reason, sizeof c->stats->done_reason, "%s", v->valuestring);
+        if (c->think_tokens) { c->stats->think_chunks = c->think_tokens; c->stats->think_seconds = c->think_secs > 0 ? c->think_secs : elapsed(&c->t_think); }
     }
     cJSON_Delete(j);
     return 0;
@@ -183,10 +197,17 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
     cJSON_AddItemReferenceToObject(req, "messages", messages);
     cJSON_AddBoolToObject(req, "stream", true);
     if (tools && cJSON_GetArraySize(tools) > 0) cJSON_AddItemReferenceToObject(req, "tools", tools);
-    if (g_cfg.think >= 0) cJSON_AddBoolToObject(req, "think", g_cfg.think == 1);
+    /* thinking: a per-call override wins; "off" is only sent when the model can think at all
+     * (older servers reject the key for models without the capability) */
+    int think = ollama_call.think >= 0 ? ollama_call.think : g_cfg.think;
+    if (think == 1 && g_cfg.think_level) cJSON_AddStringToObject(req, "think", g_cfg.think_level);   /* gpt-oss style levels */
+    else if (think == 1 || (think == 0 && (g_model_think || g_cfg.think >= 0))) cJSON_AddBoolToObject(req, "think", think == 1);
+    else if (think < 0 && g_cfg.think_level && g_model_think) cJSON_AddStringToObject(req, "think", g_cfg.think_level);
+    if (g_cfg.keep_alive && *g_cfg.keep_alive) cJSON_AddStringToObject(req, "keep_alive", g_cfg.keep_alive);
     cJSON *opts = cJSON_AddObjectToObject(req, "options");
     if (g_cfg.num_ctx > 0) cJSON_AddNumberToObject(opts, "num_ctx", g_cfg.num_ctx);
     if (g_cfg.temperature >= 0) cJSON_AddNumberToObject(opts, "temperature", g_cfg.temperature);
+    if (ollama_call.num_predict > 0) cJSON_AddNumberToObject(opts, "num_predict", ollama_call.num_predict);
     char *body = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
 
@@ -199,7 +220,7 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
     http_interrupt_fd = g_cfg.interactive ? STDIN_FILENO : -1;
     http_interrupt_check = term_poll_interrupt;
     http_idle = on_idle; http_idle_ud = &c;
-    term_busy("waiting for model");
+    term_busy(busy_or("waiting for model"));
     on_idle(&c);
     http_result res;
     int rc = http_request(g_cfg.host, "POST", "/api/chat", body, NULL, on_line, &c, &res);
@@ -336,4 +357,29 @@ int ollama_model_context_length(const char *model) {
     }
     sb_free(&out);
     return ctx;
+}
+
+/* Where the model is loaded (from /api/ps): total size and the part in GPU memory. */
+int ollama_model_placement(const char *model, double *size, double *size_vram) {
+    *size = *size_vram = 0;
+    if (!model || !*model) return -1;
+    sbuf out; sb_init(&out); http_result res;
+    int rc = plain_request("GET", "/api/ps", NULL, "checking model placement", &out, &res);
+    int found = -1;
+    if (rc == 0 && res.status == 200 && out.data) {
+        cJSON *j = cJSON_Parse(out.data);
+        cJSON *models = j ? cJSON_GetObjectItemCaseSensitive(j, "models") : NULL, *m;
+        char withtag[512]; snprintf(withtag, sizeof withtag, "%s:latest", model);
+        cJSON_ArrayForEach(m, models) {
+            cJSON *n = cJSON_GetObjectItemCaseSensitive(m, "name");
+            if (!cJSON_IsString(n) || (strcmp(n->valuestring, model) && strcmp(n->valuestring, withtag))) continue;
+            cJSON *sz = cJSON_GetObjectItemCaseSensitive(m, "size"), *sv = cJSON_GetObjectItemCaseSensitive(m, "size_vram");
+            if (cJSON_IsNumber(sz)) *size = sz->valuedouble;
+            if (cJSON_IsNumber(sv)) *size_vram = sv->valuedouble;
+            found = 0; break;
+        }
+        cJSON_Delete(j);
+    }
+    sb_free(&out);
+    return found;
 }

@@ -15,18 +15,20 @@ MODELS = [
      "details": {"parameter_size": "3B"}, "capabilities": ["completion"]},
     {"name": "fake-thinker:latest", "model": "fake-thinker:latest", "size": 1, "digest": "z",
      "details": {"parameter_size": "9B"}, "capabilities": ["completion", "tools", "thinking"]},
+    {"name": "fake-slow:latest", "model": "fake-slow:latest", "size": 1, "digest": "w",
+     "details": {"parameter_size": "30B"}, "capabilities": ["completion", "tools"]},   # /api/ps says: half in GPU memory
 ]
 
 REQUEST_LOG = []
 
-def chunk(model, content=None, tool_calls=None, thinking=None, done=False, prompt_tokens=123):
+def chunk(model, content=None, tool_calls=None, thinking=None, done=False, prompt_tokens=123, done_reason=None):
     msg = {"role": "assistant", "content": content or ""}
     if thinking: msg["thinking"] = thinking
     if tool_calls: msg["tool_calls"] = tool_calls
     d = {"model": model, "created_at": "now", "message": msg, "done": done}
     if done:
-        d.update({"done_reason": "stop", "total_duration": 1_500_000_000, "eval_duration": 1_000_000_000,
-                  "prompt_eval_count": prompt_tokens, "eval_count": 45})
+        d.update({"done_reason": done_reason or "stop", "total_duration": 1_500_000_000, "eval_duration": 1_000_000_000,
+                  "prompt_eval_duration": 200_000_000, "prompt_eval_count": prompt_tokens, "eval_count": 45})
     return json.dumps(d) + "\n"
 
 def script(model, messages, req):
@@ -37,6 +39,11 @@ def script(model, messages, req):
     if messages and messages[0]["role"] == "system" and "You maintain the persistent memory file" in messages[0]["content"]:
         # end-of-request memory extraction: only "REMEMBER_ME <fact>" is worth saving
         facts = [m["content"].split("REMEMBER_ME", 1)[1].strip() for m in messages if m["role"] == "user" and "REMEMBER_ME" in m["content"]]
+        if any("CUT_MEMORY" in m["content"] for m in messages if m["role"] == "user"):
+            # generation hit num_predict: a truncated file must never be written
+            yield chunk(model, "# Project memory\n\n## User\n- half a fac")
+            yield chunk(model, done=True, done_reason="length")
+            return
         if facts:
             yield chunk(model, "```markdown\n# Project memory\n\n## User\n- " + facts[-1] + "\n\n## Feedback\n\n## Project\n\n## Reference\n```")
         else:
@@ -60,6 +67,11 @@ def script(model, messages, req):
         return
     if "TOOL_TASK" in text:
         yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "find the needle", "prompt": "Search for needle and report where it is."}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_BIG" in text:
+        # a tool round with a big result (300 numbered lines), for the elision test
+        yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "seq -f 'line-%04g' 1 300"}}}])
         yield chunk(model, done=True)
         return
     if "TOOL_BASH" in text:
@@ -94,6 +106,11 @@ def script(model, messages, req):
     if "ERROR" in text:
         yield "ERR"
         return
+    if "HALF_CTX" in text:
+        # report a prompt using ~60% of the default 32k window: triggers tool-result elision, not compaction
+        yield chunk(model, "Echo: " + text.split("\n")[0])
+        yield chunk(model, done=True, prompt_tokens=20_000)
+        return
     if "HUGE_CTX" in text:
         # report a prompt that (nearly) fills the context window: triggers auto-compact
         yield chunk(model, "Echo: HUGE_CTX")
@@ -117,6 +134,9 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/api/version": return self._json(200, {"version": "0.0.0-fake"})
         if self.path == "/api/tags": return self._json(200, {"models": MODELS})
         if self.path == "/_requests": return self._json(200, REQUEST_LOG)
+        if self.path == "/api/ps":   # the loaded model: fake-slow is only half in GPU memory
+            return self._json(200, {"models": [{"name": "fake-coder:latest", "size": 8_000_000_000, "size_vram": 8_000_000_000},
+                                               {"name": "fake-slow:latest", "size": 8_000_000_000, "size_vram": 4_000_000_000}]})
         self._json(404, {"error": "not found"})
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))

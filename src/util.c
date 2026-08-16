@@ -157,10 +157,13 @@ void config_load(void) {
         else if (!strcmp(k, "num_ctx")) g_cfg.num_ctx = atoi(v);
         else if (!strcmp(k, "temperature")) g_cfg.temperature = atof(v);
         else if (!strcmp(k, "think")) g_cfg.think = atoi(v);
+        else if (!strcmp(k, "think_level")) { free(g_cfg.think_level); g_cfg.think_level = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "show_thinking")) g_cfg.show_thinking = atoi(v) != 0;
         else if (!strcmp(k, "yolo")) { if (atoi(v)) g_cfg.mode = MODE_AUTO; }
         else if (!strcmp(k, "mode")) { int m = mode_parse(v); if (m >= 0) g_cfg.mode = m; }
         else if (!strcmp(k, "memory")) g_cfg.memory = atoi(v) != 0;
+        else if (!strcmp(k, "memory_every")) { int n = atoi(v); if (n > 0) g_cfg.memory_every = n; }
+        else if (!strcmp(k, "keep_alive")) { free(g_cfg.keep_alive); g_cfg.keep_alive = *v ? xstrdup(v) : NULL; }
     }
     fclose(f);
 }
@@ -176,9 +179,12 @@ void config_save(void) {
     fprintf(f, "num_ctx=%d\n", g_cfg.num_ctx);
     if (g_cfg.temperature >= 0) fprintf(f, "temperature=%g\n", g_cfg.temperature);
     fprintf(f, "think=%d\n", g_cfg.think);
+    fprintf(f, "think_level=%s\n", g_cfg.think_level ? g_cfg.think_level : "");
     fprintf(f, "show_thinking=%d\n", g_cfg.show_thinking ? 1 : 0);
     fprintf(f, "mode=%s\n", mode_name(g_cfg.mode));
     fprintf(f, "memory=%d\n", g_cfg.memory ? 1 : 0);
+    fprintf(f, "memory_every=%d\n", g_cfg.memory_every);
+    fprintf(f, "keep_alive=%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "");
     fclose(f);
 }
 

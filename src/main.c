@@ -18,6 +18,7 @@
 static cJSON *g_messages = NULL;    /* conversation, without system prompt */
 static cJSON *g_tools = NULL;       /* tool definitions */
 static bool   g_model_tools = true; /* current model supports tools */
+static bool   g_placement_checked = false; /* /api/ps warning about a partly-CPU model shown once per model */
 static int    g_model_max_ctx = 0;  /* context length the model was trained for (0 = unknown) */
 static char   g_cwd[PATH_MAX];
 static char  *g_project_instructions = NULL;
@@ -27,7 +28,7 @@ static char   g_session_id[64];                  /* current session (file stem u
 
 static const char *SLASH_CMDS[] = {
     "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think",
-    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/diff", "/rewind", "/quit", "/exit"
+    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/keepalive", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/diff", "/rewind", "/quit", "/exit"
 };
 
 /* slash completion list = built-in commands + /skill names (rebuilt when skills reload) */
@@ -53,12 +54,52 @@ static void account(const chat_stats *st) {
     g_session.eval_tokens += st->eval_tokens;
     g_session.model_seconds += st->total_seconds;
     g_session.eval_seconds += st->eval_seconds;
+    g_session.think_seconds += st->think_seconds; g_session.think_chunks += st->think_chunks;
     g_session.calls++;
+}
+
+/* ---------- context hygiene: elide old tool results ----------
+ * Tool results (file contents, command output, grep hits) are the bulk of a long
+ * conversation and are re-sent with every model call, but they go stale fast: once the model
+ * has acted on them, the assistant's own text carries what mattered. So when the context is
+ * ELIDE_PCT% full, tool results from requests *before the previous one* are replaced in place
+ * by a short stub (the tool name and the first line, so the model still sees what it looked
+ * at). The model can always call the tool again; the previous request's results stay intact
+ * because "now apply that" style follow-ups still need them. This is far cheaper than
+ * compaction (no model call) and usually postpones it for a long time. */
+#define ELIDE_PCT  50      /* context usage (% of num_ctx) from which elision kicks in */
+#define ELIDE_KEEP 160     /* bytes of the original kept in the stub */
+#define ELIDE_MIN  400     /* smaller results are not worth eliding */
+static const char ELIDE_MARK[] = "[earlier output elided to save context";
+static int g_prev_request_first = -1;   /* where the most recent finished request started */
+
+static void elide_old_tool_results(int upto) {
+    if (g_cfg.num_ctx <= 0 || g_session.last_prompt_tokens <= 0) return;
+    if (100.0 * g_session.last_prompt_tokens / g_cfg.num_ctx < ELIDE_PCT) return;
+    int n = 0; size_t saved = 0;
+    for (int i = 0; i < upto && i < cJSON_GetArraySize(g_messages); i++) {
+        cJSON *m = cJSON_GetArrayItem(g_messages, i);
+        cJSON *role = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+        if (!cJSON_IsString(role) || strcmp(role->valuestring, "tool") || !cJSON_IsString(c)) continue;
+        const char *txt = c->valuestring; size_t len = strlen(txt);
+        if (len < ELIDE_MIN || !strncmp(txt, ELIDE_MARK, sizeof ELIDE_MARK - 1)) continue;
+        cJSON *tn = cJSON_GetObjectItemCaseSensitive(m, "tool_name");
+        size_t keep = ELIDE_KEEP; if (keep > len) keep = len;
+        while (keep > 0 && ((unsigned char)txt[keep] & 0xC0) == 0x80) keep--;   /* UTF-8 boundary */
+        sbuf b; sb_init(&b);
+        sb_printf(&b, "%s; %s returned %zu bytes, call it again if you need the details]\n", ELIDE_MARK, cJSON_IsString(tn) ? tn->valuestring : "the tool", len);
+        sb_append(&b, txt, keep); if (keep < len) sb_puts(&b, "…");
+        cJSON_SetValuestring(c, b.data); sb_free(&b);
+        n++; saved += len - keep;
+    }
+    if (n) printf(C_GRAY "⋯ elided %d old tool result%s (~%zu KB) to save context" C_RESET "\n", n, n == 1 ? "" : "s", saved / 1024);
 }
 
 /* a user request starts: remember where it begins in the conversation (for /rewind, memory) */
 static int begin_request(void) {
     int first = cJSON_GetArraySize(g_messages);
+    if (g_prev_request_first >= 0 && g_prev_request_first <= first) elide_old_tool_results(g_prev_request_first);
+    g_prev_request_first = first;
     tools_checkpoint_turn(first);
     return first;
 }
@@ -72,6 +113,7 @@ static int begin_request(void) {
  * if so, to return the updated file (or NO_CHANGE). Off with /memory off (saved in config). */
 #define MEMORY_PATH   ".corbienest/memory.md"
 #define MEMORY_MAX    (24 * 1024)     /* larger files are cut when loaded; the model is told to keep it short */
+#define MEMORY_MAX_TOKENS 6144   /* num_predict cap for the memory-update call (a full MEMORY_MAX file fits) */
 
 static void load_memory(void) {
     free(g_memory); g_memory = NULL;
@@ -111,12 +153,19 @@ static char *unfence(const char *t) {
     return xstrndup(t, n);
 }
 
-/* End of a request: ask the model (quietly, without tools) to fold anything worth
- * remembering from this exchange into the memory file. `first` is the index in
- * g_messages where the request started. In one-shot (-p) runs the file is only touched
- * if the project directory already exists, so `corbienest -p` leaves no litter. */
-static void memory_update(int first, bool aborted) {
-    if (!g_cfg.memory || aborted) return;
+/* Ask the model (quietly, without tools) to fold anything worth remembering from the
+ * exchanges since g_messages[first] into the memory file. In one-shot (-p) runs the file is
+ * only touched if the project directory already exists, so `corbienest -p` leaves no litter.
+ *
+ * This is a separate prompt, so it evicts Ollama's prompt cache for the conversation and the
+ * next request re-evaluates the whole context: that is why it is not run after every request
+ * but batched — memory_note() counts finished requests and memory_flush() runs the call once
+ * g_cfg.memory_every of them are pending, or when the conversation is about to go away
+ * (exit, /clear, /compact, /cd, /resume). */
+static int g_mem_first = -1;      /* index of the first message not yet folded into memory (-1 = none pending) */
+static int g_mem_pending = 0;     /* finished requests since the last flush */
+
+static void memory_extract(int first) {
     if (!g_cfg.interactive && !is_dir(".corbienest")) return;
     int total = cJSON_GetArraySize(g_messages);
     if (first < 0 || first >= total) first = 0;   /* e.g. auto-compact replaced the conversation */
@@ -160,8 +209,12 @@ static void memory_update(int first, bool aborted) {
 
     if (g_cfg.interactive) { printf(C_DIM "✎ updating memory…" C_RESET); fflush(stdout); }
     chat_stats st; bool ab = false;
+    /* a background call: no thinking (it only adds latency here), a hard cap on the reply so a
+     * runaway generation cannot hang the prompt, and an honest status-bar label */
     ollama_quiet = true;
+    ollama_call.think = 0; ollama_call.num_predict = MEMORY_MAX_TOKENS; ollama_call.busy = "updating memory";
     cJSON *reply = ollama_chat(msgs, NULL, &st, &ab);
+    ollama_call_reset();
     ollama_quiet = false;
     cJSON_Delete(msgs);
     account(&st);
@@ -170,16 +223,44 @@ static void memory_update(int first, bool aborted) {
     cJSON *c = cJSON_GetObjectItemCaseSensitive(reply, "content");
     char *text = unfence(cJSON_IsString(c) ? c->valuestring : "");
     cJSON_Delete(reply);
-    bool nochange = ab || !*text || strstr(text, "NO_CHANGE") || *text != '#' || strlen(text) > 2 * MEMORY_MAX;
+    bool cut = !strcmp(st.done_reason, "length");   /* hit num_predict: never write a truncated file */
+    bool nochange = ab || cut || !*text || strstr(text, "NO_CHANGE") || *text != '#' || strlen(text) > 2 * MEMORY_MAX;
+    bool written = false;
     if (!nochange && (!g_memory || strcmp(text, g_memory))) {
         size_t n = strlen(text);
         if (n && text[n-1] != '\n') { text = xrealloc(text, n + 2); text[n++] = '\n'; text[n] = 0; }
         if (mkdir_p(".corbienest") == 0 && write_whole_file(MEMORY_PATH, text, n) == 0) {
-            load_memory();
-            printf(C_DIM "✎ memory updated (%s)" C_RESET "\n", MEMORY_PATH);
+            load_memory(); written = true;
+            printf(C_DIM "✎ memory updated (%s) · %.1fs" C_RESET "\n", MEMORY_PATH, st.total_seconds);
         }
     }
+    /* show what this step cost, so a slow turn is never a mystery */
+    if (!written && g_cfg.interactive && st.total_seconds > 0)
+        printf(C_GRAY "✎ memory: %s · %.1fs%s" C_RESET "\n", cut ? "reply too long, ignored" : "no change", st.total_seconds,
+               st.total_seconds >= 15 ? "  (slow? /memory off skips this step)" : "");
     free(text);
+}
+
+/* Run the pending extraction now (if anything is pending). */
+static void memory_flush(void) {
+    if (!g_cfg.memory || g_mem_first < 0) { g_mem_first = -1; g_mem_pending = 0; return; }
+    int first = g_mem_first;
+    g_mem_first = -1; g_mem_pending = 0;
+    if (first >= cJSON_GetArraySize(g_messages)) return;   /* rewound past it: nothing left to learn */
+    memory_extract(first);
+}
+
+/* A request finished (it started at g_messages[first]): remember it for the next flush,
+ * and flush when enough have accumulated. Aborted requests are not counted but stay
+ * covered by the range. One-shot runs flush at once (the process is about to exit). */
+static void memory_note(int first, bool aborted) {
+    if (!g_cfg.memory) return;
+    int total = cJSON_GetArraySize(g_messages);
+    if (first < 0 || first > total) first = 0;   /* the conversation was replaced meanwhile (compact) */
+    if (g_mem_first < 0 || first < g_mem_first) g_mem_first = first;
+    if (aborted) return;
+    g_mem_pending++;
+    if (!g_cfg.interactive || g_mem_pending >= g_cfg.memory_every) memory_flush();
 }
 
 /* "# fact" typed at the prompt: append a bullet to a section of the memory file without a
@@ -215,19 +296,36 @@ static void memory_quick_add(const char *fact) {
     sb_free(&f); sb_free(&line); sb_free(&out);
 }
 
+static const char *memory_cadence(void) {
+    static char b[96];
+    if (g_cfg.memory_every <= 1) return "after each request";
+    snprintf(b, sizeof b, "every %d requests (and at exit, /clear, /compact)", g_cfg.memory_every);
+    return b;
+}
 static void cmd_memory(const char *arg) {
     if (arg && (!strcmp(arg, "on") || !strcmp(arg, "off"))) {
         g_cfg.memory = !strcmp(arg, "on"); config_save();
-        printf(C_GREEN "✓ memory %s" C_RESET "\n", g_cfg.memory ? "on: " MEMORY_PATH " is updated after each request" : "off");
+        if (g_cfg.memory) printf(C_GREEN "✓ memory on" C_RESET C_DIM " — " MEMORY_PATH " is updated %s" C_RESET "\n", memory_cadence());
+        else printf(C_GREEN "✓ memory off" C_RESET "\n");
         return;
     }
+    if (arg && !strncmp(arg, "every", 5)) {
+        int n = atoi(arg + 5);
+        if (n <= 0) { printf("usage: /memory every N   (N ≥ 1; larger keeps the model's prompt cache warm between requests)\n"); return; }
+        g_cfg.memory_every = n; config_save();
+        printf(C_GREEN "✓ memory updated %s" C_RESET "\n", memory_cadence());
+        if (g_mem_pending >= n) memory_flush();
+        return;
+    }
+    if (arg && !strcmp(arg, "update")) { if (g_mem_first < 0) printf(C_DIM "nothing pending" C_RESET "\n"); else memory_flush(); return; }
     if (arg && !strcmp(arg, "clear")) {
         if (is_file(MEMORY_PATH) && unlink(MEMORY_PATH) == 0) { load_memory(); printf(C_GREEN "✓ removed %s" C_RESET "\n", MEMORY_PATH); }
         else printf(C_DIM "no memory file" C_RESET "\n");
         return;
     }
-    if (arg && *arg) { printf("usage: /memory [on|off|clear]\n"); return; }
-    printf(C_DIM "%s — %s; loaded into the system prompt · /memory on|off|clear" C_RESET "\n", MEMORY_PATH, g_cfg.memory ? "updated after each request" : "auto-update is off");
+    if (arg && *arg) { printf("usage: /memory [on|off|clear|update|every N]\n"); return; }
+    printf(C_DIM "%s — %s; loaded into the system prompt · /memory on|off|clear|update|every N" C_RESET "\n", MEMORY_PATH, g_cfg.memory ? memory_cadence() : "auto-update is off");
+    if (g_cfg.memory && g_mem_pending > 0) printf(C_DIM "(%d request%s pending extraction — /memory update runs it now)" C_RESET "\n", g_mem_pending, g_mem_pending == 1 ? "" : "s");
     if (!g_memory) { printf(C_DIM "(no memory yet — nothing durable has been recorded)" C_RESET "\n"); return; }
     fputs(g_memory, stdout);
     if (g_memory[strlen(g_memory) - 1] != '\n') printf("\n");
@@ -361,7 +459,8 @@ static bool session_load(const char *id) {
     if (!o) return false;
     cJSON *msgs = cJSON_DetachItemFromObjectCaseSensitive(o, "messages");
     if (!cJSON_IsArray(msgs)) { if (msgs) cJSON_Delete(msgs); cJSON_Delete(o); return false; }
-    cJSON_Delete(g_messages); g_messages = msgs;
+    memory_flush();
+    cJSON_Delete(g_messages); g_messages = msgs; g_prev_request_first = -1;
     tools_reset_permissions(); tools_checkpoint_clear();
     snprintf(g_session_id, sizeof g_session_id, "%s", id);
     cJSON *pt = cJSON_GetObjectItemCaseSensitive(o, "prompt_tokens"), *et = cJSON_GetObjectItemCaseSensitive(o, "eval_tokens");
@@ -433,6 +532,7 @@ static void cmd_cost(void) {
     printf("  model calls   %d  " C_DIM "(%d request%s · %d tool call%s)" C_RESET "\n", g_session.calls, g_session.turns, g_session.turns == 1 ? "" : "s", g_session.tool_calls, g_session.tool_calls == 1 ? "" : "s");
     printf("  model time    %s  " C_DIM "(%s generating", model, gen);
     if (g_session.eval_seconds > 0) printf(" · %.1f tok/s", g_session.eval_tokens / g_session.eval_seconds);
+    if (g_session.think_chunks) { char tk[32], th[32]; fmt_tokens(g_session.think_chunks, tk, sizeof tk); fmt_dur(g_session.think_seconds, th, sizeof th); printf(" · %s thinking ≈%s tok — /think off or /think auto to spend less", th, tk); }
     printf(")" C_RESET "\n");
     printf("  wall time     %s\n", wall);
     if (g_cfg.num_ctx > 0 && g_session.last_prompt_tokens > 0)
@@ -665,13 +765,16 @@ static void refresh_model_caps(bool quiet) {
         if (!strcmp(n, g_cfg.model) || !strcmp(n, withtag)) {
             found = true;
             g_model_tools = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "tools"));
+            g_model_think = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "thinking"));
             break;
         }
     }
     cJSON_Delete(list);
     g_model_max_ctx = ollama_model_context_length(g_cfg.model);
+    g_placement_checked = false;
     if (!found) {
         g_model_tools = true;   /* unknown (maybe remote/cloud); try */
+        g_model_think = false;
         if (!quiet) printf(C_YELLOW "⚠ model '%s' not found locally — ollama may need to pull it (see /models)" C_RESET "\n", g_cfg.model);
     } else if (!g_model_tools && !quiet) {
         printf(C_YELLOW "⚠ model '%s' does not support tool calling; running in chat-only mode (no file/shell tools)" C_RESET "\n", g_cfg.model);
@@ -793,20 +896,38 @@ static void print_result_preview(const char *text, int max_lines) {
     if (!*text) printf("  ⎿  " C_DIM "(empty)" C_RESET "\n");
 }
 
-#define AUTO_COMPACT_PCT 95   /* auto-compact once the last request used this much of num_ctx */
+#define AUTO_COMPACT_PCT 85   /* auto-compact once the last request used this much of num_ctx */
+#define COMPACT_HINT_PCT 70   /* from here on the stats line suggests /compact */
 static void print_stats(chat_stats *st) {
     if (!st->eval_tokens && !st->prompt_tokens) return;
     double tps = st->eval_seconds > 0 ? st->eval_tokens / st->eval_seconds : 0;
-    printf(C_GRAY "  ↳ %d in · %d out · %.1f tok/s · %.1fs", st->prompt_tokens, st->eval_tokens, tps, st->total_seconds);
+    printf(C_GRAY "  ↳ %d in · %d out · %.1f tok/s", st->prompt_tokens, st->eval_tokens, tps);
+    if (st->prompt_seconds >= 1.0) printf(" · prefill %.1fs", st->prompt_seconds);   /* long = the prompt cache missed / cold model */
+    if (st->think_chunks) { char tk[32]; fmt_tokens(st->think_chunks, tk, sizeof tk); printf(" · thought %.0fs (≈%s tok)", st->think_seconds, tk); }
+    printf(" · %.1fs", st->total_seconds);
     if (g_cfg.num_ctx > 0) {
         int pct = (int)(100.0 * st->prompt_tokens / g_cfg.num_ctx);
         printf(" · ctx %d%%", pct);
-        if (pct >= 85 && pct < AUTO_COMPACT_PCT) {   /* at AUTO_COMPACT_PCT it compacts by itself */
+        if (pct >= COMPACT_HINT_PCT && pct < AUTO_COMPACT_PCT) {   /* at AUTO_COMPACT_PCT it compacts by itself */
             if (g_model_max_ctx > g_cfg.num_ctx) printf(C_YELLOW " (near limit — /compact, or /ctx to enlarge: model supports %s)", fmt_ctx(g_model_max_ctx));
             else printf(C_YELLOW " (near limit — consider /compact)");
         }
     }
     printf(C_RESET "\n");
+}
+
+/* Once per model: ask /api/ps where it was loaded and warn when part of it sits in system
+ * memory — the usual reason a local model crawls (too large a num_ctx or model for the GPU).
+ * `verbose` also reports a fully-GPU model (for /status). */
+static void check_model_placement(bool verbose) {
+    if (!g_cfg.interactive || (g_placement_checked && !verbose)) return;
+    g_placement_checked = true;
+    double size, vram;
+    if (ollama_model_placement(g_cfg.model, &size, &vram) != 0 || size <= 0) { if (verbose) printf(C_BOLD "placement  " C_RESET "(model not loaded)\n"); return; }
+    if (vram >= size) { if (verbose) printf(C_BOLD "placement  " C_RESET "100%% in GPU memory (%.1f GB)\n", size / 1e9); return; }
+    if (verbose) printf(C_BOLD "placement  " C_RESET);
+    printf(C_YELLOW "⚠ model is only %d%% in GPU memory (%.1f of %.1f GB) — generation will be slow; try a smaller /ctx or a smaller model" C_RESET "\n",
+           (int)(100.0 * vram / size + 0.5), vram / 1e9, size / 1e9);
 }
 
 /* short one-line summary of a tool call's main argument */
@@ -885,9 +1006,11 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
     const char *final = NULL;
     for (int iter = 0; iter <= SUBAGENT_ITERS; iter++) {
         chat_stats st; bool aborted = false;
-        ollama_quiet = true;
+        char label[48]; snprintf(label, sizeof label, "sub-agent · round %d", tool_rounds + 1);
+        ollama_quiet = true; ollama_call.busy = label;
+        if (g_cfg.think < 0 && iter > 0) ollama_call.think = 0;   /* think=auto: think about the task once, not after every tool result */
         cJSON *reply = ollama_chat(msgs, g_model_tools ? tools : NULL, &st, &aborted);
-        ollama_quiet = false;
+        ollama_call_reset(); ollama_quiet = false;
         account(&st);
         term_status_refresh();
         if (!reply) { sb_puts(out, aborted ? "error: sub-agent interrupted by the user" : "error: sub-agent model call failed"); break; }
@@ -973,7 +1096,11 @@ static bool run_turn(void) {
         cJSON *msgs = messages_with_system();
         cJSON *tools = tools_for_mode();
         chat_stats st; bool aborted = false;
+        /* think=auto: let a thinking model think about the request once, not again after every
+         * tool result — that is where most of a task's wall time goes on local models */
+        if (g_cfg.think < 0 && iters > 0) ollama_call.think = 0;
         cJSON *reply = ollama_chat(msgs, tools, &st, &aborted);
+        ollama_call_reset();
         if (tools && tools != g_tools) cJSON_Delete(tools);
         cJSON_Delete(msgs);
         if (st.prompt_tokens) g_session.last_prompt_tokens = st.prompt_tokens;
@@ -987,7 +1114,7 @@ static bool run_turn(void) {
         cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
         if (aborted || !calls || cJSON_GetArraySize(calls) == 0) {
             print_stats(&st);
-            if (!aborted) maybe_auto_compact();
+            if (!aborted) { check_model_placement(false); maybe_auto_compact(); }
             return aborted;
         }
         if (++iters > g_cfg.max_iters) {
@@ -1083,7 +1210,7 @@ static int cmd_init(void) {
     add_message("user", b.data); sb_free(&b);
     bool aborted = run_turn();
     session_save();
-    memory_update(first, aborted);
+    memory_note(first, aborted);
     load_project_instructions();   /* pick up the new file right away */
     if (!aborted && g_project_instructions) printf(C_GREEN "✓ project instructions loaded" C_RESET "\n");
     return aborted ? -1 : 0;
@@ -1128,13 +1255,14 @@ static void cmd_help(void) {
            "  /models               list models available in ollama\n"
            "  /clear                start a new conversation\n"
            "  /compact              summarise the conversation to free context\n"
-           "  /memory [on|off|clear] show the project memory (" MEMORY_PATH ", curated by the model after each request), toggle or delete it\n"
+           "  /memory [on|off|clear|update|every N]  show the project memory (" MEMORY_PATH ", curated by the model every N requests and at exit; default 5), toggle it, run the update now, set the cadence, or delete it\n"
            "  /status               show model, context usage, settings\n"
            "  /cost                 tokens, model calls, model time and wall time of this session\n"
            "  /diff [git args]      show the working-tree diff (stat + patch + untracked), without sending it to the model; e.g. /diff --staged\n"
            "  /rewind               (or Esc Esc at an empty prompt) go back to an earlier request: undo the file changes since, the conversation, or both\n"
            "  /system [text|clear]  show/set extra system instructions\n"
-           "  /think on|off|auto    ask the model to think (thinking-capable models)\n"
+           "  /think on|off|auto    thinking (thinking-capable models): on = every call, auto = only the first call of a request (default), off\n"
+           "  /think low|medium|high thinking level for models that have them (gpt-oss)\n"
            "  /think show|hide      show or hide thinking tokens\n"
            "  /skills [reload|new NAME]  list skills (SKILL.md files); run one with /NAME [args]\n"
            "  /init                 have the model explore the project and write a CORBIENEST.md (project instructions)\n"
@@ -1145,6 +1273,7 @@ static void cmd_help(void) {
            "  /ctx [N|Nk|max]       context window: no argument opens a size picker; N/64k/max/default set it\n"
            "  /temp X               set temperature (-1 = server default)\n"
            "  /host URL             set ollama host (default http://127.0.0.1:11434)\n"
+           "  /keepalive DUR        how long ollama keeps the model loaded between requests (default 30m; -1 = forever, 0 = unload, default = server's)\n"
            "  /save [file]          save transcript as markdown\n"
            "  /resume [ID|all]      pick an earlier session to continue (sessions are saved after every request; also --continue / --resume)\n"
            "  /history [N]          show the last N queries (default 20; the latest 100 are kept across sessions)\n"
@@ -1157,6 +1286,7 @@ static void cmd_help(void) {
            "  Enter                 send  ·  Alt+Enter / Ctrl+J / trailing \\ : newline\n"
            "  Enter while busy      queue a message for the model (added between tool rounds or after the turn; Ctrl-C hands it back)\n"
            "  Ctrl-C                cancel generation / clear line (twice: quit)  ·  Ctrl-L clear screen\n"
+           "  PgUp / PgDn           scroll back through the conversation (↑/↓, Home/End inside; Esc/Enter return)\n"
            "  status bar            bottom row shows the permission mode, model, session tokens and context usage\n"
            "  Tab                   complete slash commands  ·  ↑/↓ history  ·  Ctrl-R search history\n\n"
            C_BOLD "Tools the model can call\n" C_RESET "  %s\n"
@@ -1212,6 +1342,12 @@ static void cmd_model_picker(void) {
     free(descbuf); free(names); free(descs); cJSON_Delete(list);
 }
 
+static const char *think_label(void) {
+    static char b[64];
+    const char *base = g_cfg.think < 0 ? "auto (first call of a request only)" : g_cfg.think ? "on (every call)" : "off";
+    if (g_cfg.think_level && g_cfg.think) snprintf(b, sizeof b, "%s · level %s", base, g_cfg.think_level); else snprintf(b, sizeof b, "%s", base);
+    return b;
+}
 static void cmd_status(void) {
     printf(C_BOLD "model      " C_RESET "%s%s\n", g_cfg.model, g_model_tools ? "" : C_DIM " (no tool support)" C_RESET);
     printf(C_BOLD "host       " C_RESET "%s\n", g_cfg.host);
@@ -1223,8 +1359,10 @@ static void cmd_status(void) {
     printf("\n" C_BOLD "tokens     " C_RESET "%ld this session (%ld in · %ld generated)\n", g_session.prompt_tokens + g_session.eval_tokens, g_session.prompt_tokens, g_session.eval_tokens);
     printf(C_BOLD "tools      " C_RESET "%s\n", (g_cfg.no_tools || !g_model_tools) ? "off" : "on");
     printf(C_BOLD "mode       " C_RESET "%s%s" C_RESET "\n", g_cfg.mode == MODE_AUTO ? C_RED : g_cfg.mode == MODE_PLAN ? C_CYAN : g_cfg.mode == MODE_ACCEPT_EDITS ? C_ORANGE : "", mode_label(g_cfg.mode));
-    printf(C_BOLD "think      " C_RESET "%s, %s\n", g_cfg.think < 0 ? "auto" : g_cfg.think ? "on" : "off", g_cfg.show_thinking ? "shown" : "hidden");
+    printf(C_BOLD "think      " C_RESET "%s, %s\n", think_label(), g_cfg.show_thinking ? "shown" : "hidden");
     printf(C_BOLD "temp       " C_RESET "%s", g_cfg.temperature < 0 ? "default\n" : ""); if (g_cfg.temperature >= 0) printf("%g\n", g_cfg.temperature);
+    printf(C_BOLD "keep_alive " C_RESET "%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "server default (5m)");
+    check_model_placement(true);
     if (g_project_instructions) printf(C_BOLD "project    " C_RESET "instructions file loaded\n");
     printf(C_BOLD "memory     " C_RESET "%s%s\n", g_cfg.memory ? "on" : "off", g_memory ? " · " MEMORY_PATH " loaded" : "");
     if (g_session_id[0]) printf(C_BOLD "session    " C_RESET "%s · resume later with: corbienest --resume %s\n", g_session_id, g_session_id);
@@ -1234,6 +1372,7 @@ static void cmd_status(void) {
 /* Returns true when the conversation was compacted. */
 static bool cmd_compact(void) {
     if (cJSON_GetArraySize(g_messages) == 0) { printf(C_DIM "nothing to compact" C_RESET "\n"); return false; }
+    memory_flush();   /* learn from the detail before it is summarised away */
     printf(C_DIM "compacting conversation…" C_RESET "\n");
     cJSON *msgs = messages_with_system();
     cJSON *u = cJSON_CreateObject();
@@ -1244,13 +1383,15 @@ static bool cmd_compact(void) {
         "decisions made, and what remains to be done. Be specific about file paths and code details. Output only the summary.");
     cJSON_AddItemToArray(msgs, u);
     chat_stats st; bool aborted;
+    ollama_call.think = 0; ollama_call.busy = "compacting";   /* a summary needs no thinking; keep it quick */
     cJSON *reply = ollama_chat(msgs, NULL, &st, &aborted);
+    ollama_call_reset();
     cJSON_Delete(msgs);
     account(&st);
     term_status_refresh();
     if (!reply || aborted) { if (reply) cJSON_Delete(reply); printf(C_YELLOW "compact cancelled" C_RESET "\n"); return false; }
     const char *summary = cJSON_GetObjectItemCaseSensitive(reply, "content")->valuestring;
-    cJSON_Delete(g_messages); g_messages = cJSON_CreateArray();
+    cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); g_prev_request_first = -1;
     sbuf b; sb_init(&b);
     sb_printf(&b, "This conversation was compacted. Summary of the previous conversation:\n\n%s\n\nContinue from here.", summary);
     add_message("user", b.data);
@@ -1321,7 +1462,7 @@ static int handle_slash(char *line) {
         if (!arg) cmd_model_picker();
         else { free(g_cfg.model); g_cfg.model = xstrdup(arg); refresh_model_caps(false); config_save(); printf(C_GREEN "✓ model set to %s" C_RESET "\n", g_cfg.model); }
     }
-    else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); tools_reset_permissions(); tools_checkpoint_clear(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
+    else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { memory_flush(); cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); g_prev_request_first = -1; tools_reset_permissions(); tools_checkpoint_clear(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
     else if (!strcmp(cmd, "/compact")) { if (cmd_compact()) session_save(); }
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
@@ -1336,14 +1477,15 @@ static int handle_slash(char *line) {
         else { free(g_cfg.system_prompt); g_cfg.system_prompt = xstrdup(arg); printf(C_GREEN "✓ set" C_RESET "\n"); }
     }
     else if (!strcmp(cmd, "/think")) {
-        if (!arg) printf("think: %s, %s\n", g_cfg.think < 0 ? "auto" : g_cfg.think ? "on" : "off", g_cfg.show_thinking ? "shown" : "hidden");
-        else if (!strcmp(arg, "on")) g_cfg.think = 1;
-        else if (!strcmp(arg, "off")) g_cfg.think = 0;
-        else if (!strcmp(arg, "auto")) g_cfg.think = -1;
+        if (!arg) printf("think: %s, %s\n", think_label(), g_cfg.show_thinking ? "shown" : "hidden");
+        else if (!strcmp(arg, "on")) { g_cfg.think = 1; free(g_cfg.think_level); g_cfg.think_level = NULL; }
+        else if (!strcmp(arg, "off")) { g_cfg.think = 0; free(g_cfg.think_level); g_cfg.think_level = NULL; }
+        else if (!strcmp(arg, "auto") || !strcmp(arg, "first")) { g_cfg.think = -1; free(g_cfg.think_level); g_cfg.think_level = NULL; }
+        else if (!strcmp(arg, "low") || !strcmp(arg, "medium") || !strcmp(arg, "high")) { free(g_cfg.think_level); g_cfg.think_level = xstrdup(arg); if (g_cfg.think == 0) g_cfg.think = -1; }
         else if (!strcmp(arg, "show")) g_cfg.show_thinking = true;
         else if (!strcmp(arg, "hide")) g_cfg.show_thinking = false;
-        else printf("usage: /think on|off|auto|show|hide\n");
-        if (arg) { config_save(); printf(C_GREEN "✓ think: %s, %s" C_RESET "\n", g_cfg.think < 0 ? "auto" : g_cfg.think ? "on" : "off", g_cfg.show_thinking ? "shown" : "hidden"); }
+        else printf("usage: /think on|off|auto|low|medium|high|show|hide\n  auto = think once per request, not after every tool result (default) · low/medium/high = level for models that have them (gpt-oss)\n");
+        if (arg) { config_save(); printf(C_GREEN "✓ think: %s, %s" C_RESET "\n", think_label(), g_cfg.show_thinking ? "shown" : "hidden"); }
     }
     else if (!strcmp(cmd, "/yolo")) {
         bool on = !arg ? !YOLO() : !strcmp(arg, "on");
@@ -1367,6 +1509,11 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/temp")) {
         if (!arg) printf("temperature: %g\n", g_cfg.temperature); else { g_cfg.temperature = atof(arg); config_save(); printf(C_GREEN "✓ temperature = %g" C_RESET "\n", g_cfg.temperature); }
     }
+    else if (!strcmp(cmd, "/keepalive") || !strcmp(cmd, "/keep-alive")) {
+        if (!arg) printf("keep_alive: %s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "server default (5m)");
+        else { free(g_cfg.keep_alive); g_cfg.keep_alive = strcmp(arg, "default") ? xstrdup(arg) : NULL; config_save();
+               printf(C_GREEN "✓ keep_alive = %s" C_RESET " (applies from the next request)\n", g_cfg.keep_alive ? g_cfg.keep_alive : "server default"); }
+    }
     else if (!strcmp(cmd, "/host")) {
         if (!arg) printf("host: %s\n", g_cfg.host); else { free(g_cfg.host); g_cfg.host = xstrdup(arg); config_save(); refresh_model_caps(false); printf(C_GREEN "✓ host = %s" C_RESET "\n", g_cfg.host); }
     }
@@ -1375,6 +1522,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/pwd")) printf("%s\n", g_cwd);
     else if (!strcmp(cmd, "/cd")) {
         char *d = expand_home(arg ? arg : "~");
+        memory_flush();   /* the memory file belongs to the directory we are leaving */
         if (chdir(d) == 0) { if (getcwd(g_cwd, sizeof g_cwd)) {} load_project_instructions(); load_memory(); tools_permissions_load(); skills_load(); refresh_slash_completion(); printf(C_GREEN "✓ %s" C_RESET "\n", g_cwd); }
         else printf(C_RED "✗ cd %s: %s" C_RESET "\n", d, strerror(errno));
         free(d);
@@ -1392,7 +1540,7 @@ static int handle_slash(char *line) {
         free(msg); free(prompt);
         bool aborted = run_turn();
         session_save();
-        memory_update(first, aborted);
+        memory_note(first, aborted);
         if (aborted) return -1;
     }
     return 0;
@@ -1449,7 +1597,7 @@ static int process_input(char *line) {
     free(msg);
     bool aborted = run_turn();
     session_save();
-    memory_update(first, aborted);
+    memory_note(first, aborted);
     printf("\n");
     fflush(stdout);
     return aborted ? -1 : 0;
@@ -1460,6 +1608,7 @@ static void usage(void) {
            "  -m, --model NAME     model to use (default: saved / first tool-capable model)\n"
            "  -H, --host URL       ollama host (default $OLLAMA_HOST or http://127.0.0.1:11434)\n"
            "  -c, --ctx N          context window (num_ctx), e.g. 32768, 64k, 128k\n"
+           "      --keep-alive DUR keep the model loaded between requests (default 30m; -1 forever, 0 unload, default = server's)\n"
            "  -s, --system TEXT    extra system instructions\n"
            "  -p, --prompt TEXT    non-interactive: run one prompt and exit (implies tools need --yolo)\n"
            "      --output-format text|json   with -p: print the reply as text (default) or one JSON object\n"
@@ -1470,7 +1619,7 @@ static void usage(void) {
            "      --continue       resume the latest session started in this directory\n"
            "  -r, --resume [ID]    resume a session: by ID, or pick one from a menu\n"
            "      --no-memory      don't update " MEMORY_PATH " after requests\n"
-           "      --think          ask model to think; --no-think to disable; --show-thinking to display\n"
+           "      --think          think on every model call (default: only the first call of a request); --no-think to disable; --show-thinking to display\n"
            "  -h, --help           this help\n");
 }
 
@@ -1478,7 +1627,8 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 60; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true;
+    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 60; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.memory_every = 5;
+    g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();
     const char *env_host = getenv("OLLAMA_HOST");
@@ -1504,6 +1654,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--continue")) resume_latest = true;
         else if (!strcmp(a, "--output-format")) { const char *f = NEEDARG(); if (!strcmp(f, "json")) json_out = true; else if (strcmp(f, "text")) { fprintf(stderr, "unknown output format %s (text|json)\n", f); return 2; } }
         else if (!strcmp(a, "-r") || !strcmp(a, "--resume")) { resume_id = (i + 1 < argc && argv[i+1][0] != '-') ? argv[++i] : ""; }
+        else if (!strcmp(a, "--keep-alive")) { const char *kv = NEEDARG(); free(g_cfg.keep_alive); g_cfg.keep_alive = strcmp(kv, "default") ? xstrdup(kv) : NULL; }
         else if (!strcmp(a, "--think")) g_cfg.think = 1;
         else if (!strcmp(a, "--no-think")) g_cfg.think = 0;
         else if (!strcmp(a, "--show-thinking")) g_cfg.show_thinking = true;
@@ -1555,7 +1706,7 @@ int main(int argc, char **argv) {
         time_t t0 = time(NULL);
         bool aborted = run_turn();
         session_save();
-        memory_update(first, aborted);
+        memory_note(first, aborted);
         term_restore();
         if (json_out) {
             cJSON *o = cJSON_CreateObject();
@@ -1603,6 +1754,7 @@ int main(int argc, char **argv) {
         if (rc == -1) term_queue_to_editor();
     }
     hist_save();
+    memory_flush();   /* pending memory extraction runs before we leave (Ctrl-C skips it) */
     session_save();
     term_restore();   /* leaves the alternate screen: say goodbye on the normal one */
     printf(C_DIM "bye" C_RESET " · corbienest used %ld tokens this session (%ld in · %ld out) with %s\n",

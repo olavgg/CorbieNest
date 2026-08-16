@@ -26,11 +26,11 @@ build must be warning-free with `-Wall -Wextra`.
 | `src/common.h` | every shared declaration; one header, sectioned per module |
 | `src/util.c` | `sbuf` string buffer, file helpers, config load/save, permission-mode names |
 | `src/http.c` | minimal HTTP/1.1 client, chunked streaming, interrupt-while-waiting |
-| `src/term.c` | raw mode, key decoding (incl. Shift+Tab = `CSI Z`), full-screen mode (alternate screen, scroll region, bottom status bar: mode · model · queued messages · session tokens · ctx · busy spinner via `term_busy()`/`term_busy_tick()`), line editor, prompt history (latest 100, `hist_*`), the message queue (`term_queue_*`: Enter while busy turns type-ahead into a queued message; pending type-ahead is echoed live in the bar and Shift+Tab while busy cycles the mode at once), `term_confirm` menu, `term_select` picker, streaming markdown printer |
+| `src/term.c` | raw mode, key decoding (incl. Shift+Tab = `CSI Z`), full-screen mode (alternate screen, scroll region, bottom status bar: mode · model · queued messages · session tokens · ctx · busy spinner via `term_busy()`/`term_busy_tick()`), line editor, prompt history (latest 100, `hist_*`), the message queue (`term_queue_*`: Enter while busy turns type-ahead into a queued message; pending type-ahead is echoed live in the bar and Shift+Tab while busy cycles the mode at once), `term_confirm` menu, `term_select` picker, streaming markdown printer, scrollback for PgUp/PgDn (stdout is hooked via `fopencookie`/`funopen` in `sb_hook_stdout` and conversation output is modelled as lines — `sb_feed`; the editor/menus/viewer draw with `sb_pause(true)`, the editor records its submitted line with `sb_note`; `scroll_view` is the viewer) |
 | `src/tools.c` | tool definitions + implementations (incl. `task`, which calls back into `main.c`), `confirm()` (mode-aware; 4th menu option saves a rule to `.corbienest/permissions`, `tools_permissions_*`), checkpoints for `/rewind` (`tools_checkpoint_*`: pre-write file states per request), shell runner |
-| `src/ollama.c` | `/api/chat` streaming, tool-call accumulation, text tool-call recovery |
+| `src/ollama.c` | `/api/chat` streaming (options: `num_ctx`, `temperature`, `keep_alive`, per-call `ollama_call` overrides for `think`/`num_predict`/status-bar label used by the memory, compact and sub-agent calls), tool-call accumulation, text tool-call recovery, `/api/ps` model placement |
 | `src/skills.c` | SKILL.md discovery, frontmatter parsing, `/NAME` expansion, scaffolding |
-| `src/main.c` | REPL (`process_input`), slash commands, system prompt, sub-agents (`run_subagent`, hooked into `tools.c`'s `task` tool via `tools_subagent`), agent loop (`run_turn`, which injects queued messages between tool rounds via `inject_queued()` and auto-compacts at ≥`AUTO_COMPACT_PCT` context via `maybe_auto_compact()`), `/ctx` picker (model max from `/api/show`), sessions (`session_save()` after each request to `config_dir()/sessions/<id>.json`, `--continue`/`--resume`/`/resume`), project memory (`.corbienest/memory.md`: `load_memory()` into the system prompt, `memory_update()` = quiet model call after each request via `ollama_quiet`, `/memory`), banner |
+| `src/main.c` | REPL (`process_input`), slash commands, system prompt, sub-agents (`run_subagent`, hooked into `tools.c`'s `task` tool via `tools_subagent`), agent loop (`run_turn`, which injects queued messages between tool rounds via `inject_queued()` and auto-compacts at ≥`AUTO_COMPACT_PCT` context via `maybe_auto_compact()`; `begin_request()` first elides old tool results in place once the context is ≥`ELIDE_PCT` full, `elide_old_tool_results()`), `/ctx` picker (model max from `/api/show`), sessions (`session_save()` after each request to `config_dir()/sessions/<id>.json`, `--continue`/`--resume`/`/resume`), project memory (`.corbienest/memory.md`: `load_memory()` into the system prompt; `memory_note()` after each request counts it and `memory_flush()` runs the quiet extraction call (`memory_extract()`, `ollama_quiet` + `ollama_call` overrides) every `memory_every` requests and before the conversation goes away — exit, `/clear`, `/compact`, `/cd`, `/resume`; `/memory`), banner |
 
 ## Conventions
 
@@ -43,6 +43,10 @@ build must be warning-free with `-Wall -Wextra`.
   `term_select`). Never `getchar()`/`fgets()` on stdin. Anything that asks the user a question
   must set the pending type-ahead aside first (see `ta_take`/`ta_restore`) so keys typed while
   the model was generating are never taken as an answer.
+- Everything printed to stdout in full-screen mode is recorded for PgUp scrollback. Transient
+  drawing (redraws that move the cursor up, menus, spinners that stay put) must either be
+  bracketed with `sb_pause(true)`/`sb_pause(false)` or use only `\r` + `\x1b[2K`/`\x1b[J` and
+  cursor-up (which the model understands). Never write to fd 1 directly.
 - Anything that waits (HTTP streaming, shell commands) must poll `term_poll_interrupt()`: it is
   what keeps type-ahead alive and turns Enter into a queued message. Queued messages are only
   consumed by `main.c` — between tool rounds (`inject_queued()`, plain messages only) and after
@@ -55,7 +59,9 @@ build must be warning-free with `-Wall -Wextra`.
 - Slash commands: add to `SLASH_CMDS`, `handle_slash()`, `cmd_help()` and the README table.
   Unknown `/name` falls through to skills, so keep built-in names distinct from likely skill names.
 - The fake Ollama answers memory-extraction calls with `NO_CHANGE` unless a user message contains
-  `REMEMBER_ME`; the test config sets `memory=0` so only the dedicated memory test pays for the extra call.
+  `REMEMBER_ME`; the test config sets `memory=0` so only the dedicated memory test pays for the extra call
+  (it sets `/memory every 1` so the call is observable after each request). Extraction is a different
+  prompt and evicts Ollama's prompt cache for the conversation — keep it batched.
 - Anything persisted goes into `~/.config/corbienest/config` via `config_save()`; keep old keys
   readable (e.g. `yolo=1` still maps to `mode=auto`).
 - Tests: extend `tests/test_unit.c` for pure logic and `tests/test_integration.py` (pty

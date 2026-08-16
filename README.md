@@ -78,6 +78,7 @@ corbienest [options] [-p PROMPT]
   -T, --no-tools       disable tool calling
       --continue       resume the latest session started in this directory
   -r, --resume [ID]    resume a session: by ID, or pick one from a menu
+      --keep-alive DUR how long Ollama keeps the model loaded between requests (default 30m; -1 forever, 0 unload, default = server's)
       --think / --no-think / --show-thinking
 ```
 
@@ -89,13 +90,13 @@ corbienest [options] [-p PROMPT]
 | `/models` | list installed models with tool/thinking capabilities |
 | `/clear` | new conversation |
 | `/compact` | have the model summarise the conversation to free context |
-| `/memory [on\|off\|clear]` | show the project memory (`.corbienest/memory.md`), toggle its automatic update, or delete it |
+| `/memory [on\|off\|clear\|update\|every N]` | show the project memory (`.corbienest/memory.md`), toggle its automatic update, run the pending update now, set how often it runs (default every 5 requests, plus at exit/`/clear`/`/compact`), or delete it |
 | `/status` | model, context usage, settings |
 | `/diff [git args]` | show `git diff` of the working tree (stat, patch, untracked files) for you only — nothing is added to the conversation; `/diff --staged`, `/diff HEAD~1` … pass through |
 | `/rewind` | (or **Esc Esc** at an empty prompt) pick an earlier request and go back: undo the file changes the model made since (files are checkpointed before every `write_file`/`edit_file`), truncate the conversation to just before it (the request text returns to the editor), or both |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
 | `/system [text\|clear]` | extra system instructions |
-| `/think on\|off\|auto`, `/think show\|hide` | control thinking on thinking-capable models |
+| `/think on\|off\|auto`, `/think low\|medium\|high`, `/think show\|hide` | thinking on thinking-capable models: `auto` (default) lets the model think about each request once and turns thinking off for the tool rounds that follow, `on` thinks on every call, `off` never; `low`/`medium`/`high` set the level on models that have one (gpt-oss) |
 | `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (`.corbienest/permissions`) |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
@@ -104,6 +105,7 @@ corbienest [options] [-p PROMPT]
 | `/tools on\|off` | enable/disable tools |
 | `/ctx [N\|Nk\|max\|default]` | context window: no argument opens a size picker (up to the model's trained maximum), `/ctx 64k`, `/ctx max` … set it directly |
 | `/temp X`, `/host URL` | tuning |
+| `/keepalive [DUR]` | how long Ollama keeps the model loaded after a request (default `30m`, so it is not reloaded from disk mid-session; `-1` = forever, `0` = unload right away, `default` = the server's 5 minutes) |
 | `/save [file]` | save transcript as markdown |
 | `/resume [ID\|all]` | pick an earlier session to continue (this directory; `all` for every directory), or load one by ID |
 | `/history [N]` | show the last N queries (default 20; the latest 100 are kept across sessions, ↑/↓ recalls them) |
@@ -118,6 +120,9 @@ corbienest [options] [-p PROMPT]
   to (Project / User / Feedback / Reference) and the line is appended, no model call involved.
 - Enter sends; Alt+Enter, Ctrl+J or a trailing `\` inserts a newline. Bracketed paste works.
 - Ctrl-C (or Esc) cancels a running generation / clears the line (twice on an empty line quits).
+- PgUp at the prompt scrolls back through the conversation (the alternate screen has no scrollback of
+  its own, so corbienest keeps one): PgUp/PgDn/↑/↓ move, Home/End jump, Esc/Enter/PgDn at the bottom
+  return to the prompt exactly as it was.
   Esc twice at an empty prompt opens `/rewind`.
 - **You can keep typing while the model works.** What you type shows up in the status bar as
   you go (`› …▏`); press Enter to queue it as a message — add details,
@@ -228,8 +233,9 @@ new session; `/status` shows the current id, which is also printed when you quit
 ### Project memory
 
 Like Claude Code's auto-memory: corbienest keeps `.corbienest/memory.md` in the working
-directory and loads it into the system prompt of every request. The model curates it — at the
-end of each request a quiet extraction call asks whether the exchange revealed anything durable
+directory and loads it into the system prompt of every request. The model curates it — every
+few requests (default 5, `/memory every N`; also at exit, `/clear`, `/compact`, `/cd`) a quiet
+extraction call asks whether the exchanges since the last update revealed anything durable
 (who you are and how you like to work, feedback you gave, project goals/decisions/constraints
 that aren't in the code, references such as URLs or tickets) and, if so, rewrites the file;
 otherwise nothing is written. Facts the repository already records, and anything only relevant
@@ -239,6 +245,14 @@ or forget something (it edits the file with `edit_file`), or edit the file by ha
 prints it, `/memory off` (saved to config) or `--no-memory` disables the update, `/memory clear`
 deletes it. One-shot runs (`-p`) only touch the file if `.corbienest/` already exists.
 
+The extraction call is a real model call (the status bar shows `⠋ updating memory` while it
+runs) and its cost is printed afterwards (`✎ memory: no change · 3.2s`). It never asks the
+model to think and is capped in length (a cut-off reply is ignored rather than written). Its
+different prompt evicts Ollama's prompt cache for the conversation, so the request after it
+re-evaluates the whole context — which is why it is batched rather than run after every
+request (`/memory every 1` restores that; `/memory update` runs a pending one now; `/memory`
+shows how many requests are pending). On slow machines `/memory off` removes it entirely.
+
 ### Project instructions
 
 If a `CORBIENEST.md`, `CLAUDE.md` or `AGENTS.md` exists in the working directory it is
@@ -246,7 +260,7 @@ appended to the system prompt, so you can give the model project-specific guidan
 
 ### Config
 
-Settings changed with `/model`, `/ctx`, `/think`, `/mode`, `/yolo`, `/host`, `/memory on|off` are saved to
+Settings changed with `/model`, `/ctx`, `/think`, `/mode`, `/yolo`, `/host`, `/keepalive`, `/memory on|off` are saved to
 `~/.config/corbienest/config`. Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`.
 
 ## Tests
@@ -289,5 +303,22 @@ tests/         unit tests, fake Ollama server, pty integration tests
 
 - Ollama's default context is small; corbienest sends `num_ctx=32768` by default.
   Lower it with `/ctx` or `-c` if your machine runs out of memory, raise it for big tasks.
+- **Context hygiene.** Tool results (file contents, command output) are the bulk of a long
+  conversation and go stale quickly. Once the context is half full, results from requests
+  before the previous one are replaced in place by a short stub (tool name, size, first
+  line — `⋯ elided N old tool results` is printed) so the model can call the tool again if it
+  needs the details; at 85 % the conversation is auto-compacted (summarised by the model), and
+  from 70 % the stats line suggests `/compact`.
+- **Slow?** The stats line under each reply tells you where the time went: `prefill Ns` is
+  prompt evaluation (large when the model was just (re)loaded or the prompt cache missed),
+  `tok/s` is generation speed. Things that help, roughly in order: make sure the whole model
+  fits in GPU memory (corbienest warns `⚠ model is only NN% in GPU memory` after the first
+  reply when it does not — pick a smaller `/ctx` or model), turn off the per-request memory
+  update (`/memory every 10` or `/memory off`), spend less on thinking (`/think auto` — the default —
+  thinks once per request instead of after every tool result; `/think off` never; the stats line shows
+  `thought 41s (≈2.1k tok)` per call and `/cost` the session total), keep the model
+  loaded (`/keepalive`, default 30m), and `/compact` long conversations. Tool output is capped
+  (`read_file` 2000 lines / 64 KB, `bash`/`grep` 32 KB) so a single tool round cannot fill the
+  context; the model is told to page with `offset`/`limit`.
 - Models without tool support still work as a plain chat (`/models` shows which is which).
 - Only `http://` hosts are supported (Ollama's local API is plain HTTP).

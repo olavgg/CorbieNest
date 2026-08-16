@@ -18,6 +18,11 @@ static struct termios g_orig;
 static bool g_have_orig = false, g_raw = false;
 static int vis_width(const char *s);   /* display width of a UTF-8 string, ignoring SGR escapes */
 static volatile sig_atomic_t g_winch = 0;
+static void sb_hook_stdout(void);       /* scrollback capture (see "scrollback" below) */
+static void sb_pause(bool on);
+static void sb_note(const char *text);
+static size_t u8_next(const char *s, size_t pos, size_t len);
+static const char *g_bar_override;
 
 static void on_winch(int s) { (void)s; g_winch = 1; }
 
@@ -61,6 +66,13 @@ void term_size(int *rows, int *cols) {
 }
 int term_width(void) { int c; term_size(NULL, &c); return c; }
 
+/* ---------- key input ---------- */
+enum {
+    K_NONE = 0, K_UP = 1000, K_DOWN, K_LEFT, K_RIGHT, K_HOME, K_END, K_DEL,
+    K_PGUP, K_PGDN, K_ALT_ENTER, K_ESC, K_PASTE_START, K_PASTE_END, K_ALT_B, K_ALT_F, K_ALT_BS,
+    K_CTRL_LEFT, K_CTRL_RIGHT, K_SHIFT_TAB
+};
+
 /* ---------- full screen + status bar ---------- */
 /* In full-screen mode the app owns the alternate screen; rows 1..N-1 form the
  * scrolling region for the conversation and row N holds the status bar. Every
@@ -88,6 +100,12 @@ void fmt_tokens(long n, char *out, size_t sz) {
 /* Appends the status bar text, at most `cols - 1` visible columns wide. Segments are
  * dropped from the right when the terminal is narrow. */
 static void bar_build(sbuf *o, int cols) {
+    if (g_bar_override) {   /* the scrollback viewer owns the bar */
+        char *t = xstrdup(g_bar_override);
+        int w = vis_width(t);
+        if (w > cols - 1) { size_t i = 0; int k = 0; while (t[i] && k < cols - 2) { i = u8_next(t, i, strlen(t)); k++; } t[i] = 0; strcat(t, "…"); }
+        sb_printf(o, C_DIM "%s" C_RESET, t); free(t); return;
+    }
     const char *icon, *col, *text;
     switch (g_cfg.mode) {
         case MODE_ACCEPT_EDITS: icon = "⏵⏵"; col = C_ORANGE; text = "accept edits on"; break;
@@ -289,6 +307,7 @@ void term_busy_tick(void) {
 
 void term_fullscreen(bool on) {
     if (on && !g_fs) {
+        sb_hook_stdout();   /* start recording the conversation for PgUp */
         g_fs = true; g_fs_rows = g_fs_cols = 0; g_live_out = 0;
         fputs("\x1b[?1049h\x1b[H\x1b[2J", stdout);   /* alternate screen, cleared */
         term_status_refresh();                       /* also sets the scroll region */
@@ -305,12 +324,254 @@ void term_clear_screen(void) {
     fflush(stdout);
 }
 
-/* ---------- key input ---------- */
-enum {
-    K_NONE = 0, K_UP = 1000, K_DOWN, K_LEFT, K_RIGHT, K_HOME, K_END, K_DEL,
-    K_PGUP, K_PGDN, K_ALT_ENTER, K_ESC, K_PASTE_START, K_PASTE_END, K_ALT_B, K_ALT_F, K_ALT_BS,
-    K_CTRL_LEFT, K_CTRL_RIGHT, K_SHIFT_TAB
-};
+/* ---------- scrollback (PgUp / PgDn) ----------
+ * The alternate screen has no scrollback of its own, so the app keeps one: everything the
+ * conversation prints to stdout is teed (see sb_hook_stdout) into a list of logical lines,
+ * with SGR colours kept and the few cursor movements we use (CR, cursor up/down/right,
+ * erase line / erase below, DECSC…DECRC around the status bar) interpreted so the model
+ * tracks what is on screen. Drawing that is not conversation content — the line editor, the
+ * menus, the viewer itself — runs with the capture paused (sb_pause), and the editor adds
+ * the submitted line explicitly (sb_note). PgUp at the prompt opens the viewer
+ * (scroll_view): the region shows a window into the buffer, PgDn/End/Esc go back. */
+#define SB_MAX_LINES 8000
+static sbuf *g_sb = NULL;             /* logical lines */
+static int   g_sb_n = 0, g_sb_cap = 0;
+static int   g_sb_line = 0;           /* cursor: line index ... */
+static int   g_sb_col = 0;            /* ... and visual column in it (>= width means a wrapped row) */
+static bool  g_sb_pause = false;      /* not conversation output: don't record */
+static bool  g_sb_active = false;     /* stdout is hooked */
+static int   g_sb_decsc = 0;          /* inside DECSC…DECRC (status bar): ignore */
+static char  g_sb_seq[48]; static int g_sb_seqn = -1;   /* escape sequence being collected (-1 = none) */
+static bool  g_sb_cr = false;         /* a CR was seen; \r\n must not clear the line */
+
+static int sb_width(void) { return g_fs_cols > 0 ? g_fs_cols : term_width(); }
+
+/* byte offset where the visible column `col` starts in s (escapes are zero width) */
+static size_t vis_offset(const char *s, size_t len, int col) {
+    int w = 0; size_t i = 0;
+    while (i < len) {
+        if (s[i] == 27) { while (i < len && s[i] != 'm') i++; if (i < len) i++; continue; }
+        if (w >= col) break;
+        i = u8_next(s, i, len); w++;
+    }
+    return i;
+}
+static int vis_width_n(const char *s, size_t len) {
+    int w = 0;
+    for (size_t i = 0; i < len; ) {
+        if (s[i] == 27) { while (i < len && s[i] != 'm') i++; if (i < len) i++; continue; }
+        if (((unsigned char)s[i] & 0xC0) != 0x80) w++;
+        i++;
+    }
+    return w;
+}
+static void sb_ensure_line(void) {
+    if (g_sb_n == 0) { g_sb_line = 0; g_sb_col = 0; }
+    while (g_sb_line >= g_sb_n) {
+        if (g_sb_n == g_sb_cap) { g_sb_cap = g_sb_cap ? g_sb_cap * 2 : 256; g_sb = xrealloc(g_sb, sizeof *g_sb * (size_t)g_sb_cap); }
+        sb_init(&g_sb[g_sb_n]); sb_append(&g_sb[g_sb_n], "", 0); g_sb_n++;
+    }
+    if (g_sb_n > SB_MAX_LINES) {   /* drop the oldest quarter */
+        int drop = SB_MAX_LINES / 4;
+        for (int i = 0; i < drop; i++) sb_free(&g_sb[i]);
+        memmove(g_sb, g_sb + drop, sizeof *g_sb * (size_t)(g_sb_n - drop));
+        g_sb_n -= drop; g_sb_line -= drop; if (g_sb_line < 0) g_sb_line = 0;
+    }
+}
+/* the cursor is about to write: cut the line at the cursor column (a redraw overwrites the rest) */
+static void sb_cut_at_cursor(void) {
+    sb_ensure_line();
+    sbuf *l = &g_sb[g_sb_line];
+    int w = vis_width_n(l->data, l->len);
+    if (g_sb_col < w) { size_t off = vis_offset(l->data, l->len, g_sb_col); l->len = off; l->data[off] = 0; sb_puts(l, C_RESET); }
+    else while (w < g_sb_col) { sb_putc(l, ' '); w++; }   /* cursor beyond the text: pad */
+}
+static void sb_drop_after(int line) {
+    while (g_sb_n > line + 1) sb_free(&g_sb[--g_sb_n]);
+}
+static void sb_cursor_up(int n) {
+    int width = sb_width(); if (width < 1) width = 1;
+    while (n > 0) {
+        int vrow = g_sb_col == 0 ? 0 : (g_sb_col - 1) / width;
+        int col = g_sb_col - vrow * width;
+        if (vrow >= n) { g_sb_col -= n * width; return; }
+        n -= vrow + 1;
+        if (g_sb_line == 0) { g_sb_col = col; return; }
+        g_sb_line--;
+        sb_ensure_line();
+        int pw = vis_width_n(g_sb[g_sb_line].data, g_sb[g_sb_line].len);
+        int prow = pw == 0 ? 0 : (pw - 1) / width;
+        g_sb_col = prow * width + col;
+    }
+}
+static void sb_cursor_down(int n) {
+    int width = sb_width(); if (width < 1) width = 1;
+    while (n-- > 0) {
+        int w = vis_width_n(g_sb[g_sb_line].data, g_sb[g_sb_line].len);
+        int lastrow = w == 0 ? 0 : (w - 1) / width, vrow = g_sb_col == 0 ? 0 : (g_sb_col - 1) / width;
+        if (vrow < lastrow) { g_sb_col += width; continue; }
+        if (g_sb_line + 1 >= g_sb_n) return;
+        g_sb_line++; g_sb_col = g_sb_col - vrow * width;
+    }
+}
+static void sb_newline(void) {
+    sb_ensure_line();
+    if (g_sb_line + 1 < g_sb_n) { g_sb_line++; g_sb_col = 0; return; }   /* (a "\n" after cursor-up: move down) */
+    g_sb_line = g_sb_n; g_sb_col = 0; sb_ensure_line();
+}
+static void sb_escape_done(void) {
+    const char *q = g_sb_seq; int n = g_sb_seqn; g_sb_seqn = -1;
+    if (n < 2 || q[0] != '[') {   /* two-byte ESC sequences: DECSC / DECRC bracket the status bar; the rest is ignored */
+        if (n == 1 && q[0] == '7') g_sb_decsc = 1;
+        else if (n == 1 && q[0] == '8') g_sb_decsc = 0;
+        return;
+    }
+    char fin = q[n - 1]; int a = q[1] >= '0' && q[1] <= '9' ? atoi(q + 1) : 0;
+    if (fin == 'm') { sb_ensure_line(); sb_cut_at_cursor(); sbuf *l = &g_sb[g_sb_line]; sb_putc(l, 27); sb_append(l, q, (size_t)n); return; }
+    if (q[1] == '?') return;                                  /* private modes (bracketed paste, alt screen) */
+    switch (fin) {
+        case 'A': sb_cursor_up(a ? a : 1); break;
+        case 'B': sb_cursor_down(a ? a : 1); break;
+        case 'C': g_sb_col += a ? a : 1; break;
+        case 'D': g_sb_col -= a ? a : 1; if (g_sb_col < 0) g_sb_col = 0; break;
+        case 'K': if (a == 2) { int width = sb_width(); if (width < 1) width = 1; g_sb_col = ((g_sb_col == 0 ? 0 : (g_sb_col - 1) / width)) * width; }
+                  sb_cut_at_cursor(); break;
+        case 'J': if (a == 2) { for (int i = 0; i < g_sb_n; i++) sb_free(&g_sb[i]); g_sb_n = 0; g_sb_line = 0; g_sb_col = 0; }
+                  else { sb_cut_at_cursor(); sb_drop_after(g_sb_line); }
+                  break;
+        default: break;                                       /* H, r, n … : absolute moves and queries, not tracked */
+    }
+}
+static void sb_feed(const char *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if (g_sb_seqn >= 0) {   /* collecting an escape sequence */
+            if (g_sb_seqn < (int)sizeof g_sb_seq - 1) g_sb_seq[g_sb_seqn++] = (char)c;
+            bool csi = g_sb_seq[0] == '[';
+            if (!csi) { if (g_sb_seqn == 1 && c != '[') sb_escape_done(); }        /* ESC x */
+            else if (g_sb_seqn > 1 && c >= 0x40 && c <= 0x7E) sb_escape_done();      /* final byte */
+            continue;
+        }
+        if (c == 27) { g_sb_seqn = 0; continue; }
+        if (g_sb_decsc) continue;
+        if (c == '\r') { g_sb_cr = true; continue; }
+        if (g_sb_cr) { g_sb_cr = false; if (c != '\n') { int width = sb_width(); if (width < 1) width = 1; sb_ensure_line(); g_sb_col = ((g_sb_col == 0 ? 0 : (g_sb_col - 1) / width)) * width; } }
+        if (c == '\n') { sb_newline(); continue; }
+        if (c == '\b') { if (g_sb_col > 0) g_sb_col--; continue; }
+        if (c == '\a' || c == 0) continue;
+        if (c == '\t') { sb_cut_at_cursor(); sbuf *l = &g_sb[g_sb_line]; do { sb_putc(l, ' '); g_sb_col++; } while (g_sb_col % 8); continue; }
+        sb_cut_at_cursor();
+        sbuf *l = &g_sb[g_sb_line];
+        sb_putc(l, (char)c);
+        if ((c & 0xC0) != 0x80) g_sb_col++;   /* count code points, not continuation bytes */
+    }
+}
+
+/* stdout hook: every byte goes to fd 1 and, unless paused, into the model above */
+static ssize_t sb_write_fn(void *cookie, const char *buf, size_t n) {
+    (void)cookie;
+    size_t off = 0;
+    while (off < n) { ssize_t w = write(STDOUT_FILENO, buf + off, n - off); if (w < 0) { if (errno == EINTR) continue; return off ? (ssize_t)off : -1; } off += (size_t)w; }
+    if (!g_sb_pause) sb_feed(buf, n);
+    return (ssize_t)n;
+}
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+static int sb_write_bsd(void *cookie, const char *buf, int n) { return (int)sb_write_fn(cookie, buf, (size_t)n); }
+#endif
+static void sb_hook_stdout(void) {
+    if (g_sb_active) return;
+    fflush(stdout);
+    FILE *f = NULL;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+    f = funopen(NULL, NULL, sb_write_bsd, NULL, NULL);
+#else
+    cookie_io_functions_t io = { NULL, sb_write_fn, NULL, NULL };
+    f = fopencookie(NULL, "w", io);
+#endif
+    if (!f) return;
+    setvbuf(f, NULL, _IOFBF, 1 << 16);
+    stdout = f;
+    g_sb_active = true;
+}
+static void sb_pause(bool on) { if (!g_sb_active) return; fflush(stdout); g_sb_pause = on; }
+/* record text that was drawn while paused (the editor's submitted line) */
+static void sb_note(const char *text) { if (g_sb_active) { fflush(stdout); sb_feed(text, strlen(text)); } }
+
+/* visual rows of the buffer at the given width: (line, byte offset, byte length) triples */
+typedef struct { int line; size_t off, len; } sb_row;
+static sb_row *sb_rows(int width, int *count) {
+    if (width < 1) width = 1;
+    int cap = 256, n = 0; sb_row *r = xmalloc(sizeof *r * (size_t)cap);
+    for (int i = 0; i < g_sb_n; i++) {
+        const char *d = g_sb[i].data; size_t len = g_sb[i].len, off = 0;
+        do {
+            size_t end = vis_offset(d + off, len - off, width) + off;
+            if (n == cap) { cap *= 2; r = xrealloc(r, sizeof *r * (size_t)cap); }
+            r[n++] = (sb_row){ i, off, end - off };
+            off = end;
+        } while (off < len);
+    }
+    *count = n; return r;
+}
+
+static const char *g_bar_override = NULL;   /* the viewer's bar text */
+static int read_key(void);
+static void scroll_view(void) {
+    if (!g_fs || !g_sb_active) return;
+    sb_pause(true);
+    int top = -1;   /* -1 = not yet placed: start one page above the bottom (that is what PgUp asked for) */
+    for (;;) {
+        layout_sync();
+        int rows = g_fs_rows - 1, cols = g_fs_cols; if (rows < 1) rows = 1;
+        int nrows; sb_row *r = sb_rows(cols, &nrows);
+        int maxtop = nrows > rows ? nrows - rows : 0;
+        if (top < 0) top = maxtop - (rows - 1);
+        if (top < 0) top = 0;
+        if (top > maxtop) top = maxtop;
+        sbuf o; sb_init(&o);
+        for (int i = 0; i < rows; i++) {
+            sb_printf(&o, "\x1b[%d;1H", i + 1);
+            int idx = top + i;
+            if (idx < nrows) { sb_append(&o, g_sb[r[idx].line].data + r[idx].off, r[idx].len); sb_puts(&o, C_RESET); }
+            sb_puts(&o, "\x1b[K");
+        }
+        char hint[160];
+        snprintf(hint, sizeof hint, "↑ scrollback · rows %d-%d of %d · PgUp/PgDn ↑/↓ scroll · End/Esc/Enter back", nrows ? top + 1 : 0, top + rows < nrows ? top + rows : nrows, nrows);
+        g_bar_override = hint;
+        bar_append(&o);
+        g_bar_override = NULL;
+        fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o);
+        int k = read_key();
+        if (k == -2) { if (g_winch) g_winch = 0; free(r); continue; }
+        if (k == K_PGUP) top -= rows - 1;
+        else if (k == K_UP || k == 'k') top -= 1;
+        else if (k == K_PGDN || k == ' ') top += rows - 1;
+        else if (k == K_DOWN || k == 'j') top += 1;
+        else if (k == K_HOME || k == 'g') top = 0;
+        else top = maxtop;   /* End, Esc, Enter, q, anything else: back to the prompt */
+        if (top < 0) top = 0;
+        free(r);
+        if (top >= maxtop) break;   /* scrolled back down to the live view: leave the viewer */
+    }
+    /* back: redraw the tail of the buffer from the top of the region and leave the cursor on
+     * the row after it — the caller (the editor) redraws its prompt there */
+    int rows = g_fs_rows - 1, cols = g_fs_cols; if (rows < 1) rows = 1;
+    int nrows; sb_row *r = sb_rows(cols, &nrows);
+    if (nrows && g_sb_n && g_sb[g_sb_n - 1].len == 0) nrows--;   /* the cursor sits on an empty last line: that is the prompt's row */
+    int show = nrows < rows - 1 ? nrows : rows - 1;   /* leave a row for the prompt */
+    sbuf o; sb_init(&o);
+    sb_puts(&o, "\x1b[H\x1b[2J");
+    for (int i = 0; i < show; i++) {
+        int idx = nrows - show + i;
+        sb_printf(&o, "\x1b[%d;1H", i + 1);
+        sb_append(&o, g_sb[r[idx].line].data + r[idx].off, r[idx].len); sb_puts(&o, C_RESET);
+    }
+    sb_printf(&o, "\x1b[%d;1H", show + 1);
+    bar_append(&o);
+    fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o); free(r);
+    sb_pause(false);
+}
+
 
 /* Type-ahead: bytes typed while the model was generating are kept here so
  * they are not lost; read_key() consumes them before touching stdin. */
@@ -685,8 +946,10 @@ static void ed_refresh(editor *e) {
     if (ccol > 0) sb_printf(&o, "\x1b[%dC", ccol);
     e->prev_cursor_row = crow;
     bar_append(&o);   /* the "\x1b[J" above wiped the status bar; the mode may have changed too */
+    sb_pause(true);   /* the live editor is not conversation content (sb_note adds the submitted line) */
     fwrite(o.data, 1, o.len, stdout);
     fflush(stdout);
+    sb_pause(false);
     sb_free(&o);
 }
 
@@ -908,7 +1171,8 @@ static char *readline_impl(const char *prompt) {
                 if (q.len) ed_insert(&e, q.data, q.len);
                 sb_free(&p); sb_free(&q);
                 break; }
-            case K_ESC: case K_PASTE_END: case K_PGUP: case K_PGDN: break;
+            case K_PGUP: scroll_view(); e.prev_cursor_row = 0; break;
+            case K_ESC: case K_PASTE_END: case K_PGDN: break;
             default:
                 if (k >= 32 && k < 256) {
                     char u[8]; int n = 1; u[0] = (char)k;
@@ -926,11 +1190,17 @@ static char *readline_impl(const char *prompt) {
         int erow, ecol, crow, ccol;
         ed_pos(&e, e.buf.len, width, &erow, &ecol);
         ed_pos(&e, e.cur, width, &crow, &ccol);
+        sb_pause(true);
         if (erow > crow) printf("\x1b[%dB", erow - crow);
         printf("\n\r\x1b[J");   /* next line, clear anything below (candidates, hints) */
+        fputs("\x1b[?2004l", stdout);
+        term_status_refresh();   /* "\x1b[J" wiped the bar */
+        sb_pause(false);
+        if (result) {   /* what stays on screen: the prompt and the submitted text */
+            sbuf n; sb_init(&n); sb_puts(&n, prompt); sb_puts(&n, result); sb_puts(&n, C_RESET "\n");
+            sb_note(n.data); sb_free(&n);
+        } else sb_note("\n");
     }
-    fputs("\x1b[?2004l", stdout);
-    term_status_refresh();   /* "\x1b[J" wiped the bar */
     fflush(stdout);
     free(e.hist_saved);
     sb_free(&e.buf);
@@ -951,6 +1221,7 @@ int term_confirm(const char *question, const char *always_label, const char *pro
     const char *keys[4] = { "y", "a", project_label ? "p" : "n", "n" };
     int nopt = project_label ? 4 : 3, no_i = nopt - 1;
     int sel = 0, drawn = 0, choice = -1;
+    sb_pause(true);   /* the menu is transient; only its collapsed final line is conversation content */
     for (;;) {
         layout_sync();
         int width = term_width();
@@ -999,7 +1270,9 @@ int term_confirm(const char *question, const char *always_label, const char *pro
     }
     /* collapse the menu into a single line */
     if (drawn) printf("\x1b[%dA", drawn);
-    printf("\r\x1b[J  " C_YELLOW "%s" C_RESET "  %s\n", question,
+    printf("\r\x1b[J");
+    sb_pause(false);
+    printf("  " C_YELLOW "%s" C_RESET "  %s\n", question,
            choice == 0 ? C_GREEN "yes" C_RESET : choice == 1 ? C_GREEN "yes, always this session" C_RESET
            : (nopt == 4 && choice == 2) ? C_GREEN "yes, always in this project" C_RESET : C_RED "no" C_RESET);
     term_status_refresh();
@@ -1083,6 +1356,7 @@ int term_select(const char *title, const char **items, const char **descs, int n
     int max_show = 12;
     int top = 0;
     int result = -1;
+    sb_pause(true);   /* transient: not conversation content */
     for (;;) {
         /* filter */
         nvis = 0;
@@ -1135,6 +1409,7 @@ int term_select(const char *title, const char **items, const char **descs, int n
     printf("\r\x1b[J");
     term_status_refresh();
     fflush(stdout);
+    sb_pause(false);
     free(vis);
     return result;
 }

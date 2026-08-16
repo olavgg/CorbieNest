@@ -18,8 +18,12 @@
 
 #define CONF_EDIT_K 0
 #define CONF_BASH_K 1
-#define READ_CAP   (256 * 1024)
-#define OUT_CAP    (64 * 1024)
+/* Everything a tool returns lands in the model's context and is re-sent on every following
+ * round, so the caps are deliberately modest; the model is told to page with offset/limit. */
+#define READ_FILE_MAX (4 * 1024 * 1024)  /* bytes of a file we look at (offset/limit page inside this) */
+#define READ_LINES 2000                  /* default limit for read_file */
+#define READ_CAP   (64 * 1024)           /* max bytes one read_file call returns */
+#define OUT_CAP    (32 * 1024)           /* max bytes of bash/grep output fed back */
 #define MAX_ENTRIES 400
 
 static bool g_always_write = false, g_always_edit = false, g_always_bash = false;
@@ -196,7 +200,7 @@ cJSON *tools_definitions(void) {
     prop(p, "offset", "integer", "Optional 1-based line number to start reading from.");
     prop(p, "limit", "integer", "Optional maximum number of lines to return.");
     cJSON_AddItemToArray(arr, mk_tool("read_file",
-        "Read a text file. Returns the content with line numbers. Use offset/limit for large files.",
+        "Read a text file. Returns the content with line numbers; by default the first 2000 lines (at most 64 KB). Use offset/limit to page through larger files, and read only what you need.",
         p, (const char*[]){"path", NULL}));
 
     p = cJSON_CreateObject();
@@ -226,14 +230,14 @@ cJSON *tools_definitions(void) {
     prop(p, "path", "string", "File or directory to search recursively. Defaults to the current working directory.");
     prop(p, "include", "string", "Optional glob to restrict files, e.g. \"*.c\" or \"*.py\".");
     cJSON_AddItemToArray(arr, mk_tool("grep",
-        "Search file contents recursively with a regular expression. Returns matching lines as path:line:text.",
+        "Search file contents recursively with a regular expression. Returns matching lines as path:line:text (at most 300 lines / 32 KB, so narrow the pattern, path or include glob rather than grepping broadly).",
         p, (const char*[]){"pattern", NULL}));
 
     p = cJSON_CreateObject();
     prop(p, "command", "string", "The shell command to run (executed with /bin/sh -c). Use it for git, build tools, tests, package managers, find, etc.");
     prop(p, "timeout", "integer", "Optional timeout in seconds (default 120, max 600).");
     cJSON_AddItemToArray(arr, mk_tool("bash",
-        "Run a shell command in the working directory and return its combined stdout/stderr and exit code. Use for git operations, running builds/tests, installing packages, and anything the other tools do not cover. Avoid interactive commands.",
+        "Run a shell command in the working directory and return its combined stdout/stderr and exit code. Use for git operations, running builds/tests, installing packages, and anything the other tools do not cover. Avoid interactive commands. Output is capped at 32 KB (head and tail are kept), so filter or paginate noisy commands (| tail, | head, -q flags).",
         p, (const char*[]){"command", NULL}));
 
     p = cJSON_CreateObject();
@@ -341,21 +345,25 @@ static tool_status t_read_file(cJSON *args, sbuf *out) {
     char *p = expand_home(path);
     if (is_dir(p)) { sb_printf(out, "error: %s is a directory (use list_dir)", path); free(p); return TOOL_ERROR; }
     size_t len = 0;
-    char *d = read_whole_file(p, &len, READ_CAP + 1);
+    char *d = read_whole_file(p, &len, READ_FILE_MAX);
     if (!d) { sb_printf(out, "error: cannot read %s: %s", path, strerror(errno)); free(p); return TOOL_ERROR; }
-    bool truncated = len > READ_CAP;
-    if (truncated) len = READ_CAP;
     /* binary check */
     for (size_t i = 0; i < len && i < 4096; i++) if (d[i] == 0) { sb_printf(out, "error: %s appears to be a binary file", path); free(d); free(p); return TOOL_ERROR; }
     int offset = jint(args, "offset", 1), limit = jint(args, "limit", 0);
     if (offset < 1) offset = 1;
+    bool explicit_limit = limit > 0;
+    if (!explicit_limit) limit = READ_LINES;
     int lineno = 0, emitted = 0;
+    bool capped = false;   /* stopped early: default line limit or byte cap reached with more of the file left */
+    size_t start = out->len;
     const char *s = d, *end = d + len;
     while (s < end) {
         const char *e = memchr(s, '\n', (size_t)(end - s));
         size_t n = e ? (size_t)(e - s) : (size_t)(end - s);
         lineno++;
-        if (lineno >= offset && (limit <= 0 || emitted < limit)) {
+        if (lineno >= offset) {
+            if (emitted >= limit) { capped = !explicit_limit; break; }   /* the model asked for exactly this many */
+            if (emitted > 0 && out->len - start + n > READ_CAP) { capped = true; break; }
             sb_printf(out, "%6d| ", lineno);
             sb_append(out, s, n);
             sb_putc(out, '\n');
@@ -363,10 +371,10 @@ static tool_status t_read_file(cJSON *args, sbuf *out) {
         }
         if (!e) break;
         s = e + 1;
-        if (limit > 0 && emitted >= limit) break;
     }
     if (emitted == 0) sb_printf(out, "(no lines in range; file has %d lines)\n", lineno);
-    if (truncated && (limit <= 0)) sb_printf(out, "\n[file truncated at %d KB; use offset/limit to read more]\n", READ_CAP / 1024);
+    else if (capped) sb_printf(out, "\n[showing lines %d-%d; more follows: call read_file again with offset=%d]\n", offset, lineno - 1, lineno);
+    else if (len >= READ_FILE_MAX) sb_printf(out, "\n[file is larger than %d MB; only the beginning was read]\n", READ_FILE_MAX / (1024 * 1024));
     free(d); free(p);
     return TOOL_OK;
 }

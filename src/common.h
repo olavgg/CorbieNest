@@ -60,14 +60,17 @@ typedef struct {
     char *system_prompt; /* extra system prompt from CLI/config */
     int   num_ctx;       /* 0 = leave to server default */
     double temperature;  /* <0 = unset */
-    int   think;         /* -1 unset, 0 off, 1 on */
+    int   think;         /* -1 auto (server default on the first call of a request, off for tool rounds), 0 off, 1 on for every call */
+    char *think_level;   /* "low"|"medium"|"high" for models with thinking levels (gpt-oss); NULL = plain on/off */
     bool  show_thinking; /* print thinking tokens */
     int   mode;          /* permission mode, see MODE_* */
     bool  no_tools;      /* don't send tools at all */
     bool  color;
     int   max_iters;     /* tool loop guard */
     bool  interactive;   /* stdin is a tty */
-    bool  memory;        /* keep .corbienest/memory.md up to date after each request */
+    bool  memory;        /* keep .corbienest/memory.md up to date (see memory_every) */
+    int   memory_every;  /* run the memory-extraction call after this many requests (also at exit, /clear, /compact, /cd) */
+    char *keep_alive;    /* ollama keep_alive for the model ("30m", "-1" = forever, "0" = unload); NULL = server default */
 } config_t;
 
 extern config_t g_cfg;
@@ -82,6 +85,8 @@ typedef struct {
     int  tool_calls;         /* tools executed */
     double model_seconds;    /* wall time spent waiting on the model (from Ollama's total_duration) */
     double eval_seconds;     /* generation time (Ollama's eval_duration) */
+    double think_seconds;    /* of which: thinking (before the first visible token) */
+    long   think_chunks;
     time_t started;          /* session start (for /cost) */
 } session_stats;
 extern session_stats g_session;
@@ -239,8 +244,23 @@ typedef struct {
     int    prompt_tokens;
     int    eval_tokens;
     double eval_seconds;
+    double prompt_seconds;   /* prompt evaluation ("prefill") time; large = the KV cache missed */
+    double think_seconds;    /* time from the first thinking chunk to the first content/tool chunk */
+    int    think_chunks;     /* streamed thinking chunks (≈ tokens) */
     double total_seconds;
+    char   done_reason[16];  /* "stop", "length" (num_predict hit), "" if unknown */
 } chat_stats;
+
+/* Per-call overrides for ollama_chat(); set before a call and reset with ollama_call_reset()
+ * (like ollama_quiet). Callers that don't touch them get the session defaults. */
+typedef struct {
+    int         think;        /* -1 = use g_cfg.think, 0 = force off (only sent if the model can think), 1 = on */
+    int         num_predict;  /* >0 = cap on generated tokens */
+    const char *busy;         /* status-bar label while generating (default "generating") */
+} ollama_call_opts;
+extern ollama_call_opts ollama_call;
+void ollama_call_reset(void);
+extern bool g_model_think;  /* current model advertises the "thinking" capability (set by main.c) */
 
 /* Streams a chat completion. `messages` is a cJSON array (borrowed).
  * On success returns a new cJSON assistant message object (caller owns).
@@ -252,6 +272,9 @@ cJSON *ollama_list_models(void);
 int    ollama_ping(char *ver, size_t verlen);
 /* Context length the model was trained for (from /api/show), 0 if unknown. */
 int    ollama_model_context_length(const char *model);
+/* Where a loaded model lives (from /api/ps): total bytes and bytes in GPU memory.
+ * Returns 0 and fills both when the model is loaded, -1 if not loaded/unknown. */
+int    ollama_model_placement(const char *model, double *size, double *size_vram);
 /* Recover tool calls that a model emitted as text (exposed for tests). */
 cJSON *parse_text_tool_calls(const char *content);
 
