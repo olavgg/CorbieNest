@@ -47,16 +47,36 @@ exit your shell is back exactly as it was (use `/save` to keep a transcript).
 
 ## Build
 
-Dependencies: a C11 compiler, `make`, and [cJSON](https://github.com/DaveGamble/cJSON)
-(`sudo apt install libcjson-dev` on Debian/Ubuntu, `brew install cjson` on macOS).
-No libcurl, no ncurses — HTTP is done over plain POSIX sockets and the UI uses ANSI escapes.
+Dependencies: a C11 compiler, `make`, and [cJSON](https://github.com/DaveGamble/cJSON) —
+that's all. No libcurl, no ncurses: HTTP is done over plain POSIX sockets and the UI uses
+ANSI escapes. (`python3` is only needed to run the test suite.)
+
+```sh
+# Debian 13 (trixie) / Ubuntu 26.04 (resolute)
+sudo apt install build-essential libcjson-dev
+
+# Fedora 44
+sudo dnf install gcc make cjson-devel
+
+# RHEL 10 / AlmaLinux 10 / Rocky Linux 10 — cjson comes from EPEL
+sudo dnf install epel-release          # on RHEL: dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
+sudo dnf install gcc make cjson-devel
+
+# macOS
+brew install cjson
+```
+
+Then:
 
 ```sh
 make
-./corbienest                 # run in the current directory
+./corbienest               # run in the current directory
 make release               # optimized, stripped binary (no debug info) — clean rebuild
 sudo make install          # optional: installs to /usr/local/bin
 ```
+
+On macOS Homebrew installs outside the default search paths, so point the build at it:
+`make CFLAGS="-O2 -std=gnu11 -I$(brew --prefix)/include" LDLIBS="-L$(brew --prefix)/lib -lcjson"`.
 
 You need [Ollama](https://ollama.com) running (`ollama serve`) with at least one model
 pulled. For the agentic features (files/shell/git) pick a model with **tool** support,
