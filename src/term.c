@@ -73,13 +73,16 @@ enum {
     K_CTRL_LEFT, K_CTRL_RIGHT, K_SHIFT_TAB
 };
 
-/* ---------- full screen + status bar ---------- */
-/* In full-screen mode the app owns the alternate screen; rows 1..N-1 form the
- * scrolling region for the conversation and row N holds the status bar. Every
- * redraw that uses "\x1b[J" (erase to end of screen) also wipes the bar, so the
- * editor / menus append the bar again after each redraw (see bar_append). */
+/* ---------- full screen + input field + status bar ---------- */
+/* In full-screen mode the app owns the alternate screen. The bottom rows are the app's
+ * chrome — the input field (a rule, the prompt, a rule) and the status bar on the last
+ * row — and the rows above them form the scrolling region for the conversation. Every
+ * redraw that uses "\x1b[J" (erase to end of screen) also wipes the chrome, so the
+ * editor / menus append it again after each redraw (see chrome_append). */
 static bool g_fs = false;
 static int  g_fs_rows = 0, g_fs_cols = 0;   /* size the scroll region was set up for */
+static int  g_fs_reserved = 0;              /* ... and how many bottom rows it left out */
+static int  g_conv_row = 1, g_conv_col = 1; /* where conversation output continues while the editor owns the cursor */
 static long g_live_out = 0;                 /* output tokens of the generation in flight */
 static struct timeval g_live_t;             /* last live redraw (throttle) */
 static const char *g_busy = NULL;           /* activity label shown (animated) in the bar; NULL = idle */
@@ -137,35 +140,16 @@ static void bar_build(sbuf *o, int cols) {
         busy_w = vis_width(busy);
         if (busy_w + SEP_W + 24 <= room) room -= busy_w + SEP_W; else busy_w = 0;
     }
-    /* mode segment (icon is 2 cells + space), followed by the how-to-switch hint */
+    /* mode segment (icon is 2 cells + space), followed by the how-to-switch hint.
+     * (What is being typed while the model works is shown in the input field above.) */
     sb_printf(o, " %s%s %s" C_RESET, col, icon, text);
     used = 1 + 3 + vis_width(text);
-    /* text being typed while the model works: echo it here (it is not in the editor
-     * yet), in place of the hint / model / token segments, keeping the tail visible */
-    char *typing = g_busy ? ta_pending_text() : NULL;
-    if (typing) {
-        for (char *p = typing; *p; p++) if (*p == '\n') *p = ' ';
-        int tw = vis_width(typing), avail = room - used - SEP_W - 4;   /* "› " + "▏" + slack */
-        if (avail >= 4) {
-            sb_puts(o, C_DIM " │ › " C_RESET);
-            const char *p = typing;
-            if (tw > avail) {
-                int cut = tw - (avail - 1);
-                while (cut > 0 && *p) { if (((unsigned char)p[1] & 0xC0) != 0x80) cut--; p++; }
-                while (*p && ((unsigned char)*p & 0xC0) == 0x80) p++;
-                sb_puts(o, "…"); used += 1;
-            }
-            sb_puts(o, p); sb_puts(o, C_DIM "▏" C_RESET);
-            used += SEP_W + 2 + vis_width(p) + 1;
-        }
-        free(typing);
-    }
-    if (!typing) {
+    {
         int hw = vis_width(hint);
         if (used + 1 + hw + 20 <= room) { sb_printf(o, C_DIM " %s" C_RESET, hint); used += 1 + hw; }
     }
     /* model (truncate if needed) */
-    if (!typing) {
+    {
         int mw = vis_width(model), avail = room - used - SEP_W;
         if (avail >= 6) {
             sb_puts(o, C_DIM " │ " C_RESET);
@@ -185,7 +169,7 @@ static void bar_build(sbuf *o, int cols) {
         if (qw <= avail) { sb_puts(o, C_DIM " │ " C_RESET); sb_printf(o, C_ORANGE "%s" C_RESET, q); used += SEP_W + qw; }
     }
     /* tokens */
-    if (!typing) {
+    {
         int lw = vis_width(seg_tok_long), sw = vis_width(seg_tok), avail = room - used - SEP_W;
         const char *pick = lw <= avail ? seg_tok_long : sw <= avail ? seg_tok : NULL;
         if (pick) {
@@ -194,7 +178,7 @@ static void bar_build(sbuf *o, int cols) {
             used += SEP_W + vis_width(pick);
         }
     }
-    if (ctx[0] && !typing) {
+    if (ctx[0]) {
         int cw = vis_width(ctx), avail = room - used - SEP_W;
         if (cw <= avail) {
             int pct = atoi(ctx + 4);
@@ -208,6 +192,177 @@ static void bar_build(sbuf *o, int cols) {
         sb_printf(o, C_DIM " │ " C_RESET C_ORANGE "%s" C_RESET, busy);
     }
     #undef SEP_W
+}
+
+/* ---------- the input field ----------
+ * The bottom of the screen always shows the prompt, framed by a rule above and below,
+ * with the status bar underneath — so it is visible that input is accepted even while
+ * the model works (Claude Code does the same):
+ *
+ *     ──────────────────────────────────────────
+ *     ❯ what you are typing
+ *     ──────────────────────────────────────────
+ *      ⏵  manual mode │ qwen2.5-coder:7b │ 4.3k tokens
+ *
+ * The editor (readline_impl) draws into it and owns the cursor there (g_field_focus);
+ * while the model works the field shows the type-ahead instead, so keystrokes are
+ * visible before Enter turns them into a queued message. The field grows with the text
+ * up to FIELD_MAX_ROWS rows (then it scrolls, keeping the cursor row visible), and the
+ * scroll region shrinks to match (see layout_sync).
+ * All of this is drawn with absolute cursor moves inside sb_pause(): it is not
+ * conversation content, and the DECSC slot belongs to the editor (see conv_save). */
+#define FIELD_MAX_ROWS 10
+static const char *FIELD_PROMPT = C_BOLD C_ORANGE "❯ " C_RESET;
+static const char *g_field_prompt = NULL;   /* NULL = FIELD_PROMPT (the editor overrides it for Ctrl-R) */
+static const char *field_prompt(void) { return g_field_prompt ? g_field_prompt : FIELD_PROMPT; }
+static int  g_field_rows = 1;          /* input rows the field currently shows */
+static bool g_field_focus = false;     /* the editor owns the terminal cursor */
+static const char *g_field_text = "";  /* text shown in the field (the editor's buffer) */
+static size_t g_field_len = 0, g_field_cur = 0;
+static int  g_field_view = 0;          /* first visible wrapped row, when the text is taller */
+
+/* rows the app owns at the bottom: the two rules, the input rows and the status bar.
+ * On a terminal too short to spare them, only the bar is kept. */
+#define FIELD_MIN_ROWS 6
+static int fs_reserved_for(int rows) { return g_fs && rows >= FIELD_MIN_ROWS ? g_field_rows + 3 : 1; }
+static int fs_reserved(void) { return fs_reserved_for(g_fs_rows); }
+/* last row of the scrolling region (the conversation) */
+static int fs_region(void) { int r = g_fs_rows - fs_reserved(); return r < 1 ? 1 : r; }
+
+/* (row, col) reached after `len` bytes of `s`, starting at column `col0`, wrapping at
+ * `width`. Shared by the field and the editor's cursor arithmetic. */
+static void wrap_pos(const char *s, size_t len, int width, int col0, int *row, int *col) {
+    if (width < 1) width = 1;
+    int r = 0, c = col0;
+    if (c >= width) { r = c / width; c %= width; }
+    for (size_t i = 0; i < len; ) {
+        if (s[i] == '\n') { r++; c = 0; i++; continue; }
+        c++;
+        if (c >= width) { r++; c = 0; }
+        i = u8_next(s, i, len);
+    }
+    *row = r; *col = c;
+}
+
+/* byte offset where wrapped row `want` of the field text starts */
+static size_t field_row_start(int width, int col0, int want) {
+    if (want <= 0) return 0;
+    if (width < 1) width = 1;
+    int r = 0, c = col0;
+    if (c >= width) { r = c / width; c %= width; }
+    for (size_t i = 0; i < g_field_len; ) {
+        if (g_field_text[i] == '\n') { r++; c = 0; i++; if (r == want) return i; continue; }
+        c++;
+        size_t nx = u8_next(g_field_text, i, g_field_len);
+        if (c >= width) { r++; c = 0; if (r == want) return nx; }
+        i = nx;
+    }
+    return g_field_len;
+}
+
+/* How many rows the current field text needs, and where its cursor sits. */
+static void field_metrics(int *need, int *crow, int *ccol) {
+    int width = g_fs_cols > 2 ? g_fs_cols : 2;
+    int plen = vis_width(field_prompt());
+    int erow, ecol;
+    wrap_pos(g_field_text, g_field_len, width, plen, &erow, &ecol);
+    wrap_pos(g_field_text, g_field_cur, width, plen, crow, ccol);
+    (void)ecol;
+    *need = erow + 1;
+}
+
+/* Recompute how tall the field has to be; returns true when it changed (the caller
+ * re-applies the scroll region through layout_sync). */
+static bool field_sync_rows(void) {
+    int need, crow, ccol;
+    field_metrics(&need, &crow, &ccol);
+    int max = FIELD_MAX_ROWS;
+    if (max > g_fs_rows - FIELD_MIN_ROWS) max = g_fs_rows - FIELD_MIN_ROWS;   /* always leave room to read */
+    if (max < 1) max = 1;
+    int rows = need < max ? need : max;
+    if (crow < g_field_view) g_field_view = crow;
+    if (crow >= g_field_view + rows) g_field_view = crow - rows + 1;
+    if (g_field_view > need - rows) g_field_view = need - rows;
+    if (g_field_view < 0) g_field_view = 0;
+    if (rows == g_field_rows) return false;
+    g_field_rows = rows;
+    return true;
+}
+
+static void rule_row(sbuf *o, int row) {
+    sb_printf(o, "\x1b[%d;1H" C_DIM, row);
+    for (int i = 0; i < g_fs_cols; i++) sb_puts(o, "─");
+    sb_puts(o, C_RESET "\x1b[K");
+}
+
+/* Draw the field with absolute moves. `typed` is the type-ahead shown when the editor
+ * is not the one holding the field (i.e. the model is working). */
+static void field_draw(sbuf *o, const char *typed) {
+    if (!g_fs || g_fs_rows < FIELD_MIN_ROWS) return;
+    int top = g_fs_rows - g_field_rows - 2;   /* row of the upper rule */
+    int width = g_fs_cols > 2 ? g_fs_cols : 2;
+    rule_row(o, top);
+    for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;1H\x1b[K", top + 1 + i);
+    sb_printf(o, "\x1b[%d;1H", top + 1);
+    if (!g_field_view) sb_puts(o, field_prompt());
+    if (typed) {
+        /* not the editor's text: one line, tail kept, with a block for the cursor */
+        int avail = width - vis_width(field_prompt()) - 2;
+        char *t = xstrdup(typed);
+        for (char *p = t; *p; p++) if (*p == '\n') *p = ' ';
+        const char *p = t;
+        int tw = vis_width(t);
+        if (avail > 1 && tw > avail) {
+            int cut = tw - (avail - 1);
+            while (cut > 0 && *p) { if (((unsigned char)p[1] & 0xC0) != 0x80) cut--; p++; }
+            while (*p && ((unsigned char)*p & 0xC0) == 0x80) p++;
+            sb_puts(o, "…");
+        }
+        sb_puts(o, p); sb_puts(o, C_DIM "▏" C_RESET);
+        free(t);
+    } else if (g_field_len) {
+        int plen = vis_width(field_prompt());
+        size_t from = field_row_start(width, plen, g_field_view);
+        for (int i = 0; i < g_field_rows; i++) {
+            size_t to = field_row_start(width, plen, g_field_view + i + 1);
+            if (from >= g_field_len && i) break;
+            if (to > g_field_len) to = g_field_len;
+            sb_printf(o, "\x1b[%d;1H", top + 1 + i);
+            if (i == 0 && g_field_view == 0) sb_puts(o, field_prompt());
+            size_t n = to > from ? to - from : 0;
+            while (n && g_field_text[from + n - 1] == '\n') n--;
+            sb_append(o, g_field_text + from, n);
+            sb_puts(o, C_RESET "\x1b[K");
+            from = to;
+        }
+    }
+    rule_row(o, g_fs_rows - 1);
+}
+
+/* Where conversation output continues on screen, without asking the terminal: the
+ * scrollback model has produced N visual rows since the last clear and the region shows
+ * their tail, so the cursor sits on row min(N, region) — at the bottom once it is full. */
+typedef struct { int line; size_t off, len; } sb_row;
+static sb_row *sb_rows(int width, int *count);
+static int  g_sb_col;                 /* visual column of the scrollback cursor in its line */
+static bool g_sb_active;              /* stdout is hooked (see sb_hook_stdout) */
+static void conv_pos(int region, int *row, int *col) {
+    int n = 1;
+    fflush(stdout);   /* the model only sees what left stdio's buffer */
+    if (g_sb_active && g_fs_cols > 0) { int c = 0; free(sb_rows(g_fs_cols, &c)); if (c > 0) n = c; }
+    *row = n > region ? region : n;
+    *col = (g_fs_cols > 0 ? g_sb_col % g_fs_cols : 0) + 1;
+}
+
+/* Put the terminal cursor where the editor's cursor is inside the field. */
+static void field_cursor(sbuf *o) {
+    if (!g_fs || g_fs_rows < FIELD_MIN_ROWS) return;
+    int need, crow, ccol;
+    field_metrics(&need, &crow, &ccol);
+    int row = g_fs_rows - g_field_rows - 1 + (crow - g_field_view);
+    if (row < g_fs_rows - g_field_rows - 1) row = g_fs_rows - g_field_rows - 1;
+    if (row > g_fs_rows - 2) row = g_fs_rows - 2;
+    sb_printf(o, "\x1b[%d;%dH", row, ccol + 1);
 }
 
 /* Ask the terminal where the cursor is (CSI 6n). Bytes the user typed meanwhile
@@ -241,41 +396,75 @@ static bool query_cursor(int *row, int *col) {
     return ok;
 }
 
-/* Must run before any redraw. If the terminal was resized: re-apply the scroll
- * region for the new size and, when the shrink pushed the cursor onto the reserved
- * bottom row, scroll the region up one line (IND) so that the caller's relative
- * "cursor up N, erase, redraw" still lands inside the region. Writes to stdout. */
+/* Must run before any redraw. When the terminal was resized, or the input field grew or
+ * shrank, re-apply the scroll region for the new geometry; if that leaves the cursor
+ * below the region — a shrink under it — scroll the region up (IND) by as much, so that
+ * output and the caller's relative "cursor up N, erase, redraw" stay inside it. None of
+ * this is conversation content, so it is written with the scrollback capture paused. */
 static void layout_sync(void) {
     if (!g_fs) return;
     int rows, cols; term_size(&rows, &cols);
-    if (rows == g_fs_rows && cols == g_fs_cols) return;
+    int reserved = fs_reserved_for(rows);
+    if (rows == g_fs_rows && cols == g_fs_cols && reserved == g_fs_reserved) return;
     bool first = g_fs_rows == 0;
-    g_fs_rows = rows; g_fs_cols = cols;
+    int was = first ? 0 : g_fs_rows - g_fs_reserved;   /* previous last row of the region */
+    g_fs_rows = rows; g_fs_cols = cols; g_fs_reserved = reserved;
+    int region = fs_region();
     int crow = 1, ccol = 1;
-    bool known = first || query_cursor(&crow, &ccol);
-    fputs("\x1b" "7", stdout);                                   /* DECSTBM homes the cursor: bracket it */
-    if (rows > 1) printf("\x1b[1;%dr", rows - 1); else fputs("\x1b[r", stdout);
-    fputs("\x1b" "8", stdout);
-    if (!first && known && crow >= rows && rows > 1) printf("\x1b[%d;%dH\x1b" "D", rows - 1, ccol);
+    bool known = !first && (g_field_focus ? (conv_pos(was > 0 ? was : region, &crow, &ccol), true) : query_cursor(&crow, &ccol));
+    sb_pause(true);
+    if (known && crow > region && was > 0) {
+        printf("\x1b[1;%dr\x1b[%d;1H", was, was);           /* scroll inside the region it still has */
+        for (int i = crow - region; i > 0; i--) fputs("\x1b" "D", stdout);
+        crow = region;
+        if (g_field_focus) { g_conv_row = region; ccol = g_conv_col; }
+    }
+    if (known) {                                             /* DECSTBM homes the cursor: put it back */
+        printf("\x1b[1;%dr\x1b[%d;%dH", region, crow, ccol);
+    } else {
+        fputs("\x1b" "7", stdout);
+        printf("\x1b[1;%dr", region);
+        fputs("\x1b" "8", stdout);
+    }
+    sb_pause(false);
     fflush(stdout);
 }
 
-/* Draw the bar without disturbing the cursor: DECSC, jump to the last row, draw,
- * erase the rest of the row, DECRC. Callers run layout_sync() first. */
-static void bar_append(sbuf *o) {
-    if (!g_fs) return;
-    sb_printf(o, "\x1b" "7" "\x1b[%d;1H", g_fs_rows);
+/* Draw the status bar on the last row (absolute; the caller preserves the cursor). */
+static void bar_draw(sbuf *o) {
+    sb_printf(o, "\x1b[%d;1H", g_fs_rows);
     bar_build(o, g_fs_cols);
-    sb_puts(o, "\x1b[K" "\x1b" "8");
+    sb_puts(o, "\x1b[K");
+}
+
+/* Append the whole chrome — input field + status bar — without disturbing the cursor
+ * (DECSC/DECRC). For callers that erase to the end of the screen and redraw.
+ * Callers run layout_sync() first, and draw with the capture paused. */
+static void chrome_append(sbuf *o) {
+    if (!g_fs) return;
+    char *typed = g_busy && !g_field_focus ? ta_pending_text() : NULL;
+    sb_puts(o, "\x1b" "7");
+    field_draw(o, typed);
+    bar_draw(o);
+    sb_puts(o, "\x1b" "8");
+    free(typed);
 }
 
 void term_status_refresh(void) {
     if (!g_fs) return;
     layout_sync();
+    if (field_sync_rows()) layout_sync();   /* the field changed height: re-cut the region */
+    char *typed = g_busy && !g_field_focus ? ta_pending_text() : NULL;
     sbuf o; sb_init(&o);
-    bar_append(&o);
+    if (!g_field_focus) sb_puts(&o, "\x1b" "7");
+    field_draw(&o, typed);
+    bar_draw(&o);
+    if (g_field_focus) field_cursor(&o); else sb_puts(&o, "\x1b" "8");
+    sb_pause(true);
     fwrite(o.data, 1, o.len, stdout); fflush(stdout);
+    sb_pause(false);
     sb_free(&o);
+    free(typed);
     gettimeofday(&g_live_t, NULL);
 }
 
@@ -308,7 +497,8 @@ void term_busy_tick(void) {
 void term_fullscreen(bool on) {
     if (on && !g_fs) {
         sb_hook_stdout();   /* start recording the conversation for PgUp */
-        g_fs = true; g_fs_rows = g_fs_cols = 0; g_live_out = 0;
+        g_fs = true; g_fs_rows = g_fs_cols = g_fs_reserved = 0; g_live_out = 0;
+        g_field_rows = 1; g_field_view = 0; g_conv_row = g_conv_col = 1;
         fputs("\x1b[?1049h\x1b[H\x1b[2J", stdout);   /* alternate screen, cleared */
         term_status_refresh();                       /* also sets the scroll region */
     } else if (!on && g_fs) {
@@ -320,6 +510,7 @@ void term_fullscreen(bool on) {
 
 void term_clear_screen(void) {
     fputs("\x1b[H\x1b[2J", stdout);
+    g_conv_row = g_conv_col = 1;   /* the conversation starts over at the top of the region */
     term_status_refresh();
     fflush(stdout);
 }
@@ -329,17 +520,18 @@ void term_clear_screen(void) {
  * conversation prints to stdout is teed (see sb_hook_stdout) into a list of logical lines,
  * with SGR colours kept and the few cursor movements we use (CR, cursor up/down/right,
  * erase line / erase below, DECSC…DECRC around the status bar) interpreted so the model
- * tracks what is on screen. Drawing that is not conversation content — the line editor, the
- * menus, the viewer itself — runs with the capture paused (sb_pause), and the editor adds
- * the submitted line explicitly (sb_note). PgUp at the prompt opens the viewer
+ * tracks what is on screen. Drawing that is not conversation content — the bottom chrome, the
+ * menus, the viewer itself — runs with the capture paused (sb_pause); the field editor prints
+ * its submitted line as ordinary output, the inline one notes it (sb_note). It is also what
+ * tells the field editor where the transcript ended (conv_pos). PgUp at the prompt opens the viewer
  * (scroll_view): the region shows a window into the buffer, PgDn/End/Esc go back. */
 #define SB_MAX_LINES 8000
 static sbuf *g_sb = NULL;             /* logical lines */
 static int   g_sb_n = 0, g_sb_cap = 0;
 static int   g_sb_line = 0;           /* cursor: line index ... */
-static int   g_sb_col = 0;            /* ... and visual column in it (>= width means a wrapped row) */
+/* g_sb_col: visual column in that line (>= width means a wrapped row), declared with the field */
 static bool  g_sb_pause = false;      /* not conversation output: don't record */
-static bool  g_sb_active = false;     /* stdout is hooked */
+/* g_sb_active / g_sb_col are declared with the input field, which uses them */
 static int   g_sb_decsc = 0;          /* inside DECSC…DECRC (status bar): ignore */
 static char  g_sb_seq[48]; static int g_sb_seqn = -1;   /* escape sequence being collected (-1 = none) */
 static bool  g_sb_cr = false;         /* a CR was seen; \r\n must not clear the line */
@@ -506,7 +698,6 @@ void term_line_break(void) {
 }
 
 /* visual rows of the buffer at the given width: (line, byte offset, byte length) triples */
-typedef struct { int line; size_t off, len; } sb_row;
 static sb_row *sb_rows(int width, int *count) {
     if (width < 1) width = 1;
     int cap = 256, n = 0; sb_row *r = xmalloc(sizeof *r * (size_t)cap);
@@ -530,7 +721,7 @@ static void scroll_view(void) {
     int top = -1;   /* -1 = not yet placed: start one page above the bottom (that is what PgUp asked for) */
     for (;;) {
         layout_sync();
-        int rows = g_fs_rows - 1, cols = g_fs_cols; if (rows < 1) rows = 1;
+        int rows = fs_region(), cols = g_fs_cols;
         int nrows; sb_row *r = sb_rows(cols, &nrows);
         int maxtop = nrows > rows ? nrows - rows : 0;
         if (top < 0) top = maxtop - (rows - 1);
@@ -546,7 +737,7 @@ static void scroll_view(void) {
         char hint[160];
         snprintf(hint, sizeof hint, "↑ scrollback · rows %d-%d of %d · PgUp/PgDn ↑/↓ scroll · End/Esc/Enter back", nrows ? top + 1 : 0, top + rows < nrows ? top + rows : nrows, nrows);
         g_bar_override = hint;
-        bar_append(&o);
+        chrome_append(&o);
         g_bar_override = NULL;
         fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o);
         int k = read_key();
@@ -562,11 +753,11 @@ static void scroll_view(void) {
         if (top >= maxtop) break;   /* scrolled back down to the live view: leave the viewer */
     }
     /* back: redraw the tail of the buffer from the top of the region and leave the cursor on
-     * the row after it — the caller (the editor) redraws its prompt there */
-    int rows = g_fs_rows - 1, cols = g_fs_cols; if (rows < 1) rows = 1;
+     * the row after it — that is where conversation output continues */
+    int rows = fs_region(), cols = g_fs_cols;
     int nrows; sb_row *r = sb_rows(cols, &nrows);
-    if (nrows && g_sb_n && g_sb[g_sb_n - 1].len == 0) nrows--;   /* the cursor sits on an empty last line: that is the prompt's row */
-    int show = nrows < rows - 1 ? nrows : rows - 1;   /* leave a row for the prompt */
+    if (nrows && g_sb_n && g_sb[g_sb_n - 1].len == 0) nrows--;   /* the cursor sits on an empty last line */
+    int show = nrows < rows - 1 ? nrows : rows - 1;
     sbuf o; sb_init(&o);
     sb_puts(&o, "\x1b[H\x1b[2J");
     for (int i = 0; i < show; i++) {
@@ -575,7 +766,8 @@ static void scroll_view(void) {
         sb_append(&o, g_sb[r[idx].line].data + r[idx].off, r[idx].len); sb_puts(&o, C_RESET);
     }
     sb_printf(&o, "\x1b[%d;1H", show + 1);
-    bar_append(&o);
+    g_conv_row = show + 1; g_conv_col = 1;
+    chrome_append(&o);
     fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o); free(r);
     sb_pause(false);
 }
@@ -914,32 +1106,49 @@ static int vis_width(const char *s) {   /* width of prompt ignoring escapes */
     return w;
 }
 
-/* ---------- editor ---------- */
+/* ---------- editor ----------
+ * In full-screen mode the main prompt lives in the input field at the bottom of the
+ * screen (in_field): the editor only hands its buffer to the field and lets
+ * term_status_refresh() draw it, and it keeps the terminal cursor there. Conversation
+ * output from inside the editor — completion candidates, hints, the submitted line —
+ * goes through ed_conv_out(), which jumps back to where the transcript ended.
+ * term_ask_line() (a question inside a turn) keeps drawing inline, as before. */
 typedef struct {
     sbuf buf;
     size_t cur;          /* byte offset of cursor */
     const char *prompt;
     int plen;
-    int prev_cursor_row; /* row (relative to first line) where cursor was after last refresh */
+    bool in_field;       /* drawn in the bottom input field rather than inline */
+    int prev_cursor_row; /* row (relative to first line) where cursor was after last refresh (inline only) */
     int hist_idx;        /* g_hist_n == not browsing */
     char *hist_saved;    /* current line saved when browsing */
 } editor;
 
 /* compute (row,col) at byte offset `upto`, walking from prompt. Returns via out params. */
 static void ed_pos(editor *e, size_t upto, int width, int *row, int *col) {
-    int r = 0, c = e->plen;
-    if (c >= width) { r = c / width; c %= width; }
-    for (size_t i = 0; i < upto && i < e->buf.len; ) {
-        unsigned char ch = (unsigned char)e->buf.data[i];
-        if (ch == '\n') { r++; c = 0; i++; continue; }
-        c++;
-        if (c >= width) { r++; c = 0; }
-        i = u8_next(e->buf.data, i, e->buf.len);
-    }
-    *row = r; *col = c;
+    wrap_pos(e->buf.data ? e->buf.data : "", upto < e->buf.len ? upto : e->buf.len, width, e->plen, row, col);
+}
+
+/* Print conversation content while the editor owns the cursor in the field. */
+static void ed_conv_out(editor *e, const char *text) {
+    if (!e->in_field) { fputs(text, stdout); return; }
+    sb_pause(true);
+    printf("\x1b[%d;%dH", g_conv_row, g_conv_col);
+    fflush(stdout);
+    sb_pause(false);
+    fputs(text, stdout);
+    fflush(stdout);
+    conv_pos(fs_region(), &g_conv_row, &g_conv_col);
 }
 
 static void ed_refresh(editor *e) {
+    if (e->in_field) {
+        g_field_text = e->buf.data ? e->buf.data : "";
+        g_field_len = e->buf.len;
+        g_field_cur = e->cur;
+        term_status_refresh();
+        return;
+    }
     layout_sync();
     int width = term_width();
     sbuf o; sb_init(&o);
@@ -959,7 +1168,7 @@ static void ed_refresh(editor *e) {
     sb_puts(&o, "\r");
     if (ccol > 0) sb_printf(&o, "\x1b[%dC", ccol);
     e->prev_cursor_row = crow;
-    bar_append(&o);   /* the "\x1b[J" above wiped the status bar; the mode may have changed too */
+    chrome_append(&o);   /* the "\x1b[J" above wiped the status bar; the mode may have changed too */
     sb_pause(true);   /* the live editor is not conversation content (sb_note adds the submitted line) */
     fwrite(o.data, 1, o.len, stdout);
     fflush(stdout);
@@ -1008,8 +1217,11 @@ static void ed_complete(editor *e) {
     }
     if (nm == 1) { ed_set(e, match); ed_insert(e, " ", 1); }
     else if (nm > 1) {
-        /* print candidates below, then redraw */
-        printf("\n" C_DIM "%s" C_RESET "\n", all.data);
+        /* list the candidates in the conversation, then redraw */
+        sbuf c; sb_init(&c);
+        sb_printf(&c, "%s" C_DIM "%s" C_RESET "\n", e->in_field ? "" : "\n", all.data);
+        ed_conv_out(e, c.data);
+        sb_free(&c);
         e->prev_cursor_row = 0;
         /* extend to common prefix */
         size_t cp = strlen(match);
@@ -1042,6 +1254,7 @@ static void ed_hist_search(editor *e) {
         /* newest match at or below `idx` (when the query changed, from the newest entry again) */
         snprintf(pbuf, sizeof pbuf, C_DIM "(reverse-i-search)" C_RESET "`%s': ", query);
         e->prompt = pbuf; e->plen = vis_width(pbuf);
+        if (e->in_field) g_field_prompt = pbuf;
         if (idx >= 0 && idx < g_hist_n) ed_set(e, g_hist[idx]); else if (ql) ed_set(e, ""); else ed_set(e, orig);
         ed_refresh(e);
         int k = read_key();
@@ -1065,17 +1278,24 @@ static void ed_hist_search(editor *e) {
         idx = i >= 0 ? i : g_hist_n;
     }
     e->prompt = saved_prompt; e->plen = saved_plen;
+    g_field_prompt = NULL;
     if (keep && idx < g_hist_n) e->hist_idx = idx;
     free(orig);
 }
 
-static char *readline_impl(const char *prompt) {
+static char *readline_impl(const char *prompt, bool in_field) {
     editor e; memset(&e, 0, sizeof e);
     sb_init(&e.buf); sb_append(&e.buf, "", 0);
     e.prompt = prompt; e.plen = vis_width(prompt);
+    e.in_field = in_field && g_fs;
     e.hist_idx = g_hist_n;
     term_raw(true);
     fputs("\x1b[?2004h", stdout);   /* bracketed paste on */
+    if (e.in_field) {
+        layout_sync();
+        conv_pos(fs_region(), &g_conv_row, &g_conv_col);
+        g_field_focus = true; g_field_view = 0; g_field_prompt = NULL;
+    }
     ed_refresh(&e);
     char *result = NULL;
     bool done = false;
@@ -1089,7 +1309,8 @@ static char *readline_impl(const char *prompt) {
         if (k == K_ESC && e.buf.len == 0) {
             if (esc_pending) { result = xstrdup("/rewind"); done = true; break; }
             esc_pending = true;
-            printf("\n" C_DIM "(press Esc again to rewind the conversation / files)" C_RESET "\n");
+            ed_conv_out(&e, e.in_field ? C_DIM "(press Esc again to rewind the conversation / files)" C_RESET "\n"
+                                       : "\n" C_DIM "(press Esc again to rewind the conversation / files)" C_RESET "\n");
             e.prev_cursor_row = 0;
             ed_refresh(&e);
             continue;
@@ -1107,7 +1328,8 @@ static char *readline_impl(const char *prompt) {
                 else {
                     ctrlc_count++;
                     if (ctrlc_count >= 2) { result = NULL; done = true; break; }
-                    printf("\n" C_DIM "(press Ctrl-C again or Ctrl-D to exit, /help for help)" C_RESET "\n");
+                    ed_conv_out(&e, e.in_field ? C_DIM "(press Ctrl-C again or Ctrl-D to exit, /help for help)" C_RESET "\n"
+                                               : "\n" C_DIM "(press Ctrl-C again or Ctrl-D to exit, /help for help)" C_RESET "\n");
                     e.prev_cursor_row = 0;
                 }
                 break;
@@ -1130,7 +1352,7 @@ static char *readline_impl(const char *prompt) {
             case 23: case K_ALT_BS: { size_t p = word_left(&e); ed_delete_range(&e, p, e.cur); e.cur = p; break; }  /* Ctrl-W */
             case 11: ed_delete_range(&e, e.cur, e.buf.len); break;   /* Ctrl-K */
             case 21: ed_delete_range(&e, 0, e.cur); e.cur = 0; break;   /* Ctrl-U */
-            case 12: term_clear_screen(); e.prev_cursor_row = 0; break;   /* Ctrl-L */
+            case 12: term_clear_screen(); e.prev_cursor_row = 0; ed_refresh(&e); break;   /* Ctrl-L */
             case 18: ed_hist_search(&e); break;                             /* Ctrl-R */
             case '\t': ed_complete(&e); break;
             case K_SHIFT_TAB: g_cfg.mode = (g_cfg.mode + 1) % MODE_COUNT; break;
@@ -1185,7 +1407,10 @@ static char *readline_impl(const char *prompt) {
                 if (q.len) ed_insert(&e, q.data, q.len);
                 sb_free(&p); sb_free(&q);
                 break; }
-            case K_PGUP: scroll_view(); e.prev_cursor_row = 0; break;
+            case K_PGUP:
+                scroll_view();
+                e.prev_cursor_row = 0;
+                break;
             case K_ESC: case K_PASTE_END: case K_PGDN: break;
             default:
                 if (k >= 32 && k < 256) {
@@ -1198,8 +1423,20 @@ static char *readline_impl(const char *prompt) {
         }
         if (!done) ed_refresh(&e);
     }
-    /* move cursor to end of input and newline */
-    {
+    /* Leave the field empty again and put what was submitted into the conversation, where
+     * the transcript continues — the field itself keeps no history of the turn. */
+    if (e.in_field) {
+        g_field_focus = false;
+        g_field_text = ""; g_field_len = g_field_cur = 0; g_field_view = 0; g_field_prompt = NULL;
+        sb_pause(true);
+        fputs("\x1b[?2004l", stdout);
+        printf("\x1b[%d;%dH", g_conv_row, g_conv_col);
+        fflush(stdout);
+        sb_pause(false);
+        if (result) printf("%s%s" C_RESET "\n", prompt, result);
+        else printf("\n");
+        term_status_refresh();
+    } else {   /* drawn inline (a question inside a turn): finish where it stands */
         int width = term_width();
         int erow, ecol, crow, ccol;
         ed_pos(&e, e.buf.len, width, &erow, &ecol);
@@ -1221,8 +1458,8 @@ static char *readline_impl(const char *prompt) {
     return result;
 }
 
-char *term_readline(const char *prompt) { return readline_impl(prompt); }
-char *term_ask_line(const char *prompt) { return readline_impl(prompt); }
+char *term_readline(const char *prompt) { return readline_impl(prompt, true); }
+char *term_ask_line(const char *prompt) { return readline_impl(prompt, false); }
 
 /* ---------- confirmation menu ---------- */
 int term_confirm(const char *question, const char *always_label, const char *project_label, char **reason) {
@@ -1263,7 +1500,7 @@ int term_confirm(const char *question, const char *always_label, const char *pro
                       : width >= 44 ? "↑/↓ · enter · 1-3 / y / a / n · esc = no" : "↑/↓ enter y/a/n esc");
         sb_puts(&o, C_RESET);
         drawn = lines;   /* cursor sits on the hint line, `lines` rows below the question */
-        bar_append(&o);
+        chrome_append(&o);
         fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o);
 
         int k = read_key();
@@ -1401,7 +1638,7 @@ int term_select(const char *title, const char **items, const char **descs, int n
         if (nvis == 0) { sb_puts(&o, C_DIM "  (no matches)" C_RESET "\n"); lines++; }
         if (nvis > max_show) { sb_printf(&o, C_DIM "  … %d of %d shown" C_RESET "\n", max_show < nvis ? max_show : nvis, nvis); lines++; }
         drawn = lines;
-        bar_append(&o);
+        chrome_append(&o);
         fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o);
 
         int k = read_key();

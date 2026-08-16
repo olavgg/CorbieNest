@@ -30,16 +30,20 @@ is shown to you and confirmed before it runs.
 ● Fixed the None handling in `src/parser.py:42`; both tests pass.
   ↳ 4120 in · 210 out · 62.3 tok/s · 4.1s · ctx 12%
 
-›
-
-
+────────────────────────────────────────────────────────────────────────────────────────
+❯ and now make it handle the empty file case
+────────────────────────────────────────────────────────────────────────────────────────
  ⏵  manual mode (shift+tab to cycle) │ qwen2.5-coder:7b │ 4.3k tokens (↑4.1k ↓210) │ ctx 12%
 ```
 
 corbienest takes over the terminal (alternate screen) while it runs, like Claude Code: the
-conversation scrolls in the upper part and the bottom row is a status bar showing the
-permission mode, the model, the tokens used this session (↑ prompt · ↓ generated, ticking
-while the model streams) and context usage. Whenever the app is waiting on something — the
+conversation scrolls in the upper part, and the bottom of the screen is the app's: an input
+field — a rule, the `❯` prompt, a rule — so it is always visible that input is accepted,
+even while the model works, and under it a status bar showing the permission mode, the
+model, the tokens used this session (↑ prompt · ↓ generated, ticking while the model
+streams) and context usage. The field grows with what you type (up to ten rows, then it
+scrolls) and the conversation region shrinks to match; what you send moves up into the
+transcript as a `›` line. Whenever the app is waiting on something — the
 model loading or generating, a tool's shell command, an Ollama request — an animated
 spinner with what it is waiting for (`⠋ generating`, `⠹ running command`, …) appears at the
 right end of the bar, and long waits also get an inline spinner with the elapsed time. On
@@ -144,8 +148,8 @@ corbienest [options] [-p PROMPT]
   its own, so corbienest keeps one): PgUp/PgDn/↑/↓ move, Home/End jump, Esc/Enter/PgDn at the bottom
   return to the prompt exactly as it was.
   Esc twice at an empty prompt opens `/rewind`.
-- **You can keep typing while the model works.** What you type shows up in the status bar as
-  you go (`› …▏`); press Enter to queue it as a message — add details,
+- **You can keep typing while the model works.** What you type shows up in the input field as
+  you go (`❯ …▏`); press Enter to queue it as a message — add details,
   narrow the request, change the spec — the status bar shows `N queued`, and the message is
   delivered at the next opportunity: between tool rounds (so the model sees it before its next
   step, alongside the tool result) or as the next turn once the current one finishes. Queue as
