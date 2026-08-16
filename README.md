@@ -5,35 +5,35 @@ A Claude-Code-style terminal coding agent written in plain C that talks to
 files, grep the codebase, and run shell and git commands — each mutating action
 is shown to you and confirmed before it runs.
 
-```
-╭──────────────────────────────────────────────────────────────╮
-│ 🐦‍⬛ Corbie Nest v0.1.0 — local coding agent for Ollama
-│ model: qwen3-coder:30b
-│ host:  http://127.0.0.1:11434 ● connected
-│ cwd:   ~/projects/myapp
-╰──────────────────────────────────────────────────────────────╯
-› fix the failing test in tests/test_parser.py
+```ansi
+[38;5;208m╭──────────────────────────────────────────────────────────────╮[0m
+[38;5;208m│[0m [1m🐦‍⬛ Corbie Nest[0m v0.1.0 — local coding agent for Ollama
+[38;5;208m│[0m [2mmodel:[0m qwen3-coder:30b
+[38;5;208m│[0m [2mhost: [0m http://127.0.0.1:11434 [32m● connected[0m
+[38;5;208m│[0m [2mcwd:  [0m ~/projects/myapp
+[38;5;208m╰──────────────────────────────────────────────────────────────╯[0m
+[1m[38;5;208m› [0m[2mfix the failing test in tests/test_parser.py[0m
 
-● bash(python3 -m pytest tests/test_parser.py -q)
-  $ python3 -m pytest tests/test_parser.py -q
-  Run this command?  yes
-  ⎿  F.
-     … +12 lines
-● read_file(src/parser.py)
-● edit_file(src/parser.py)
-  - if tok == "":
-  + if tok == "" or tok is None:
-  Apply this edit?  yes
-● bash(python3 -m pytest tests/test_parser.py -q)
-  ⎿  ..
-     exit code: 0
-● Fixed the None handling in `src/parser.py:42`; both tests pass.
-  ↳ 4120 in · 210 out · 62.3 tok/s · 4.1s · ctx 12%
+[32m●[0m [1mbash[0m[2m(python3 -m pytest tests/test_parser.py -q)[0m
+  [2m$ [0m[1mpython3 -m pytest tests/test_parser.py -q[0m
+  [33mRun this command?[0m  [32myes[0m
+  ⎿  [2mF.[0m
+     [2m… +12 lines[0m
+[32m●[0m [1mread_file[0m[2m(src/parser.py)[0m
+[32m●[0m [1medit_file[0m[2m(src/parser.py)[0m
+  [31m- if tok == "":[0m
+  [32m+ if tok == "" or tok is None:[0m
+  [33mApply this edit?[0m  [32myes[0m
+[32m●[0m [1mbash[0m[2m(python3 -m pytest tests/test_parser.py -q)[0m
+  ⎿  [2m..[0m
+     [2mexit code: 0[0m
+[32m●[0m Fixed the None handling in [36m`src/parser.py:42`[0m; both tests pass.
+  [90m↳ 4120 in · 210 out · 62.3 tok/s · 4.1s · ctx 12%[0m
 
-────────────────────────────────────────────────────────────────────────────────────────
-❯ and now make it handle the empty file case
-────────────────────────────────────────────────────────────────────────────────────────
- ⏵  manual mode (shift+tab to cycle) │ qwen2.5-coder:7b │ 4.3k tokens (↑4.1k ↓210) │ ctx 12%
+[2m────────────────────────────────────────────────────────────────────────────────────────[0m
+[1m[38;5;208m❯ [0mand now make it handle the empty file case
+[2m────────────────────────────────────────────────────────────────────────────────────────[0m
+ [2m⏵  manual mode[0m[2m (shift+tab to cycle)[0m[2m │ [0mqwen2.5-coder:7b[2m │ [0m4.3k tokens (↑4.1k ↓210)[2m │ [0mctx 12%
 ```
 
 corbienest takes over the terminal (alternate screen) while it runs, like Claude Code: the
@@ -103,7 +103,9 @@ corbienest [options] [-p PROMPT]
       --continue       resume the latest session started in this directory
   -r, --resume [ID]    resume a session: by ID, or pick one from a menu
       --keep-alive DUR how long Ollama keeps the model loaded between requests (default 30m; -1 forever, 0 unload, default = server's)
+      --no-memory      don't update .corbienest/memory.md after requests
       --think / --no-think / --show-thinking
+  -h, --help / -v, --version
 ```
 
 ### Slash commands
@@ -195,13 +197,13 @@ Cycle with **Shift+Tab** at the prompt, or set one with `/mode NAME`, `--mode NA
 
 Each confirmation is a small menu:
 
-```
-  Run this command?
-  ❯ 1. Yes  (y)
-    2. Yes, and don't ask again for shell commands this session  (a)
-    3. Yes, and always allow `git status …` in this project  (p)
-    4. No, and tell the model what to do instead  (n)
-  ↑/↓ or j/k move · enter select · 1-4 / y / a / p / n · esc = no
+```ansi
+  [33m[1mRun this command?[0m
+  [38;5;208m❯ [1m1. Yes[0m[2m  (y)[0m
+    2. Yes, and don't ask again for shell commands this session[2m  (a)[0m
+    3. Yes, and always allow `git status …` in this project[2m  (p)[0m
+    4. No, and tell the model what to do instead[2m  (n)[0m
+  [90m↑/↓ or j/k move · enter select · 1-4 / y / a / p / n · esc = no[0m
 ```
 
 Move with ↑/↓ (or j/k) and press Enter, or hit `1`–`4` or the `y`/`a`/`p`/`n` shortcuts;
