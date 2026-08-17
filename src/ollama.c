@@ -117,6 +117,7 @@ static int on_line(const char *line, size_t len, void *ud) {
         if ((v = cJSON_GetObjectItemCaseSensitive(j, "eval_duration"))) c->stats->eval_seconds = v->valuedouble / 1e9;
         if ((v = cJSON_GetObjectItemCaseSensitive(j, "prompt_eval_duration"))) c->stats->prompt_seconds = v->valuedouble / 1e9;
         if ((v = cJSON_GetObjectItemCaseSensitive(j, "total_duration"))) c->stats->total_seconds = v->valuedouble / 1e9;
+        if ((v = cJSON_GetObjectItemCaseSensitive(j, "load_duration"))) c->stats->load_seconds = v->valuedouble / 1e9;
         if ((v = cJSON_GetObjectItemCaseSensitive(j, "done_reason")) && cJSON_IsString(v)) snprintf(c->stats->done_reason, sizeof c->stats->done_reason, "%s", v->valuestring);
         if (c->think_tokens) { c->stats->think_chunks = c->think_tokens; c->stats->think_seconds = c->think_secs > 0 ? c->think_secs : elapsed(&c->t_think); }
     }
@@ -208,6 +209,7 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
     if (g_cfg.num_ctx > 0) cJSON_AddNumberToObject(opts, "num_ctx", g_cfg.num_ctx);
     if (g_cfg.temperature >= 0) cJSON_AddNumberToObject(opts, "temperature", g_cfg.temperature);
     if (ollama_call.num_predict > 0) cJSON_AddNumberToObject(opts, "num_predict", ollama_call.num_predict);
+    if (g_cfg.draft >= 0) cJSON_AddNumberToObject(opts, "draft_num_predict", g_cfg.draft);   /* changing it reloads the model */
     char *body = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
 
@@ -357,6 +359,26 @@ int ollama_model_context_length(const char *model) {
     }
     sb_free(&out);
     return ctx;
+}
+
+int ollama_model_draft(const char *model) {
+    if (!model || !*model) return -1;
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddStringToObject(req, "model", model);
+    char *body = cJSON_PrintUnformatted(req); cJSON_Delete(req);
+    sbuf out; sb_init(&out); http_result res;
+    int rc = plain_request("POST", "/api/show", body, "reading model info", &out, &res);
+    free(body);
+    int draft = -1;
+    if (rc == 0 && res.status == 200 && out.data) {
+        cJSON *j = cJSON_Parse(out.data);
+        cJSON *p = j ? cJSON_GetObjectItemCaseSensitive(j, "parameters") : NULL;   /* Modelfile PARAMETER lines as text */
+        const char *d = cJSON_IsString(p) ? strstr(p->valuestring, "draft_num_predict") : NULL;
+        if (d) draft = atoi(d + strlen("draft_num_predict"));
+        cJSON_Delete(j);
+    }
+    sb_free(&out);
+    return draft;
 }
 
 /* Where the model is loaded (from /api/ps): total size and the part in GPU memory. */

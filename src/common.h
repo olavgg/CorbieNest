@@ -59,6 +59,7 @@ typedef struct {
     char *model;
     char *system_prompt; /* extra system prompt from CLI/config */
     int   num_ctx;       /* 0 = leave to server default */
+    int   draft;         /* draft_num_predict: speculative/MTP draft tokens per step; -1 = model default, 0 = off */
     double temperature;  /* <0 = unset */
     int   think;         /* -1 auto (server default on the first call of a request, off for tool rounds), 0 off, 1 on for every call */
     char *think_level;   /* "low"|"medium"|"high" for models with thinking levels (gpt-oss); NULL = plain on/off */
@@ -262,6 +263,7 @@ typedef struct {
     double think_seconds;    /* time from the first thinking chunk to the first content/tool chunk */
     int    think_chunks;     /* streamed thinking chunks (≈ tokens) */
     double total_seconds;
+    double load_seconds;     /* model load time (0 when it was already loaded) */
     char   done_reason[16];  /* "stop", "length" (num_predict hit), "" if unknown */
 } chat_stats;
 
@@ -286,6 +288,9 @@ cJSON *ollama_list_models(void);
 int    ollama_ping(char *ver, size_t verlen);
 /* Context length the model was trained for (from /api/show), 0 if unknown. */
 int    ollama_model_context_length(const char *model);
+/* The model's own draft_num_predict (speculative decoding / MTP draft head), from /api/show
+ * parameters; -1 when the model has none. */
+int    ollama_model_draft(const char *model);
 /* Where a loaded model lives (from /api/ps): total bytes and bytes in GPU memory.
  * Returns 0 and fills both when the model is loaded, -1 if not loaded/unknown. */
 int    ollama_model_placement(const char *model, double *size, double *size_vram);

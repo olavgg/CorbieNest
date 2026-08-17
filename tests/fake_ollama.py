@@ -144,7 +144,9 @@ class H(BaseHTTPRequestHandler):
         model = req.get("model", "")
         if self.path == "/api/show":
             if not any(m["name"] == model for m in MODELS): return self._json(404, {"error": f"model '{model}' not found"})
-            return self._json(200, {"model_info": {"general.architecture": "fake", "fake.context_length": 65536, "fake.embedding_length": 8}})
+            info = {"model_info": {"general.architecture": "fake", "fake.context_length": 65536, "fake.embedding_length": 8}}
+            if model == "fake-thinker:latest": info["parameters"] = "top_k 20\ndraft_num_predict 4\ntemperature 1"   # ships an MTP draft head
+            return self._json(200, info)
         if self.path != "/api/chat": return self._json(404, {"error": "not found"})
         REQUEST_LOG.append(req)   # only chat requests: tests read the last one
         if not any(m["name"] == model for m in MODELS):

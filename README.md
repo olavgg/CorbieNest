@@ -76,8 +76,31 @@ corbienest [options] [-p PROMPT]
       --keep-alive DUR how long Ollama keeps the model loaded between requests (default 30m; -1 forever, 0 unload, default = server's)
       --no-memory      don't update .corbienest/memory.md after requests
       --think / --no-think / --show-thinking
+      --draft N        draft_num_predict: speculative-decoding / MTP draft tokens per step (0 = off; default: the model's own,
+                       e.g. models that ship an MTP head set 4); changing it makes Ollama reload the model
+      --benchmark [N]  measure tokens per second at every context size the model supports (or just the -c size):
+                       per size a warm-up (model load time, GPU placement) then N timed runs (default 3) of a fixed
+                       prompt (or -p PROMPT) capped at 256 tokens; prompt-eval and generation tok/s per size;
+                       --output-format json for one JSON object
   -h, --help / -v, --version
 ```
+
+```
+$ corbienest --model qwen3.8 --benchmark 1
+benchmark  qwen3.8 · 1 run × 256 tokens per context size · draft 4 (model default, MTP/speculative) · http://127.0.0.1:11434
+  ctx    load     placement                 prompt eval    generation              first token
+  4k     6.1s     100% GPU (17.3 GB)        441 tok/s     60.2 tok/s               0.36s
+  8k     5.9s     100% GPU (17.3 GB)        441 tok/s     56.7 tok/s               0.37s
+  16k    5.9s     100% GPU (17.3 GB)        439 tok/s     45.7 tok/s               0.36s
+  32k    5.9s     100% GPU (17.4 GB)        437 tok/s     58.2 tok/s               0.37s
+  64k    7.7s     89% GPU (16.5/18.6 GB)    342 tok/s     33.7 tok/s               0.40s
+  128k   8.8s     66% GPU (13.9/20.9 GB)    205 tok/s     15.4 tok/s               0.50s
+  256k   19.1s    41% GPU (11.0/27.1 GB)    137 tok/s      9.5 tok/s               0.63s
+```
+(The row where the placement drops below 100% is where the KV cache stopped fitting in VRAM — the
+largest context you can run at full speed is the row before it. With several runs per size the
+generation column also shows the min–max spread; a size that fails to load is reported and the
+larger ones skipped.)
 
 ### Slash commands
 

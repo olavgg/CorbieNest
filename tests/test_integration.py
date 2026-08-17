@@ -159,6 +159,30 @@ out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_BASH", "--output
 j = json.loads(out.strip()); check(j["tool_calls"] == 1 and j["result"].startswith("Tool said:"), f"tool run in json mode: {j}")
 out, rc = run(["-m", "fake-coder:latest", "-p", "x", "--output-format", "yaml"]); check(rc == 2, "bad format rejected")
 
+print("test --benchmark")
+n_sess = len(os.listdir(SESS))
+out, rc = run(["-m", "fake-coder:latest", "-c", "16k", "--benchmark", "2"])
+check(rc == 0, "exit 0")
+check("benchmark  fake-coder:latest" in out and "2 runs" in out and "no draft/MTP" in out, f"header: {out!r}")
+rows = [l for l in out.splitlines() if l.strip().startswith("16k")]
+check(len(rows) == 1 and "45.0 tok/s" in rows[0] and "615 tok/s" in rows[0] and "100% GPU" in rows[0], f"one row with ollama's rates and placement: {out!r}")
+reqs = requests()[-3:]   # warm-up + 2 runs
+check(all(r["model"] == "fake-coder:latest" and "tools" not in r and r["messages"][0]["role"] == "user" and r["options"]["num_ctx"] == 16384 for r in reqs), "no tools, no system prompt, -c size")
+check(reqs[0]["options"]["num_predict"] == 8 and reqs[1]["options"]["num_predict"] == 256 and reqs[2]["options"]["num_predict"] == 256, "warm-up then capped runs")
+check(all("draft_num_predict" not in r["options"] for r in reqs), "no draft option unless asked")
+check(len(os.listdir(SESS)) == n_sess, "benchmark saves no session")
+out, rc = run(["-m", "fake-thinker:latest", "--benchmark", "1"])   # no -c: every size up to the model's 64k
+sizes = [l.split()[0] for l in out.splitlines() if l.strip().split()[:1] and l.strip().split()[0] in ("4k", "8k", "16k", "32k", "64k")]
+check(sizes == ["4k", "8k", "16k", "32k", "64k"], f"sweeps the supported context sizes: {sizes}")
+check("draft 4 (model default, MTP/speculative)" in out, f"model's MTP draft reported: {out!r}")
+check([r["options"]["num_ctx"] for r in requests()[-10:]] == [4096, 4096, 8192, 8192, 16384, 16384, 32768, 32768, 65536, 65536], "warm-up + run at each size")
+out, rc = run(["-m", "fake-coder:latest", "--draft", "0", "--benchmark", "-c", "8k", "-p", "my own prompt", "--output-format", "json"])
+j = json.loads(out.strip())
+check(j["model"] == "fake-coder:latest" and j["draft_num_predict"] == 0 and len(j["sizes"]) == 1 and j["sizes"][0]["num_ctx"] == 8192 and len(j["sizes"][0]["runs"]) == 3 and j["sizes"][0]["generation_tps"] == 45 and j["interrupted"] is False, f"json report: {j}")
+check(requests()[-1]["messages"][-1]["content"] == "my own prompt" and requests()[-1]["options"]["draft_num_predict"] == 0, "-p sets the prompt; --draft 0 sent")
+out, rc = run(["-m", "nope:latest", "--benchmark"]); check(rc == 1 and "not found" in out, "unknown model fails")
+out, rc = run(["-m", "fake-coder:latest", "--draft", "x", "-p", "hi"]); check(rc == 2, "bad --draft rejected")
+
 # ---------- interactive via pty ----------
 class Session:
     def __init__(self, args=(), cols=100, rows=40):

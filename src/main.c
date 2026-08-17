@@ -849,6 +849,24 @@ static void set_ctx(int n) {
 
 /* /ctx: no argument opens a picker of sizes up to the model's trained maximum;
  * /ctx N|Nk|max|default sets it directly. */
+/* The context sizes worth offering for the current model: the standard powers of two up to
+ * the model's trained maximum, the maximum itself, and `extra` (the current setting; 0 = none),
+ * ascending. Returns the count. */
+static int ctx_size_list(int *sizes, int cap, int extra) {
+    static const int STD[] = { 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576 };
+    int n = 0;
+    for (size_t i = 0; i < sizeof STD / sizeof *STD && n < cap; i++)
+        if (!g_model_max_ctx || STD[i] <= g_model_max_ctx) sizes[n++] = STD[i];
+    int add[2] = { g_model_max_ctx, extra };
+    for (int k = 0; k < 2; k++) {
+        if (add[k] <= 0 || n >= cap) continue;
+        bool has = false; for (int i = 0; i < n; i++) if (sizes[i] == add[k]) has = true;
+        if (!has) sizes[n++] = add[k];
+    }
+    for (int i = 1; i < n; i++) for (int j = i; j > 0 && sizes[j-1] > sizes[j]; j--) { int t = sizes[j]; sizes[j] = sizes[j-1]; sizes[j-1] = t; }
+    return n;
+}
+
 static void cmd_ctx(const char *arg) {
     if (arg) {
         int n = parse_ctx_arg(arg);
@@ -866,13 +884,7 @@ static void cmd_ctx(const char *arg) {
         printf("\n");
         return;
     }
-    static const int STD[] = { 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576 };
-    int sizes[16], n = 0;
-    for (size_t i = 0; i < sizeof STD / sizeof *STD; i++)
-        if (!g_model_max_ctx || STD[i] <= g_model_max_ctx) sizes[n++] = STD[i];
-    if (g_model_max_ctx > 0) { bool has = false; for (int i = 0; i < n; i++) if (sizes[i] == g_model_max_ctx) has = true; if (!has) sizes[n++] = g_model_max_ctx; }
-    if (g_cfg.num_ctx > 0) { bool has = false; for (int i = 0; i < n; i++) if (sizes[i] == g_cfg.num_ctx) has = true; if (!has) sizes[n++] = g_cfg.num_ctx; }
-    for (int i = 1; i < n; i++) for (int j = i; j > 0 && sizes[j-1] > sizes[j]; j--) { int t = sizes[j]; sizes[j] = sizes[j-1]; sizes[j-1] = t; }
+    int sizes[16], n = ctx_size_list(sizes, 14, g_cfg.num_ctx);
     sizes[n++] = 0;   /* server default, last */
     const char **items = xmalloc(sizeof(char*) * (size_t)n), **descs = xmalloc(sizeof(char*) * (size_t)n);
     char **own = xmalloc(sizeof(char*) * (size_t)n * 2);
@@ -1392,6 +1404,7 @@ static void cmd_status(void) {
     printf(C_BOLD "think      " C_RESET "%s, %s\n", think_label(), g_cfg.show_thinking ? "shown" : "hidden");
     printf(C_BOLD "temp       " C_RESET "%s", g_cfg.temperature < 0 ? "default\n" : ""); if (g_cfg.temperature >= 0) printf("%g\n", g_cfg.temperature);
     printf(C_BOLD "keep_alive " C_RESET "%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "server default (5m)");
+    if (g_cfg.draft >= 0) printf(C_BOLD "draft      " C_RESET "%d (draft_num_predict, %s)\n", g_cfg.draft, g_cfg.draft ? "speculative decoding / MTP" : "speculative decoding off");
     check_model_placement(true);
     if (g_project_instructions) printf(C_BOLD "project    " C_RESET "instructions file loaded\n");
     printf(C_BOLD "memory     " C_RESET "%s%s\n", g_cfg.memory ? "on" : "off", g_memory ? " · " MEMORY_PATH " loaded" : "");
@@ -1675,6 +1688,148 @@ static int process_input(char *line) {
     return aborted ? -1 : 0;
 }
 
+/* ---------- --benchmark: tokens per second ----------
+ * For each context size (the /ctx list up to the model's maximum, or just -c N): a warm-up call
+ * (Ollama reloads the model for the new num_ctx — its load time and GPU placement are what
+ * change with the size), then `runs` timed generations of the same prompt, capped at
+ * BENCH_TOKENS tokens, with no tools or system prompt. Prompt-evaluation and generation rates
+ * come from Ollama's own counters in the final chunk. Nothing is saved: no session, no memory. */
+#define BENCH_TOKENS 256
+static const char *BENCH_PROMPT =
+    "Write a long, detailed essay on the history of programming languages, from Fortran and "
+    "Lisp through C, Smalltalk, Python and Java to Rust. Write flowing prose, no lists or headings.";
+
+static cJSON *bench_call(const char *prompt, int num_predict, chat_stats *st, bool *aborted) {
+    cJSON *msgs = cJSON_CreateArray();
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", prompt);
+    cJSON_AddItemToArray(msgs, m);
+    ollama_call.num_predict = num_predict;
+    ollama_quiet = true;
+    cJSON *reply = ollama_chat(msgs, NULL, st, aborted);
+    ollama_quiet = false;
+    ollama_call_reset();
+    cJSON_Delete(msgs);
+    return reply;
+}
+
+/* progress note on the current line; the result line then overwrites it (interactive only) */
+static void bench_note(const char *what) {
+    if (!g_cfg.interactive) return;
+    printf("\r\x1b[2K" C_DIM "  %s…" C_RESET, what); fflush(stdout);
+}
+static void bench_note_clear(void) { if (g_cfg.interactive) fputs("\r\x1b[2K", stdout); }
+static double tps(long tokens, double secs) { return secs > 0 ? (double)tokens / secs : 0; }
+
+/* one context size; returns 0 ok, 1 failed, 130 interrupted; fills *row (JSON) when wanted */
+static int bench_ctx(int num_ctx, int runs, const char *prompt, cJSON *jrow) {
+    g_cfg.num_ctx = num_ctx;
+    char what[64], label[16];
+    snprintf(label, sizeof label, "%s", fmt_ctx(num_ctx));
+    chat_stats st; bool aborted = false;
+    snprintf(what, sizeof what, "ctx %s · loading", label);
+    bench_note(what);
+    cJSON *r = bench_call(prompt, 8, &st, &aborted);
+    bench_note_clear();
+    if (jrow) cJSON_AddNumberToObject(jrow, "num_ctx", num_ctx);
+    if (!r) { printf(C_BOLD "  %-6s " C_RESET C_RED "%s" C_RESET "\n", label, aborted ? "interrupted" : "failed"); if (jrow) cJSON_AddStringToObject(jrow, "error", aborted ? "interrupted" : "failed"); return aborted ? 130 : 1; }
+    cJSON_Delete(r);
+    double load = st.load_seconds, size, vram; int placed = ollama_model_placement(g_cfg.model, &size, &vram);
+    if (jrow) {
+        cJSON_AddNumberToObject(jrow, "load_seconds", load);
+        if (placed == 0) { cJSON_AddNumberToObject(jrow, "size_bytes", size); cJSON_AddNumberToObject(jrow, "size_vram_bytes", vram); }
+    }
+    cJSON *jruns = jrow ? cJSON_AddArrayToObject(jrow, "runs") : NULL;
+    long tok_sum = 0, ptok_sum = 0; double gen_sum = 0, prompt_sum = 0, ttft_sum = 0, gen_min = 1e30, gen_max = 0;
+    int done = 0;
+    for (int i = 0; i < runs; i++) {
+        snprintf(what, sizeof what, "ctx %s · run %d/%d", label, i + 1, runs);
+        bench_note(what);
+        r = bench_call(prompt, BENCH_TOKENS, &st, &aborted);
+        bench_note_clear();
+        if (!r) break;
+        cJSON_Delete(r);
+        double gen = tps(st.eval_tokens, st.eval_seconds), pe = tps(st.prompt_tokens, st.prompt_seconds);
+        tok_sum += st.eval_tokens; gen_sum += st.eval_seconds; ptok_sum += st.prompt_tokens; prompt_sum += st.prompt_seconds;
+        ttft_sum += st.load_seconds + st.prompt_seconds;
+        if (gen < gen_min) gen_min = gen;
+        if (gen > gen_max) gen_max = gen;
+        done++;
+        if (jruns) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddNumberToObject(o, "prompt_tokens", st.prompt_tokens);
+            cJSON_AddNumberToObject(o, "prompt_seconds", st.prompt_seconds);
+            cJSON_AddNumberToObject(o, "eval_tokens", st.eval_tokens);
+            cJSON_AddNumberToObject(o, "eval_seconds", st.eval_seconds);
+            cJSON_AddNumberToObject(o, "total_seconds", st.total_seconds);
+            cJSON_AddNumberToObject(o, "generation_tps", gen);
+            cJSON_AddNumberToObject(o, "prompt_tps", pe);
+            cJSON_AddItemToArray(jruns, o);
+        }
+    }
+    /* row: ctx · load · placement · prompt eval · generation · ttft */
+    char pl[40] = ""; bool spill = placed == 0 && size > 0 && vram < size;
+    if (placed == 0 && size > 0) {
+        if (!spill) snprintf(pl, sizeof pl, "100%% GPU (%.1f GB)", size / 1e9);
+        else snprintf(pl, sizeof pl, "%d%% GPU (%.1f/%.1f GB)", (int)(100.0 * vram / size + 0.5), vram / 1e9, size / 1e9);
+    }
+    char ld[16]; if (load > 0.05) snprintf(ld, sizeof ld, "%.1fs", load); else snprintf(ld, sizeof ld, "loaded");
+    printf(C_BOLD "  %-6s " C_RESET "%-8s %s%-22s" C_RESET "  ", label, ld, spill ? C_YELLOW : "", pl);
+    if (done) {
+        printf("%5.0f tok/s   " C_ORANGE "%6.1f tok/s" C_RESET, tps(ptok_sum, prompt_sum), tps(tok_sum, gen_sum));
+        if (done > 1) printf(C_DIM " (%.1f–%.1f)" C_RESET, gen_min, gen_max); else printf("            ");
+        printf("   %.2fs", ttft_sum / done);
+    }
+    if (done < runs) printf("  " C_RED "%s after %d run%s" C_RESET, aborted ? "interrupted" : "failed", done, done == 1 ? "" : "s");
+    printf("\n"); fflush(stdout);
+    if (jrow) {
+        cJSON_AddNumberToObject(jrow, "generation_tps", tps(tok_sum, gen_sum));
+        cJSON_AddNumberToObject(jrow, "prompt_tps", tps(ptok_sum, prompt_sum));
+        cJSON_AddNumberToObject(jrow, "ttft_seconds", done ? ttft_sum / done : 0);
+        if (done < runs) cJSON_AddStringToObject(jrow, "error", aborted ? "interrupted" : "failed");
+    }
+    return aborted ? 130 : done == runs ? 0 : 1;
+}
+
+static int run_benchmark(int runs, const char *prompt, bool ctx_given, bool json_out, int json_fd) {
+    if (!prompt) prompt = BENCH_PROMPT;
+    if (runs < 1) runs = 1;
+    int sizes[16], n = 0;
+    if (ctx_given || g_cfg.num_ctx <= 0) sizes[n++] = g_cfg.num_ctx;   /* one size (0 = the server's default) */
+    else n = ctx_size_list(sizes, 16, 0);
+    int draft = ollama_model_draft(g_cfg.model);
+    printf(C_BOLD "benchmark" C_RESET "  %s · %d run%s × %d tokens per context size · ", g_cfg.model, runs, runs == 1 ? "" : "s", BENCH_TOKENS);
+    if (g_cfg.draft >= 0) printf("draft %d (--draft)", g_cfg.draft);
+    else if (draft > 0) printf("draft %d (model default, MTP/speculative)", draft);
+    else printf("no draft/MTP");
+    printf(" · %s\n", g_cfg.host);
+    printf(C_DIM "  %-6s %-8s %-22s  %-14s%-27s%s" C_RESET "\n", "ctx", "load", "placement", "  prompt eval", "   generation", "first token");
+    fflush(stdout);
+    cJSON *jrows = json_out ? cJSON_CreateArray() : NULL;
+    int rc = 0;
+    for (int i = 0; i < n; i++) {
+        cJSON *row = jrows ? cJSON_CreateObject() : NULL;
+        rc = bench_ctx(sizes[i], runs, prompt, row);
+        if (row) cJSON_AddItemToArray(jrows, row);
+        if (rc) { if (rc != 130 && i + 1 < n) printf(C_DIM "  larger sizes skipped" C_RESET "\n"); break; }   /* larger sizes will not fare better */
+    }
+    term_restore();
+    fflush(stdout);
+    if (jrows) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "model", g_cfg.model);
+        cJSON_AddNumberToObject(o, "draft_num_predict", g_cfg.draft >= 0 ? g_cfg.draft : draft);
+        cJSON_AddNumberToObject(o, "runs_per_size", runs);
+        cJSON_AddNumberToObject(o, "tokens_per_run", BENCH_TOKENS);
+        cJSON_AddItemToObject(o, "sizes", jrows);
+        cJSON_AddBoolToObject(o, "interrupted", rc == 130);
+        char *txt = cJSON_PrintUnformatted(o);
+        if (json_fd >= 0) { if (write(json_fd, txt, strlen(txt)) < 0 || write(json_fd, "\n", 1) < 0) {} }
+        free(txt); cJSON_Delete(o);
+    }
+    return rc;
+}
+
 static void usage(void) {
     printf("usage: corbienest [options] [-p PROMPT]\n"
            "  -m, --model NAME     model to use (default: saved / first tool-capable model)\n"
@@ -1692,6 +1847,9 @@ static void usage(void) {
            "  -r, --resume [ID]    resume a session: by ID, or pick one from a menu\n"
            "      --no-memory      don't update " MEMORY_PATH " after requests\n"
            "      --think          think on every model call (default: only the first call of a request); --no-think to disable; --show-thinking to display\n"
+           "      --draft N        draft_num_predict: speculative-decoding/MTP draft tokens per step (0 = off; default: the model's own)\n"
+           "      --benchmark [N]  measure tokens per second at each context size the model supports (or just -c N):\n"
+           "                       N timed runs (default 3) of a fixed prompt (or -p PROMPT) per size, then exit\n"
            "  -h, --help           this help\n");
 }
 
@@ -1699,7 +1857,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 60; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15;
+    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 60; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15;
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();
@@ -1710,13 +1868,13 @@ int main(int argc, char **argv) {
     const char *env_model = getenv("CORBIENEST_MODEL");
     if (env_model && *env_model) { free(g_cfg.model); g_cfg.model = xstrdup(env_model); }
 
-    const char *oneshot = NULL, *resume_id = NULL; bool resume_latest = false, json_out = false;
+    const char *oneshot = NULL, *resume_id = NULL; bool resume_latest = false, json_out = false, ctx_given = false; int bench_runs = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         #define NEEDARG() (i + 1 < argc ? argv[++i] : (usage(), exit(2), (char*)NULL))
         if (!strcmp(a, "-m") || !strcmp(a, "--model")) { free(g_cfg.model); g_cfg.model = xstrdup(NEEDARG()); }
         else if (!strcmp(a, "-H") || !strcmp(a, "--host")) { free(g_cfg.host); g_cfg.host = xstrdup(NEEDARG()); }
-        else if (!strcmp(a, "-c") || !strcmp(a, "--ctx")) { const char *cv = NEEDARG(); int n = parse_ctx_arg(cv); if (n < 0) { fprintf(stderr, "bad context size %s (use e.g. 32768, 64k, default)\n", cv); return 2; } g_cfg.num_ctx = n; }
+        else if (!strcmp(a, "-c") || !strcmp(a, "--ctx")) { const char *cv = NEEDARG(); int n = parse_ctx_arg(cv); if (n < 0) { fprintf(stderr, "bad context size %s (use e.g. 32768, 64k, default)\n", cv); return 2; } g_cfg.num_ctx = n; ctx_given = true; }
         else if (!strcmp(a, "-s") || !strcmp(a, "--system")) { free(g_cfg.system_prompt); g_cfg.system_prompt = xstrdup(NEEDARG()); }
         else if (!strcmp(a, "-p") || !strcmp(a, "--prompt")) oneshot = NEEDARG();
         else if (!strcmp(a, "-y") || !strcmp(a, "--yolo")) g_cfg.mode = MODE_AUTO;
@@ -1730,6 +1888,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--think")) g_cfg.think = 1;
         else if (!strcmp(a, "--no-think")) g_cfg.think = 0;
         else if (!strcmp(a, "--show-thinking")) g_cfg.show_thinking = true;
+        else if (!strcmp(a, "--draft")) { const char *dv = NEEDARG(); if (strspn(dv, "0123456789") != strlen(dv) || !*dv) { fprintf(stderr, "bad draft count %s (a number of tokens, 0 = off)\n", dv); return 2; } g_cfg.draft = atoi(dv); }
+        else if (!strcmp(a, "--benchmark")) { bench_runs = 3; if (i + 1 < argc && argv[i+1][0] >= '1' && argv[i+1][0] <= '9' && strspn(argv[i+1], "0123456789") == strlen(argv[i+1])) bench_runs = atoi(argv[++i]); }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (!strcmp(a, "-v") || !strcmp(a, "--version")) { printf("corbienest %s\n", CORBIE_VERSION); return 0; }
         else { fprintf(stderr, "unknown option %s\n", a); usage(); return 2; }
@@ -1745,8 +1905,17 @@ int main(int argc, char **argv) {
     load_memory();
     tools_permissions_load();
     skills_load();
-    refresh_model_caps(oneshot != NULL);
+    refresh_model_caps(oneshot != NULL || bench_runs);
     if (!g_cfg.model) { fprintf(stderr, "corbienest: no models found on %s (run `ollama pull <model>`)\n", g_cfg.host); return 1; }
+    if (bench_runs) {
+        int json_fd = -1;
+        if (json_out) {   /* the report is dropped; only the JSON goes to the real stdout */
+            fflush(stdout);
+            json_fd = dup(STDOUT_FILENO);
+            if (!freopen("/dev/null", "w", stdout)) { fprintf(stderr, "corbienest: cannot redirect stdout\n"); return 1; }
+        }
+        return run_benchmark(bench_runs, oneshot, ctx_given, json_out, json_fd);
+    }
     if (g_cfg.interactive && !oneshot) term_fullscreen(true);   /* alternate screen + bottom status bar */
     if (resume_latest) {
         int n; session_info *v = sessions_list(true, &n);
