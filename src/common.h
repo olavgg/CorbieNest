@@ -283,6 +283,9 @@ extern bool g_model_think;  /* current model advertises the "thinking" capabilit
  * On error/abort returns NULL and sets *aborted / prints error. */
 cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted);
 extern bool ollama_quiet;   /* when set, ollama_chat() does not print the streamed reply (background calls) */
+/* Error text of the most recent ollama_chat() ("" when it succeeded or was interrupted), so the
+ * caller can react to a specific server error instead of only seeing a NULL reply. */
+extern char ollama_error[512];
 /* Fetch model names. Returns cJSON array of strings (caller owns) or NULL. */
 cJSON *ollama_list_models(void);
 int    ollama_ping(char *ver, size_t verlen);

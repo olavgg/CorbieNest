@@ -152,6 +152,13 @@ class H(BaseHTTPRequestHandler):
         if not any(m["name"] == model for m in MODELS):
             return self._json(404, {"error": f"model '{model}' not found"})
         msgs = req.get("messages", [])
+        # Ollama trims an over-long prompt by dropping whole messages from the front, and its
+        # qwen3.8 renderer then refuses a prompt the user's request has fallen out of. Play that
+        # back for CTX_OVERFLOW once there are tool results, until the client has shrunk them.
+        tool_msgs = [m for m in msgs if m["role"] == "tool"]
+        if tool_msgs and any("CTX_OVERFLOW" in (m.get("content") or "") for m in msgs if m["role"] == "user") \
+           and not any("elided to save context" in (m.get("content") or "") for m in tool_msgs):
+            return self._json(500, {"error": "no user query found in messages"})
         gen = script(model, msgs, req)
         self.send_response(200); self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Transfer-Encoding", "chunked"); self.end_headers()

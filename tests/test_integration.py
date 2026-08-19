@@ -641,6 +641,27 @@ s.send("\x04"); s.close()
 
 
 
+print("test interactive: a prompt that no longer fits is shrunk and retried, not lost")
+s = Session(["-m", "fake-coder:latest", "--yolo"]); s.expect("Ctrl-D to quit")
+s.send("TOOL_BIG CTX_OVERFLOW\r")
+check(s.expect("no longer fits", 10), f"the overflow is reported: {s.text()[-300:]!r}")
+check(s.expect("elided 1 old tool result", 10), "the tool results are elided")
+check(s.expect("Tool said:", 10), f"the turn continues after the retry: {s.text()[-300:]!r}")
+last = requests()[-1]["messages"]
+check([m for m in last if m["role"] == "user" and "CTX_OVERFLOW" in m["content"]], "the request itself is still in the prompt")
+check(all(m["content"].startswith("[earlier output elided") for m in last if m["role"] == "tool"), "the retry carries stubs, not the full results")
+s.send("\x04"); s.close()
+
+
+print("test interactive: a tool result may not take more than a quarter of the context window")
+s = Session(["-m", "fake-coder:latest", "--yolo", "-c", "2048"]); s.expect("Ctrl-D to quit")
+s.send("TOOL_BIG one\r"); check(s.expect("Tool said:", 10), "tool round")
+res = [m for m in requests()[-1]["messages"] if m["role"] == "tool"][-1]["content"]
+check(len(res) < 2048 and "line-0001" in res and "line-0300" in res and "cut:" in res,
+      f"the middle is cut, both ends kept: {len(res)} bytes, {res[:60]!r}")
+s.send("\x04"); s.close()
+
+
 print("test interactive: PgUp/PgDn scrollback viewer")
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
 def since(): return clean(s.out[s.mark:].decode("utf-8", "replace"))

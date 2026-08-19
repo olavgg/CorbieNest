@@ -59,6 +59,63 @@ static void account(const chat_stats *st) {
     g_session.calls++;
 }
 
+/* ---------- how full the context is ----------
+ * Ollama reports prompt_eval_count, but only for calls that have already happened: everything
+ * appended since — an assistant reply, a 64 KB tool result — is unmeasured, and that is exactly
+ * when the window overflows. So the unmeasured part is estimated from its byte count, with
+ * bytes-per-token calibrated on the last measured call (code and prose differ far too much for
+ * a fixed 4). Overflowing matters because Ollama does not refuse an over-long prompt: it drops
+ * whole messages from the front until the rest fits, and once the user's own request has fallen
+ * off, the model is answering a conversation that no longer contains the question (qwen3.8 is
+ * the one that says so out loud: "no user query found in messages"). */
+static double g_bytes_per_token = 3.5;   /* calibrated below; only the starting guess */
+static size_t g_sys_bytes = 0;           /* system prompt as last built (messages_with_system) */
+static size_t g_tools_bytes = 0;         /* tool definitions as JSON (measured once) */
+static size_t g_measured_bytes = 0;      /* prompt bytes of the last measured call */
+
+/* bytes of a conversation as sent (content plus the tool-call JSON; the template's own tags and
+ * the tool definitions are not counted, which the calibrated ratio absorbs) */
+static size_t conv_bytes(cJSON *msgs) {
+    size_t n = 0;
+    cJSON *m;
+    cJSON_ArrayForEach(m, msgs) {
+        cJSON *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+        if (cJSON_IsString(c)) n += strlen(c->valuestring);
+        cJSON *tc = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+        if (tc) { char *t = cJSON_PrintUnformatted(tc); if (t) { n += strlen(t); free(t); } }
+    }
+    return n;
+}
+
+/* the tool definitions go into every prompt too, and they are far from free (a few KB) */
+static size_t tools_bytes(void) {
+    if (g_cfg.no_tools || !g_model_tools) return 0;
+    if (!g_tools_bytes && g_tools) { char *t = cJSON_PrintUnformatted(g_tools); if (t) { g_tools_bytes = strlen(t); free(t); } }
+    return g_tools_bytes;
+}
+
+/* everything the next call would send */
+static size_t prompt_bytes(void) { return g_sys_bytes + tools_bytes() + conv_bytes(g_messages); }
+
+/* prompt tokens the next call would use: the last measured figure plus everything added since */
+static int ctx_estimate(void) {
+    size_t now = prompt_bytes();
+    if (g_session.last_prompt_tokens > 0 && now >= g_measured_bytes)
+        return g_session.last_prompt_tokens + (int)((double)(now - g_measured_bytes) / g_bytes_per_token);
+    return (int)((double)now / g_bytes_per_token);   /* nothing measured yet, or the conversation shrank */
+}
+
+/* usage as a percentage of the window (0 when num_ctx is left to the server) */
+static int ctx_pct(void) { return g_cfg.num_ctx > 0 ? (int)(100.0 * ctx_estimate() / g_cfg.num_ctx) : 0; }
+
+/* a call came back with a real prompt_eval_count: re-calibrate on it */
+static void ctx_measured(int prompt_tokens, size_t sent_bytes) {
+    if (prompt_tokens <= 0) return;
+    double r = (double)sent_bytes / prompt_tokens;
+    if (r > 1.0 && r < 12.0) g_bytes_per_token = r;
+    g_measured_bytes = sent_bytes;
+}
+
 /* ---------- context hygiene: elide old tool results ----------
  * Tool results (file contents, command output, grep hits) are the bulk of a long
  * conversation and are re-sent with every model call, but they go stale fast: once the model
@@ -74,12 +131,11 @@ static void account(const chat_stats *st) {
 static const char ELIDE_MARK[] = "[earlier output elided to save context";
 static int g_prev_request_first = -1;   /* where the most recent finished request started */
 
-static void elide_old_tool_results(int upto) {
-    if (g_cfg.num_ctx <= 0 || g_session.last_prompt_tokens <= 0) return;
-    if (100.0 * g_session.last_prompt_tokens / g_cfg.num_ctx < ELIDE_PCT) return;
+/* Replace every tool result before `upto` with its stub; returns how many were elided. */
+static int elide_tool_results(cJSON *msgs, int upto) {
     int n = 0; size_t saved = 0;
-    for (int i = 0; i < upto && i < cJSON_GetArraySize(g_messages); i++) {
-        cJSON *m = cJSON_GetArrayItem(g_messages, i);
+    for (int i = 0; i < upto && i < cJSON_GetArraySize(msgs); i++) {
+        cJSON *m = cJSON_GetArrayItem(msgs, i);
         cJSON *role = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
         if (!cJSON_IsString(role) || strcmp(role->valuestring, "tool") || !cJSON_IsString(c)) continue;
         const char *txt = c->valuestring; size_t len = strlen(txt);
@@ -94,6 +150,13 @@ static void elide_old_tool_results(int upto) {
         n++; saved += len - keep;
     }
     if (n) printf(C_GRAY "⋯ elided %d old tool result%s (~%zu KB) to save context" C_RESET "\n", n, n == 1 ? "" : "s", saved / 1024);
+    return n;
+}
+
+/* the conversation, when it is worth it */
+static int elide_old_tool_results(int upto) {
+    if (g_cfg.num_ctx <= 0 || ctx_pct() < ELIDE_PCT) return 0;
+    return elide_tool_results(g_messages, upto);
 }
 
 /* a user request starts: remember where it begins in the conversation (for /rewind, memory) */
@@ -758,6 +821,7 @@ static cJSON *messages_with_system(void) {
     cJSON_AddStringToObject(sys, "role", "system");
     char *sp = build_system_prompt();
     cJSON_AddStringToObject(sys, "content", sp);
+    g_sys_bytes = strlen(sp);
     free(sp);
     cJSON_AddItemToArray(arr, sys);
     cJSON *m; cJSON_ArrayForEach(m, g_messages) cJSON_AddItemReferenceToArray(arr, m);
@@ -998,6 +1062,37 @@ static void tool_arg_summary(const char *name, cJSON *args, char *out, size_t n)
     }
 }
 
+/* ---------- a tool result becomes a message ----------
+ * The tools cap their own output (64 KB for read_file, 32 KB for bash), but a cap in bytes is
+ * meaningless next to a small window: at num_ctx 8k a single full file read is the whole
+ * context, and since Ollama trims an over-long prompt from the front, the result would push the
+ * request that asked for it out of the prompt. So no one result may take more than
+ * TOOL_RESULT_PCT of the window; the middle goes, both ends stay, and the note tells the model
+ * how to get the rest. */
+#define TOOL_RESULT_PCT 25
+static cJSON *tool_result_message(const char *name, const char *res) {
+    cJSON *tm = cJSON_CreateObject();
+    cJSON_AddStringToObject(tm, "role", "tool");
+    cJSON_AddStringToObject(tm, "tool_name", name);
+    size_t len = strlen(res);
+    size_t cap = g_cfg.num_ctx > 0 ? (size_t)(g_cfg.num_ctx * (TOOL_RESULT_PCT / 100.0) * g_bytes_per_token) : 0;
+    if (!cap || len <= cap) { cJSON_AddStringToObject(tm, "content", res); return tm; }
+    size_t head = cap * 2 / 3, tail = cap - head;
+    while (head && ((unsigned char)res[head] & 0xC0) == 0x80) head--;            /* UTF-8 boundaries */
+    const char *t = res + len - tail;
+    while (tail && ((unsigned char)*t & 0xC0) == 0x80) { t++; tail--; }
+    sbuf b; sb_init(&b);
+    sb_append(&b, res, head);
+    sb_printf(&b, "\n\n[... %zu KB cut: this result alone would fill more than %d%% of the %s context window. "
+                 "Ask for less — read_file offset/limit, a narrower grep, `| head` — if you need what is missing ...]\n\n",
+              (len - head - tail) / 1024, TOOL_RESULT_PCT, fmt_ctx(g_cfg.num_ctx));
+    sb_append(&b, t, tail);
+    cJSON_AddStringToObject(tm, "content", b.data);
+    sb_free(&b);
+    printf("  ⎿  " C_GRAY "result trimmed to %zu KB: more than %d%% of the context window" C_RESET "\n", cap / 1024, TOOL_RESULT_PCT);
+    return tm;
+}
+
 /* tools to offer the model in the current mode (plan mode drops the mutating ones) */
 static cJSON *tools_for_mode(void) {
     if (!g_model_tools || g_cfg.no_tools) return NULL;
@@ -1031,6 +1126,7 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
                    "Do the research thoroughly, then finish with ONE final message: a clear, complete report with concrete file paths, line numbers and code snippets where useful — "
                    "the main agent sees only that final message, nothing else you did. Do not ask questions; make reasonable assumptions and state them.", g_cwd);
     if (g_project_instructions) sb_puts(&sp, g_project_instructions);
+    size_t sp_bytes = sp.len;
     cJSON_AddStringToObject(sys, "content", sp.data); sb_free(&sp);
     cJSON_AddItemToArray(msgs, sys);
     cJSON *u = cJSON_CreateObject(); cJSON_AddStringToObject(u, "role", "user"); cJSON_AddStringToObject(u, "content", prompt);
@@ -1042,9 +1138,14 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         const char *name = cJSON_IsString(nm) ? nm->valuestring : "";
         if (!strcmp(name, "read_file") || !strcmp(name, "list_dir") || !strcmp(name, "grep") || !strcmp(name, "bash")) cJSON_AddItemReferenceToArray(tools, t);
     }
-    int rc = 1, tool_rounds = 0;
+    int rc = 1, tool_rounds = 0, round_first = -1;
     const char *final = NULL;
     for (int iter = 0; iter <= SUBAGENT_ITERS; iter++) {
+        /* the sub-agent has its own conversation and up to SUBAGENT_ITERS rounds of results in
+         * it: keep it inside the window the same way, on bytes (nothing here is measured) */
+        if (round_first > 0 && g_cfg.num_ctx > 0 &&
+            (double)(sp_bytes + tools_bytes() + conv_bytes(msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0))
+            elide_tool_results(msgs, round_first);
         chat_stats st; bool aborted = false;
         char label[48]; snprintf(label, sizeof label, "sub-agent · round %d", tool_rounds + 1);
         ollama_quiet = true; ollama_call.busy = label;
@@ -1061,6 +1162,7 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         if (!calls || cJSON_GetArraySize(calls) == 0) { final = cJSON_IsString(content) ? content->valuestring : ""; rc = 0; break; }
         if (iter == SUBAGENT_ITERS) { sb_printf(out, "error: sub-agent stopped after %d tool rounds without a report", SUBAGENT_ITERS); if (cJSON_IsString(content) && content->valuestring[0]) sb_printf(out, "\nIts last message:\n%s", content->valuestring); break; }
         cJSON *call;
+        round_first = cJSON_GetArraySize(msgs);
         cJSON_ArrayForEach(call, calls) {
             cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
             cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
@@ -1076,11 +1178,7 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
             if (!strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "task")) { sb_printf(&o, "error: %s is not available to a sub-agent (read-only)", name); ts = TOOL_ERROR; }
             else ts = tools_execute(name, args, &o);
             (void)ts;
-            cJSON *tm = cJSON_CreateObject();
-            cJSON_AddStringToObject(tm, "role", "tool");
-            cJSON_AddStringToObject(tm, "tool_name", name);
-            cJSON_AddStringToObject(tm, "content", o.data ? o.data : "");
-            cJSON_AddItemToArray(msgs, tm);
+            cJSON_AddItemToArray(msgs, tool_result_message(name, o.data ? o.data : ""));
             sb_free(&o);
             if (parsed) cJSON_Delete(parsed);
         }
@@ -1126,15 +1224,27 @@ static int inject_queued(void) {
 
 /* ---------- the agent loop ---------- */
 static bool maybe_auto_compact(void);
+static bool cmd_compact(void);
+
+/* Keep the next call inside the window. A whole tool round lands between two calls, so this
+ * works on the estimate rather than on what was measured last: elide the tool results older
+ * than the round the model is about to reason about (free), and compact only if that was not
+ * enough. `keep_from` is the first message of that round. */
+static void shrink_context(int keep_from) {
+    elide_old_tool_results(keep_from);
+    maybe_auto_compact();
+}
 
 /* Returns true if the user interrupted the turn. */
 static bool run_turn(void) {
-    int iters = 0;
+    int iters = 0, shrinks = 0;
+    int round_first = -1;   /* where this round's tool results start (-1 before the first round) */
     g_session.turns++;
     for (;;) {
-        maybe_auto_compact();   /* context nearly full: summarise before the next model call */
+        shrink_context(round_first >= 0 ? round_first : cJSON_GetArraySize(g_messages));
         cJSON *msgs = messages_with_system();
         cJSON *tools = tools_for_mode();
+        size_t sent = prompt_bytes();
         chat_stats st; bool aborted = false;
         /* think=auto: let a thinking model think about the request once, not again after every
          * tool result — that is where most of a task's wall time goes on local models */
@@ -1143,10 +1253,19 @@ static bool run_turn(void) {
         ollama_call_reset();
         if (tools && tools != g_tools) cJSON_Delete(tools);
         cJSON_Delete(msgs);
-        if (st.prompt_tokens) g_session.last_prompt_tokens = st.prompt_tokens;
+        if (st.prompt_tokens) { g_session.last_prompt_tokens = st.prompt_tokens; ctx_measured(st.prompt_tokens, sent); }
         account(&st);
         term_status_refresh();
         if (!reply) {
+            /* The prompt did not fit and Ollama dropped messages from the front until the user's
+             * own request was gone (see "how full the context is"): the estimate was too low, so
+             * shrink for real and retry rather than losing the turn — first by eliding every tool
+             * result, then, when there is nothing left to elide, by compacting. */
+            if (!aborted && shrinks < 2 && strstr(ollama_error, "no user query")) {
+                shrinks++;
+                printf(C_YELLOW "⚠ the conversation no longer fits in %s of context — shrinking it and retrying" C_RESET "\n", fmt_ctx(g_cfg.num_ctx));
+                if (elide_tool_results(g_messages, cJSON_GetArraySize(g_messages)) || cmd_compact()) { round_first = -1; continue; }
+            }
             /* On failure, keep the conversation as is; the user can retry. */
             return aborted;
         }
@@ -1162,6 +1281,7 @@ static bool run_turn(void) {
             return false;
         }
         cJSON *call;
+        round_first = cJSON_GetArraySize(g_messages);
         cJSON_ArrayForEach(call, calls) {
             cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
             cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
@@ -1180,11 +1300,7 @@ static bool run_turn(void) {
             if (ts == TOOL_DENIED) printf("  ⎿  " C_RED "denied" C_RESET "\n");
             else if (ts == TOOL_ERROR) printf("  ⎿  " C_RED "%s" C_RESET "\n", res);
             else print_result_preview(res, !strcmp(name, "read_file") ? 3 : 8);
-            cJSON *tm = cJSON_CreateObject();
-            cJSON_AddStringToObject(tm, "role", "tool");
-            cJSON_AddStringToObject(tm, "tool_name", name);
-            cJSON_AddStringToObject(tm, "content", res);
-            cJSON_AddItemToArray(g_messages, tm);
+            cJSON_AddItemToArray(g_messages, tool_result_message(name, res));
             sb_free(&out);
             if (parsed) cJSON_Delete(parsed);
         }
@@ -1450,10 +1566,10 @@ static bool cmd_compact(void) {
  * is not retried until the usage figure changes (a new request came through). */
 static bool maybe_auto_compact(void) {
     static int tried_at = -1;
-    if (g_cfg.num_ctx <= 0 || g_session.last_prompt_tokens <= 0) return false;
-    int pct = (int)(100.0 * g_session.last_prompt_tokens / g_cfg.num_ctx);
-    if (pct < AUTO_COMPACT_PCT || g_session.last_prompt_tokens == tried_at) return false;
-    tried_at = g_session.last_prompt_tokens;
+    if (g_cfg.num_ctx <= 0) return false;
+    int est = ctx_estimate(), pct = (int)(100.0 * est / g_cfg.num_ctx);
+    if (pct < AUTO_COMPACT_PCT || est == tried_at) return false;
+    tried_at = est;
     printf(C_YELLOW "⚠ context %d%% full — auto-compacting" C_RESET "\n", pct);
     return cmd_compact();
 }

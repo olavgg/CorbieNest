@@ -33,6 +33,7 @@ static double elapsed(struct timeval *t0) {
 static const char *SPIN[] = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
 bool ollama_quiet = false;
+char ollama_error[512];
 ollama_call_opts ollama_call = { -1, 0, NULL };
 bool g_model_think = false;   /* set by main.c from the model's capabilities */
 void ollama_call_reset(void) { ollama_call.think = -1; ollama_call.num_predict = 0; ollama_call.busy = NULL; }
@@ -192,6 +193,7 @@ cJSON *parse_text_tool_calls(const char *content) {
 
 cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted) {
     *aborted = false;
+    ollama_error[0] = 0;
     if (stats) memset(stats, 0, sizeof *stats);
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "model", g_cfg.model);
@@ -239,9 +241,11 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
         *aborted = true;
         printf("\n" C_YELLOW "⏹ interrupted" C_RESET "\n");
     } else if (rc != 0) {
+        snprintf(ollama_error, sizeof ollama_error, "%s", res.err);
         printf(C_RED "✗ request failed: %s" C_RESET "\n", res.err);
         if (strstr(res.err, "connect")) printf(C_DIM "  is ollama running? try: ollama serve   (host: %s)" C_RESET "\n", g_cfg.host);
     } else if (c.error[0] || res.status >= 400) {
+        snprintf(ollama_error, sizeof ollama_error, "%s", c.error[0] ? c.error : "unknown");
         printf(C_RED "✗ ollama error (%d): %s" C_RESET "\n", res.status, c.error[0] ? c.error : "unknown");
         if (strstr(c.error, "not found")) printf(C_DIM "  try /models to list, or: ollama pull %s" C_RESET "\n", g_cfg.model);
         if (strstr(c.error, "does not support tools")) printf(C_DIM "  this model has no tool support; use /tools off or pick another model" C_RESET "\n");
