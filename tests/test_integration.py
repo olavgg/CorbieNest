@@ -259,7 +259,10 @@ check(re.search(r"\x1b\[1;14r", raw) is not None, f"the region shrank by the two
 check(re.search(r"\x1b\[16;1H[^\n]*three", raw) is not None, "the last input row sits just above the lower rule")
 sf.send("\x15")   # ctrl-u back to one row
 check(sf.expect("❯ "), "cleared")
-check(re.search(r"\x1b\[1;16r", sf.out.decode("utf-8", "replace")[-4000:]) is not None, "the region grew back")
+raw = sf.out.decode("utf-8", "replace")[-4000:]
+check(re.search(r"\x1b\[1;16r", raw) is not None, "the region grew back")
+check(re.search(r"\x1b\[15;1H\x1b\[K", raw) and re.search(r"\x1b\[16;1H\x1b\[K", raw),
+      f"the rows the field gave back are wiped, not left showing its old text: {raw[-300:]!r}")
 fcntl.ioctl(sf.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
 os.kill(sf.pid, __import__("signal").SIGWINCH)
 sf.send("after resize")
@@ -269,6 +272,20 @@ check(re.search(r"\x1b\[1;26r", raw) is not None, f"the region was re-cut for th
 sf.send("\r"); check(sf.expect("Echo: after resize"), "and the line still sends")
 check("› after resize" in sf.text(), "the submitted line goes into the transcript, not the field")
 sf.close()
+
+print("test interactive: a multi-line paste leaves nothing behind when it is sent")
+sp = Session(["-m", "fake-coder:latest"], cols=60, rows=20); sp.expect("Ctrl-D to quit")
+sp.send("\x1b[200~" + "\n".join("pasted line %d" % i for i in range(1, 9)) + "\x1b[201~")
+check(sp.expect("pasted line 8"), "the paste lands in the field, newlines and all")
+raw = sp.out.decode("utf-8", "replace")
+check(re.search(r"\x1b\[1;9r", raw) is not None, f"the field grew to 8 rows and the region shrank: {raw[-300:]!r}")
+sp.send("\r"); check(sp.expect("Echo: pasted line 1"), "the whole paste is sent as one message")
+check(requests()[-1]["messages"][-1]["content"].count("pasted line 8") == 1, "sent once, not twice")
+raw = sp.out.decode("utf-8", "replace")[-6000:]
+missing = [r for r in range(10, 17) if not re.search(r"\x1b\[%d;1H\x1b\[K" % r, raw)]
+check(not missing, f"every row the field gave back is wiped, so the paste is not repainted below the reply: rows {missing} left dirty")
+sp.close()
+
 
 print("test interactive: confirmation menu — deny with reason, arrow keys, then always")
 s.send("TOOL_BASH\r")

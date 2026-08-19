@@ -295,12 +295,20 @@ static void rule_row(sbuf *o, int row) {
     sb_puts(o, C_RESET "\x1b[K");
 }
 
+static int g_field_drawn_top = 0;   /* upper rule of the last drawing, to clean up after a shrink */
+
 /* Draw the field with absolute moves. `typed` is the type-ahead shown when the editor
  * is not the one holding the field (i.e. the model is working). */
 static void field_draw(sbuf *o, const char *typed) {
     if (!g_fs || g_fs_rows < FIELD_MIN_ROWS) return;
     int top = g_fs_rows - g_field_rows - 2;   /* row of the upper rule */
     int width = g_fs_cols > 2 ? g_fs_cols : 2;
+    /* A shrinking field (the text was submitted or deleted) hands its upper rows back to the
+     * conversation, which re-cuts the scroll region around them but does not repaint them: what
+     * the field last drew there would stay on screen — a paste appearing to duplicate itself
+     * under the reply. They are ours until the region scrolls into them, so wipe them. */
+    for (int r = g_field_drawn_top; r > 0 && r < top; r++) sb_printf(o, "\x1b[%d;1H\x1b[K", r);
+    g_field_drawn_top = top;
     rule_row(o, top);
     for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;1H\x1b[K", top + 1 + i);
     sb_printf(o, "\x1b[%d;1H", top + 1);
