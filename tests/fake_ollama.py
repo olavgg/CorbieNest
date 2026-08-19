@@ -65,6 +65,17 @@ def script(model, messages, req):
         yield chunk(model, last["content"].strip().splitlines()[0][:60])
         yield chunk(model, done=True)
         return
+    if "EMPTY_ONCE" in text or "EMPTY_ALWAYS" in text:
+        # tokens generated, but the server delivers neither text nor a tool call (Ollama's
+        # parser dropping a malformed call looks like this). EMPTY_ONCE answers on the retry.
+        seen = sum(1 for r in REQUEST_LOG
+                   if any("EMPTY_" in (m.get("content") or "") for m in r.get("messages", []) if m["role"] == "user"))
+        if "EMPTY_ALWAYS" in text or seen == 1:
+            yield chunk(model, done=True)
+            return
+        yield chunk(model, "Echo: " + text.split("\n")[0])
+        yield chunk(model, done=True)
+        return
     if "TOOL_TASK" in text:
         yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "find the needle", "prompt": "Search for needle and report where it is."}}}])
         yield chunk(model, done=True)

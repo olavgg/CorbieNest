@@ -89,6 +89,17 @@ print("test recovery of leaked XML tool call")
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_XML"])
 check("recovered 1 tool call" in out, "recovery notice"); check("● list_dir(.)" in out and "made.txt" in out, "list_dir executed")
 
+print("test empty reply: retried once, then reported")
+out, rc = run(["-m", "fake-coder:latest", "-p", "EMPTY_ONCE please"])
+check("empty reply: 45 tokens generated" in out and "asking again" in out, f"empty reply explained and retried: {out!r}")
+check("Echo: EMPTY_ONCE please" in out and rc == 0, "the retry answers")
+msgs = requests()[-1]["messages"]
+check(not any(m["role"] == "assistant" and not m.get("content") and not m.get("tool_calls") for m in msgs),
+      f"the empty message is kept out of the conversation: {msgs!r}")
+out, rc = run(["-m", "fake-coder:latest", "-p", "EMPTY_ALWAYS please"])
+check("empty reply again — stopping here" in out and "send another message to continue" in out, f"gives up after one retry: {out!r}")
+check(out.count("empty reply") == 2, "asks exactly once more")
+
 print("test @file mention and -T")
 open(os.path.join(WORK, "note.txt"), "w").write("secret-content-42\n")
 out, rc = run(["-m", "fake-coder:latest", "-T", "-p", "look at @note.txt ok"])

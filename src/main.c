@@ -1235,9 +1235,19 @@ static void shrink_context(int keep_from) {
     maybe_auto_compact();
 }
 
+/* An assistant turn with neither text nor a tool call: the model generated tokens the server
+ * delivered as nothing at all. Ollama's tool-call parser swallowing a call the model rendered
+ * badly looks exactly like this, and it rarely repeats. */
+static bool reply_is_empty(cJSON *reply) {
+    cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
+    if (calls && cJSON_GetArraySize(calls) > 0) return false;
+    cJSON *c = cJSON_GetObjectItemCaseSensitive(reply, "content");
+    return !cJSON_IsString(c) || !c->valuestring[0];
+}
+
 /* Returns true if the user interrupted the turn. */
 static bool run_turn(void) {
-    int iters = 0, shrinks = 0;
+    int iters = 0, shrinks = 0, empties = 0;
     int round_first = -1;   /* where this round's tool results start (-1 before the first round) */
     g_session.turns++;
     for (;;) {
@@ -1272,6 +1282,23 @@ static bool run_turn(void) {
         cJSON_AddItemToArray(g_messages, reply);
         cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
         if (aborted || !calls || cJSON_GetArraySize(calls) == 0) {
+            /* Nothing to show and nothing to run would end the request in silence, and the user
+             * reads whatever was printed last — the stats line, the placement warning — as the
+             * reason it stopped. Say it, and ask once more. The empty message stays out of the
+             * conversation: it says nothing the model can build on, and every later call would
+             * have to carry it — an assistant turn the chat template still has to render. */
+            if (!aborted && reply_is_empty(reply)) {
+                cJSON_DeleteItemFromArray(g_messages, cJSON_GetArraySize(g_messages) - 1);
+                print_stats(&st);
+                if (++empties < 2) {
+                    printf(C_YELLOW "⚠ empty reply: %d token%s generated, delivered as neither text nor a tool call — asking again" C_RESET "\n",
+                           st.eval_tokens, st.eval_tokens == 1 ? "" : "s");
+                    continue;
+                }
+                printf(C_YELLOW "⚠ empty reply again — stopping here" C_RESET "\n");
+                printf(C_DIM "  nothing was added to the conversation; send another message to continue, or /model to try a different one" C_RESET "\n");
+                return false;
+            }
             print_stats(&st);
             if (!aborted) { check_model_placement(false); maybe_auto_compact(); }
             return aborted;
