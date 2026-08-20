@@ -29,7 +29,7 @@ static char   g_session_id[64];                  /* current session (file stem u
 
 static const char *SLASH_CMDS[] = {
     "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think",
-    "/mode", "/yolo", "/tools", "/ctx", "/temp", "/host", "/keepalive", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/diff", "/rewind", "/quit", "/exit"
+    "/mode", "/yolo", "/tools", "/max_iters", "/ctx", "/temp", "/host", "/keepalive", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/diff", "/rewind", "/quit", "/exit"
 };
 
 /* slash completion list = built-in commands + /skill names (rebuilt when skills reload) */
@@ -1469,6 +1469,7 @@ static void cmd_help(void) {
            "  /permissions [...]    list the project's saved \"always allow\" rules (.corbienest/permissions); add/remove/clear\n"
            "  /yolo [on|off]        shortcut for /mode auto / /mode manual (dangerous!)\n"
            "  /tools on|off         enable/disable tool calling\n"
+           "  /max_iters [N]        tool rounds one request may run before the loop guard stops it (default 100); takes effect at once, even mid-turn\n"
            "  /ctx [N|Nk|max]       context window: no argument opens a size picker; N/64k/max/default set it\n"
            "  /temp X               set temperature (-1 = server default)\n"
            "  /host URL             set ollama host (default http://127.0.0.1:11434)\n"
@@ -1485,7 +1486,7 @@ static void cmd_help(void) {
            "  Enter                 send  ·  Alt+Enter / Ctrl+J / trailing \\ : newline\n"
            "  Enter while busy      queue a message for the model (added between tool rounds or after the turn; Ctrl-C hands it back)\n"
            "                        commands that only report or set something run at once instead: /help /status /cost /diff /history /pwd\n"
-           "                        /skills /memory /mode /yolo /permissions /tools /think /temp /keepalive\n"
+           "                        /skills /memory /mode /yolo /permissions /tools /max_iters /think /temp /keepalive\n"
            "  Ctrl-C                cancel generation / clear line (twice: quit)  ·  Ctrl-L clear screen\n"
            "  PgUp / PgDn           scroll back through the conversation (↑/↓, Home/End inside; Esc/Enter return)\n"
            "  status bar            bottom row shows the permission mode, model, session tokens and context usage\n"
@@ -1728,6 +1729,14 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/tools")) {
         if (!arg) printf("tools: %s\n", g_cfg.no_tools ? "off" : "on"); else { g_cfg.no_tools = !strcmp(arg, "off"); printf(C_GREEN "✓ tools %s" C_RESET "\n", g_cfg.no_tools ? "off" : "on"); }
     }
+    else if (!strcmp(cmd, "/max_iters") || !strcmp(cmd, "/max-iters")) {
+        if (!arg) printf("max_iters: %d tool rounds per request\n", g_cfg.max_iters);
+        else {
+            int n = atoi(arg);
+            if (n < 1) printf("usage: /max_iters N   (N ≥ 1: tool rounds one request may run before the loop guard stops it)\n");
+            else { g_cfg.max_iters = n; config_save(); printf(C_GREEN "✓ max_iters = %d" C_RESET C_DIM " tool rounds per request" C_RESET "\n", n); }
+        }
+    }
     else if (!strcmp(cmd, "/ctx") || !strcmp(cmd, "/context")) cmd_ctx(arg);
     else if (!strcmp(cmd, "/temp")) {
         if (!arg) printf("temperature: %g\n", g_cfg.temperature); else { g_cfg.temperature = atof(arg); config_save(); printf(C_GREEN "✓ temperature = %g" C_RESET "\n", g_cfg.temperature); }
@@ -1781,7 +1790,8 @@ static int handle_slash(char *line) {
 static bool slash_runs_while_busy(const char *cmd, const char *arg) {
     static const char *ok[] = {
         "/help", "/?", "/status", "/cost", "/diff", "/history", "/pwd", "/skills",
-        "/mode", "/yolo", "/permissions", "/tools", "/think", "/temp", "/keepalive", "/keep-alive", "/memory", NULL };
+        "/mode", "/yolo", "/permissions", "/tools", "/max_iters", "/max-iters", "/think", "/temp",
+        "/keepalive", "/keep-alive", "/memory", NULL };
     /* /memory update — and "every N" once N requests are pending — runs the extraction call;
      * "idle N" only sets the delay for the next prompt, so it is safe mid-turn */
     if (!strcmp(cmd, "/memory") && arg && strcmp(arg, "on") && strcmp(arg, "off") && strcmp(arg, "clear")

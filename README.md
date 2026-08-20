@@ -123,6 +123,7 @@ larger ones skipped.)
 | `/init` | have the model explore the project and write a `CORBIENEST.md` (build/test commands, architecture, conventions); improves an existing one |
 | `/skills [reload\|new NAME]` | list skills; run one with `/NAME [args]` |
 | `/tools on\|off` | enable/disable tools |
+| `/max_iters [N]` | how many tool rounds one request may run before the loop guard stops it (default 100). Takes effect at once, so it can be raised from under a turn that is about to hit it |
 | `/ctx [N\|Nk\|max\|default]` | context window: no argument opens a size picker (up to the model's trained maximum), `/ctx 64k`, `/ctx max` … set it directly |
 | `/temp X`, `/host URL` | tuning |
 | `/keepalive [DUR]` | how long Ollama keeps the model loaded after a request (default `30m`, so it is not reloaded from disk mid-session; `-1` = forever, `0` = unload right away, `default` = the server's 5 minutes) |
@@ -159,9 +160,9 @@ larger ones skipped.)
   remaining tool confirmations of that turn); the current mode is shown in the bottom status bar.
 - **Slash commands that only report or set something answer straight away while the model
   works** — they never become a queued message: `/help`, `/status`, `/cost`, `/diff`, `/history`,
-  `/pwd`, `/skills`, `/memory`, `/mode`, `/yolo`, `/permissions`, `/tools`, `/think`, `/temp`,
-  `/keepalive`. A `/permissions add` or `/mode` typed mid-turn applies to the tool confirmations
-  still to come, like Shift+Tab. Everything that touches the conversation (`/clear`, `/compact`,
+  `/pwd`, `/skills`, `/memory`, `/mode`, `/yolo`, `/permissions`, `/tools`, `/max_iters`,
+  `/think`, `/temp`, `/keepalive`. A `/permissions add` or `/mode` typed mid-turn applies to the
+  tool confirmations still to come, like Shift+Tab, and `/max_iters` to the rounds still to come. Everything that touches the conversation (`/clear`, `/compact`,
   `/rewind`, `/resume`, `/save`, `/system`, `/init`, skills), needs the server (`/model`,
   `/models`, `/ctx`, `/host`, `/memory update`) or asks a question stays queued until the turn ends.
 
