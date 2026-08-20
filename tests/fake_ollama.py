@@ -51,7 +51,12 @@ def script(model, messages, req):
         yield chunk(model, done=True)
         return
     if messages[0]["role"] == "system" and "You are a sub-agent" in messages[0]["content"]:
-        # sub-agent: one grep round, then a report
+        # sub-agent: one grep round, then a report — or, for a SLEEP task, one slow command,
+        # so a test can type a message while the sub-agent is in the middle of a round
+        if "SLEEP" in messages[1]["content"] and last["role"] != "tool":
+            yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "sleep 2; echo sub-slept"}}}])
+            yield chunk(model, done=True)
+            return
         if last["role"] == "tool":
             yield chunk(model, "REPORT: found it in " + last["content"].strip().splitlines()[0][:40])
             yield chunk(model, done=True)
@@ -76,6 +81,10 @@ def script(model, messages, req):
         yield chunk(model, "Echo: " + text.split("\n")[0])
         yield chunk(model, done=True)
         return
+    if "TOOL_TASK_SLEEP" in text:
+        yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "slow research", "prompt": "SLEEP, then report."}}}])
+        yield chunk(model, done=True)
+        return
     if "TOOL_TASK" in text:
         yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "find the needle", "prompt": "Search for needle and report where it is."}}}])
         yield chunk(model, done=True)
@@ -88,6 +97,12 @@ def script(model, messages, req):
     if "TOOL_BASH" in text:
         yield chunk(model, "Running it.")
         yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "echo hello-from-tool"}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_SLEEP2" in text:
+        # two calls in one round, the first slow: a message can arrive before the second starts
+        yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "sleep 2; echo slept-one"}}},
+                                       {"function": {"name": "bash", "arguments": {"command": "echo second-tool"}}}])
         yield chunk(model, done=True)
         return
     if "TOOL_SLEEP" in text:

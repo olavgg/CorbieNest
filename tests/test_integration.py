@@ -426,11 +426,40 @@ check("queued" not in clean(s.out[-400:].decode("utf-8", "replace")), "queue cou
 s.send("/mode auto\r"); s.expect("mode: auto")
 s.send("TOOL_SLEEP\r"); check(s.expect("running…", 10), "slow tool running")
 s.send("mid-task note\r"); check(s.expect("1 queued", 3), "queued while the tool runs")
-check(s.expect("slept", 10), "tool finished")
-check(s.expect("› mid-task note", 5), "queued message injected between tool rounds")
+check(s.expect("stopped: your message goes to the model first", 8), f"the running command was stopped for it: {s.text()[-300:]!r}")
+check(s.expect("› mid-task note", 5), "queued message injected at once, not after the command")
+check("slept" not in clean(s.out[s.mark:].decode("utf-8", "replace")), "the command never ran to completion")
 check(s.expect("Echo: mid-task note", 15), "model saw the mid-task message on its next call")
 msgs = requests()[-1]["messages"]
 check(msgs[-1]["role"] == "user" and msgs[-1]["content"] == "mid-task note" and msgs[-2]["role"] == "tool", f"injected right after the tool result: {[m['role'] for m in msgs[-4:]]}")
+check("did not finish" in msgs[-2]["content"], f"the tool result says the command was cut short: {msgs[-2]['content'][:100]!r}")
+
+print("test interactive: a queued message stops the tool calls of the round that have not started")
+s.send("TOOL_SLEEP2\r"); check(s.expect("running…", 10), "the first of two calls is running")
+s.send("second thoughts\r")
+check(s.expect("○ bash(echo second-tool)", 8), f"the call that had not started is shown as skipped: {s.text()[-400:]!r}")
+check(s.expect("⎿  not run — your message goes to the model first", 5), "with the reason under it")
+check(s.expect("› second thoughts", 8), "and the message goes in instead")
+check(s.expect("Echo: second thoughts", 15), "the model was called with it right away")
+msgs = requests()[-1]["messages"]
+check(len([m for m in msgs if m["role"] == "tool"]) >= 2 and msgs[-2]["role"] == "tool" and "not run" in msgs[-2]["content"],
+      f"the skipped call still got a result of its own: {[m['role'] for m in msgs[-4:]]}")
+
+print("test interactive: a message queued behind a slash command is not held back by it")
+s.send("TOOL_SLEEP\r"); check(s.expect("running…", 10), "tool running")
+s.send("/save queued.md\r"); check(s.expect("1 queued", 3), "a command that touches the conversation waits for the turn")
+s.send("and one more thing\r"); check(s.expect("2 queued", 3), "the message is queued behind it")
+check(s.expect("› and one more thing", 8), f"it is injected without waiting for the command in front of it: {s.text()[-300:]!r}")
+check(s.expect("Echo: and one more thing", 15), "the model saw it inside the turn")
+check(s.expect("saved", 8), "and the slash command still ran after the turn")
+
+print("test interactive: a message queued before a turn starts does not cut into it")
+s.send("SLOW\r"); check(s.expect("two"), "streaming")
+s.send("TOOL_SLEEP\r"); s.send("after the tool\r"); check(s.expect("2 queued", 3), "two messages queued while the model was busy")
+check(s.expect("running…", 25), "the first of them starts a tool round of its own")
+check(s.expect("slept", 25), f"the one still waiting does not stop that command: {s.text()[-300:]!r}")
+check(s.expect("› after the tool", 10), "it is delivered between rounds, the way it always was")
+check(s.expect("Echo: after the tool", 15), "and answered")
 s.send("/mode manual\r"); s.expect("mode: manual")
 
 print("test interactive: shift+tab while the model works switches the mode immediately")
@@ -548,6 +577,18 @@ sub = [r for r in requests() if r["messages"][0]["role"] == "system" and "You ar
 check(sub and all(t["function"]["name"] in ("read_file", "list_dir", "grep", "bash") for t in sub[-1]["tools"]), "sub-agent got read-only tools only")
 check("hay.txt" in sub[-1]["messages"][-1]["content"], "grep ran for real inside the sub-agent")
 os.remove(os.path.join(WORK, "hay.txt"))
+s.send("/mode auto\r"); s.expect("mode: auto")
+s.send("TOOL_TASK_SLEEP\r"); check(s.expect("⤷ sub-agent slow research", 15), "sub-agent started")
+check(s.expect("running…", 10), "its shell command is running")
+s.send("never mind, do this instead\r")
+check(s.expect("stopped after 1 tool round", 10), f"a queued message stops the sub-agent between its rounds: {s.text()[-400:]!r}")
+check("sub-slept" not in clean(s.out[s.mark:].decode("utf-8", "replace")), "its command was stopped as well")
+check(s.expect("› never mind, do this instead", 8), "and the message reaches the model")
+check(s.expect("Echo: never mind, do this instead", 15), "which is called with it right away")
+msgs = requests()[-1]["messages"]
+check(any(m["role"] == "tool" and "stopped after 1 tool round" in m["content"] for m in msgs),
+      f"the parent gets what the sub-agent had gathered, not an error: {[m['role'] for m in msgs[-4:]]}")
+s.send("/mode manual\r"); s.expect("mode: manual")
 
 print("test interactive: /ctx picker and sizes")
 s.send("/ctx 64k\r"); check(s.expect("context window: 64k (num_ctx 65536)"), "/ctx 64k")
@@ -773,6 +814,28 @@ s.send("multi one\\\r"); s.send("two\r"); check(s.expect("Echo: multi one"), "mu
 s.send("\x04"); check(s.expect("bye"), "exit"); s.close()
 hist = open(os.path.join(CFG, "corbienest", "history")).read()
 check("multi one\x1ftwo" in hist, "history saved with encoded newline")
+
+print("test two sessions at once: shared history accumulates, the config is never half-written")
+ha = Session(["-m", "fake-coder:latest"]); check(ha.expect("Ctrl-D to quit"), "session A up")
+hb = Session(["-m", "fake-coder:latest"]); check(hb.expect("Ctrl-D to quit"), "session B up, having loaded the history A is about to add to")
+ha.send("alpha-in-a\r"); check(ha.expect("tok/s", 15), "A answered")
+hb.send("beta-in-b\r"); check(hb.expect("tok/s", 15), "B answered")
+ha.send("second-in-a\r"); check(ha.expect("tok/s", 15), "A again, after B had written the file")
+hb.send("/keepalive 7m\r"); check(hb.expect("keep_alive = 7m"), "B rewrites the config")
+ha.send("/temp 0.3\r"); check(ha.expect("temperature = 0.3"), "A rewrites it too")
+hist = open(os.path.join(CFG, "corbienest", "history")).read()
+check("alpha-in-a" in hist and "beta-in-b" in hist and "second-in-a" in hist,
+      f"neither session's queries were clobbered by the other's save: {hist[-200:]!r}")
+pos = [hist.find(k) for k in ("alpha-in-a", "beta-in-b", "second-in-a")]
+check(all(p >= 0 for p in pos) and pos == sorted(pos), f"appended in the order they were typed: {pos}")
+cfg = open(os.path.join(CFG, "corbienest", "config")).read()
+check(cfg.startswith("# corbienest config") and "model=fake-coder:latest" in cfg and cfg.endswith("\n"),
+      f"the config is one whole file, not a mixture of two writes: {cfg[-140:]!r}")
+check(len([l for l in cfg.splitlines() if "=" in l]) >= 10, f"every key is there — nothing was truncated: {cfg!r}")
+check("temperature=0.3" in cfg and "keep_alive=30m" in cfg,
+      f"and it is A's whole state: the last writer wins, which atomicity does not change: {cfg!r}")
+check(not [f for f in os.listdir(os.path.join(CFG, "corbienest")) if ".tmp" in f], "no temporary files left behind")
+ha.send("\x04"); hb.send("\x04"); ha.close(); hb.close()
 
 shutil.rmtree(WORK, ignore_errors=True); shutil.rmtree(CFG, ignore_errors=True)
 print(f"{passed} checks passed, {failed} failed")

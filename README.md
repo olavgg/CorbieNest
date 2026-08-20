@@ -147,11 +147,16 @@ larger ones skipped.)
   Esc twice at an empty prompt opens `/rewind`.
 - **You can keep typing while the model works.** What you type shows up in the input field as
   you go (`❯ …▏`); press Enter to queue it as a message — add details,
-  narrow the request, change the spec — the status bar shows `N queued`, and the message is
-  delivered at the next opportunity: between tool rounds (so the model sees it before its next
-  step, alongside the tool result) or as the next turn once the current one finishes. Queue as
-  many as you like; they are sent in order. Ctrl-C hands queued text back to the editor instead
-  of sending it. Text without Enter simply reappears in the prompt afterwards.
+  narrow the request, change the spec — the status bar shows `N queued`.
+  **A queued message does not wait for the job in flight to end**, because it is usually about
+  that job: the running shell command is stopped, the tool calls of that round that had not
+  started are skipped (the model is told they did not run), a sub-agent reports what it has
+  found so far instead of finishing its research, and the message goes to the model on its very
+  next call. A message queued *before* the turn started — the ones sent one after another after
+  a turn ends — stops nothing; it is delivered between tool rounds as before. Queue as many as
+  you like; they are sent in order, and a `/command` waiting for the end of the turn does not
+  hold back the messages behind it. Ctrl-C hands queued text back to the editor instead of
+  sending it. Text without Enter simply reappears in the prompt afterwards.
 - Tab completes slash commands and skill names; ↑/↓ browse history — the latest 100 queries are
   kept in `~/.config/corbienest/history` (`/history` lists them). Ctrl-R searches it
   incrementally (`(reverse-i-search)`, like bash): type to refine, Ctrl-R again for an older
@@ -294,6 +299,34 @@ appended to the system prompt, so you can give the model project-specific guidan
 Settings changed with `/model`, `/ctx`, `/think`, `/mode`, `/yolo`, `/host`, `/keepalive`, `/memory on|off|every N|idle N` are saved to
 `~/.config/corbienest/config`. Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`.
 
+### Running more than one session
+
+Several corbienest sessions can work on separate tasks against the same Ollama at the same
+time. On the Ollama side that needs `OLLAMA_NUM_PARALLEL` ≥ the number of sessions (otherwise
+they simply queue behind one another), enough VRAM for one KV cache *per slot*, and the same
+`-c` in every session — corbienest always sends `num_ctx`, and different values make the
+scheduler load a separate runner for each rather than sharing one.
+
+Give each session its own directory (a `git worktree` is the natural fit): two agents editing
+one tree fight over the files themselves, and `/rewind` only knows about the writes its own
+process made. Then nothing per-project collides — `.corbienest/memory.md` and
+`.corbienest/permissions` are per directory, session files are named after the start time and
+pid, and `--continue` resumes the latest session *from this directory*.
+
+What is shared is `~/.config/corbienest`, and it is written to survive that:
+
+- **History accumulates.** `history` is only ever appended to, so what one session typed is
+  never overwritten by another's save (it is folded back to the latest 100 entries once the
+  file grows past 64 KB). Each session still starts with the entries that existed when it did.
+- **The config is never half-written.** It is swapped in with `rename(2)`, so a session reading
+  it gets the whole old file or the whole new one — never a truncated one, and never a mixture.
+  It is not merged, though: it is rewritten in full on every setting change, so whichever
+  session saved last is what the *next* one starts with. Give the sessions separate settings
+  with `XDG_CONFIG_HOME=~/.config/crow-a corbienest` if that matters.
+
+The same atomic swap is used for `.corbienest/memory.md`, `.corbienest/permissions` and the
+session files, so a crash or a kill mid-write cannot truncate any of them either.
+
 ## Tests
 
 ```sh
@@ -310,8 +343,9 @@ make test
   with results fed back, `--yolo`, XML tool-call recovery, `@file`, errors, and — through a
   pseudo-terminal — the editor (cursor keys, history, multi-line, paste, type-ahead),
   the confirmation menu (arrow keys, deny with reason, always, stray keys ignored),
-  messages queued with Enter while the model streams or a tool runs (delivered between tool
-  rounds / after the turn, handed back on Ctrl-C), the `/ctx` picker and `/history`,
+  messages queued with Enter while the model streams or a tool runs (they stop the command,
+  the round and the sub-agent in flight, step past a queued `/command`, and are handed back on
+  Ctrl-C), the `/ctx` picker and `/history`,
   Shift+Tab mode cycling (plan / accept-edits behaviour), `/skills`, Ctrl-C interruption,
   slash commands, the `/model` picker, `!cmd`, `/save`, and config/history persistence.
 

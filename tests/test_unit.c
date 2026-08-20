@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -278,6 +279,18 @@ static void test_util(void) {
     char f[400]; snprintf(f, sizeof f, "%s/f", deep);
     CHECK(write_whole_file(f, "hi", 2) == 0); size_t n; char *d = read_whole_file(f, &n, 0); CHECK(n == 2); CHECK_STR(d, "hi"); free(d);
     d = read_whole_file(f, &n, 1); CHECK(n == 1); free(d);   /* cap honoured */
+    /* atomic replace: the file is swapped in whole, keeps its mode, and leaves no litter */
+    CHECK(chmod(f, 0640) == 0);
+    CHECK(write_whole_file_atomic(f, "replaced", 8) == 0);
+    d = read_whole_file(f, &n, 0); CHECK(n == 8); CHECK_STR(d, "replaced"); free(d);
+    struct stat sb; CHECK(stat(f, &sb) == 0 && (sb.st_mode & 07777) == 0640);
+    DIR *dp = opendir(deep); int stray = 0; struct dirent *de;
+    while (dp && (de = readdir(dp))) if (strstr(de->d_name, ".tmp")) stray++;
+    if (dp) closedir(dp);
+    CHECK(stray == 0);
+    char nf[400]; snprintf(nf, sizeof nf, "%s/new", deep);
+    CHECK(write_whole_file_atomic(nf, "", 0) == 0 && is_file(nf));   /* creates it too */
+    CHECK(write_whole_file_atomic("/nope/nowhere/x", "x", 1) != 0);  /* and reports failure */
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
 }
 
@@ -345,6 +358,22 @@ static void test_queue(void) {
     t = term_queue_pop(); CHECK_STR(t, "one"); free(t);
     t = term_queue_pop(); CHECK_STR(t, "two"); free(t);
     CHECK(term_queue_count() == 0);
+    /* a queued /command or !line waits for the REPL, but does not hold back the messages
+       behind it: those are what the model is waiting for */
+    term_queue_push("/save f.md"); term_queue_push("behind it"); term_queue_push("!ls");
+    t = term_queue_pop_plain(); CHECK_STR(t, "behind it"); free(t);
+    CHECK(term_queue_count() == 2 && term_queue_pop_plain() == NULL);
+    CHECK_STR(term_queue_peek(), "/save f.md");
+    term_queue_clear();
+    /* "new since the mark": what stops the work in flight. Only plain messages count, and
+       only ones queued after main.c last marked the queue seen. */
+    term_queue_mark(); CHECK(!term_queue_new());
+    term_queue_push("/status"); CHECK(!term_queue_new());
+    term_queue_push("look at this too"); CHECK(term_queue_new());
+    term_queue_mark(); CHECK(!term_queue_new());          /* still queued, but no longer new */
+    t = term_queue_pop_plain(); free(t);
+    CHECK(!term_queue_new());
+    term_queue_clear();
     #undef KT
     /* prompt history keeps the latest 100 queries */
     for (int i = 0; i < 150; i++) { char l[32]; snprintf(l, sizeof l, "query %d", i); hist_add(l); }

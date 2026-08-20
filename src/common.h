@@ -48,6 +48,11 @@ void  die(const char *fmt, ...);
 /* file helpers */
 char *read_whole_file(const char *path, size_t *len_out, size_t cap);   /* NULL on error */
 int   write_whole_file(const char *path, const char *data, size_t len);
+/* Same, but the file is replaced in one step: written to a temporary next to it, then
+ * rename(2)d over it. Another process reading the file gets either the whole old one or the
+ * whole new one, never half of either, and a crash mid-write cannot truncate what was there.
+ * Use it for every file corbienest keeps its own state in — several sessions may share it. */
+int   write_whole_file_atomic(const char *path, const char *data, size_t len);
 int   mkdir_p(const char *path);
 char *expand_home(const char *path);   /* "~/x" -> "/home/u/x", malloc'd */
 int   is_dir(const char *path);
@@ -178,6 +183,14 @@ char       *term_queue_pop(void);         /* malloc'd, or NULL */
 void        term_queue_push(const char *msg);
 void        term_queue_clear(void);
 void        term_queue_to_editor(void);   /* after an interrupt: hand queued text back to the editor */
+char       *term_queue_pop_plain(void);   /* oldest plain message, stepping over queued /commands and !lines */
+/* "The user said something since main.c last looked." A message queued after term_queue_mark()
+ * stops the work in flight so it reaches the model at once instead of after the task: the tool
+ * calls of a round still to run, a shell command, a sub-agent. A message that was already
+ * waiting when that work started does not — it is delivered at the normal point. Queued
+ * /commands and !lines belong to the REPL and stop nothing. */
+int         term_queue_new(void);
+void        term_queue_mark(void);        /* everything queued so far is accounted for */
 /* Slash commands that only look at state or flip a setting do not have to wait for the turn
  * to end: when Enter is pressed while busy, term.c offers the line to this hook first and
  * only queues it as a message when the hook returns 0. Set by main.c. */
