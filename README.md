@@ -219,9 +219,14 @@ did — the changes, the files they touched, and how it verified them (build, te
 program, or that it did not) — and, when there is something worth raising, up to three
 suggestions of what you may want to do next: follow-up work it left out on purpose, a weakness
 it noticed nearby, something worth testing. Suggestions are only suggestions; it does not start
-on them. There is no report in plan mode (the plan is the answer), nor after a turn that only
-answered a question or stopped to ask you something. Small local models follow this more loosely
-than large ones.
+on them.
+
+The report is meant to say *finished*, so it is asked for only when the work really is. When
+something is left — a step skipped, a tool you denied, a build or test that failed, work stopped
+partway — the model writes no report and says instead, in a line or two, what is done, what is
+not, and what comes next. There is no report in plan mode either (the plan is the answer), nor
+after a turn that only answered a question or stopped to ask you something. Small local models
+follow all of this more loosely than large ones.
 
 ### Skills
 
