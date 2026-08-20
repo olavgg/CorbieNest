@@ -212,6 +212,17 @@ Some local models occasionally emit their native tool syntax as plain text
 (e.g. `<function=grep>…`) when Ollama's parser fails; corbienest recognises the
 Qwen XML and Hermes `<tool_call>{json}</tool_call>` shapes and still executes them.
 
+### The end-of-task report
+
+When the model is done with what you asked for it closes the turn with a short report: what it
+did — the changes, the files they touched, and how it verified them (build, tests, running the
+program, or that it did not) — and, when there is something worth raising, up to three
+suggestions of what you may want to do next: follow-up work it left out on purpose, a weakness
+it noticed nearby, something worth testing. Suggestions are only suggestions; it does not start
+on them. There is no report in plan mode (the plan is the answer), nor after a turn that only
+answered a question or stopped to ask you something. Small local models follow this more loosely
+than large ones.
+
 ### Skills
 
 A skill is a reusable instruction file, `SKILL.md`, with a short frontmatter:

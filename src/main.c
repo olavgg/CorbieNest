@@ -791,8 +791,7 @@ static char *build_system_prompt(void) {
             "- After making code changes, verify them when practical (compile, run tests, or run the program).\n"
             "- Do not fabricate tool results. If a tool errors, read the error and adjust.\n"
             "- Use task to hand a broad, self-contained investigation (\"find all places that…\", \"how does X work across the code\") to a read-only sub-agent "
-            "and get back a report, keeping the noise out of this conversation; give it a complete prompt, it knows nothing of this chat.\n"
-            "- When a task is done, briefly summarise what you changed and how you verified it.\n");
+            "and get back a report, keeping the noise out of this conversation; give it a complete prompt, it knows nothing of this chat.\n");
     } else {
         sb_puts(&b, "\n(No tools are available in this session; if you need file contents or command output, ask the user to provide them.)\n");
     }
@@ -800,6 +799,16 @@ static char *build_system_prompt(void) {
         "\n# Style\n- Be concise and direct. Do not pad answers with pleasantries.\n"
         "- Use markdown lightly (code blocks for code, short lists). Reference code as path:line.\n"
         "- When writing code, follow the existing conventions of the project and write complete, working code.\n");
+    if (g_model_tools && !g_cfg.no_tools && g_cfg.mode != MODE_PLAN)
+        sb_puts(&b,
+            "\n# Finishing a task\nWhen the work the user asked for is done, end your turn with a short report:\n"
+            "- What was done: a few bullets — the changes you made, the files they touched (path:line), and how you "
+            "verified them (build, tests, running the program) or that you did not.\n"
+            "- Suggestions: up to three bullets on what the user may want to do next — follow-up work you left out on "
+            "purpose, a weakness you noticed nearby, something worth testing. One line each, saying what and why. "
+            "Do not start on them, they are the user's to decide; leave the whole section out rather than inventing work.\n"
+            "Keep the report under about ten lines. Skip it when you only answered a question, or when you are stopping "
+            "to ask the user something rather than finishing.\n");
     if (g_cfg.mode == MODE_PLAN)
         sb_puts(&b, "\n# Plan mode (read-only)\n"
             "The user has put you in plan mode. Explore the codebase with read_file, list_dir, grep and read-only shell commands, "
