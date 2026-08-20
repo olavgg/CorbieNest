@@ -1071,6 +1071,13 @@ static void tool_arg_summary(const char *name, cJSON *args, char *out, size_t n)
  * TOOL_RESULT_PCT of the window; the middle goes, both ends stay, and the note tells the model
  * how to get the rest. */
 #define TOOL_RESULT_PCT 25
+/* The result a tool call gets when the user's message cut the round short: the model has to
+ * know the call did not happen, and that what follows is why. */
+static const char *TOOL_NOT_RUN =
+    "not run: the user sent a message while this tool round was in flight, so the calls that had "
+    "not started were skipped. Their message follows below — read it first, and call this tool "
+    "again if it is still what you need.";
+
 static cJSON *tool_result_message(const char *name, const char *res) {
     cJSON *tm = cJSON_CreateObject();
     cJSON_AddStringToObject(tm, "role", "tool");
@@ -1140,6 +1147,7 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         if (!strcmp(name, "read_file") || !strcmp(name, "list_dir") || !strcmp(name, "grep") || !strcmp(name, "bash")) cJSON_AddItemReferenceToArray(tools, t);
     }
     int rc = 1, tool_rounds = 0, round_first = -1;
+    bool stopped_early = false;   /* the user sent a message: report what it has and get out */
     const char *final = NULL;
     for (int iter = 0; iter <= SUBAGENT_ITERS; iter++) {
         /* the sub-agent has its own conversation and up to SUBAGENT_ITERS rounds of results in
@@ -1164,6 +1172,7 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         if (iter == SUBAGENT_ITERS) { sb_printf(out, "error: sub-agent stopped after %d tool rounds without a report", SUBAGENT_ITERS); if (cJSON_IsString(content) && content->valuestring[0]) sb_printf(out, "\nIts last message:\n%s", content->valuestring); break; }
         cJSON *call;
         round_first = cJSON_GetArraySize(msgs);
+        bool cut = false;   /* a message arrived mid-round: start nothing more */
         cJSON_ArrayForEach(call, calls) {
             cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
             cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
@@ -1172,6 +1181,13 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
             cJSON *parsed = NULL;
             if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
             char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
+            if (!cut && term_queue_new()) cut = true;
+            if (cut) {
+                printf("    " C_DIM "⎿ %s — not run" C_RESET "\n", name);
+                cJSON_AddItemToArray(msgs, tool_result_message(name, TOOL_NOT_RUN));
+                if (parsed) cJSON_Delete(parsed);
+                continue;
+            }
             printf("    " C_DIM "⎿ %s%s%s%s" C_RESET "\n", name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
             sbuf o; sb_init(&o);
             g_session.tool_calls++;
@@ -1185,8 +1201,19 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         }
         tool_rounds++;
         if (term_poll_interrupt()) { sb_puts(out, "error: sub-agent interrupted by the user"); break; }
+        /* The user is talking to the main agent: half a report now beats a whole one after
+         * another twenty rounds of research it may no longer want. */
+        if (term_queue_new()) {
+            sb_printf(out, "The sub-agent was stopped after %d tool round%s because the user sent a message that comes first. What it had gathered so far:\n%s",
+                      tool_rounds, tool_rounds == 1 ? "" : "s",
+                      cJSON_IsString(content) && content->valuestring[0] ? content->valuestring : "(nothing reported yet)");
+            stopped_early = true; rc = 0; break;
+        }
     }
-    if (rc == 0) {
+    if (stopped_early) {
+        printf("    " C_YELLOW "⎿ stopped after %d tool round%s — your message goes first" C_RESET "\n",
+               tool_rounds, tool_rounds == 1 ? "" : "s");
+    } else if (rc == 0) {
         sb_printf(out, "%s", final && *final ? final : "(the sub-agent returned an empty report)");
         printf("    " C_DIM "⎿ report after %d tool round%s:" C_RESET "\n", tool_rounds, tool_rounds == 1 ? "" : "s");
         print_result_preview(final && *final ? final : "(empty)", 8);
@@ -1205,20 +1232,22 @@ static void echo_queued(const char *text) {
     printf(C_BOLD C_ORANGE "› " C_RESET C_DIM "%s" C_RESET "\n", text);
 }
 
-/* Deliver plain messages queued while the model was working (Claude Code style):
- * they are appended as user messages so the model sees them on its next call.
- * Slash / ! lines stay queued and are handled by the REPL after the turn.
+/* Deliver plain messages queued while the model was working (Claude Code style): they are
+ * appended as user messages so the model sees them on its next call. Slash / ! lines stay
+ * queued for the REPL to run after the turn, but they do not hold the messages behind them
+ * back — those are what the model is waiting for. Marking the queue afterwards is what tells
+ * the rest of the turn that nothing is waiting any more.
  * Returns the number of messages injected. */
 static int inject_queued(void) {
     int n = 0;
-    const char *q;
-    while ((q = term_queue_peek()) && *q != '/' && *q != '!') {
-        char *text = term_queue_pop();
+    char *text;
+    while ((text = term_queue_pop_plain())) {
         echo_queued(text);
         char *msg = expand_mentions(text);
         add_message("user", msg);
         free(msg); free(text); n++;
     }
+    term_queue_mark();
     if (n) { term_status_refresh(); printf("\n"); }
     return n;
 }
@@ -1265,6 +1294,9 @@ static bool run_turn(void) {
     int iters = 0, shrinks = 0, empties = 0;
     int round_first = -1;   /* where this round's tool results start (-1 before the first round) */
     g_session.turns++;
+    /* Messages already queued when the turn starts (the REPL sends them one after another) are
+     * delivered the normal way; only what the user types from here on cuts into the work. */
+    term_queue_mark();
     for (;;) {
         if (shrink_context(round_first >= 0 ? round_first : cJSON_GetArraySize(g_messages))) round_first = -1;
         cJSON *msgs = messages_with_system();
@@ -1325,6 +1357,7 @@ static bool run_turn(void) {
         }
         cJSON *call;
         round_first = cJSON_GetArraySize(g_messages);
+        bool cut = false;   /* a message arrived mid-round: start nothing more, let it through */
         cJSON_ArrayForEach(call, calls) {
             cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
             cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
@@ -1333,6 +1366,15 @@ static bool run_turn(void) {
             cJSON *parsed = NULL;
             if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
             char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
+            if (!cut && term_queue_new()) cut = true;
+            if (cut) {
+                printf(C_DIM "○" C_RESET " " C_BOLD "%s" C_RESET, name);
+                if (summ[0]) printf(C_DIM "(%s)" C_RESET, summ);
+                printf("\n  ⎿  " C_DIM "not run — your message goes to the model first" C_RESET "\n");
+                cJSON_AddItemToArray(g_messages, tool_result_message(name, TOOL_NOT_RUN));
+                if (parsed) cJSON_Delete(parsed);
+                continue;
+            }
             printf(C_GREEN "●" C_RESET " " C_BOLD "%s" C_RESET, name);
             if (summ[0]) printf(C_DIM "(%s)" C_RESET, summ);
             printf("\n");

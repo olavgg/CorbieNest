@@ -345,6 +345,22 @@ static void test_queue(void) {
     t = term_queue_pop(); CHECK_STR(t, "one"); free(t);
     t = term_queue_pop(); CHECK_STR(t, "two"); free(t);
     CHECK(term_queue_count() == 0);
+    /* a queued /command or !line waits for the REPL, but does not hold back the messages
+       behind it: those are what the model is waiting for */
+    term_queue_push("/save f.md"); term_queue_push("behind it"); term_queue_push("!ls");
+    t = term_queue_pop_plain(); CHECK_STR(t, "behind it"); free(t);
+    CHECK(term_queue_count() == 2 && term_queue_pop_plain() == NULL);
+    CHECK_STR(term_queue_peek(), "/save f.md");
+    term_queue_clear();
+    /* "new since the mark": what stops the work in flight. Only plain messages count, and
+       only ones queued after main.c last marked the queue seen. */
+    term_queue_mark(); CHECK(!term_queue_new());
+    term_queue_push("/status"); CHECK(!term_queue_new());
+    term_queue_push("look at this too"); CHECK(term_queue_new());
+    term_queue_mark(); CHECK(!term_queue_new());          /* still queued, but no longer new */
+    t = term_queue_pop_plain(); free(t);
+    CHECK(!term_queue_new());
+    term_queue_clear();
     #undef KT
     /* prompt history keeps the latest 100 queries */
     for (int i = 0; i < 150; i++) { char l[32]; snprintf(l, sizeof l, "query %d", i); hist_add(l); }

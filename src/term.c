@@ -828,6 +828,16 @@ int (*term_run_while_busy)(const char *line) = NULL;   /* set by main.c; see com
 static bool  g_ta_paste = false;     /* inside a bracketed paste (ESC[200~ … ESC[201~) */
 static unsigned char g_ta_tail[6];   /* last bytes appended, to spot the paste brackets */
 
+/* Whether a queued line is a message for the model (a /command or !line is the REPL's). */
+static bool queue_is_plain(const char *m) { return m && *m != '/' && *m != '!'; }
+
+/* Messages queued since main.c last marked the queue seen. Work in flight is stopped for
+ * those and only those, so a message still waiting from before a turn started never kills
+ * the command that turn goes on to run. */
+static unsigned g_queue_seq, g_queue_mark;
+void term_queue_mark(void) { g_queue_mark = g_queue_seq; }
+int  term_queue_new(void) { return g_queue_seq != g_queue_mark; }
+
 int term_queue_count(void) { return g_queue_n; }
 const char *term_queue_peek(void) { return g_queue_n ? g_queue[0] : NULL; }
 char *term_queue_pop(void) {
@@ -839,10 +849,25 @@ char *term_queue_pop(void) {
 }
 void term_queue_push(const char *msg) {
     if (!msg || !*msg) return;
+    if (queue_is_plain(msg)) g_queue_seq++;
     if (g_queue_n >= QUEUE_MAX) { free(g_queue[0]); memmove(g_queue, g_queue + 1, sizeof(char*) * (QUEUE_MAX - 1)); g_queue_n--; }
     g_queue[g_queue_n++] = xstrdup(msg);
 }
 void term_queue_clear(void) { while (g_queue_n) free(g_queue[--g_queue_n]); }
+
+/* The oldest plain message, stepping over any /command or !line queued in front of it: those
+ * wait for the REPL at the end of the turn, and a message behind one would otherwise wait
+ * with them — for the whole turn — instead of reaching the model at the next round. */
+char *term_queue_pop_plain(void) {
+    for (int i = 0; i < g_queue_n; i++) {
+        if (!queue_is_plain(g_queue[i])) continue;
+        char *m = g_queue[i];
+        memmove(g_queue + i, g_queue + i + 1, sizeof(char*) * (size_t)(g_queue_n - i - 1));
+        g_queue_n--;
+        return m;
+    }
+    return NULL;
+}
 
 /* Turn raw keystrokes typed while busy into message text: printable bytes are
  * kept, backspace deletes, Ctrl-U clears the line, Ctrl-W deletes a word, escape

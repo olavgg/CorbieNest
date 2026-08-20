@@ -488,7 +488,7 @@ static tool_status t_list_dir(cJSON *args, sbuf *out) {
 
 /* ---------- shell runner ---------- */
 /* Runs cmd via /bin/sh -c, capturing stdout+stderr. Returns exit code (or -1 on failure,
- * 124 on timeout, 130 if interrupted by user). */
+ * 124 on timeout, 125 if a message the user queued stopped it, 130 if interrupted by user). */
 static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupted) {
     *interrupted = false;
     int pfd[2];
@@ -513,7 +513,7 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
     setpgid(pid, pid);
     struct pollfd fds[2] = { { pfd[0], POLLIN, 0 }, { g_cfg.interactive ? STDIN_FILENO : -1, POLLIN, 0 } };
     long remaining_ms = (long)timeout_s * 1000;
-    bool timed_out = false;
+    bool timed_out = false, by_msg = false;
     term_raw(true);
     term_busy("running command");
     struct timeval t0; gettimeofday(&t0, NULL);
@@ -536,6 +536,9 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
         }
         if (fds[1].revents & POLLIN) {
             if (term_poll_interrupt()) { *interrupted = true; break; }
+            /* A message queued while this runs is almost always about the job in flight: stop
+             * the command so it reaches the model now, not when a ten-minute build is done. */
+            if (term_queue_new()) { by_msg = true; break; }
         }
         if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             char buf[8192]; ssize_t n = read(pfd[0], buf, sizeof buf);
@@ -545,12 +548,13 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
     }
     if (spin_shown) { fputs("\r\x1b[2K", stdout); fflush(stdout); }
     term_busy(NULL);
-    if (timed_out || *interrupted) { kill(-pid, SIGTERM); usleep(200 * 1000); kill(-pid, SIGKILL); }
+    if (timed_out || *interrupted || by_msg) { kill(-pid, SIGTERM); usleep(200 * 1000); kill(-pid, SIGKILL); }
     /* drain */
     close(pfd[0]);
     int status = 0;
     waitpid(pid, &status, 0);
     if (timed_out) return 124;
+    if (by_msg) return 125;
     if (*interrupted) return 130;
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
@@ -575,6 +579,10 @@ static tool_status t_bash(cJSON *args, sbuf *out) {
     cap_output(&o, OUT_CAP);
     if (rc == 124) sb_printf(out, "(command timed out after %ds and was killed)\n", timeout);
     if (intr) sb_puts(out, "(command interrupted by user with Ctrl-C)\n");
+    if (rc == 125) {
+        printf("  " C_YELLOW "⚠ stopped: your message goes to the model first" C_RESET "\n");
+        sb_puts(out, "(the command did not finish: the user sent a message while it ran and it was stopped so they could be answered. Its output up to that point follows.)\n");
+    }
     if (o.len) { sb_append(out, o.data, o.len); if (o.data[o.len-1] != '\n') sb_putc(out, '\n'); }
     else sb_puts(out, "(no output)\n");
     sb_printf(out, "exit code: %d", rc);
@@ -601,10 +609,11 @@ static tool_status t_grep(cJSON *args, sbuf *out) {
     char *p = expand_home(path); sh_quote(&cmd, p); free(p);
     sb_puts(&cmd, " 2>/dev/null | head -n 300");
     sbuf o; sb_init(&o); bool intr;
-    run_shell(cmd.data, 60, &o, &intr);
+    int rc = run_shell(cmd.data, 60, &o, &intr);
     cap_output(&o, OUT_CAP);
     if (!o.len) sb_printf(out, "No matches for /%s/ in %s", pat, path);
     else { sb_append(out, o.data, o.len); }
+    if (rc == 125) sb_puts(out, "\n(the search was stopped before it finished: the user sent a message while it ran)");
     sb_free(&o); sb_free(&cmd);
     return TOOL_OK;
 }

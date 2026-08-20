@@ -147,11 +147,16 @@ larger ones skipped.)
   Esc twice at an empty prompt opens `/rewind`.
 - **You can keep typing while the model works.** What you type shows up in the input field as
   you go (`❯ …▏`); press Enter to queue it as a message — add details,
-  narrow the request, change the spec — the status bar shows `N queued`, and the message is
-  delivered at the next opportunity: between tool rounds (so the model sees it before its next
-  step, alongside the tool result) or as the next turn once the current one finishes. Queue as
-  many as you like; they are sent in order. Ctrl-C hands queued text back to the editor instead
-  of sending it. Text without Enter simply reappears in the prompt afterwards.
+  narrow the request, change the spec — the status bar shows `N queued`.
+  **A queued message does not wait for the job in flight to end**, because it is usually about
+  that job: the running shell command is stopped, the tool calls of that round that had not
+  started are skipped (the model is told they did not run), a sub-agent reports what it has
+  found so far instead of finishing its research, and the message goes to the model on its very
+  next call. A message queued *before* the turn started — the ones sent one after another after
+  a turn ends — stops nothing; it is delivered between tool rounds as before. Queue as many as
+  you like; they are sent in order, and a `/command` waiting for the end of the turn does not
+  hold back the messages behind it. Ctrl-C hands queued text back to the editor instead of
+  sending it. Text without Enter simply reappears in the prompt afterwards.
 - Tab completes slash commands and skill names; ↑/↓ browse history — the latest 100 queries are
   kept in `~/.config/corbienest/history` (`/history` lists them). Ctrl-R searches it
   incrementally (`(reverse-i-search)`, like bash): type to refine, Ctrl-R again for an older
@@ -310,8 +315,9 @@ make test
   with results fed back, `--yolo`, XML tool-call recovery, `@file`, errors, and — through a
   pseudo-terminal — the editor (cursor keys, history, multi-line, paste, type-ahead),
   the confirmation menu (arrow keys, deny with reason, always, stray keys ignored),
-  messages queued with Enter while the model streams or a tool runs (delivered between tool
-  rounds / after the turn, handed back on Ctrl-C), the `/ctx` picker and `/history`,
+  messages queued with Enter while the model streams or a tool runs (they stop the command,
+  the round and the sub-agent in flight, step past a queued `/command`, and are handed back on
+  Ctrl-C), the `/ctx` picker and `/history`,
   Shift+Tab mode cycling (plan / accept-edits behaviour), `/skills`, Ctrl-C interruption,
   slash commands, the `/model` picker, `!cmd`, `/save`, and config/history persistence.
 
