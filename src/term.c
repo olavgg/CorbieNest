@@ -4,12 +4,14 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <termios.h>
 #include <unistd.h>
@@ -1082,8 +1084,14 @@ int term_getkey(void) {
 
 /* ---------- history ---------- */
 #define HIST_MAX 100   /* the latest 100 queries are kept (and persisted) */
+/* The file is shared: several corbienest sessions may have it open at once, each with its own
+ * window of the last HIST_MAX queries. Rewriting it from that window would throw away whatever
+ * the other sessions typed since we started, so the file is only ever *appended* to, and folded
+ * back down to HIST_MAX entries once it has grown well past them. */
+#define HIST_FILE_MAX (64 * 1024)   /* bytes; ~1000 queries, so folding is rare */
 static char *g_hist[HIST_MAX];
 static int g_hist_n = 0;
+static int g_hist_pending = 0;   /* entries added since the last save: the tail of g_hist */
 
 int hist_count(void) { return g_hist_n; }
 const char *hist_get(int i) { return i >= 0 && i < g_hist_n ? g_hist[i] : NULL; }
@@ -1099,6 +1107,7 @@ void hist_add(const char *line) {
     if (g_hist_n && !strcmp(g_hist[g_hist_n - 1], line)) return;
     if (g_hist_n == HIST_MAX) { free(g_hist[0]); memmove(g_hist, g_hist + 1, sizeof(char*) * (HIST_MAX - 1)); g_hist_n--; }
     g_hist[g_hist_n++] = xstrdup(line);
+    if (g_hist_pending < g_hist_n) g_hist_pending++;
 }
 
 void hist_load(void) {
@@ -1111,16 +1120,48 @@ void hist_load(void) {
         hist_add(l);
     }
     free(d);
+    g_hist_pending = 0;   /* what is already in the file is not ours to append again */
+}
+
+/* Append-only means the file grows. Once it is well past the window, fold it back to the last
+ * HIST_MAX entries — of the *file*, not of our own window, so the other sessions' queries are
+ * kept too. The swap is atomic; a session appending in the same instant loses at worst those
+ * few entries, which is why the threshold is high enough that this almost never happens. */
+static void hist_compact(void) {
+    struct stat st;
+    if (stat(hist_path(), &st) != 0 || st.st_size <= HIST_FILE_MAX) return;
+    /* read it whole: a cap here would fold the *oldest* part of the file back and throw the
+       newest entries away, which is the opposite of what this is for */
+    size_t n; char *d = read_whole_file(hist_path(), &n, (size_t)st.st_size + 1);
+    if (!d) return;
+    int lines = 0;
+    for (size_t i = 0; i < n; i++) if (d[i] == '\n') lines++;
+    size_t start = 0;
+    for (size_t i = 0; i < n && lines > HIST_MAX; i++) if (d[i] == '\n') { lines--; start = i + 1; }
+    write_whole_file_atomic(hist_path(), d + start, n - start);
+    free(d);
 }
 
 void hist_save(void) {
-    FILE *f = fopen(hist_path(), "w");
-    if (!f) return;
-    for (int i = 0; i < g_hist_n; i++) {
-        for (const char *c = g_hist[i]; *c; c++) fputc(*c == '\n' ? 0x1f : *c, f);
-        fputc('\n', f);
+    if (g_hist_pending <= 0) return;
+    sbuf b; sb_init(&b);
+    for (int i = g_hist_n - g_hist_pending; i < g_hist_n; i++) {
+        for (const char *c = g_hist[i]; *c; c++) sb_putc(&b, *c == '\n' ? 0x1f : *c);
+        sb_putc(&b, '\n');
     }
-    fclose(f);
+    /* O_APPEND: every write lands at the end of the file as it is *now*, so it goes after
+     * whatever another session wrote in the meantime instead of on top of it. */
+    int fd = open(hist_path(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) { sb_free(&b); return; }
+    for (size_t off = 0; off < b.len; ) {
+        ssize_t k = write(fd, b.data + off, b.len - off);
+        if (k < 0) { if (errno == EINTR) continue; break; }
+        off += (size_t)k;
+    }
+    close(fd);
+    sb_free(&b);
+    g_hist_pending = 0;
+    hist_compact();
 }
 
 /* ---------- slash completion ---------- */

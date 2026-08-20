@@ -294,7 +294,7 @@ static void memory_extract(int first) {
     if (!nochange && (!g_memory || strcmp(text, g_memory))) {
         size_t n = strlen(text);
         if (n && text[n-1] != '\n') { text = xrealloc(text, n + 2); text[n++] = '\n'; text[n] = 0; }
-        if (mkdir_p(".corbienest") == 0 && write_whole_file(MEMORY_PATH, text, n) == 0) {
+        if (mkdir_p(".corbienest") == 0 && write_whole_file_atomic(MEMORY_PATH, text, n) == 0) {
             load_memory(); written = true;
             printf(C_DIM "✎ memory updated (%s) · %.1fs" C_RESET "\n", MEMORY_PATH, st.total_seconds);
         }
@@ -367,7 +367,7 @@ static void memory_quick_add(const char *fact) {
     sbuf out; sb_init(&out); sb_append(&out, f.data, ins); sb_append(&out, line.data, line.len);
     if (ins < f.len) sb_append(&out, f.data + ins, f.len - ins); else sb_putc(&out, '\n');
     if (out.data[out.len-1] != '\n') sb_putc(&out, '\n');
-    if (mkdir_p(".corbienest") == 0 && write_whole_file(MEMORY_PATH, out.data, out.len) == 0) {
+    if (mkdir_p(".corbienest") == 0 && write_whole_file_atomic(MEMORY_PATH, out.data, out.len) == 0) {
         load_memory();
         printf(C_GREEN "✓ remembered under %s" C_RESET C_DIM " (%s)" C_RESET "\n", secs[sec], MEMORY_PATH);
     } else printf(C_RED "✗ cannot write %s: %s" C_RESET "\n", MEMORY_PATH, strerror(errno));
@@ -494,7 +494,7 @@ static void session_save(void) {
     char *txt = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     char path[1400]; session_path(g_session_id, path, sizeof path);
-    write_whole_file(path, txt, strlen(txt));
+    write_whole_file_atomic(path, txt, strlen(txt));
     free(txt);
     sessions_prune();
 }

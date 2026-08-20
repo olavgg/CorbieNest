@@ -87,6 +87,15 @@ build must be warning-free with `-Wall -Wextra`.
   only spends that cache when the user is not using it anyway.
 - Anything persisted goes into `~/.config/corbienest/config` via `config_save()`; keep old keys
   readable (e.g. `yolo=1` still maps to `mode=auto`).
+- Several sessions may share these files, so every file corbienest keeps its *own* state in is
+  written with `write_whole_file_atomic()` (temp file + `rename(2)`): the config, `memory.md`,
+  `permissions`, the session JSON. Never `fopen(..., "w")` one of them — a reader in another
+  session would see it truncated, and so would you after a crash. Files the *user* asked for
+  (`write_file`, `edit_file`, `/save`, skill scaffolding) keep plain `write_whole_file()`: they
+  are theirs, and replacing the inode is not ours to do. The history file is the exception to
+  the whole-file rule — it is append-only (`hist_save()` writes just the entries added since
+  the last save, `O_APPEND`), because rewriting it from one session's window would drop what the
+  others typed; `hist_compact()` folds it back to `HIST_MAX` once it passes `HIST_FILE_MAX`.
 - Tests: extend `tests/test_unit.c` for pure logic and `tests/test_integration.py` (pty
   `Session`) for anything the user sees. Integration checks read `clean()`ed output — the
   editor redraws in place, so assert on stable phrases, not layout.

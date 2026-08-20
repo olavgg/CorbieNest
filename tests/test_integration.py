@@ -815,6 +815,28 @@ s.send("\x04"); check(s.expect("bye"), "exit"); s.close()
 hist = open(os.path.join(CFG, "corbienest", "history")).read()
 check("multi one\x1ftwo" in hist, "history saved with encoded newline")
 
+print("test two sessions at once: shared history accumulates, the config is never half-written")
+ha = Session(["-m", "fake-coder:latest"]); check(ha.expect("Ctrl-D to quit"), "session A up")
+hb = Session(["-m", "fake-coder:latest"]); check(hb.expect("Ctrl-D to quit"), "session B up, having loaded the history A is about to add to")
+ha.send("alpha-in-a\r"); check(ha.expect("tok/s", 15), "A answered")
+hb.send("beta-in-b\r"); check(hb.expect("tok/s", 15), "B answered")
+ha.send("second-in-a\r"); check(ha.expect("tok/s", 15), "A again, after B had written the file")
+hb.send("/keepalive 7m\r"); check(hb.expect("keep_alive = 7m"), "B rewrites the config")
+ha.send("/temp 0.3\r"); check(ha.expect("temperature = 0.3"), "A rewrites it too")
+hist = open(os.path.join(CFG, "corbienest", "history")).read()
+check("alpha-in-a" in hist and "beta-in-b" in hist and "second-in-a" in hist,
+      f"neither session's queries were clobbered by the other's save: {hist[-200:]!r}")
+pos = [hist.find(k) for k in ("alpha-in-a", "beta-in-b", "second-in-a")]
+check(all(p >= 0 for p in pos) and pos == sorted(pos), f"appended in the order they were typed: {pos}")
+cfg = open(os.path.join(CFG, "corbienest", "config")).read()
+check(cfg.startswith("# corbienest config") and "model=fake-coder:latest" in cfg and cfg.endswith("\n"),
+      f"the config is one whole file, not a mixture of two writes: {cfg[-140:]!r}")
+check(len([l for l in cfg.splitlines() if "=" in l]) >= 10, f"every key is there — nothing was truncated: {cfg!r}")
+check("temperature=0.3" in cfg and "keep_alive=30m" in cfg,
+      f"and it is A's whole state: the last writer wins, which atomicity does not change: {cfg!r}")
+check(not [f for f in os.listdir(os.path.join(CFG, "corbienest")) if ".tmp" in f], "no temporary files left behind")
+ha.send("\x04"); hb.send("\x04"); ha.close(); hb.close()
+
 shutil.rmtree(WORK, ignore_errors=True); shutil.rmtree(CFG, ignore_errors=True)
 print(f"{passed} checks passed, {failed} failed")
 sys.exit(1 if failed else 0)

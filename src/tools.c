@@ -60,7 +60,7 @@ static void perm_save(void) {
     sb_puts(&b, "# corbienest project permissions — one rule per line: \"edit\" or \"bash <leading words>\" (see /permissions)\n");
     for (int i = 0; i < g_perm_n; i++) sb_printf(&b, "%s\n", g_perm[i]);
     mkdir_p(".corbienest");
-    write_whole_file(PERM_PATH, b.data, b.len);
+    write_whole_file_atomic(PERM_PATH, b.data, b.len);
     sb_free(&b);
 }
 int tools_permissions_count(void) { return g_perm_n; }

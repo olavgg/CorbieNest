@@ -48,6 +48,11 @@ void  die(const char *fmt, ...);
 /* file helpers */
 char *read_whole_file(const char *path, size_t *len_out, size_t cap);   /* NULL on error */
 int   write_whole_file(const char *path, const char *data, size_t len);
+/* Same, but the file is replaced in one step: written to a temporary next to it, then
+ * rename(2)d over it. Another process reading the file gets either the whole old one or the
+ * whole new one, never half of either, and a crash mid-write cannot truncate what was there.
+ * Use it for every file corbienest keeps its own state in — several sessions may share it. */
+int   write_whole_file_atomic(const char *path, const char *data, size_t len);
 int   mkdir_p(const char *path);
 char *expand_home(const char *path);   /* "~/x" -> "/home/u/x", malloc'd */
 int   is_dir(const char *path);

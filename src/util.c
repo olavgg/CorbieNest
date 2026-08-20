@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,6 +91,24 @@ int write_whole_file(const char *path, const char *data, size_t len) {
     return 0;
 }
 
+int write_whole_file_atomic(const char *path, const char *data, size_t len) {
+    char tmp[1400];
+    if (snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid()) >= (int)sizeof tmp) return -1;
+    struct stat st;
+    mode_t mode = stat(path, &st) == 0 ? (st.st_mode & 07777) : 0600;   /* keep what was there */
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0) return -1;
+    for (size_t off = 0; off < len; ) {
+        ssize_t k = write(fd, data + off, len - off);
+        if (k < 0) { if (errno == EINTR) continue; close(fd); unlink(tmp); return -1; }
+        off += (size_t)k;
+    }
+    /* the data has to be on disk before the name points at it, or a crash between the two
+     * leaves a file that is present, named right and empty */
+    if (fsync(fd) != 0 || close(fd) != 0 || rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    return 0;
+}
+
 int mkdir_p(const char *path) {
     char *p = xstrdup(path);
     for (char *s = p + 1; *s; s++) {
@@ -170,26 +189,30 @@ void config_load(void) {
     fclose(f);
 }
 
+/* The whole file is rewritten on every setting change, and another session may be reading it
+ * (or writing it) at that moment — so it is built in memory and swapped in in one step. This
+ * makes a torn or truncated config impossible; it does not merge two sessions' settings, and
+ * is not meant to: whoever saved last is what the next session starts with. */
 void config_save(void) {
     char path[1200];
     snprintf(path, sizeof path, "%s/config", config_dir());
-    FILE *f = fopen(path, "w");
-    if (!f) return;
-    fprintf(f, "# corbienest config (auto-written)\n");
-    if (g_cfg.model) fprintf(f, "model=%s\n", g_cfg.model);
-    if (g_cfg.host) fprintf(f, "host=%s\n", g_cfg.host);
-    fprintf(f, "num_ctx=%d\n", g_cfg.num_ctx);
-    if (g_cfg.temperature >= 0) fprintf(f, "temperature=%g\n", g_cfg.temperature);
-    fprintf(f, "think=%d\n", g_cfg.think);
-    fprintf(f, "think_level=%s\n", g_cfg.think_level ? g_cfg.think_level : "");
-    fprintf(f, "show_thinking=%d\n", g_cfg.show_thinking ? 1 : 0);
-    fprintf(f, "mode=%s\n", mode_name(g_cfg.mode));
-    fprintf(f, "max_iters=%d\n", g_cfg.max_iters);
-    fprintf(f, "memory=%d\n", g_cfg.memory ? 1 : 0);
-    fprintf(f, "memory_every=%d\n", g_cfg.memory_every);
-    fprintf(f, "memory_idle=%d\n", g_cfg.memory_idle);
-    fprintf(f, "keep_alive=%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "");
-    fclose(f);
+    sbuf b; sb_init(&b);
+    sb_puts(&b, "# corbienest config (auto-written)\n");
+    if (g_cfg.model) sb_printf(&b, "model=%s\n", g_cfg.model);
+    if (g_cfg.host) sb_printf(&b, "host=%s\n", g_cfg.host);
+    sb_printf(&b, "num_ctx=%d\n", g_cfg.num_ctx);
+    if (g_cfg.temperature >= 0) sb_printf(&b, "temperature=%g\n", g_cfg.temperature);
+    sb_printf(&b, "think=%d\n", g_cfg.think);
+    sb_printf(&b, "think_level=%s\n", g_cfg.think_level ? g_cfg.think_level : "");
+    sb_printf(&b, "show_thinking=%d\n", g_cfg.show_thinking ? 1 : 0);
+    sb_printf(&b, "mode=%s\n", mode_name(g_cfg.mode));
+    sb_printf(&b, "max_iters=%d\n", g_cfg.max_iters);
+    sb_printf(&b, "memory=%d\n", g_cfg.memory ? 1 : 0);
+    sb_printf(&b, "memory_every=%d\n", g_cfg.memory_every);
+    sb_printf(&b, "memory_idle=%d\n", g_cfg.memory_idle);
+    sb_printf(&b, "keep_alive=%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "");
+    write_whole_file_atomic(path, b.data, b.len);
+    sb_free(&b);
 }
 
 /* ---------- permission modes ---------- */

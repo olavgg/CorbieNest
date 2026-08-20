@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -278,6 +279,18 @@ static void test_util(void) {
     char f[400]; snprintf(f, sizeof f, "%s/f", deep);
     CHECK(write_whole_file(f, "hi", 2) == 0); size_t n; char *d = read_whole_file(f, &n, 0); CHECK(n == 2); CHECK_STR(d, "hi"); free(d);
     d = read_whole_file(f, &n, 1); CHECK(n == 1); free(d);   /* cap honoured */
+    /* atomic replace: the file is swapped in whole, keeps its mode, and leaves no litter */
+    CHECK(chmod(f, 0640) == 0);
+    CHECK(write_whole_file_atomic(f, "replaced", 8) == 0);
+    d = read_whole_file(f, &n, 0); CHECK(n == 8); CHECK_STR(d, "replaced"); free(d);
+    struct stat sb; CHECK(stat(f, &sb) == 0 && (sb.st_mode & 07777) == 0640);
+    DIR *dp = opendir(deep); int stray = 0; struct dirent *de;
+    while (dp && (de = readdir(dp))) if (strstr(de->d_name, ".tmp")) stray++;
+    if (dp) closedir(dp);
+    CHECK(stray == 0);
+    char nf[400]; snprintf(nf, sizeof nf, "%s/new", deep);
+    CHECK(write_whole_file_atomic(nf, "", 0) == 0 && is_file(nf));   /* creates it too */
+    CHECK(write_whole_file_atomic("/nope/nowhere/x", "x", 1) != 0);  /* and reports failure */
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
 }
 
