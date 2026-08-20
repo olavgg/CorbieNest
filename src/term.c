@@ -1425,7 +1425,18 @@ static char *readline_impl(const char *prompt, bool in_field) {
     bool idle_armed = term_idle_hook && term_idle_ms > 0;
     while (!done) {
         int k = idle_armed && e.buf.len == 0 ? read_key_wait(term_idle_ms) : read_key();
-        if (k == K_IDLE) { idle_armed = false; ed_idle_run(&e); continue; }
+        if (k == K_IDLE) {
+            idle_armed = false;
+            ed_idle_run(&e);
+            /* The idle work is a model call of its own (main.c: the memory extraction), and
+             * Enter while it runs queues a message rather than reaching the editor. Nobody
+             * else looks at the queue until a line is submitted here, so a message queued
+             * meanwhile would sit and wait for the user to press Enter a second time:
+             * submit the oldest one now instead, and the REPL runs it (and the rest behind
+             * it) as if it had just been typed. */
+            if (e.in_field && e.buf.len == 0 && g_queue_n) { result = term_queue_pop(); done = true; break; }
+            continue;
+        }
         if (k != -2) idle_armed = false;
         if (k == -2) { if (g_winch) { g_winch = 0; ed_refresh(&e); } continue; }
         if (k == -1) { result = NULL; break; }

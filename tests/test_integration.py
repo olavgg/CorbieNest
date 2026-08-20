@@ -700,6 +700,16 @@ s.expect("(no such text)", 1)   # drain: the prompt is redrawn just after the ex
 check(re.search(r"\x1b\[38;1H[^\n]*❯", s.out[s.mark:].decode("utf-8", "replace")) is not None, "the input field is redrawn after the idle flush")
 s.send("/memory\r"); check(not s.expect("pending extraction", 2), "nothing left pending after the idle flush")
 s.send("still here\r"); check(s.expect("Echo: still here"), "the prompt still works after the idle flush")
+# a message typed while the idle extraction runs is queued (the prompt is busy): it must run
+# as soon as the memory write is done, not sit in the queue waiting for another Enter
+s.send("MEMWAIT please\r"); check(s.expect("Echo: MEMWAIT please"), "reply")
+check(s.expect("updating memory", 5), f"the idle extraction started: {s.text()[-200:]!r}")
+s.send("queued during the memory write\r")
+check(s.expect("1 queued", 3), f"the message was queued while memory was being written: {s.text()[-200:]!r}")
+check(s.expect("memory updated", 10), f"the extraction still finished: {s.text()[-200:]!r}")
+check("slow fact" in open(os.path.join(WORK, ".corbienest", "memory.md")).read(), "the slow extraction was written")
+check(s.expect("Echo: queued during the memory write", 10), f"the queued message ran once memory was written: {s.text()[-300:]!r}")
+s.expect("(no such text)", 3)   # drain: let the extraction pending after that request run
 s.send("/memory idle off\r"); check(s.expect("memory idle update off"), "/memory idle off")
 s.send("/memory every 5\r"); s.expect("every 5 requests")
 s.send("pending one\r"); check(s.expect("Echo: pending one"), "reply")

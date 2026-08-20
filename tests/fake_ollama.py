@@ -44,6 +44,12 @@ def script(model, messages, req):
             yield chunk(model, "# Project memory\n\n## User\n- half a fac")
             yield chunk(model, done=True, done_reason="length")
             return
+        if any("MEMWAIT" in m["content"] for m in messages if m["role"] == "user"):
+            # a slow extraction: lets a test type (and so queue) a message while memory is written
+            for w in ["# Project memory\n\n", "## User\n", "- slow fact\n\n", "## Feedback\n\n", "## Project\n\n", "## Reference\n"]:
+                yield chunk(model, w); time.sleep(0.5)
+            yield chunk(model, done=True)
+            return
         if facts:
             yield chunk(model, "```markdown\n# Project memory\n\n## User\n- " + facts[-1] + "\n\n## Feedback\n\n## Project\n\n## Reference\n```")
         else:

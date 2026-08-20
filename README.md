@@ -302,8 +302,10 @@ So that a pending update never holds up the way out, it also runs on its own onc
 has been idle for 15 seconds (`/memory idle N`, `/memory idle off`, saved to config): the call
 happens while you read the reply, and by the time you quit there is usually nothing left to
 write. Typing anything cancels it for that prompt — a request you start right away still finds
-a warm prompt cache, and the batch simply waits for the next pause. If you do quit with an
-update still pending, the flush on the way out says so and Ctrl-C skips it.
+a warm prompt cache, and the batch simply waits for the next pause. The update is a model call
+like any other, so Enter while it runs queues your message (`1 queued` in the status bar)
+rather than sending it: it is sent the moment the write is done, without a second Enter. If you
+do quit with an update still pending, the flush on the way out says so and Ctrl-C skips it.
 
 ### Project instructions
 
