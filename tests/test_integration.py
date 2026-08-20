@@ -56,6 +56,7 @@ req = requests()[-1]
 check(req["model"] == "fake-coder:latest" and req["stream"] is True, "request shape")
 check(req["messages"][0]["role"] == "system" and "corbienest" in req["messages"][0]["content"], "system prompt sent")
 check("# Finishing a task" in req["messages"][0]["content"], "end-of-task report asked for in the system prompt")
+check("you are not finished" in req["messages"][0]["content"], "the report is conditional on the work being finished")
 check(any(t["function"]["name"] == "bash" for t in req.get("tools", [])), "tools sent")
 check(req["options"]["num_ctx"] == 32768, "default num_ctx")
 check(req["keep_alive"] == "30m" and "num_predict" not in req["options"] and "think" not in req, "default keep_alive 30m; no num_predict/think on a normal call")

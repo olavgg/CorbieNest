@@ -801,14 +801,19 @@ static char *build_system_prompt(void) {
         "- When writing code, follow the existing conventions of the project and write complete, working code.\n");
     if (g_model_tools && !g_cfg.no_tools && g_cfg.mode != MODE_PLAN)
         sb_puts(&b,
-            "\n# Finishing a task\nWhen the work the user asked for is done, end your turn with a short report:\n"
+            "\n# Finishing a task\nA report closes work you have finished; it is not how every turn ends. Before you "
+            "write one, read the user's request again and check that every part of it is carried out. If anything is "
+            "left — a step you skipped, a tool the user denied, a build or test that failed, work you stopped partway — "
+            "then you are not finished: write no report, and say in a line or two what is done, what is not, and what "
+            "comes next.\n"
+            "When it is done, end your turn with a short report:\n"
             "- What was done: a few bullets — the changes you made, the files they touched (path:line), and how you "
-            "verified them (build, tests, running the program) or that you did not.\n"
+            "verified them (build, tests, running the program) or that you did not. Never claim a check you did not run.\n"
             "- Suggestions: up to three bullets on what the user may want to do next — follow-up work you left out on "
             "purpose, a weakness you noticed nearby, something worth testing. One line each, saying what and why. "
             "Do not start on them, they are the user's to decide; leave the whole section out rather than inventing work.\n"
-            "Keep the report under about ten lines. Skip it when you only answered a question, or when you are stopping "
-            "to ask the user something rather than finishing.\n");
+            "Keep the report under about ten lines. There is no report after a turn that only answered a question, or "
+            "one that stops to ask the user something rather than finishing.\n");
     if (g_cfg.mode == MODE_PLAN)
         sb_puts(&b, "\n# Plan mode (read-only)\n"
             "The user has put you in plan mode. Explore the codebase with read_file, list_dir, grep and read-only shell commands, "
