@@ -5,7 +5,7 @@ deterministic: it looks at the last message and replies with canned streaming
 NDJSON, including tool calls, so the whole agent loop can be exercised without
 a real model. Run standalone: python3 fake_ollama.py PORT
 """
-import json, sys, time
+import json, re, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 MODELS = [
@@ -93,6 +93,17 @@ def script(model, messages, req):
         return
     if "TOOL_TASK" in text:
         yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "find the needle", "prompt": "Search for needle and report where it is."}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_SEARCH" in text:
+        q = text.split("TOOL_SEARCH", 1)[1].strip() or "keycloak admin rest api"
+        yield chunk(model, tool_calls=[{"function": {"name": "web_search", "arguments": {"query": q, "max_results": 3}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_FETCH" in text:
+        # the test puts the URL of its own little docs server in the prompt
+        m = re.search(r"https?://\S+", text)
+        yield chunk(model, tool_calls=[{"function": {"name": "web_fetch", "arguments": {"url": m.group(0) if m else "no-url"}}}])
         yield chunk(model, done=True)
         return
     if "TOOL_BIG" in text:

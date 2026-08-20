@@ -1,5 +1,5 @@
-/* Agent tools: read_file, write_file, edit_file, list_dir, grep, bash, task (sub-agent).
- * Mutating / shell tools ask the user for confirmation depending on the permission mode. */
+/* Agent tools: read_file, write_file, edit_file, list_dir, grep, bash, web_search, web_fetch, task (sub-agent).
+ * Mutating / shell / network tools ask the user for confirmation depending on the permission mode. */
 #define _GNU_SOURCE
 #include "common.h"
 #include <ctype.h>
@@ -18,24 +18,29 @@
 
 #define CONF_EDIT_K 0
 #define CONF_BASH_K 1
+#define CONF_FETCH_K 2
 /* Everything a tool returns lands in the model's context and is re-sent on every following
  * round, so the caps are deliberately modest; the model is told to page with offset/limit. */
 #define READ_FILE_MAX (4 * 1024 * 1024)  /* bytes of a file we look at (offset/limit page inside this) */
 #define READ_LINES 2000                  /* default limit for read_file */
 #define READ_CAP   (64 * 1024)           /* max bytes one read_file call returns */
 #define OUT_CAP    (32 * 1024)           /* max bytes of bash/grep output fed back */
+#define WEB_CAP    (24 * 1024)           /* max bytes one web_fetch call returns (it pages with offset) */
+#define WEB_MAX    (2u * 1024 * 1024)    /* refuse to download more of a page than this */
 #define MAX_ENTRIES 400
 
-static bool g_always_write = false, g_always_edit = false, g_always_bash = false;
+static bool g_always_write = false, g_always_edit = false, g_always_bash = false, g_always_fetch = false;
 bool tools_no_confirm = false;   /* set by the caller for user-typed "!cmd": no prompt, no plan-mode veto */
-void tools_reset_permissions(void) { g_always_write = g_always_edit = g_always_bash = false; }
-const char *tools_summary_line(void) { return "read_file, write_file, edit_file, list_dir, grep, bash, task"; }
+void tools_reset_permissions(void) { g_always_write = g_always_edit = g_always_bash = g_always_fetch = false; }
+const char *tools_summary_line(void) { return g_cfg.web ? "read_file, write_file, edit_file, list_dir, grep, bash, web_search, web_fetch, task"
+                                                        : "read_file, write_file, edit_file, list_dir, grep, bash, task"; }
 
 /* ---------- persistent project permissions ----------
  * .corbienest/permissions holds one rule per line: "edit" (file writes/edits are fine in
- * this project) or "bash <words>" (shell commands whose leading words match, e.g. "bash git
- * status", "bash make"). Commands with shell metacharacters (; | & $ ` > < newline) never
- * match a rule — a chained command is not "just git status". */
+ * this project), "bash <words>" (shell commands whose leading words match, e.g. "bash git
+ * status", "bash make") or "fetch <host>" (web_fetch may read pages from that host, e.g.
+ * "fetch www.postgresql.org"). Commands with shell metacharacters (; | & $ ` > < newline)
+ * never match a rule — a chained command is not "just git status". */
 #define PERM_PATH ".corbienest/permissions"
 #define PERM_MAX  200
 static char *g_perm[PERM_MAX]; static int g_perm_n = 0;
@@ -57,7 +62,7 @@ void tools_permissions_load(void) {
 static void perm_save(void) {
     if (!g_perm_n) { unlink(PERM_PATH); return; }
     sbuf b; sb_init(&b);
-    sb_puts(&b, "# corbienest project permissions — one rule per line: \"edit\" or \"bash <leading words>\" (see /permissions)\n");
+    sb_puts(&b, "# corbienest project permissions — one rule per line: \"edit\", \"bash <leading words>\" or \"fetch <host>\" (see /permissions)\n");
     for (int i = 0; i < g_perm_n; i++) sb_printf(&b, "%s\n", g_perm[i]);
     mkdir_p(".corbienest");
     write_whole_file_atomic(PERM_PATH, b.data, b.len);
@@ -114,10 +119,29 @@ static bool bash_rule_matches(const char *rule, const char *cmd) {
         r = re; c = ce;
     }
 }
+/* Rule text a URL is remembered under: its host, so approving one page of a manual approves
+ * the manual. Empty if the URL has no host we can name. */
+static void fetch_rule_for(const char *url, char *out, size_t n) {
+    char host[512];
+    out[0] = 0;
+    if (!url_host(url, host, sizeof host)) return;
+    if (strlen(host) + 7 > n) return;   /* a truncated host would match the wrong thing: offer no rule */
+    snprintf(out, n, "fetch %s", host);
+}
+/* Exact host match — no wildcards: "always allow docs.example.org" should not quietly mean
+ * every other name under example.org. */
+static bool fetch_rule_matches(const char *rule, const char *url) {
+    if (strncmp(rule, "fetch ", 6)) return false;
+    char host[512];
+    if (!url_host(url, host, sizeof host)) return false;
+    return !strcmp(rule + 6, host);
+}
+
 static const char *perm_match(int kind, const char *cmd) {
     for (int i = 0; i < g_perm_n; i++) {
         if (kind == CONF_EDIT_K && !strcmp(g_perm[i], "edit")) return g_perm[i];
         if (kind == CONF_BASH_K && cmd && bash_rule_matches(g_perm[i], cmd)) return g_perm[i];
+        if (kind == CONF_FETCH_K && cmd && fetch_rule_matches(g_perm[i], cmd)) return g_perm[i];
     }
     return NULL;
 }
@@ -240,6 +264,23 @@ cJSON *tools_definitions(void) {
         "Run a shell command in the working directory and return its combined stdout/stderr and exit code. Use for git operations, running builds/tests, installing packages, and anything the other tools do not cover. Avoid interactive commands. Output is capped at 32 KB (head and tail are kept), so filter or paginate noisy commands (| tail, | head, -q flags).",
         p, (const char*[]){"command", NULL}));
 
+    if (g_cfg.web) {
+        p = cJSON_CreateObject();
+        prop(p, "url", "string", "Absolute http:// or https:// URL.");
+        prop(p, "offset", "integer", "1-based line of the text to start at (for paging). Default 1.");
+        prop(p, "timeout", "integer", "Seconds (default 30, max 120).");
+        cJSON_AddItemToArray(arr, mk_tool("web_fetch",
+            "Read a web page as text: markup, scripts and styling stripped, code samples kept. At most 24 KB per call — the page is paged, not truncated, so use offset for the rest.",
+            p, (const char*[]){"url", NULL}));
+
+        p = cJSON_CreateObject();
+        prop(p, "query", "string", "A few precise words: the project, its version, and the exact symbol, option or error.");
+        prop(p, "max_results", "integer", "Default 8, max 20.");
+        cJSON_AddItemToArray(arr, mk_tool("web_search",
+            "Find documentation when you do not know its URL. Returns title, URL and snippet per result; the snippets are not the docs — web_fetch the best one, preferring the project's own domain over blogs and Q&A sites.",
+            p, (const char*[]){"query", NULL}));
+    }
+
     p = cJSON_CreateObject();
     prop(p, "description", "string", "A short (3-6 word) label for what the sub-agent does, shown to the user.");
     prop(p, "prompt", "string", "The complete task for the sub-agent. It starts with a fresh context and sees nothing of this conversation, so include every relevant detail: what to look for, where, and exactly what to report back.");
@@ -301,9 +342,9 @@ static void preview_lines(const char *text, int max_lines, const char *color) {
 }
 
 /* Confirmation prompt. Returns 1 allow, 0 deny. On deny, *reason may be set (malloc'd).
- * kind: CONF_EDIT for write/edit, CONF_BASH for shell commands; `cmd` is the shell command
- * (for the project rules), NULL for edits. */
-enum { CONF_EDIT = CONF_EDIT_K, CONF_BASH = CONF_BASH_K };
+ * kind: CONF_EDIT for write/edit, CONF_BASH for shell commands, CONF_FETCH for web_fetch;
+ * `cmd` is the shell command or the URL (for the project rules), NULL for edits. */
+enum { CONF_EDIT = CONF_EDIT_K, CONF_BASH = CONF_BASH_K, CONF_FETCH = CONF_FETCH_K };
 static int confirm(const char *what, int kind, bool *always_flag, const char *cmd, char **reason) {
     *reason = NULL;
     if (always_flag && *always_flag) return 1;
@@ -327,10 +368,12 @@ static int confirm(const char *what, int kind, bool *always_flag, const char *cm
         *reason = xstrdup("corbienest is running non-interactively and cannot ask for confirmation. Continue without this action.");
         return 0;
     }
-    const char *always = kind == CONF_BASH ? "Yes, and don't ask again for shell commands this session"
-                                           : "Yes, and don't ask again for file edits this session";
+    const char *always = kind == CONF_BASH  ? "Yes, and don't ask again for shell commands this session"
+                       : kind == CONF_FETCH ? "Yes, and don't ask again for web fetches this session"
+                                            : "Yes, and don't ask again for file edits this session";
     char newrule[256] = "", plabel[320] = "";
     if (kind == CONF_BASH) { bash_rule_for(cmd, newrule, sizeof newrule); if (newrule[0]) snprintf(plabel, sizeof plabel, "Yes, and always allow `%s …` in this project", newrule + 5); }
+    else if (kind == CONF_FETCH) { fetch_rule_for(cmd, newrule, sizeof newrule); if (newrule[0]) snprintf(plabel, sizeof plabel, "Yes, and always allow fetching from %s in this project", newrule + 6); }
     else { snprintf(newrule, sizeof newrule, "edit"); snprintf(plabel, sizeof plabel, "Yes, and always allow file edits in this project"); }
     int r = term_confirm(what, always, newrule[0] ? plabel : NULL, reason);
     if (r == 2 && always_flag) *always_flag = true;
@@ -488,8 +531,11 @@ static tool_status t_list_dir(cJSON *args, sbuf *out) {
 
 /* ---------- shell runner ---------- */
 /* Runs cmd via /bin/sh -c, capturing stdout+stderr. Returns exit code (or -1 on failure,
- * 124 on timeout, 125 if a message the user queued stopped it, 130 if interrupted by user). */
-static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupted) {
+ * 124 on timeout, 125 if a message the user queued stopped it, 130 if interrupted by user).
+ * `cap` bounds what is kept while it streams (a runaway command cannot eat the heap);
+ * `busy`/`verb` label the status bar and the inline spinner while it runs. */
+static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupted,
+                     size_t cap, const char *busy, const char *verb) {
     *interrupted = false;
     int pfd[2];
     if (pipe(pfd) != 0) return -1;
@@ -515,7 +561,7 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
     long remaining_ms = (long)timeout_s * 1000;
     bool timed_out = false, by_msg = false;
     term_raw(true);
-    term_busy("running command");
+    term_busy(busy);
     struct timeval t0; gettimeofday(&t0, NULL);
     int spin = 0; bool spin_shown = false;
     for (;;) {
@@ -529,7 +575,7 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
                 double el = (double)(t.tv_sec - t0.tv_sec) + (double)(t.tv_usec - t0.tv_usec) / 1e6;
                 static const char *SP[] = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
                 spin = (spin + 1) % 10;
-                printf("\r\x1b[2K  " C_ORANGE "%s" C_RESET C_DIM " running… (%.0fs)  " C_GRAY "ctrl-c to interrupt" C_RESET, SP[spin], el);
+                printf("\r\x1b[2K  " C_ORANGE "%s" C_RESET C_DIM " %s… (%.0fs)  " C_GRAY "ctrl-c to interrupt" C_RESET, SP[spin], verb, el);
                 fflush(stdout); spin_shown = true;
             }
             continue;
@@ -542,7 +588,7 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
         }
         if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             char buf[8192]; ssize_t n = read(pfd[0], buf, sizeof buf);
-            if (n > 0) { sb_append(out, buf, (size_t)n); if (out->len > OUT_CAP * 4) cap_output(out, OUT_CAP * 2); }
+            if (n > 0) { sb_append(out, buf, (size_t)n); if (out->len > cap * 2) cap_output(out, cap); }
             else break;   /* EOF */
         }
     }
@@ -575,7 +621,7 @@ static tool_status t_bash(cJSON *args, sbuf *out) {
     }
     sbuf o; sb_init(&o);
     bool intr = false;
-    int rc = run_shell(cmd, timeout, &o, &intr);
+    int rc = run_shell(cmd, timeout, &o, &intr, OUT_CAP * 2, "running command", "running");
     cap_output(&o, OUT_CAP);
     if (rc == 124) sb_printf(out, "(command timed out after %ds and was killed)\n", timeout);
     if (intr) sb_puts(out, "(command interrupted by user with Ctrl-C)\n");
@@ -609,12 +655,221 @@ static tool_status t_grep(cJSON *args, sbuf *out) {
     char *p = expand_home(path); sh_quote(&cmd, p); free(p);
     sb_puts(&cmd, " 2>/dev/null | head -n 300");
     sbuf o; sb_init(&o); bool intr;
-    int rc = run_shell(cmd.data, 60, &o, &intr);
+    int rc = run_shell(cmd.data, 60, &o, &intr, OUT_CAP * 2, "running command", "running");
     cap_output(&o, OUT_CAP);
     if (!o.len) sb_printf(out, "No matches for /%s/ in %s", pat, path);
     else { sb_append(out, o.data, o.len); }
     if (rc == 125) sb_puts(out, "\n(the search was stopped before it finished: the user sent a message while it ran)");
     sb_free(&o); sb_free(&cmd);
+    return TOOL_OK;
+}
+
+/* ---------- web_fetch ----------
+ * corbienest's own HTTP client is plain POSIX sockets and does not speak TLS (http.c), and a
+ * TLS library would break the "C11 + cJSON, nothing else" promise — so the page comes in
+ * through curl (or wget), which any machine that can build corbienest already has. What the
+ * model gets back is readable text, not markup: a docs page is worth a tool round, its <div>
+ * soup is not. */
+#define WEB_MARK "<<<corbie-fetch:"
+
+static bool have_bin(const char *name) {
+    const char *path = getenv("PATH");
+    if (!path || !*path) path = "/usr/bin:/bin:/usr/local/bin";
+    for (const char *p = path; *p; ) {
+        const char *e = strchr(p, ':');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n) {
+            char full[4096];
+            snprintf(full, sizeof full, "%.*s/%s", (int)n, p, name);
+            if (access(full, X_OK) == 0) return true;
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    return false;
+}
+
+/* wget tells us nothing about the content type, so sniff the start of the body. */
+static bool looks_like_html(const char *d, size_t len) {
+    size_t n = len < 2048 ? len : 2048;
+    for (size_t i = 0; i + 5 < n; i++)
+        if (d[i] == '<' && (!strncasecmp(d + i, "<html", 5) || !strncasecmp(d + i, "<!doctype html", 14) ||
+                            !strncasecmp(d + i, "<head", 5) || !strncasecmp(d + i, "<body", 5))) return true;
+    return false;
+}
+
+/* Downloads `url`. On success `body` holds the page (owned by the caller), *status the HTTP
+ * status (0 with wget, which does not report one) and `ctype` its content type. On failure
+ * `err` gets a line the model can act on. */
+static bool web_get(const char *url, int timeout, const char *busy, const char *verb,
+                    sbuf *body, int *status, char *ctype, size_t ctype_n, sbuf *err) {
+    sb_init(body); *status = 0; if (ctype_n) ctype[0] = 0;
+    bool curl = have_bin("curl");
+    if (!curl && !have_bin("wget")) {
+        sb_puts(err, "error: neither curl nor wget is installed, so corbienest cannot reach the network. Tell the user; do not guess what the page says.");
+        return false;
+    }
+    sbuf cmd; sb_init(&cmd);
+    if (curl) {
+        sb_printf(&cmd, "curl -sSL --max-time %d --max-filesize %u --compressed -A 'corbienest/%s' "
+                        "-H 'Accept: text/html,text/plain,text/markdown,application/json;q=0.9,*/*;q=0.8' "
+                        "-w '\n" WEB_MARK "%%{http_code} %%{content_type}>>>' -- ", timeout, WEB_MAX, CORBIE_VERSION);
+    } else {
+        sb_printf(&cmd, "wget -q -O - --timeout=%d --tries=2 -U 'corbienest/%s' -- ", timeout, CORBIE_VERSION);
+    }
+    sh_quote(&cmd, url);
+
+    bool intr = false;
+    int rc = run_shell(cmd.data, timeout + 5, body, &intr, WEB_MAX, busy, verb);
+    sb_free(&cmd);
+
+    /* curl's -w marker is appended after the body: status and content type, then off it goes */
+    if (body->len) {
+        char *mark = NULL;
+        for (char *q = strstr(body->data, WEB_MARK); q; q = strstr(q + 1, WEB_MARK)) mark = q;
+        if (mark) {
+            sscanf(mark + strlen(WEB_MARK), "%d %127[^>]", status, ctype);
+            size_t at = (size_t)(mark - body->data);
+            if (at && body->data[at-1] == '\n') at--;
+            body->data[at] = 0; body->len = at;
+        }
+    }
+
+    bool ok = true;
+    if (rc == 124) { sb_printf(err, "error: fetching %s timed out after %ds", url, timeout); ok = false; }
+    else if (intr) { sb_puts(err, "(the fetch was interrupted by the user with Ctrl-C)"); ok = false; }
+    else if (rc == 125) {
+        printf("  " C_YELLOW "⚠ stopped: your message goes to the model first" C_RESET "\n");
+        sb_puts(err, "(nothing was fetched: the user sent a message while it was downloading and it was stopped so they could be answered)");
+        ok = false;
+    }
+    else if (*status && (*status < 200 || *status >= 300))
+        { sb_printf(err, "error: %s returned HTTP %d.%s", url, *status,
+                    *status == 404 ? " The page does not exist — check the URL or the documentation version." : ""); ok = false; }
+    else if ((curl && !*status) || (!curl && rc != 0)) {
+        /* no HTTP response at all: DNS, TLS, connection refused. What curl said is on stderr,
+         * which run_shell captured with the body — hand it to the model, it explains itself. */
+        char msg[320] = "";
+        if (body->len) {
+            size_t n = body->len > 220 ? 220 : body->len;
+            snprintf(msg, sizeof msg, ": %.*s", (int)n, body->data);
+            for (char *q = msg; *q; q++) if (*q == '\n' || *q == '\r') *q = ' ';
+        }
+        sb_printf(err, "error: could not fetch %s (%s exited %d)%s", url, curl ? "curl" : "wget", rc, msg);
+        ok = false;
+    }
+    else if (!body->len) { sb_printf(err, "error: %s returned nothing", url); ok = false; }
+    if (!ok) sb_free(body);
+    return ok;
+}
+
+static tool_status t_web_fetch(cJSON *args, sbuf *out) {
+    const char *url = jstr(args, "url", NULL);
+    if (!url || !*url) { sb_puts(out, "error: missing 'url'"); return TOOL_ERROR; }
+    if (!g_cfg.web) { sb_puts(out, "error: web access is off in this session (the user can turn it on with /web on). Say so instead of guessing what the page says."); return TOOL_ERROR; }
+    if (!url_ok(url)) { sb_printf(out, "error: web_fetch will not open '%s' — http:// or https:// only, no whitespace or control characters, and cloud-metadata addresses are refused.", url); return TOOL_ERROR; }
+    int timeout = jint(args, "timeout", 30);
+    if (timeout <= 0) timeout = 30;
+    if (timeout > 120) timeout = 120;
+    int offset = jint(args, "offset", 1);
+    if (offset < 1) offset = 1;
+
+    printf("  " C_DIM "⇣ " C_RESET C_BOLD "%s" C_RESET "\n", url);
+    char *reason = NULL;
+    if (!confirm("Fetch this page?", CONF_FETCH, &g_always_fetch, url, &reason)) {
+        sb_printf(out, "User denied fetching the page.%s%s", reason ? " Reason: " : "", reason ? reason : "");
+        free(reason); return TOOL_DENIED;
+    }
+
+    sbuf o; int status; char ctype[128];
+    if (!web_get(url, timeout, "fetching page", "fetching", &o, &status, ctype, sizeof ctype, out)) return TOOL_ERROR;
+
+    bool html = ctype[0] ? (strcasestr(ctype, "html") != NULL || strcasestr(ctype, "xml") != NULL)
+                         : looks_like_html(o.data, o.len);
+    char base[600] = "";   /* scheme://host, so rooted links come back fetchable */
+    { const char *sl = strchr(url + 8, '/'); snprintf(base, sizeof base, "%.*s", sl ? (int)(sl - url) : (int)strlen(url), url); }
+    char *text = html ? html_to_text(o.data, o.len, base) : xstrndup(o.data, o.len);
+    sb_free(&o);
+    size_t tlen = strlen(text);
+
+    char size[32];
+    if (tlen < 2048) snprintf(size, sizeof size, "%zu bytes", tlen);
+    else snprintf(size, sizeof size, "%zu KB", (tlen + 512) / 1024);
+    sb_printf(out, "%s%s%s (%s of text)\n\n", url, ctype[0] ? " — " : "", ctype[0] ? ctype : "", size);
+    int total = 0;
+    for (const char *q = text; *q; q++) if (*q == '\n') total++;
+    if (tlen && text[tlen-1] != '\n') total++;
+
+    int lineno = 0, emitted = 0; bool capped = false;
+    size_t start = out->len;
+    for (const char *q = text; *q; ) {
+        const char *e = strchr(q, '\n');
+        size_t n = e ? (size_t)(e - q) : strlen(q);
+        lineno++;
+        if (lineno >= offset) {
+            if (emitted > 0 && out->len - start + n > WEB_CAP) { capped = true; break; }
+            sb_append(out, q, n);
+            sb_putc(out, '\n');
+            emitted++;
+        }
+        if (!e) break;
+        q = e + 1;
+    }
+    if (!emitted) sb_printf(out, "(no text at line %d; the page has %d lines)\n", offset, total);
+    else if (capped) sb_printf(out, "\n[showing lines %d-%d of %d; call web_fetch again with the same url and offset=%d for the rest]\n", offset, lineno - 1, total, lineno);
+    free(text);
+    return TOOL_OK;
+}
+
+/* ---------- web_search ----------
+ * The engine is a URL template with %s where the query goes (config `search_url`, /web
+ * engine), so anyone can point this at their own SearXNG instead of the default. Results
+ * come back as title / URL / snippet — the model is expected to web_fetch the good one. */
+const char *SEARCH_URL_DEFAULT = "https://html.duckduckgo.com/html/?q=%s";
+
+static tool_status t_web_search(cJSON *args, sbuf *out) {
+    const char *q = jstr(args, "query", NULL);
+    if (!q || !*q) { sb_puts(out, "error: missing 'query'"); return TOOL_ERROR; }
+    if (!g_cfg.web) { sb_puts(out, "error: web access is off in this session (the user can turn it on with /web on). Say so instead of guessing."); return TOOL_ERROR; }
+    int max = jint(args, "max_results", 8);
+    if (max < 1) max = 1;
+    if (max > 20) max = 20;
+
+    const char *tmpl = g_cfg.search_url && *g_cfg.search_url ? g_cfg.search_url : SEARCH_URL_DEFAULT;
+    char *enc = url_encode(q);
+    sbuf u; sb_init(&u);
+    const char *pct = strstr(tmpl, "%s");
+    if (pct) { sb_append(&u, tmpl, (size_t)(pct - tmpl)); sb_puts(&u, enc); sb_puts(&u, pct + 2); }
+    else { sb_puts(&u, tmpl); sb_puts(&u, enc); }   /* a template without %s: the query goes on the end */
+    free(enc);
+    char *url = sb_detach(&u);
+    if (!url_ok(url)) { sb_printf(out, "error: the search engine URL '%s' is not usable (see /web engine)", url); free(url); return TOOL_ERROR; }
+    char ehost[512] = ""; url_host(url, ehost, sizeof ehost);
+
+    printf("  " C_DIM "⌕ " C_RESET C_BOLD "%s" C_RESET C_DIM " · %s" C_RESET "\n", q, ehost);
+    char *reason = NULL;
+    if (!confirm("Search the web?", CONF_FETCH, &g_always_fetch, url, &reason)) {
+        sb_printf(out, "User denied the search.%s%s", reason ? " Reason: " : "", reason ? reason : "");
+        free(reason); free(url); return TOOL_DENIED;
+    }
+
+    sbuf o; int status; char ctype[128];
+    if (!web_get(url, 30, "searching the web", "searching", &o, &status, ctype, sizeof ctype, out)) { free(url); return TOOL_ERROR; }
+
+    int n = 0;
+    char *list = search_results_text(o.data, o.len, url, max, &n);
+    sb_free(&o);
+    if (!n) {
+        sb_printf(out, "error: %s returned no results that could be read (the engine may have changed its page or refused the request). "
+                       "Try different words, or web_fetch a documentation URL directly.", ehost);
+        free(list); free(url);
+        return TOOL_ERROR;
+    }
+    sb_printf(out, "%d result%s for \"%s\" via %s — web_fetch the best one, the snippets are not the docs.\n\n",
+              n, n == 1 ? "" : "s", q, ehost);
+    sb_puts(out, list);
+    if (out->len > WEB_CAP) cap_output(out, WEB_CAP);
+    free(list); free(url);
     return TOOL_OK;
 }
 
@@ -644,6 +899,8 @@ tool_status tools_execute(const char *name, cJSON *args, sbuf *out) {
     else if (!strcmp(name, "list_dir")) st = t_list_dir(args, out);
     else if (!strcmp(name, "grep")) st = t_grep(args, out);
     else if (!strcmp(name, "bash") || !strcmp(name, "shell") || !strcmp(name, "run_command")) st = t_bash(args, out);
+    else if (!strcmp(name, "web_fetch") || !strcmp(name, "fetch_url") || !strcmp(name, "fetch")) st = t_web_fetch(args, out);
+    else if (!strcmp(name, "web_search") || !strcmp(name, "search_web") || !strcmp(name, "search")) st = t_web_search(args, out);
     else if (!strcmp(name, "task")) st = t_task(args, out);
     else { sb_printf(out, "error: unknown tool '%s'. Available tools: %s", name, tools_summary_line()); st = TOOL_ERROR; }
     if (tmp) cJSON_Delete(tmp);

@@ -29,7 +29,7 @@ static char   g_session_id[64];                  /* current session (file stem u
 
 static const char *SLASH_CMDS[] = {
     "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think",
-    "/mode", "/yolo", "/tools", "/max_iters", "/ctx", "/temp", "/host", "/keepalive", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/diff", "/rewind", "/quit", "/exit"
+    "/mode", "/yolo", "/tools", "/web", "/max_iters", "/ctx", "/temp", "/host", "/keepalive", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/diff", "/rewind", "/quit", "/exit"
 };
 
 /* slash completion list = built-in commands + /skill names (rebuilt when skills reload) */
@@ -726,7 +726,7 @@ static int cmd_rewind(void) {
 static void cmd_permissions(const char *arg) {
     if (arg && !strncmp(arg, "add ", 4)) {
         const char *r = arg + 4; while (*r == ' ') r++;
-        if (strcmp(r, "edit") && strncmp(r, "bash ", 5)) { printf("usage: /permissions add edit | add bash <leading words>\n"); return; }
+        if (strcmp(r, "edit") && strncmp(r, "bash ", 5) && strncmp(r, "fetch ", 6)) { printf("usage: /permissions add edit | add bash <leading words> | add fetch <host>\n"); return; }
         printf(tools_permissions_add(r) ? C_GREEN "✓ added: %s" C_RESET "\n" : C_DIM "already there: %s" C_RESET "\n", r);
         return;
     }
@@ -736,13 +736,14 @@ static void cmd_permissions(const char *arg) {
         return;
     }
     if (arg && !strcmp(arg, "clear")) { tools_permissions_clear(); printf(C_GREEN "✓ project permissions cleared" C_RESET "\n"); return; }
-    if (arg && *arg) { printf("usage: /permissions [add edit|add bash <words>|remove N|clear]\n"); return; }
+    if (arg && *arg) { printf("usage: /permissions [add edit|add bash <words>|add fetch <host>|remove N|clear]\n"); return; }
     int n = tools_permissions_count();
     printf(C_BOLD "project permissions" C_RESET C_DIM " (.corbienest/permissions — answers of \"always allow … in this project\")" C_RESET "\n");
     if (!n) printf(C_DIM "  none — pick \"always allow … in this project\" (p) at a confirmation, or /permissions add bash git status" C_RESET "\n");
     for (int i = 0; i < n; i++) {
         const char *r = tools_permissions_get(i);
         if (!strcmp(r, "edit")) printf("  %2d. file writes and edits\n", i + 1);
+        else if (!strncmp(r, "fetch ", 6)) printf("  %2d. web pages from " C_BOLD "%s" C_RESET "\n", i + 1, r + 6);
         else printf("  %2d. shell commands starting with " C_BOLD "%s" C_RESET "\n", i + 1, r + 5);
     }
     if (n) printf(C_DIM "  /permissions remove N · /permissions clear" C_RESET "\n");
@@ -778,18 +779,24 @@ static char *build_system_prompt(void) {
     sb_printf(&b, "# Environment\n- Working directory: %s\n- OS: %s %s\n- Shell: /bin/sh\n- Date: %s\n- Git repository: %s\n",
               g_cwd, u.sysname, u.machine, date, git ? "yes" : "no");
     if (g_model_tools && !g_cfg.no_tools) {
+        sb_printf(&b,
+            "\n# Tools\nYou have these tools: %s. Use them proactively "
+            "instead of asking the user to paste files or run commands for you.\n", tools_summary_line());
         sb_puts(&b,
-            "\n# Tools\nYou have these tools: read_file, write_file, edit_file, list_dir, grep, bash, task. Use them proactively "
-            "instead of asking the user to paste files or run commands for you.\n"
             "- Explore first: use list_dir / grep / read_file to understand relevant code before changing it.\n"
             "- Always read a file before editing it. Use edit_file for targeted changes (old_string must match exactly); "
             "use write_file only for new files or full rewrites.\n"
             "- Use bash for shell work: git (status, diff, log, add, commit, branch...), building, running tests, "
             "package managers, find, etc. Commands run non-interactively with /bin/sh in the working directory. "
             "Never run interactive programs (editors, pagers, prompts).\n"
-            "- The user must approve each write, edit and shell command, so proceed and call the tool rather than asking permission in text.\n"
+            "- The user must approve each write, edit, shell command and page fetch, so proceed and call the tool rather than asking permission in text.\n"
             "- After making code changes, verify them when practical (compile, run tests, or run the program).\n"
-            "- Do not fabricate tool results. If a tool errors, read the error and adjust.\n"
+            "- Do not fabricate tool results. If a tool errors, read the error and adjust.\n");
+        if (g_cfg.web) sb_puts(&b,
+            "- Never guess at another project's API, options or errors: web_search for its docs, web_fetch to read "
+            "them — the version this project uses (check its lockfile, manifest or image tag). Say which page you "
+            "used; skip the web when the repo answers it.\n");
+        sb_puts(&b,
             "- Use task to hand a broad, self-contained investigation (\"find all places that…\", \"how does X work across the code\") to a read-only sub-agent "
             "and get back a report, keeping the noise out of this conversation; give it a complete prompt, it knows nothing of this chat.\n");
     } else {
@@ -1051,7 +1058,7 @@ static void check_model_placement(bool verbose) {
 
 /* short one-line summary of a tool call's main argument */
 static void tool_arg_summary(const char *name, cJSON *args, char *out, size_t n) {
-    const char *keys[] = { !strcmp(name, "grep") ? "pattern" : "command", "path", "pattern", NULL };
+    const char *keys[] = { !strcmp(name, "grep") ? "pattern" : "command", "url", "query", "path", "pattern", NULL };
     const char *v = NULL;
     for (int i = 0; keys[i] && !v; i++) {
         cJSON *a = cJSON_GetObjectItemCaseSensitive(args, keys[i]);
@@ -1144,9 +1151,10 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
     sbuf sp; sb_init(&sp);
     sb_printf(&sp, "You are a sub-agent of Corbie Nest (corbienest), a terminal coding agent. The main agent delegated one self-contained task to you.\n"
                    "Working directory: %s\n"
-                   "You have read-only tools: read_file, list_dir, grep, bash (for read-only shell commands such as git log, find, wc; do not modify files, do not run interactive programs). "
+                   "You have read-only tools: read_file, list_dir, grep, bash (for read-only shell commands such as git log, find, wc; do not modify files, do not run interactive programs)%s. "
                    "Do the research thoroughly, then finish with ONE final message: a clear, complete report with concrete file paths, line numbers and code snippets where useful — "
-                   "the main agent sees only that final message, nothing else you did. Do not ask questions; make reasonable assumptions and state them.", g_cwd);
+                   "the main agent sees only that final message, nothing else you did. Do not ask questions; make reasonable assumptions and state them.",
+                   g_cwd, g_cfg.web ? " and web_search/web_fetch for the documentation of external projects" : "");
     if (g_project_instructions) sb_puts(&sp, g_project_instructions);
     size_t sp_bytes = sp.len;
     cJSON_AddStringToObject(sys, "content", sp.data); sb_free(&sp);
@@ -1158,7 +1166,8 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
         cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
         const char *name = cJSON_IsString(nm) ? nm->valuestring : "";
-        if (!strcmp(name, "read_file") || !strcmp(name, "list_dir") || !strcmp(name, "grep") || !strcmp(name, "bash")) cJSON_AddItemReferenceToArray(tools, t);
+        if (!strcmp(name, "read_file") || !strcmp(name, "list_dir") || !strcmp(name, "grep") || !strcmp(name, "bash") ||
+            !strcmp(name, "web_fetch") || !strcmp(name, "web_search")) cJSON_AddItemReferenceToArray(tools, t);
     }
     int rc = 1, tool_rounds = 0, round_first = -1;
     bool stopped_early = false;   /* the user sent a message: report what it has and get out */
@@ -1398,7 +1407,7 @@ static bool run_turn(void) {
             const char *res = out.data ? out.data : "";
             if (ts == TOOL_DENIED) printf("  ⎿  " C_RED "denied" C_RESET "\n");
             else if (ts == TOOL_ERROR) printf("  ⎿  " C_RED "%s" C_RESET "\n", res);
-            else print_result_preview(res, !strcmp(name, "read_file") ? 3 : 8);
+            else print_result_preview(res, (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8);
             cJSON_AddItemToArray(g_messages, tool_result_message(name, res));
             sb_free(&out);
             if (parsed) cJSON_Delete(parsed);
@@ -1523,6 +1532,7 @@ static void cmd_help(void) {
            "  /init                 have the model explore the project and write a CORBIENEST.md (project instructions)\n"
            "  /mode [name]          permission mode: manual · accept-edits · plan · auto (or press shift+tab to cycle)\n"
            "  /permissions [...]    list the project's saved \"always allow\" rules (.corbienest/permissions); add/remove/clear\n"
+           "  /web [on|off|engine URL]  let the model look documentation up with web_search/web_fetch (on by default); set the search engine\n"
            "  /yolo [on|off]        shortcut for /mode auto / /mode manual (dangerous!)\n"
            "  /tools on|off         enable/disable tool calling\n"
            "  /max_iters [N]        tool rounds one request may run before the loop guard stops it (default 100); takes effect at once, even mid-turn\n"
@@ -1542,7 +1552,7 @@ static void cmd_help(void) {
            "  Enter                 send  ·  Alt+Enter / Ctrl+J / trailing \\ : newline\n"
            "  Enter while busy      queue a message for the model (added between tool rounds or after the turn; Ctrl-C hands it back)\n"
            "                        commands that only report or set something run at once instead: /help /status /cost /diff /history /pwd\n"
-           "                        /skills /memory /mode /yolo /permissions /tools /max_iters /think /temp /keepalive\n"
+           "                        /skills /memory /mode /yolo /permissions /tools /web /max_iters /think /temp /keepalive\n"
            "  Ctrl-C                cancel generation / clear line (twice: quit)  ·  Ctrl-L clear screen\n"
            "  PgUp / PgDn           scroll back through the conversation (↑/↓, Home/End inside; Esc/Enter return)\n"
            "  status bar            bottom row shows the permission mode, model, session tokens and context usage\n"
@@ -1615,7 +1625,8 @@ static void cmd_status(void) {
     if (g_cfg.num_ctx > 0) printf(" of %d (%d%%)", g_cfg.num_ctx, (int)(100.0 * g_session.last_prompt_tokens / g_cfg.num_ctx)); else printf(" (num_ctx: server default)");
     if (g_model_max_ctx > 0) printf(" · model max %d%s", g_model_max_ctx, g_model_max_ctx > g_cfg.num_ctx ? " (/ctx to enlarge)" : "");
     printf("\n" C_BOLD "tokens     " C_RESET "%ld this session (%ld in · %ld generated)\n", g_session.prompt_tokens + g_session.eval_tokens, g_session.prompt_tokens, g_session.eval_tokens);
-    printf(C_BOLD "tools      " C_RESET "%s\n", (g_cfg.no_tools || !g_model_tools) ? "off" : "on");
+    printf(C_BOLD "tools      " C_RESET "%s%s\n", (g_cfg.no_tools || !g_model_tools) ? "off" : "on",
+           (g_cfg.no_tools || !g_model_tools) ? "" : (g_cfg.web ? C_DIM " · web on" C_RESET : C_DIM " · web off" C_RESET));
     printf(C_BOLD "mode       " C_RESET "%s%s" C_RESET "\n", g_cfg.mode == MODE_AUTO ? C_RED : g_cfg.mode == MODE_PLAN ? C_CYAN : g_cfg.mode == MODE_ACCEPT_EDITS ? C_ORANGE : "", mode_label(g_cfg.mode));
     printf(C_BOLD "think      " C_RESET "%s, %s\n", think_label(), g_cfg.show_thinking ? "shown" : "hidden");
     printf(C_BOLD "temp       " C_RESET "%s", g_cfg.temperature < 0 ? "default\n" : ""); if (g_cfg.temperature >= 0) printf("%g\n", g_cfg.temperature);
@@ -1785,6 +1796,31 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/tools")) {
         if (!arg) printf("tools: %s\n", g_cfg.no_tools ? "off" : "on"); else { g_cfg.no_tools = !strcmp(arg, "off"); printf(C_GREEN "✓ tools %s" C_RESET "\n", g_cfg.no_tools ? "off" : "on"); }
     }
+    else if (!strcmp(cmd, "/web")) {
+        const char *engine = g_cfg.search_url ? g_cfg.search_url : SEARCH_URL_DEFAULT;
+        if (!arg) printf("web_search/web_fetch: %s\n" C_DIM "engine: %s%s" C_RESET "\n",
+                         g_cfg.web ? "on" : "off", engine, g_cfg.search_url ? "" : " (default)");
+        else if (!strncmp(arg, "engine", 6)) {
+            const char *v = arg + 6; while (*v == ' ') v++;
+            if (!*v) printf("engine: %s\n" C_DIM "  /web engine URL (%%s = the query) · /web engine default" C_RESET "\n", engine);
+            else {
+                free(g_cfg.search_url);
+                g_cfg.search_url = strcmp(v, "default") ? xstrdup(v) : NULL;
+                config_save();
+                printf(C_GREEN "✓ engine: %s" C_RESET "\n", g_cfg.search_url ? g_cfg.search_url : SEARCH_URL_DEFAULT);
+            }
+        }
+        else if (strcmp(arg, "on") && strcmp(arg, "off")) printf("usage: /web on|off|engine URL\n");
+        else {
+            bool want = !strcmp(arg, "on");
+            if (want != g_cfg.web) {   /* the tool list is built once at startup: rebuild it so the model sees the change */
+                g_cfg.web = want;
+                cJSON_Delete(g_tools); g_tools = tools_definitions(); g_tools_bytes = 0;
+                config_save();
+            }
+            printf(C_GREEN "✓ web_search/web_fetch %s" C_RESET "\n", g_cfg.web ? "on" : "off");
+        }
+    }
     else if (!strcmp(cmd, "/max_iters") || !strcmp(cmd, "/max-iters")) {
         if (!arg) printf("max_iters: %d tool rounds per request\n", g_cfg.max_iters);
         else {
@@ -1847,7 +1883,10 @@ static bool slash_runs_while_busy(const char *cmd, const char *arg) {
     static const char *ok[] = {
         "/help", "/?", "/status", "/cost", "/diff", "/history", "/pwd", "/skills",
         "/mode", "/yolo", "/permissions", "/tools", "/max_iters", "/max-iters", "/think", "/temp",
-        "/keepalive", "/keep-alive", "/memory", NULL };
+        "/keepalive", "/keep-alive", "/memory", "/web", NULL };
+    /* /web with an argument is not just a report: on|off rebuilds the tool list the running
+     * turn is holding, and engine writes the config. Bare /web only prints. */
+    if (!strcmp(cmd, "/web") && arg) return false;
     /* /memory update — and "every N" once N requests are pending — runs the extraction call;
      * "idle N" only sets the delay for the next prompt, so it is safe mid-turn */
     if (!strcmp(cmd, "/memory") && arg && strcmp(arg, "on") && strcmp(arg, "off") && strcmp(arg, "clear")
@@ -2092,6 +2131,7 @@ static void usage(void) {
            "      --continue       resume the latest session started in this directory\n"
            "  -r, --resume [ID]    resume a session: by ID, or pick one from a menu\n"
            "      --no-memory      don't update " MEMORY_PATH " after requests\n"
+           "      --no-web         don't offer web_search/web_fetch (the model cannot look documentation up)\n"
            "      --think          think on every model call (default: only the first call of a request); --no-think to disable; --show-thinking to display\n"
            "      --draft N        draft_num_predict: speculative-decoding/MTP draft tokens per step (0 = off; default: the model's own)\n"
            "      --benchmark [N]  measure tokens per second at each context size the model supports (or just -c N):\n"
@@ -2103,7 +2143,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15;
+    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15;
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();
@@ -2127,6 +2167,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--mode")) { const char *mn = NEEDARG(); int m = mode_parse(mn); if (m < 0) { fprintf(stderr, "unknown mode %s\n", mn); return 2; } g_cfg.mode = m; }
         else if (!strcmp(a, "-T") || !strcmp(a, "--no-tools")) g_cfg.no_tools = true;
         else if (!strcmp(a, "--no-memory")) g_cfg.memory = false;
+        else if (!strcmp(a, "--no-web")) g_cfg.web = false;
         else if (!strcmp(a, "--continue")) resume_latest = true;
         else if (!strcmp(a, "--output-format")) { const char *f = NEEDARG(); if (!strcmp(f, "json")) json_out = true; else if (strcmp(f, "text")) { fprintf(stderr, "unknown output format %s (text|json)\n", f); return 2; } }
         else if (!strcmp(a, "-r") || !strcmp(a, "--resume")) { resume_id = (i + 1 < argc && argv[i+1][0] != '-') ? argv[++i] : ""; }

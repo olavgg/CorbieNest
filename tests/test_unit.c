@@ -294,6 +294,95 @@ static void test_util(void) {
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
 }
 
+/* ---------- URLs and HTML (web_fetch) ---------- */
+static void test_web(void) {
+    CHECK(url_ok("https://www.postgresql.org/docs/17/runtime-config-client.html"));
+    CHECK(url_ok("http://localhost:8000/x"));
+    CHECK(!url_ok("ftp://example.org/x"));
+    CHECK(!url_ok("file:///etc/passwd"));
+    CHECK(!url_ok("https://example.org/a b"));            /* whitespace */
+    CHECK(!url_ok("https://example.org/a\nrm -rf /"));    /* control characters */
+    CHECK(!url_ok("https://"));                           /* no host */
+    CHECK(!url_ok("http://169.254.169.254/latest/meta-data/"));   /* cloud metadata */
+    CHECK(!url_ok("http://metadata.google.internal/computeMetadata/v1/"));
+    CHECK(!url_ok(NULL));
+
+    char h[64];
+    CHECK(url_host("https://Docs.Example.ORG/a/b?q=1", h, sizeof h)); CHECK_STR(h, "docs.example.org");
+    CHECK(url_host("http://127.0.0.1:8000", h, sizeof h)); CHECK_STR(h, "127.0.0.1:8000");
+    CHECK(url_host("https://user@example.org/x", h, sizeof h)); CHECK_STR(h, "example.org");
+    CHECK(!url_host("not-a-url", h, sizeof h));
+
+    /* script/style/comments dropped, entities decoded, blocks broken, <pre> fenced */
+    const char *page =
+        "<!doctype html><html><head><title>Keycloak &amp; you</title>"
+        "<style>body{color:red}</style></head><body>"
+        "<!-- a comment --><h1>Admin REST API</h1>"
+        "<p>Use <code>GET /admin/realms/{realm}/users</code> to list users.</p>"
+        "<ul><li>first</li><li>second</li></ul>"
+        "<pre>curl -H 'Authorization: Bearer $TOKEN' \\\n  https://kc/admin</pre>"
+        "<script>var x = '<p>not text</p>';</script>"
+        "<p>See <a href=\"https://www.keycloak.org/docs\">the docs</a> or <a href=\"/downloads\">downloads</a>.</p>"
+        "</body></html>";
+    char *t = html_to_text(page, strlen(page), "https://kc.example.org");
+    CHECK(strstr(t, "Keycloak & you") != NULL);              /* title kept, entity decoded */
+    CHECK(strstr(t, "Admin REST API") != NULL);
+    CHECK(strstr(t, "GET /admin/realms/{realm}/users") != NULL);
+    CHECK(strstr(t, "- first") != NULL && strstr(t, "- second") != NULL);
+    CHECK(strstr(t, "```") != NULL);                          /* <pre> fenced */
+    CHECK(strstr(t, "Bearer $TOKEN") != NULL);
+    CHECK(strstr(t, "\n  https://kc/admin") != NULL);         /* <pre> whitespace kept */
+    CHECK(strstr(t, "the docs (https://www.keycloak.org/docs)") != NULL);
+    CHECK(strstr(t, "(https://kc.example.org/downloads)") != NULL);   /* rooted href resolved against the page */
+    CHECK(strstr(t, "color:red") == NULL);                    /* <style> gone */
+    CHECK(strstr(t, "not text") == NULL);                     /* <script> gone */
+    CHECK(strstr(t, "a comment") == NULL);
+    CHECK(strstr(t, "<p>") == NULL && strstr(t, "</html>") == NULL);
+    CHECK(strstr(t, "\n\n\n") == NULL);                       /* blank lines collapsed */
+    free(t);
+
+    /* --- search results --- */
+    char *e2 = url_encode("keycloak admin rest api & \"more\"");
+    CHECK_STR(e2, "keycloak+admin+rest+api+%26+%22more%22"); free(e2);
+    e2 = url_decode("https%3A%2F%2Fx.org%2Fa+b", strlen("https%3A%2F%2Fx.org%2Fa+b"));
+    CHECK_STR(e2, "https://x.org/a b"); free(e2);
+
+    /* the shape every engine has: title link, the same href again as display URL and snippet,
+     * behind a redirect wrapper, mixed with the engine's own navigation links */
+    const char *serp =
+        "<html><body>"
+        "<a href=\"/html/?q=x&kl=us-en\">US (English)</a>"
+        "<a class=\"result__a\" href=\"//duck.example/l/?uddg=https%3A%2F%2Fwww.keycloak.org%2Fdocs&rut=ab\">Keycloak Docs</a>"
+        "<a href=\"//duck.example/l/?uddg=https%3A%2F%2Fwww.keycloak.org%2Fdocs&rut=ab\">www.keycloak.org/docs</a>"
+        "<a href=\"//duck.example/l/?uddg=https%3A%2F%2Fwww.keycloak.org%2Fdocs&rut=ab\">Documentation for Keycloak, the open source identity and access management solution.</a>"
+        "<a href=\"https://example.org/second\">Second hit</a>"
+        "<a href=\"https://duck.example/settings\">Settings</a>"
+        "</body></html>";
+    int found = -1;
+    char *res = search_results_text(serp, strlen(serp), "https://duck.example/html/?q=x", 10, &found);
+    CHECK(found == 2);
+    CHECK(strstr(res, "1. Keycloak Docs") != NULL);
+    CHECK(strstr(res, "https://www.keycloak.org/docs") != NULL);            /* redirect unwrapped */
+    CHECK(strstr(res, "duckduckgo") == NULL && strstr(res, "uddg") == NULL);
+    CHECK(strstr(res, "Documentation for Keycloak, the open source") != NULL);   /* prose became the snippet */
+    CHECK(strstr(res, "1. www.keycloak.org") == NULL);                      /* the display-URL repeat is not a result of its own */
+    CHECK(strstr(res, "2. Second hit") != NULL);
+    CHECK(strstr(res, "Settings") == NULL);                                 /* the engine's own pages dropped */
+    free(res);
+    res = search_results_text(serp, strlen(serp), "https://duck.example/html/?q=x", 1, &found);
+    CHECK(found == 1 && strstr(res, "Second hit") == NULL);                 /* max_results honoured */
+    free(res);
+    res = search_results_text("<html><body>nothing here</body></html>", 38, "https://duck.example/", 10, &found);
+    CHECK(found == 0 && res && !*res);                                      /* a page with no results says so */
+    free(res);
+
+    /* numeric entities, a bare '<', and text that is not really HTML */
+    const char *odd = "<p>a &lt; b &#65;&#x42; &nosuch; 3 < 4</p>";
+    t = html_to_text(odd, strlen(odd), NULL);
+    CHECK(strstr(t, "a < b AB &nosuch; 3 < 4") != NULL);
+    free(t);
+}
+
 /* ---------- permission modes ---------- */
 static void test_modes_body(void *ud) {
     (void)ud;
@@ -424,6 +513,7 @@ int main(void) {
         { "sbuf", test_sbuf }, { "util", test_util }, { "markdown", test_md },
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "http", test_http },
+        { "web", test_web },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

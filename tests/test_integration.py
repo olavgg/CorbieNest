@@ -7,6 +7,7 @@ confirmations, Ctrl-C interruption, type-ahead, slash commands and the /model
 picker. Requires only python3 (stdlib). No real Ollama needed.
 """
 import json, os, pty, re, select, shutil, socket, struct, subprocess, sys, tempfile, termios, fcntl, time, threading, urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.join(HERE, "..", "corbienest")
@@ -23,6 +24,43 @@ for _ in range(50):
     try: urllib.request.urlopen(f"{HOST}/api/version", timeout=0.2); break
     except Exception: time.sleep(0.1)
 
+# A page for web_fetch to read: the tool shells out to curl, so it needs a real server.
+DOC_PORT = free_port()
+DOC_URL = f"http://127.0.0.1:{DOC_PORT}/doc.html"
+DOC_HTML = b"""<!doctype html><html><head><title>Fake Docs</title>
+<style>body{color:red}</style><script>var tracker=1;</script></head><body>
+<!-- nav --><nav><a href="/index.html">Home</a></nav>
+<h1>statement_timeout</h1>
+<p>Aborts any statement that takes more than the specified amount of time.</p>
+<ul><li>Default: 0 (disabled)</li></ul>
+<pre>SET statement_timeout = '5s';</pre>
+</body></html>"""
+
+# and a search engine to go with it, shaped the way the real ones are: the result link is
+# wrapped in a redirect, and repeated for the display URL and the snippet.
+SERP_HTML = ("""<html><body>
+<a href="/search?q=x&region=no">Norway</a>
+<a class="result__a" href="/l/?uddg=REDIR">Keycloak Admin REST API</a>
+<a href="/l/?uddg=REDIR">www.keycloak.org/docs-api</a>
+<a href="/l/?uddg=REDIR">The administration REST API of Keycloak, with every endpoint and its parameters.</a>
+<a href="https://example.org/keycloak-notes">Fake Docs, locally</a>
+</body></html>""").replace("REDIR", "https%3A%2F%2Fwww.keycloak.org%2Fdocs%2Dapi%2F26.0%2Frest%2Dapi%2F")
+
+class _Docs(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/search"):
+            body, code = SERP_HTML.encode(), 200
+        else:
+            body, code = (DOC_HTML, 200) if self.path == "/doc.html" else (b"gone", 404)
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+
+threading.Thread(target=HTTPServer(("127.0.0.1", DOC_PORT), _Docs).serve_forever, daemon=True).start()
+
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[78]")   # CSI sequences, DECSC/DECRC
 def clean(s): return ANSI.sub("", s).replace("\r", "")
 
@@ -33,7 +71,8 @@ ENV.pop("CORBIENEST_MODEL", None)
 # memory extraction adds a background model call after every request; keep it off for the
 # general tests (they assert on requests()[-1]) and exercise it explicitly at the end.
 # memory_idle=0 too, so a pending extraction never fires from a slow expect() mid-test.
-os.makedirs(os.path.join(CFG, "corbienest")); open(os.path.join(CFG, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\n")
+os.makedirs(os.path.join(CFG, "corbienest")); open(os.path.join(CFG, "corbienest", "config"), "w").write(
+    f"memory=0\nmemory_idle=0\nsearch_url=http://127.0.0.1:{DOC_PORT}/search?q=%s\n")
 
 passed = failed = 0
 def check(cond, msg):
@@ -100,6 +139,54 @@ check("non-interactively" in requests()[-1]["messages"][-1]["content"], "denial 
 print("test write_file with --yolo")
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_WRITE please"])
 check(open(os.path.join(WORK, "made.txt")).read() == "made by fake\n", "file written")
+
+print("test web_fetch returns a page as readable text")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", f"TOOL_FETCH {DOC_URL}"])
+check(f"● web_fetch({DOC_URL})" in out, f"tool header shows the url: {out!r}")
+res = [m for m in requests()[-1]["messages"] if m["role"] == "tool"][-1]["content"]
+check(res.startswith(DOC_URL) and "text/html" in res.splitlines()[0], f"result names the page: {res[:80]!r}")
+check("Aborts any statement that takes more than the specified amount of time." in res, "prose extracted")
+check("Fake Docs" in res, "title kept")
+check("- Default: 0 (disabled)" in res, "list item")
+check("```" in res and "SET statement_timeout = '5s';" in res, "code sample fenced and kept")
+check(f"Home (http://127.0.0.1:{DOC_PORT}/index.html)" in res, "rooted link resolved against the page")
+check("<h1>" not in res and "<p>" not in res, "markup stripped")
+check("color:red" not in res and "var tracker" not in res, "style and script dropped")
+check("nav" not in res.split("Home")[0].split("\n")[-1], "comment dropped")
+
+print("test web_search returns title/url/snippet")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_SEARCH keycloak admin rest api"])
+check("● web_search(keycloak admin rest api)" in out, f"tool header shows the query: {out!r}")
+res = [m for m in requests()[-1]["messages"] if m["role"] == "tool"][-1]["content"]
+check(res.startswith("2 results for \"keycloak admin rest api\""), f"result header: {res[:80]!r}")
+check(f"via 127.0.0.1:{DOC_PORT}" in res, "names the engine")
+check("1. Keycloak Admin REST API\n   https://www.keycloak.org/docs-api/26.0/rest-api/" in res, "redirect wrapper unwrapped")
+check("The administration REST API of Keycloak" in res, "snippet kept")
+check("uddg" not in res and "Norway" not in res, "engine's own links dropped")
+check("2. Fake Docs, locally\n   https://example.org/keycloak-notes" in res, "second result")
+check("web_fetch" in res, "the model is told to read the good one")
+
+print("test web_fetch error paths")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", f"TOOL_FETCH http://127.0.0.1:{DOC_PORT}/nope.html"])
+check("returned HTTP 404" in requests()[-1]["messages"][-1]["content"], f"404 reported to the model: {out!r}")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_FETCH file:///etc/passwd"])
+check("will not open" in requests()[-1]["messages"][-1]["content"], "non-http scheme refused")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_FETCH http://169.254.169.254/latest/meta-data/"])
+check("will not open" in requests()[-1]["messages"][-1]["content"], "cloud metadata refused")
+out, rc = run(["-m", "fake-coder:latest", "-p", f"TOOL_FETCH {DOC_URL}"])
+check("denied" in out and "non-interactively" in requests()[-1]["messages"][-1]["content"], "denied when non-interactive without --yolo")
+
+print("test --no-web takes the tool away")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "--no-web", "-p", f"TOOL_FETCH {DOC_URL}"])
+check(not any(t["function"]["name"] in ("web_fetch", "web_search") for t in requests()[-1].get("tools", [])), "neither web tool offered")
+check("web access is off" in requests()[-1]["messages"][-1]["content"], "and refused if the model calls it anyway")
+sysmsg = requests()[-1]["messages"][0]["content"]
+check("web_fetch" not in sysmsg and "web_search" not in sysmsg, "the system prompt does not promise them either")
+sysmsg = [r for r in requests() if any(t["function"]["name"] == "web_fetch" for t in r.get("tools", []))][-1]["messages"][0]["content"]
+check("Never guess at another project's API" in sysmsg and "web_search for its docs, web_fetch to read them" in sysmsg,
+      "every session is told to look documentation up instead of guessing")
+check("the version this project uses" in sysmsg and "skip the web when the repo answers it" in sysmsg,
+      "and to match the version, and stay off the web when the repo answers")
 
 print("test recovery of leaked XML tool call")
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_XML"])
@@ -347,6 +434,33 @@ check(not os.path.exists(os.path.join(WORK, ".corbienest", "permissions")), "fil
 s3.send("TOOL_BASH\r"); check(s3.expect("Run this command?"), "asks again after clear"); s3.send("y"); s3.expect("tok/s")
 s3.send("\x04"); s3.close()
 
+print("test interactive: web_fetch asks per page, and 'p' remembers the host")
+s3 = Session(["-m", "fake-coder:latest"]); s3.expect("Ctrl-D to quit")
+s3.send(f"TOOL_FETCH {DOC_URL}\r")
+check(s3.expect("Fetch this page?"), f"confirmation shown: {s3.text()[-300:]!r}")
+check(DOC_URL in s3.text(), "the whole url is shown before it is fetched")
+check(s3.expect(f"3. Yes, and always allow fetching from 127.0.0.1:{DOC_PORT} in this project"), f"per-host rule offered: {s3.text()[-400:]!r}")
+s3.send("p"); check(s3.expect(f"saved to .corbienest/permissions: fetch 127.0.0.1:{DOC_PORT}"), "host rule saved")
+check(s3.expect("Fake Docs", 15), "the page text is previewed"); s3.expect("tok/s")
+s3.send(f"TOOL_FETCH {DOC_URL}\r")
+check(s3.expect(f"auto-approved (project rule: fetch 127.0.0.1:{DOC_PORT})"), "the host is not asked about again"); s3.expect("tok/s")
+s3.send("/permissions\r"); check(s3.expect(f"web pages from 127.0.0.1:{DOC_PORT}"), "/permissions lists the host")
+s3.send("/permissions clear\r"); s3.expect("permissions cleared")   # else that rule approves the search below too
+s3.send("TOOL_SEARCH keycloak\r")
+check(s3.expect("Search the web?"), f"a search is confirmed too: {s3.text()[-300:]!r}")
+check(s3.expect(f"⌕ keycloak") and f"127.0.0.1:{DOC_PORT}" in s3.text(), "the query and the engine are shown")
+s3.send("y"); check(s3.expect("Keycloak Admin REST API", 15), "results previewed"); s3.expect("tok/s")
+s3.send("/web\r"); check(s3.expect(f"engine: http://127.0.0.1:{DOC_PORT}/search?q=%s"), "/web shows the engine")
+s3.send("/web engine https://example.org/s?q=%s\r"); check(s3.expect("✓ engine: https://example.org/s?q=%s"), "/web engine sets it")
+s3.send("/web engine default\r"); check(s3.expect("✓ engine: https://html.duckduckgo.com"), "/web engine default resets it")
+s3.send(f"/web engine http://127.0.0.1:{DOC_PORT}/search?q=%s\r"); s3.expect("✓ engine")
+s3.send("/web off\r"); check(s3.expect("web_search/web_fetch off"), "/web off")
+s3.send(f"TOOL_FETCH {DOC_URL}\r"); check(s3.expect("web access is off", 15), "the tool is gone while it is off"); s3.expect("tok/s")
+check(not any(t["function"]["name"] == "web_fetch" for t in requests()[-1].get("tools", [])), "and the tool list sent to the model shrank")
+s3.send("/web on\r"); check(s3.expect("web_search/web_fetch on"), "/web on")
+s3.send("/permissions clear\r"); s3.expect("permissions cleared")
+s3.send("\x04"); s3.close()
+
 print("test interactive: keys typed during generation do not answer a confirmation")
 s2 = Session(["-m", "fake-coder:latest"]); s2.expect("Ctrl-D to quit")
 s2.send("SLOW\r"); check(s2.expect("two"), "streaming"); s2.send("yes yes"); s2.expect("tok/s")
@@ -577,7 +691,8 @@ check(s.expect("⎿ grep("), "its tool calls are echoed")
 check(s.expect("report after 1 tool round"), f"report preview: {s.text()[-300:]!r}")
 check(s.expect("Tool said: REPORT: found it in", 15), "parent model received the report as the tool result")
 sub = [r for r in requests() if r["messages"][0]["role"] == "system" and "You are a sub-agent" in r["messages"][0]["content"]]
-check(sub and all(t["function"]["name"] in ("read_file", "list_dir", "grep", "bash") for t in sub[-1]["tools"]), "sub-agent got read-only tools only")
+check(sub and all(t["function"]["name"] in ("read_file", "list_dir", "grep", "bash", "web_fetch", "web_search") for t in sub[-1]["tools"]), "sub-agent got read-only tools only")
+check(sub and sum(t["function"]["name"] in ("web_fetch", "web_search") for t in sub[-1]["tools"]) == 2, "sub-agent can look documentation up")
 check("hay.txt" in sub[-1]["messages"][-1]["content"], "grep ran for real inside the sub-agent")
 os.remove(os.path.join(WORK, "hay.txt"))
 s.send("/mode auto\r"); s.expect("mode: auto")

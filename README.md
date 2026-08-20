@@ -75,6 +75,7 @@ corbienest [options] [-p PROMPT]
   -r, --resume [ID]    resume a session: by ID, or pick one from a menu
       --keep-alive DUR how long Ollama keeps the model loaded between requests (default 30m; -1 forever, 0 unload, default = server's)
       --no-memory      don't update .corbienest/memory.md after requests
+      --no-web         don't offer web_search/web_fetch (the model cannot look documentation up)
       --think / --no-think / --show-thinking
       --draft N        draft_num_predict: speculative-decoding / MTP draft tokens per step (0 = off; default: the model's own,
                        e.g. models that ship an MTP head set 4); changing it makes Ollama reload the model
@@ -123,6 +124,7 @@ larger ones skipped.)
 | `/init` | have the model explore the project and write a `CORBIENEST.md` (build/test commands, architecture, conventions); improves an existing one |
 | `/skills [reload\|new NAME]` | list skills; run one with `/NAME [args]` |
 | `/tools on\|off` | enable/disable tools |
+| `/web [on\|off\|engine URL]` | whether the model may look documentation up with `web_search`/`web_fetch` (on by default; saved), and which search engine it uses (`%s` = the query; `/web engine default` restores DuckDuckGo) |
 | `/max_iters [N]` | how many tool rounds one request may run before the loop guard stops it (default 100). Takes effect at once, so it can be raised from under a turn that is about to hit it |
 | `/ctx [N\|Nk\|max\|default]` | context window: no argument opens a size picker (up to the model's trained maximum), `/ctx 64k`, `/ctx max` … set it directly |
 | `/temp X`, `/host URL` | tuning |
@@ -193,7 +195,9 @@ Cycle with **Shift+Tab** at the prompt, or set one with `/mode NAME`, `--mode NA
 | `write_file(path, content)` | yes — shows a preview |
 | `edit_file(path, old_string, new_string, replace_all?)` | yes — shows a diff |
 | `bash(command, timeout?)` | yes — shows the command; output/exit code returned to the model |
-| `task(description, prompt)` | none for the call itself — runs a **sub-agent**: a fresh, read-only agent loop (read_file, list_dir, grep, bash — with the usual confirmations) that investigates and returns a report as the tool result, keeping the noise out of the main context. Its tool calls are echoed as `⎿ grep(…)` lines and the report is previewed. Sub-agents cannot edit files or start further sub-agents |
+| `web_search(query, max_results?)` | yes — shows the query and the engine; "always allow" saves the engine's **host** |
+| `web_fetch(url, offset?, timeout?)` | yes — shows the URL; "always allow" saves the **host** |
+| `task(description, prompt)` | none for the call itself — runs a **sub-agent**: a fresh, read-only agent loop (read_file, list_dir, grep, bash, web_search, web_fetch — with the usual confirmations) that investigates and returns a report as the tool result, keeping the noise out of the main context. Its tool calls are echoed as `⎿ grep(…)` lines and the report is previewed. Sub-agents cannot edit files or start further sub-agents |
 
 Each confirmation is a small menu:
 
@@ -203,14 +207,50 @@ Move with ↑/↓ (or j/k) and press Enter, or hit `1`–`4` or the `y`/`a`/`p`/
 Esc or Ctrl-C means no. `p` saves a rule to `.corbienest/permissions` (like Claude Code's
 project allow-list): `edit` allows file writes/edits, `bash git status` allows shell commands
 that start with those words (`git status --short` yes, `git status; rm -rf /` no — commands
-with `; | & $ \` < >` never match a rule). `/permissions` lists the rules; `/permissions add
-bash make`, `/permissions remove N`, `/permissions clear` manage them by hand. On "no" you can type what the model should do instead (Enter to skip)
+with `; | & $ \` < >` never match a rule), `fetch www.postgresql.org` allows `web_fetch` to read
+pages from that host (exact host, no wildcards — approve a manual once and read the rest of it
+without being asked). `/permissions` lists the rules; `/permissions add
+bash make`, `/permissions add fetch keycloak.org`, `/permissions remove N`, `/permissions clear`
+manage them by hand. On "no" you can type what the model should do instead (Enter to skip)
 and it is sent back as the tool result. Anything you typed while the model was still generating
 is never taken as an answer — it is kept for your next prompt. Ctrl-C while a command runs kills it.
 
 Some local models occasionally emit their native tool syntax as plain text
 (e.g. `<function=grep>…`) when Ollama's parser fails; corbienest recognises the
 Qwen XML and Hermes `<tool_call>{json}</tool_call>` shapes and still executes them.
+
+### Reading documentation (`web_search`, `web_fetch`)
+
+Local models are confidently wrong about other projects' APIs: an admin endpoint that does not
+exist, a `postgresql.conf` option from three major versions ago. These two tools give the model
+the page instead of its memory of the page.
+
+- **`web_search(query)`** — the top results as title, URL and snippet, for when it does not know
+  where the documentation is. Default engine is DuckDuckGo's HTML endpoint; `/web engine URL`
+  points it anywhere (`%s` is the query), so a self-hosted SearXNG works as well.
+- **`web_fetch(url)`** — the page as readable text: scripts, styling and markup stripped,
+  `<pre>` blocks kept as fenced code, links kept with their target so it can follow the docs to
+  the next page. At most 24 KB per call, the rest paged with `offset`, so a long manual page
+  cannot swallow the context window.
+
+**Every session is told to use them.** One line of the system prompt corbienest builds for every
+request: never guess at another project's API, options or errors — search for its docs, read
+them, match the version this project actually uses (lockfile, manifest, image tag), say which
+page you used, and skip the web when the repository answers the question. It is deliberately
+one line: the two tools' own descriptions carry the rest, and a system prompt is re-sent with
+every single call. Naming the doc sites you care about in `CORBIENEST.md` makes it concrete —
+see [Project instructions](#project-instructions).
+
+Pages come in through `curl` (or `wget`): corbienest's own HTTP client is plain sockets and
+does not speak TLS, and a TLS library would be a dependency this project does not want. Every
+search and fetch is confirmed like a shell command — a search shows the query, which is what
+leaves your machine — `http(s)` only, and cloud-metadata addresses (`169.254.169.254`,
+`metadata.google.internal`) are refused outright. Approving a host once (`p`) covers the rest of
+that manual, and the engine's host covers later searches. `/web off` (or `--no-web`) takes both
+tools away.
+
+A big page is often best handed to `task` — the sub-agent has both tools too, reads the manual
+in its own context and reports back the three endpoints that matter.
 
 ### The end-of-task report
 
@@ -310,11 +350,32 @@ do quit with an update still pending, the flush on the way out says so and Ctrl-
 ### Project instructions
 
 If a `CORBIENEST.md`, `CLAUDE.md` or `AGENTS.md` exists in the working directory it is
-appended to the system prompt, so you can give the model project-specific guidance.
+appended to the system prompt, so you can give the model project-specific guidance (up to
+32 KB). `/init` writes a first one for you.
+
+This is the place to say which upstream projects this code talks to and where their
+documentation lives, so `web_fetch` lands on the right page and the right *version* of it:
+
+```markdown
+# Project instructions
+
+We run Keycloak 26 behind PostgreSQL 17.
+
+- Keycloak admin REST API: https://www.keycloak.org/docs-api/26.0/rest-api/ —
+  the admin client lives in src/auth/. Check the docs before adding an endpoint.
+- PostgreSQL settings and SQL: https://www.postgresql.org/docs/17/ — we are on 17,
+  do not use syntax from 18, and do not trust your memory of default values.
+- Look it up when you are unsure (web_search to find the page, web_fetch to read it)
+  and say which page you used. Searching for "keycloak 26 <thing>" beats guessing.
+```
+
+Three other ways to add instructions: `-s "…"` / `/system …` for the session, a skill for
+instructions the model should pull in on demand (see [Skills](#skills)), and
+`.corbienest/memory.md`, which the model curates itself (see [Project memory](#project-memory)).
 
 ### Config
 
-Settings changed with `/model`, `/ctx`, `/think`, `/mode`, `/yolo`, `/host`, `/keepalive`, `/memory on|off|every N|idle N` are saved to
+Settings changed with `/model`, `/ctx`, `/think`, `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N` are saved to
 `~/.config/corbienest/config`. Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`.
 
 ### Running more than one session
@@ -354,7 +415,8 @@ make test
 - `tests/test_unit.c` — C unit tests: string buffer, file helpers, the HTTP client
   (chunked/content-length/abort against a forked local server), the streaming
   markdown printer, text tool-call recovery, every tool (read/write/edit/list/grep/bash
-  including timeouts and non-interactive denial), permission modes, and skills
+  including timeouts and non-interactive denial), URL checks and the HTML-to-text and
+  search-result extraction behind `web_fetch`/`web_search`, permission modes, and skills
   (frontmatter parsing, `$ARGUMENTS`, scaffolding).
 - `tests/test_integration.py` — runs the real binary against `tests/fake_ollama.py`,
   a tiny scripted Ollama stand-in (no model needed): one-shot mode, the full tool loop
@@ -371,7 +433,7 @@ make test
 
 ```
 src/common.h   shared declarations
-src/util.c     string buffer, file helpers, config
+src/util.c     string buffer, file helpers, config, URL checks + HTML-to-text + search results
 src/http.c     minimal HTTP/1.1 client (chunked streaming, Ctrl-C interrupt)
 src/term.c     raw mode, key decoding, full-screen mode + status bar, line editor, confirmation menu,
                list picker, markdown printer
@@ -401,16 +463,21 @@ tests/         unit tests, fake Ollama server, pty integration tests
   thinks once per request instead of after every tool result; `/think off` never; the stats line shows
   `thought 41s (≈2.1k tok)` per call and `/cost` the session total), keep the model
   loaded (`/keepalive`, default 30m), and `/compact` long conversations. Tool output is capped
-  (`read_file` 2000 lines / 64 KB, `bash`/`grep` 32 KB) so a single tool round cannot fill the
+  (`read_file` 2000 lines / 64 KB, `bash`/`grep` 32 KB, `web_search`/`web_fetch` 24 KB) so a single tool round cannot fill the
   context; the model is told to page with `offset`/`limit`.
 - Models without tool support still work as a plain chat (`/models` shows which is which).
-- Only `http://` hosts are supported (Ollama's local API is plain HTTP).
+- Only `http://` hosts are supported for the Ollama API itself: corbienest's HTTP client is
+  plain POSIX sockets with no TLS, and Ollama's local API is plain HTTP anyway. `web_search`/`web_fetch` are
+  not affected — they shell out to `curl`/`wget` and read `https://` pages fine.
 
 ## Safety
 
-Corbie Nest writes files and runs shell commands in the directory you start it in. In the
-default `manual` mode every mutating action is shown and confirmed first, and `plan` mode is
-read-only — but `--yolo` / `/mode auto` approves everything, and rules saved to
+Corbie Nest writes files and runs shell commands in the directory you start it in, and with
+`web_search`/`web_fetch` it makes outbound HTTP requests to hosts the model picked — a search
+sends your query text to the engine. In the
+default `manual` mode every mutating action, command and page fetch is shown and confirmed
+first, and `plan` mode is read-only (a fetch is still allowed there: reading the docs is how a
+plan gets the API right) — but `--yolo` / `/mode auto` approves everything, and rules saved to
 `.corbienest/permissions` stay approved for that project. Run it on code you can restore
 (a git working tree), and remember that a local model is still a model: it can be talked into
 things by the content of the files it reads.

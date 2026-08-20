@@ -58,6 +58,15 @@ char *expand_home(const char *path);   /* "~/x" -> "/home/u/x", malloc'd */
 int   is_dir(const char *path);
 int   is_file(const char *path);
 
+/* URLs and HTML, for the web_fetch tool (in util.c so the unit tests can reach them) */
+bool  url_ok(const char *url);                                  /* http(s), sane, not cloud metadata */
+bool  url_host(const char *url, char *out, size_t n);           /* "host[:port]", lowercased */
+char *html_to_text(const char *html, size_t len, const char *base);  /* readable text, malloc'd; base = "scheme://host" for rooted links */
+char *url_encode(const char *s);                                /* percent-encoding for a query value */
+char *url_decode(const char *s, size_t n);                      /* the reverse, malloc'd */
+/* A search engine's result page as "N. title / url / snippet" lines; *count gets how many */
+char *search_results_text(const char *html, size_t len, const char *engine_url, int max, int *count);
+
 /* ---------- global config ---------- */
 typedef struct {
     char *host;          /* e.g. http://127.0.0.1:11434 */
@@ -71,6 +80,8 @@ typedef struct {
     bool  show_thinking; /* print thinking tokens */
     int   mode;          /* permission mode, see MODE_* */
     bool  no_tools;      /* don't send tools at all */
+    bool  web;           /* offer the web_fetch/web_search tools (/web, --no-web) */
+    char *search_url;    /* search engine, %s = the url-encoded query (/web engine) */
     bool  color;
     int   max_iters;     /* tool loop guard */
     bool  interactive;   /* stdin is a tty */
@@ -229,6 +240,7 @@ void md_finish(md_state *m);
 /* ---------- tools.h ---------- */
 typedef enum { TOOL_OK = 0, TOOL_DENIED = 1, TOOL_ERROR = 2 } tool_status;
 
+extern const char *SEARCH_URL_DEFAULT;   /* web_search engine template, %s = the query */
 cJSON *tools_definitions(void);   /* array of tool defs (Ollama/OpenAI format), caller owns */
 /* Executes tool. Returns status; writes result text into out. */
 tool_status tools_execute(const char *name, cJSON *args, sbuf *out);
