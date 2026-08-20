@@ -999,6 +999,7 @@ static void print_result_preview(const char *text, int max_lines) {
 }
 
 #define AUTO_COMPACT_PCT 85   /* auto-compact once the last request used this much of num_ctx */
+#define COMPACT_REQUEST_MAX 4000  /* bytes of the pending request kept when compacting mid-turn */
 #define COMPACT_HINT_PCT 70   /* from here on the stats line suggests /compact */
 static void print_stats(chat_stats *st) {
     if (!st->eval_tokens && !st->prompt_tokens) return;
@@ -1223,16 +1224,30 @@ static int inject_queued(void) {
 }
 
 /* ---------- the agent loop ---------- */
-static bool maybe_auto_compact(void);
-static bool cmd_compact(void);
+static bool maybe_auto_compact(bool resuming, const char *request);
+static bool compact_conversation(bool resuming, const char *request);
+static bool cmd_compact(void) { return compact_conversation(false, NULL); }
+
+/* The request the current turn is working on, as the user wrote it. A compaction in the
+ * middle of a turn summarises it away, so it is handed back verbatim — a summary of the
+ * work is not the same as the ask itself. NULL when there is nothing to point at (a second
+ * compaction within one turn: the first one already reset g_prev_request_first). */
+static const char *pending_request(void) {
+    if (g_prev_request_first < 0 || g_prev_request_first >= cJSON_GetArraySize(g_messages)) return NULL;
+    cJSON *m = cJSON_GetArrayItem(g_messages, g_prev_request_first);
+    cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+    if (!cJSON_IsString(r) || strcmp(r->valuestring, "user") || !cJSON_IsString(c) || !c->valuestring[0]) return NULL;
+    return c->valuestring;
+}
 
 /* Keep the next call inside the window. A whole tool round lands between two calls, so this
  * works on the estimate rather than on what was measured last: elide the tool results older
  * than the round the model is about to reason about (free), and compact only if that was not
- * enough. `keep_from` is the first message of that round. */
-static void shrink_context(int keep_from) {
+ * enough. `keep_from` is the first message of that round. Returns true when it compacted —
+ * the conversation was replaced, so every index into it is stale. */
+static bool shrink_context(int keep_from) {
     elide_old_tool_results(keep_from);
-    maybe_auto_compact();
+    return maybe_auto_compact(true, pending_request());
 }
 
 /* An assistant turn with neither text nor a tool call: the model generated tokens the server
@@ -1251,7 +1266,7 @@ static bool run_turn(void) {
     int round_first = -1;   /* where this round's tool results start (-1 before the first round) */
     g_session.turns++;
     for (;;) {
-        shrink_context(round_first >= 0 ? round_first : cJSON_GetArraySize(g_messages));
+        if (shrink_context(round_first >= 0 ? round_first : cJSON_GetArraySize(g_messages))) round_first = -1;
         cJSON *msgs = messages_with_system();
         cJSON *tools = tools_for_mode();
         size_t sent = prompt_bytes();
@@ -1274,7 +1289,8 @@ static bool run_turn(void) {
             if (!aborted && shrinks < 2 && strstr(ollama_error, "no user query")) {
                 shrinks++;
                 printf(C_YELLOW "⚠ the conversation no longer fits in %s of context — shrinking it and retrying" C_RESET "\n", fmt_ctx(g_cfg.num_ctx));
-                if (elide_tool_results(g_messages, cJSON_GetArraySize(g_messages)) || cmd_compact()) { round_first = -1; continue; }
+                if (elide_tool_results(g_messages, cJSON_GetArraySize(g_messages))
+                    || compact_conversation(true, pending_request())) { round_first = -1; continue; }
             }
             /* On failure, keep the conversation as is; the user can retry. */
             return aborted;
@@ -1300,7 +1316,7 @@ static bool run_turn(void) {
                 return false;
             }
             print_stats(&st);
-            if (!aborted) { check_model_placement(false); maybe_auto_compact(); }
+            if (!aborted) { check_model_placement(false); maybe_auto_compact(false, NULL); }
             return aborted;
         }
         if (++iters > g_cfg.max_iters) {
@@ -1555,9 +1571,24 @@ static void cmd_status(void) {
     else printf(C_BOLD "session    " C_RESET "(nothing saved yet)\n");
 }
 
-/* Returns true when the conversation was compacted. */
-static bool cmd_compact(void) {
+/* Summarise the conversation and start again from the summary. Returns true when it did.
+ *
+ * `resuming` says who speaks next. At the prompt (false) the compacted conversation ends with
+ * an assistant turn, so whatever the user types next follows one. In the middle of a turn
+ * (true) it must end with a user turn instead: the model has a job half done — a tool result
+ * it never got to read, a task several rounds in — and a conversation that ends with the
+ * assistant asking "how should we continue?" makes it stop and wait for an answer that is
+ * never coming, dropping the work. So the summary is handed back as a request to carry on,
+ * with `request` (the user's own words, if we still have them) appended. */
+static bool compact_conversation(bool resuming, const char *request) {
     if (cJSON_GetArraySize(g_messages) == 0) { printf(C_DIM "nothing to compact" C_RESET "\n"); return false; }
+    /* a copy: `request` points into the conversation this is about to delete */
+    char *ask = NULL; bool ask_cut = false;
+    if (request && *request) {
+        size_t len = strlen(request), keep = len > COMPACT_REQUEST_MAX ? COMPACT_REQUEST_MAX : len;
+        while (keep && keep < len && ((unsigned char)request[keep] & 0xC0) == 0x80) keep--;   /* UTF-8 boundary */
+        ask = xstrndup(request, keep); ask_cut = keep < len;
+    }
     memory_flush();   /* learn from the detail before it is summarised away */
     printf(C_DIM "compacting conversation…" C_RESET "\n");
     cJSON *msgs = messages_with_system();
@@ -1575,30 +1606,36 @@ static bool cmd_compact(void) {
     cJSON_Delete(msgs);
     account(&st);
     term_status_refresh();
-    if (!reply || aborted) { if (reply) cJSON_Delete(reply); printf(C_YELLOW "compact cancelled" C_RESET "\n"); return false; }
+    if (!reply || aborted) { free(ask); if (reply) cJSON_Delete(reply); printf(C_YELLOW "compact cancelled" C_RESET "\n"); return false; }
     const char *summary = cJSON_GetObjectItemCaseSensitive(reply, "content")->valuestring;
     cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); g_prev_request_first = -1;
     sbuf b; sb_init(&b);
     sb_printf(&b, "This conversation was compacted. Summary of the previous conversation:\n\n%s\n\nContinue from here.", summary);
+    if (resuming) {
+        sb_puts(&b, " The work in the summary is unfinished: pick it up where it left off and carry on until it is done. "
+                    "Do not start over, do not summarise what happened, and do not ask what to do next — act.");
+        if (ask) sb_printf(&b, "\n\nThe request you are working on, as it was made:\n\n%s%s", ask, ask_cut ? "\n[…truncated]" : "");
+    }
     add_message("user", b.data);
-    add_message("assistant", "Understood, I have the context from the summary. How should we continue?");
-    sb_free(&b); cJSON_Delete(reply);
+    if (!resuming) add_message("assistant", "Understood, I have the context from the summary. How should we continue?");
+    sb_free(&b); free(ask); cJSON_Delete(reply);
     g_session.last_prompt_tokens = 0;   /* unknown until the next request; also stops auto-compact re-firing */
-    printf(C_GREEN "✓ conversation compacted" C_RESET "\n");
+    printf(C_GREEN "✓ conversation compacted%s" C_RESET "\n", resuming ? " — continuing" : "");
     return true;
 }
 
 /* Auto-compact: once the last request used AUTO_COMPACT_PCT% or more of the context
  * window, summarise the conversation before sending anything else. A failed attempt
- * is not retried until the usage figure changes (a new request came through). */
-static bool maybe_auto_compact(void) {
+ * is not retried until the usage figure changes (a new request came through).
+ * `resuming`/`request`: see compact_conversation(). */
+static bool maybe_auto_compact(bool resuming, const char *request) {
     static int tried_at = -1;
     if (g_cfg.num_ctx <= 0) return false;
     int est = ctx_estimate(), pct = (int)(100.0 * est / g_cfg.num_ctx);
     if (pct < AUTO_COMPACT_PCT || est == tried_at) return false;
     tried_at = est;
     printf(C_YELLOW "⚠ context %d%% full — auto-compacting" C_RESET "\n", pct);
-    return cmd_compact();
+    return compact_conversation(resuming, request);
 }
 
 static void cmd_save(const char *arg) {

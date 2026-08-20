@@ -122,6 +122,12 @@ def script(model, messages, req):
         yield chunk(model, "Echo: " + text.split("\n")[0])
         yield chunk(model, done=True, prompt_tokens=20_000)
         return
+    if "HUGE_TOOL" in text:
+        # a tool round that also reports a (nearly) full context window: auto-compact fires
+        # in the middle of the turn, between the tool result and the next model call
+        yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "echo hello-from-tool"}}}])
+        yield chunk(model, done=True, prompt_tokens=999_999)
+        return
     if "HUGE_CTX" in text:
         # report a prompt that (nearly) fills the context window: triggers auto-compact
         yield chunk(model, "Echo: HUGE_CTX")

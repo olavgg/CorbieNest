@@ -239,8 +239,10 @@ used; the footer under a reply warns when it is nearly full. To grow it, run `/c
 picker of sizes up to the model's trained maximum (read from `ollama show`), or set one directly:
 `/ctx 64k`, `/ctx 131072`, `/ctx max`, `/ctx default`. `/status` shows the model's maximum.
 Larger windows need more RAM/VRAM and take effect on the next request; `/compact` is the other
-way out when a long session fills up. Once a request has used 95% or more of the window,
-corbienest compacts automatically before the next model call (also mid-task, between tool rounds).
+way out when a long session fills up. Once a request has used 85% or more of the window,
+corbienest compacts automatically before the next model call — also mid-task, between tool
+rounds, and then the summary is handed straight back to the model, along with your request as
+you made it, so it carries on with the job instead of stopping to ask what to do next.
 
 ### Sessions
 

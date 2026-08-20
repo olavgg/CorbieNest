@@ -76,6 +76,20 @@ msgs = requests()[-1]["messages"]
 check(msgs[-1]["role"] == "tool" and msgs[-1]["tool_name"] == "bash", "tool result message sent back")
 check("tool_calls" in msgs[-2], "assistant tool_calls kept in history")
 
+print("test auto-compact in the middle of a turn hands the work back and carries on")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "HUGE_TOOL please"])
+check("auto-compacting" in out, f"auto-compact fired between the tool result and the next call: {out!r}")
+check("conversation compacted \u2014 continuing" in out, "compaction says it is continuing the turn")
+check("Tool said: hello-from-tool" in out, f"the turn resumed instead of stopping at the summary: {out!r}")
+reqs = requests()
+i = next(k for k, r in enumerate(reqs) if "Write a detailed summary" in (r["messages"][-1].get("content") or ""))
+msgs = reqs[i + 1]["messages"]   # the first call after the compaction
+check(msgs[-1]["role"] == "user", f"the compacted conversation ends with a user turn: {msgs[-1]['role']}")
+check("This conversation was compacted" in msgs[-1]["content"], "it carries the summary")
+check("HUGE_TOOL please" in msgs[-1]["content"], "and the pending request verbatim")
+check("do not ask what to do next" in msgs[-1]["content"], "told to carry on rather than ask")
+check(not any("How should we continue" in (m.get("content") or "") for m in msgs), "no trailing assistant turn mid-request")
+
 print("test tool denied when non-interactive without --yolo")
 out, rc = run(["-m", "fake-coder:latest", "-p", "TOOL_WRITE please"])
 check("denied" in out, "denied shown"); check(not os.path.exists(os.path.join(WORK, "made.txt")), "file not written")
