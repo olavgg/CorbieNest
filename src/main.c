@@ -2037,7 +2037,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 60; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15;
+    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15;
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();
