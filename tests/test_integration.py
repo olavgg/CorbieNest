@@ -100,7 +100,7 @@ check(any(t["function"]["name"] == "bash" for t in req.get("tools", [])), "tools
 check(req["options"]["num_ctx"] == 32768, "default num_ctx")
 check(req["keep_alive"] == "30m" and "num_predict" not in req["options"] and "think" not in req, "default keep_alive 30m; no num_predict/think on a normal call")
 out, rc = run(["-m", "fake-coder:latest", "--keep-alive", "-1", "-p", "hello"])
-check(requests()[-1]["keep_alive"] == "-1", "--keep-alive -1 sent")
+check(requests()[-1]["keep_alive"] == -1, "--keep-alive -1 sent as a number: the server refuses the string (missing unit in duration)")
 out, rc = run(["-m", "fake-coder:latest", "--keep-alive", "default", "-p", "hello"])
 check("keep_alive" not in requests()[-1], "--keep-alive default omits the key")
 out, rc = run(["-m", "fake-coder:latest", "-c", "16k", "-p", "hello"])

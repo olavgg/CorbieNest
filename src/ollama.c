@@ -191,6 +191,17 @@ cJSON *parse_text_tool_calls(const char *content) {
     return arr;
 }
 
+/* keep_alive is a duration ("30m") or a bare number of seconds — and the server only takes the
+ * latter as a JSON number: "-1" or "300" as a string is refused (missing unit in duration).
+ * Only a plain decimal is one: strtod also takes "inf", "nan" and "1e400", which cJSON prints
+ * as null — "not set" to the server, in silence, where a string at least gets an error back. */
+static void add_keep_alive(cJSON *req, const char *v) {
+    if (!v || !*v) return;
+    char *end; double n = strtod(v, &end);
+    if (end != v && !*end && strspn(v, "+-.0123456789") == strlen(v)) cJSON_AddNumberToObject(req, "keep_alive", n);
+    else cJSON_AddStringToObject(req, "keep_alive", v);
+}
+
 cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted) {
     *aborted = false;
     ollama_error[0] = 0;
@@ -206,7 +217,7 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
     if (think == 1 && g_cfg.think_level) cJSON_AddStringToObject(req, "think", g_cfg.think_level);   /* gpt-oss style levels */
     else if (think == 1 || (think == 0 && (g_model_think || g_cfg.think >= 0))) cJSON_AddBoolToObject(req, "think", think == 1);
     else if (think < 0 && g_cfg.think_level && g_model_think) cJSON_AddStringToObject(req, "think", g_cfg.think_level);
-    if (g_cfg.keep_alive && *g_cfg.keep_alive) cJSON_AddStringToObject(req, "keep_alive", g_cfg.keep_alive);
+    add_keep_alive(req, g_cfg.keep_alive);
     cJSON *opts = cJSON_AddObjectToObject(req, "options");
     if (g_cfg.num_ctx > 0) cJSON_AddNumberToObject(opts, "num_ctx", g_cfg.num_ctx);
     if (g_cfg.temperature >= 0) cJSON_AddNumberToObject(opts, "temperature", g_cfg.temperature);
