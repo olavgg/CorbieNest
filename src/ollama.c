@@ -234,29 +234,47 @@ static void add_keep_alive(cJSON *req, const char *v) {
     else cJSON_AddStringToObject(req, "keep_alive", v);
 }
 
+/* A call that is one long wait and not what the user is after (the advisor's answer) gives way
+ * to a message they queue meanwhile, the way a shell command and a sub-agent do. */
+bool ollama_stopped_for_message = false;
+static int poll_or_message(void) {
+    if (term_poll_interrupt()) return 1;
+    if (term_queue_new()) { ollama_stopped_for_message = true; return 1; }
+    return 0;
+}
+
 cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted) {
     *aborted = false;
     ollama_error[0] = 0;
     if (stats) memset(stats, 0, sizeof *stats);
+    const char *model = ollama_call.model ? ollama_call.model : g_cfg.model;   /* the advisor call names its own */
     cJSON *req = cJSON_CreateObject();
-    cJSON_AddStringToObject(req, "model", g_cfg.model);
+    cJSON_AddStringToObject(req, "model", model);
     cJSON_AddItemReferenceToObject(req, "messages", messages);
     cJSON_AddBoolToObject(req, "stream", true);
     if (tools && cJSON_GetArraySize(tools) > 0) cJSON_AddItemReferenceToObject(req, "tools", tools);
     /* thinking: whether, and how hard, is the model's own business — see think_decide() */
+    static const model_info no_info;   /* a model we know nothing about: it cannot think, as far as we know */
+    const model_info *mi = ollama_call.model ? (ollama_call.info ? ollama_call.info : &no_info) : &g_model_info;
     const char *level = NULL;
-    switch (think_decide(g_cfg.think, ollama_call.think == 0, ollama_call.followup, effort_get(g_cfg.model), &g_model_info, &level)) {
+    /* a call to another model is no part of the conversation's rhythm: /think says when the main
+     * model thinks, the other one follows its own effort */
+    switch (think_decide(ollama_call.model ? -1 : g_cfg.think, ollama_call.think == 0, ollama_call.followup, effort_get(model), mi, &level)) {
         case THINK_FALSE: cJSON_AddBoolToObject(req, "think", false); break;
         case THINK_TRUE:  cJSON_AddBoolToObject(req, "think", true); break;
         case THINK_LEVEL: cJSON_AddStringToObject(req, "think", level); break;
         case THINK_OMIT:  break;
     }
-    add_keep_alive(req, g_cfg.keep_alive);
+    add_keep_alive(req, ollama_call.keep_alive ? ollama_call.keep_alive : g_cfg.keep_alive);
     cJSON *opts = cJSON_AddObjectToObject(req, "options");
-    if (g_cfg.num_ctx > 0) cJSON_AddNumberToObject(opts, "num_ctx", g_cfg.num_ctx);
-    if (g_cfg.temperature >= 0) cJSON_AddNumberToObject(opts, "temperature", g_cfg.temperature);
+    int num_ctx = ollama_call.num_ctx > 0 ? ollama_call.num_ctx : ollama_call.num_ctx < 0 ? 0 : g_cfg.num_ctx;
+    if (num_ctx > 0) cJSON_AddNumberToObject(opts, "num_ctx", num_ctx);
+    /* temperature and the draft length were chosen for the main model; and the main model gets
+     * them on every call, its own advisor call included — a changed draft length reloads it */
+    bool other = ollama_call.model && !model_same(ollama_call.model, g_cfg.model);
+    if (g_cfg.temperature >= 0 && !other) cJSON_AddNumberToObject(opts, "temperature", g_cfg.temperature);
     if (ollama_call.num_predict > 0) cJSON_AddNumberToObject(opts, "num_predict", ollama_call.num_predict);
-    if (g_cfg.draft >= 0) cJSON_AddNumberToObject(opts, "draft_num_predict", g_cfg.draft);   /* changing it reloads the model */
+    if (g_cfg.draft >= 0 && !other) cJSON_AddNumberToObject(opts, "draft_num_predict", g_cfg.draft);   /* changing it reloads the model */
     char *body = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
 
@@ -266,13 +284,17 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
     gettimeofday(&c.t0, NULL);
 
     term_raw(true);
+    ollama_stopped_for_message = false;
     http_interrupt_fd = g_cfg.interactive ? STDIN_FILENO : -1;
-    http_interrupt_check = term_poll_interrupt;
+    http_interrupt_check = ollama_call.stop_on_message ? poll_or_message : term_poll_interrupt;
     http_idle = on_idle; http_idle_ud = &c;
     term_busy(busy_or("waiting for model"));
     on_idle(&c);
     http_result res;
+    int idle_was = http_idle_timeout_ms;
+    if (ollama_call.idle_ms > 0) http_idle_timeout_ms = ollama_call.idle_ms;
     int rc = http_request(g_cfg.host, "POST", "/api/chat", body, NULL, on_line, &c, &res);
+    http_idle_timeout_ms = idle_was;
     http_idle = NULL; http_interrupt_fd = -1;
     term_busy(NULL);
     free(body);
@@ -284,7 +306,7 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
     cJSON *msg = NULL;
     if (res.aborted) {
         *aborted = true;
-        printf("\n" C_YELLOW "⏹ interrupted" C_RESET "\n");
+        if (!ollama_stopped_for_message) printf("\n" C_YELLOW "⏹ interrupted" C_RESET "\n");   /* else the caller says what it stopped for */
     } else if (rc != 0) {
         snprintf(ollama_error, sizeof ollama_error, "%s", res.err);
         printf(C_RED "✗ request failed: %s" C_RESET "\n", res.err);
@@ -292,10 +314,10 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
     } else if (c.error[0] || res.status >= 400) {
         snprintf(ollama_error, sizeof ollama_error, "%s", c.error[0] ? c.error : "unknown");
         printf(C_RED "✗ ollama error (%d): %s" C_RESET "\n", res.status, c.error[0] ? c.error : "unknown");
-        if (strstr(c.error, "not found")) printf(C_DIM "  try /models to list, or: ollama pull %s" C_RESET "\n", g_cfg.model);
+        if (strstr(c.error, "not found")) printf(C_DIM "  try /models to list, or: ollama pull %s" C_RESET "\n", model);
         if (strstr(c.error, "does not support tools")) printf(C_DIM "  this model has no tool support; use /tools off or pick another model" C_RESET "\n");
         /* the server's own three complaints about it — not any error that quotes a model called "…-thinking" */
-        if (strstr(c.error, "think value") || strstr(c.error, "think must be") || strstr(c.error, "does not support thinking")) printf(C_DIM "  the server refused the \"think\" value sent to %s — /effort default takes it back" C_RESET "\n", g_cfg.model);
+        if (strstr(c.error, "think value") || strstr(c.error, "think must be") || strstr(c.error, "does not support thinking")) printf(C_DIM "  the server refused the \"think\" value sent to %s — %s default takes it back" C_RESET "\n", model, ollama_call.model ? "/advisor effort" : "/effort");
     }
     /* Build the assistant message even on abort (partial content keeps context coherent) */
     if (res.aborted || (rc == 0 && !c.error[0] && res.status < 400)) {

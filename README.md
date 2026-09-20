@@ -67,7 +67,7 @@ corbienest [options] [-p PROMPT]
   -s, --system TEXT    extra system instructions
   -p, --prompt TEXT    non-interactive: run one prompt and exit (add --yolo to allow tools)
       --output-format text|json   with -p: plain reply (default) or one JSON object
-                       {result, session_id, model, prompt_tokens, eval_tokens, model_calls, tool_calls, duration_s}
+                       {result, session_id, model, prompt_tokens, eval_tokens, model_calls, tool_calls, advisor_calls, duration_s}
   -y, --yolo           auto-approve tool calls (same as --mode auto)
       --mode NAME      permission mode: manual, accept-edits, plan, auto
   -T, --no-tools       disable tool calling
@@ -78,6 +78,7 @@ corbienest [options] [-p PROMPT]
       --no-web         don't offer web_search/web_fetch (the model cannot look documentation up)
       --think / --no-think / --show-thinking
       --effort LEVEL   how hard the model thinks: one of the levels it has (off, on, low, medium, high, … — see /effort); default = the model's own
+      --advisor MODEL  a stronger model the agent may consult through the advisor tool (see /advisor); off = none
       --draft N        draft_num_predict: speculative-decoding / MTP draft tokens per step (0 = off; default: the model's own,
                        e.g. models that ship an MTP head set 4); changing it makes Ollama reload the model
       --benchmark [N]  measure tokens per second at every context size the model supports (or just the -c size):
@@ -120,6 +121,7 @@ larger ones skipped.)
 | `/system [text\|clear]` | extra system instructions |
 | `/think on\|off\|auto`, `/think show\|hide` | *when* a thinking-capable model thinks: `auto` (default) lets it think about each request once and turns thinking off for the tool rounds that follow, `on` thinks on every call, `off` never. *How hard* is `/effort` (`/think low\|medium\|high\|max` still works, as an alias for it) |
 | `/effort [LEVEL\|default]` | how hard **this model** thinks, in the levels it has — see [Effort](#effort). No argument opens a picker of them; `default` leaves it to the model. Kept per model, shown next to the model's name in the status bar |
+| `/advisor [MODEL\|off]`, `/advisor effort [LEVEL]`, `/advisor ctx N\|auto` | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud model is set by name: `/advisor gpt-oss:120b-cloud`) |
 | `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (`.corbienest/permissions`) |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
@@ -170,7 +172,7 @@ larger ones skipped.)
 - **Slash commands that only report or set something answer straight away while the model
   works** — they never become a queued message: `/help`, `/status`, `/cost`, `/diff`, `/history`,
   `/pwd`, `/skills`, `/memory`, `/mode`, `/yolo`, `/permissions`, `/tools`, `/max_iters`,
-  `/think`, `/effort` (it prints the levels instead of opening the picker), `/temp`, `/keepalive`. A `/permissions add` or `/mode` typed mid-turn applies to the
+  `/think`, `/effort` (it prints the levels instead of opening the picker), bare `/advisor`, `/temp`, `/keepalive`. A `/permissions add` or `/mode` typed mid-turn applies to the
   tool confirmations still to come, like Shift+Tab, and `/max_iters` to the rounds still to come. Everything that touches the conversation (`/clear`, `/compact`,
   `/rewind`, `/resume`, `/save`, `/system`, `/init`, skills), needs the server (`/model`,
   `/models`, `/ctx`, `/host`, `/memory update`) or asks a question stays queued until the turn ends.
@@ -200,6 +202,7 @@ Cycle with **Shift+Tab** at the prompt, or set one with `/mode NAME`, `--mode NA
 | `web_search(query, max_results?)` | yes — shows the query and the engine; "always allow" saves the engine's **host** |
 | `web_fetch(url, offset?, timeout?)` | yes — shows the URL; "always allow" saves the **host** |
 | `task(description, prompt)` | none for the call itself — runs a **sub-agent**: a fresh, read-only agent loop (read_file, list_dir, grep, bash, web_search, web_fetch — with the usual confirmations) that investigates and returns a report as the tool result, keeping the noise out of the main context. Its tool calls are echoed as `⎿ grep(…)` lines and the report is previewed. Sub-agents cannot edit files or start further sub-agents |
+| `advisor(question?)` | none — only on offer after `/advisor MODEL`. Puts the agent's question, and the conversation so far, to a **stronger model** and returns its advice as the tool result; see [The advisor](#the-advisor) |
 
 Each confirmation is a small menu:
 
@@ -408,10 +411,50 @@ Capabilities are read from `/api/show`, not from the model list: `/api/tags` rep
 they were when the model was pulled, so a model whose template has learned tools or thinking
 since then (deepseek-r1, for one) shows up there as chat-only.
 
+### The advisor
+
+`/advisor MODEL` names a stronger model that the agent may **consult** while it works — a bigger
+local model, or one of Ollama's cloud models (`/advisor gpt-oss:120b-cloud`; run `ollama signin`
+once, the local server relays the call). The agent gets an `advisor` tool and is told when to
+use it: before it commits to an approach for a non-trivial change, when an error has survived
+two fixes or a result makes no sense, and before it calls a difficult task done. You can also
+just say so: *"ask the advisor before you continue"*.
+
+```
+● advisor(parse() crashes on the input "1, 2,,3" - what is the smallest corr…)
+  ⤷ advisor gpt-oss:120b-cloud · consultation 1 of 3 in this request · 2 KB of the conversation · esc skips it
+    ⎿ advice · 930 tokens · 14s:
+  ⎿  The crash is int("") on the empty field between the two commas. …
+```
+
+- **What the advisor sees.** Not just the question — a small model writes a poor brief — but the
+  conversation itself, as one quoted text: your request, what the agent said, its tool calls and
+  their results (long ones lose their middle; when it does not all fit, the newest part wins and
+  the request always stays), plus the project's rules. It has **no tools**: it cannot read a
+  file or run anything, it answers with advice, and the agent is told that where a file or a
+  command contradicts the advice, they are right.
+- **What it costs.** Time — and on one machine more than that: loading a second local model may
+  push the main one out of memory, and its next reply then reloads it and reads the whole
+  conversation again (corbienest says so when it happens). So a consultation runs in a window
+  of its own (`/advisor ctx`, default the main window but at most 16k: a 70B model pays several
+  times the memory per token that a small one does), the advisor is unloaded as soon as it has
+  answered, and one request may consult it at most **3 times** — after that the tool answers with
+  an error instead. A cloud advisor touches neither your memory nor the main model's prompt
+  cache, which makes it the cheap choice on a small machine; it does mean the conversation is
+  sent to ollama.com with each consultation.
+- `/advisor effort LEVEL` sets how hard *it* thinks (the same levels as `/effort`, kept with its
+  model; `/think` does not apply to it). Lower it if consultations run out of tokens while
+  thinking. `/advisor MODEL` with the model already doing the work is allowed — a second opinion
+  from a fresh context, not a stronger one.
+- Enter with a message while it is consulted stops the consultation (your message goes first);
+  Esc skips it. Either way the turn carries on. Plan mode keeps the advisor — it changes
+  nothing; sub-agents do not get it. Its tokens are part of the session totals, and `/cost`
+  shows them on a line of their own.
+
 ### Config
 
-Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N` are saved to
-`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`.
+Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/advisor`, `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N` are saved to
+`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=` and `advisor_ctx=`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`.
 
 ### Running more than one session
 
@@ -453,7 +496,8 @@ make test
   including timeouts and non-interactive denial), URL checks and the HTML-to-text and
   search-result extraction behind `web_fetch`/`web_search`, permission modes, skills
   (frontmatter parsing, `$ARGUMENTS`, scaffolding), what each kind of model can be set to and
-  what is sent as `think` for every combination of `/think`, `/effort` and kind of call.
+  what is sent as `think` for every combination of `/think`, `/effort` and kind of call, and
+  where an advisor consultation runs and what it is shown.
 - `tests/test_integration.py` — runs the real binary against `tests/fake_ollama.py`,
   a tiny scripted Ollama stand-in (no model needed): one-shot mode, the full tool loop
   with results fed back, `--yolo`, XML tool-call recovery, `@file`, errors, and — through a
@@ -463,8 +507,9 @@ make test
   the round and the sub-agent in flight, step past a queued `/command`, and are handed back on
   Ctrl-C), the `/ctx` picker and `/history`,
   Shift+Tab mode cycling (plan / accept-edits behaviour), `/skills`, Ctrl-C interruption,
-  slash commands, the `/model` picker, `!cmd`, `/save`, config/history persistence, and `/effort`
-  (per-model levels, the picker, the status bar).
+  slash commands, the `/model` picker, `!cmd`, `/save`, config/history persistence, `/effort`
+  (per-model levels, the picker, the status bar) and `/advisor` (the consultation, its limit,
+  a missing or signed-out advisor, Esc and a queued message during one).
 
 ## Layout
 
@@ -477,7 +522,7 @@ src/term.c     raw mode, key decoding, full-screen mode + status bar, line edito
 src/tools.c    the tools + permission-mode checks + shell runner
 src/ollama.c   /api/chat streaming, tool-call accumulation, /api/tags, /api/show (capabilities, effort levels)
 src/skills.c   SKILL.md discovery/parsing, /NAME expansion, scaffolding
-src/main.c     REPL, slash commands, system prompt, agent loop, sub-agents
+src/main.c     REPL, slash commands, system prompt, agent loop, sub-agents, the advisor
 tests/         unit tests, fake Ollama server, pty integration tests
 ```
 

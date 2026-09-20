@@ -19,6 +19,8 @@ MODELS = [
      "details": {"parameter_size": "30B"}, "capabilities": ["completion", "tools"]},   # /api/ps says: half in GPU memory
     {"name": "fake-levels:latest", "model": "fake-levels:latest", "size": 1, "digest": "v",
      "details": {"parameter_size": "20B", "family": "gptoss"}, "capabilities": ["completion", "tools", "thinking"]},   # thinks in levels, like gpt-oss
+    {"name": "fake-big:latest", "model": "fake-big:latest", "size": 1, "digest": "u",
+     "details": {"parameter_size": "120B", "family": "fakebig"}, "capabilities": ["completion", "tools", "thinking"]},   # the expensive one: /advisor
     {"name": "fake-stale:latest", "model": "fake-stale:latest", "size": 1, "digest": "t",
      "details": {"parameter_size": "32B", "family": "fakestale"}, "capabilities": ["completion"]},   # /api/tags is out of date: /api/show knows better
     {"name": "fake-declared:latest", "model": "fake-declared:latest", "size": 1, "digest": "s",
@@ -29,6 +31,9 @@ SHOW_CAPS = {"fake-stale:latest": ["completion", "tools", "thinking"]}
 # thinking.values/default in /api/show (Ollama >= 0.34.3): the levels a model has, in its own names
 SHOW_THINKING = {"fake-declared:latest": {"values": [False, "low", "xhigh"], "default": "low"}}
 LEGACY_LEVELS = ("low", "medium", "high", "max")
+# a cloud model: /api/show knows it, /api/tags does not list it, and /api/chat wants `ollama signin`
+CLOUD = {"fake-remote:cloud": {"details": {"parameter_size": "671B", "family": "fakecloud"}, "capabilities": ["completion", "tools", "thinking"]}}
+EVICTED = set()   # models an advisor call pushed out of memory: gone from /api/ps until their next chat
 
 REQUEST_LOG = []
 
@@ -67,6 +72,31 @@ def script(model, messages, req):
             yield chunk(model, "NO_CHANGE")
         yield chunk(model, done=True)
         return
+    if messages[0]["role"] == "system" and "You are the advisor" in messages[0]["content"]:
+        # the advisor: one toolless call that is shown the conversation. Keywords sit in the
+        # transcript it is handed (the user's request is quoted in it).
+        brief = messages[-1]["content"]
+        if req.get("think"): yield chunk(model, thinking="weighing it up... ")
+        if "EVICTMAIN" in brief: EVICTED.add("fake-coder:latest")   # loading this one took the main model's place
+        if "THINKTAG" in brief:
+            # a model whose thinking the server does not split off: it arrives inside the answer
+            yield chunk(model, "<think>SECRET-REASONING about the needle</think>\n\nADVICE: strip me")
+            yield chunk(model, done=True)
+            return
+        if "CUTADVICE" in brief:
+            yield chunk(model, done=True, done_reason="length")   # still thinking when num_predict ran out
+            return
+        if "SLOWADVICE" in brief:
+            for w in ["ADVICE: ", "take ", "it ", "slowly, ", "one ", "step ", "at ", "a ", "time."]:
+                yield chunk(model, w); time.sleep(0.5)
+            yield chunk(model, done=True)
+            return
+        asked = brief.split("# What the agent asks you\n", 1)[-1].strip().splitlines()[0][:80]
+        yield chunk(model, "ADVICE: read hay.txt before you edit anything.\n")
+        yield chunk(model, "You asked: " + asked)
+        # a prompt of 30k tokens: were it taken for the conversation's, a 32k window would look 91% full
+        yield chunk(model, done=True, prompt_tokens=30_000)
+        return
     if messages[0]["role"] == "system" and "You are a sub-agent" in messages[0]["content"]:
         # sub-agent: one grep round, then a report — or, for a SLEEP task, one slow command,
         # so a test can type a message while the sub-agent is in the middle of a round
@@ -79,6 +109,11 @@ def script(model, messages, req):
             yield chunk(model, done=True)
             return
         yield chunk(model, tool_calls=[{"function": {"name": "grep", "arguments": {"pattern": "needle", "path": "."}}}])
+        yield chunk(model, done=True)
+        return
+    if last["role"] == "tool" and "ADVISOR_LOOP" in text and not last["content"].startswith("error: the advisor has been consulted"):
+        # a model that cannot stop asking: the client has to be the one to say "enough"
+        yield chunk(model, tool_calls=[{"function": {"name": "advisor", "arguments": {"question": "and now?"}}}])
         yield chunk(model, done=True)
         return
     if last["role"] == "tool":
@@ -96,6 +131,14 @@ def script(model, messages, req):
             yield chunk(model, done=True)
             return
         yield chunk(model, "Echo: " + text.split("\n")[0])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_ADVISOR_NOQ" in text:
+        yield chunk(model, tool_calls=[{"function": {"name": "advisor", "arguments": {}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_ADVISOR" in text:
+        yield chunk(model, tool_calls=[{"function": {"name": "advisor", "arguments": {"question": "Why does the needle test fail, and where should I look first?"}}}])
         yield chunk(model, done=True)
         return
     if "TOOL_TASK_SLEEP" in text:
@@ -195,15 +238,16 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/api/tags": return self._json(200, {"models": MODELS})
         if self.path == "/_requests": return self._json(200, REQUEST_LOG)
         if self.path == "/api/ps":   # the loaded model: fake-slow is only half in GPU memory
-            return self._json(200, {"models": [{"name": "fake-coder:latest", "size": 8_000_000_000, "size_vram": 8_000_000_000},
-                                               {"name": "fake-slow:latest", "size": 8_000_000_000, "size_vram": 4_000_000_000}]})
+            loaded = [{"name": "fake-coder:latest", "size": 8_000_000_000, "size_vram": 8_000_000_000},
+                      {"name": "fake-slow:latest", "size": 8_000_000_000, "size_vram": 4_000_000_000}]
+            return self._json(200, {"models": [m for m in loaded if m["name"] not in EVICTED]})
         self._json(404, {"error": "not found"})
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         req = json.loads(self.rfile.read(n) or b"{}")
         model = req.get("model", "")
         if self.path == "/api/show":
-            entry = next((m for m in MODELS if m["name"] == model), None)
+            entry = next((m for m in MODELS if m["name"] == model), None) or CLOUD.get(model)
             if not entry: return self._json(404, {"error": f"model '{model}' not found"})
             info = {"model_info": {"general.architecture": "fake", "fake.context_length": 65536, "fake.embedding_length": 8},
                     "details": entry["details"], "capabilities": SHOW_CAPS.get(model, entry["capabilities"])}
@@ -212,6 +256,8 @@ class H(BaseHTTPRequestHandler):
             return self._json(200, info)
         if self.path != "/api/chat": return self._json(404, {"error": "not found"})
         REQUEST_LOG.append(req)   # only chat requests: tests read the last one
+        if model in CLOUD: return self._json(401, {"error": "Unauthorized"})   # relayed to ollama.com, which wants an account
+        EVICTED.discard(model)   # a chat loads the model (again)
         entry = next((m for m in MODELS if m["name"] == model), None)
         if not entry:
             return self._json(404, {"error": f"model '{model}' not found"})

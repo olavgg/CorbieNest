@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 int http_interrupt_fd = -1;
+int http_idle_timeout_ms = 600 * 1000;
 int (*http_interrupt_check)(void) = NULL;
 http_idle_cb http_idle = NULL;
 void *http_idle_ud = NULL;
@@ -214,7 +215,7 @@ int http_request(const char *base_url, const char *method, const char *path,
     char buf[16384];
 
     for (;;) {
-        int w = wait_readable(fd, 600 * 1000);
+        int w = wait_readable(fd, http_idle_timeout_ms);
         if (w == 0) { res->aborted = true; break; }
         if (w < 0) { snprintf(res->err, sizeof res->err, "recv: %s", strerror(errno)); rv = -1; break; }
         ssize_t n = recv(fd, buf, sizeof buf, 0);

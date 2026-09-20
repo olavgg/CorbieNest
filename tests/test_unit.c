@@ -575,6 +575,7 @@ static void test_effort(void) {
     effort_set("m:7b", NULL); CHECK(effort_get("m:7b") == NULL && g_cfg.n_efforts == 2);
     effort_set("reg:5000/ns/other", NULL); effort_set("plain", NULL); effort_set("never-set", NULL); CHECK(g_cfg.n_efforts == 0);
     CHECK(model_same("a:latest", "a") && model_same("a", "a") && !model_same("a:7b", "a") && !model_same("a", NULL) && !model_same("reg:5000/ns/m", "reg:5000/ns/n"));
+    CHECK(model_is_cloud("gpt-oss:120b-cloud") && model_is_cloud("kimi-k3:cloud") && !model_is_cloud("cloud") && !model_is_cloud("cloudy:7b") && !model_is_cloud(NULL));
 
     /* think_decide(when, quiet, followup, effort): when -1 auto / 0 off / 1 every call */
     /* a model that cannot think is never sent anything but false */
@@ -620,6 +621,148 @@ static void test_effort(void) {
     THINKS(glim, 0, false, true, NULL, THINK_FALSE, NULL);   /* and off for good is the same on every call */
 }
 
+/* ---------- the advisor: where it runs, what it is shown ---------- */
+static void test_advisor(void) {
+    advisor_plan p;
+    char *old_model = g_cfg.model; int old_ctx = g_cfg.num_ctx, old_actx = g_cfg.advisor_ctx;
+    g_cfg.model = "small:7b"; g_cfg.num_ctx = 32768; g_cfg.advisor_ctx = 0;
+    advisor_plan_for("big:70b", 131072, &p);           /* another local model: a window of its own, memory back at once */
+    CHECK(!p.same && !p.cloud && p.window == 16384 && p.send_ctx == 16384 && p.reply == 5461); CHECK_STR(p.keep_alive, "0");
+    CHECK(p.budget == (size_t)(16384 - 5461 - 256) * 3);
+    g_cfg.advisor_ctx = 65536; advisor_plan_for("big:70b", 8192, &p);   /* never more than it was trained for */
+    CHECK(p.window == 8192 && p.send_ctx == 8192 && p.reply == 2730);
+    advisor_plan_for("big:70b", 0, &p); CHECK(p.window == 65536 && p.reply == ADVISOR_REPLY_MAX && p.budget == ADVISOR_BRIEF_MAX);   /* however large: reading it is the wait */
+    g_cfg.advisor_ctx = 0; g_cfg.num_ctx = 0; advisor_plan_for("big:70b", 131072, &p);
+    CHECK(p.window == ADVISOR_CTX_UNSET && p.send_ctx == 0);                                 /* left to the server: plan for little */
+    g_cfg.num_ctx = 512; advisor_plan_for("small:7b", 131072, &p); CHECK(p.window == 512 && p.budget == ADVISOR_BRIEF_MIN);   /* too small to plan for: a floor, not an underflow */
+    g_cfg.advisor_ctx = 100; advisor_plan_for("big:70b", 0, &p); CHECK(p.budget == ADVISOR_BRIEF_MIN); g_cfg.advisor_ctx = 0;
+    g_cfg.num_ctx = 65536; advisor_plan_for("small:7b", 131072, &p);   /* the main model itself: called exactly as it always is */
+    CHECK(p.same && !p.cloud && p.window == 65536 && p.send_ctx == 0 && p.keep_alive == NULL);
+    g_cfg.model = "small"; advisor_plan_for("small:latest", 0, &p); CHECK(p.same); g_cfg.model = "small:7b";
+    g_cfg.advisor_ctx = 8192; advisor_plan_for("gpt-oss:120b-cloud", 131072, &p);           /* a cloud model: nothing of ours to set */
+    CHECK(p.cloud && !p.same && p.window == ADVISOR_CTX_CLOUD && p.send_ctx < 0); CHECK_STR(p.keep_alive, "");
+    advisor_plan_for("tiny:cloud", 8192, &p); CHECK(p.window == 8192);
+    g_cfg.model = old_model; g_cfg.num_ctx = old_ctx; g_cfg.advisor_ctx = old_actx;
+
+    cJSON *msgs = cJSON_CreateArray();
+    cJSON *m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", "fix the parser"); cJSON_AddItemToArray(msgs, m);
+    sbuf rules; sb_init(&rules); sb_puts(&rules, "RULES-HEAD\n"); for (int i = 0; i < 3000; i++) sb_puts(&rules, "rule "); sb_puts(&rules, "\nDONTS-AT-THE-END");
+    char *b = advisor_brief(msgs, 0, 20000, "Working directory: /w · Linux x86_64", true, rules.data, "  Is my plan right?");
+    CHECK(strstr(b, "# Environment\nWorking directory: /w") == b);
+    CHECK(strstr(b, "plan mode") != NULL);
+    CHECK(strstr(b, "RULES-HEAD") && strstr(b, "DONTS-AT-THE-END") && strstr(b, "bytes cut"));   /* the rules lose their middle, not their end */
+    CHECK(strstr(b, "# The agent's conversation so far\n") && strstr(b, "[user]\nfix the parser\n\n# What the agent asks you\nIs my plan right?\n"));
+    const char *tail = "do not call tools.\n"; CHECK(strlen(b) > strlen(tail) && !strcmp(b + strlen(b) - strlen(tail), tail));   /* what a cut prompt keeps */
+    CHECK(strlen(b) < 20000);
+    free(b);
+    b = advisor_brief(msgs, 0, 20000, "env", false, NULL, NULL);
+    CHECK(strstr(b, "(It did not say.") && !strstr(b, "plan mode") && !strstr(b, "project's rules"));
+    free(b); sb_free(&rules); cJSON_Delete(msgs);
+
+    CHECK_STR(strip_think_block("plain advice"), "plain advice");
+    CHECK_STR(strip_think_block("  \n<think>hmm\nhmm</think>\n\nADVICE"), "ADVICE");
+    CHECK_STR(strip_think_block("<think>never finished"), "");
+    CHECK_STR(strip_think_block("say <think> later"), "say <think> later");
+
+    /* the tool is on offer only while an advisor is set, and says so when called without one */
+    char *old_adv = g_cfg.advisor;
+    g_cfg.advisor = NULL;
+    cJSON *defs = tools_definitions(); char *t = cJSON_PrintUnformatted(defs);
+    CHECK(!strstr(t, "\"advisor\"") && !strstr(tools_summary_line(), "advisor")); free(t); cJSON_Delete(defs);
+    sbuf out; sb_init(&out);
+    CHECK(tools_execute("advisor", NULL, &out) == TOOL_ERROR && strstr(out.data, "no advisor is set")); sb_free(&out);
+    g_cfg.advisor = "big:70b";
+    defs = tools_definitions(); t = cJSON_PrintUnformatted(defs);
+    CHECK(strstr(t, "\"name\":\"advisor\"") && strstr(tools_summary_line(), "task, advisor")); free(t);
+    cJSON *last = cJSON_GetArrayItem(defs, cJSON_GetArraySize(defs) - 1);
+    CHECK_STR(cJSON_GetObjectItem(cJSON_GetObjectItem(last, "function"), "name")->valuestring, "advisor");   /* last: the tools before it keep their place in the prompt */
+    t = cJSON_PrintUnformatted(last); CHECK(strstr(t, "\"required\":[]") != NULL); free(t);             /* the question is optional */
+    cJSON_Delete(defs);
+    sb_init(&out); CHECK(tools_execute("advisor", NULL, &out) == TOOL_ERROR && strstr(out.data, "no advisor is set")); sb_free(&out);   /* set, but nothing to run it (main.c's hook) */
+    g_cfg.advisor = old_adv;
+}
+
+/* strict enough to see a sequence cut at either end: every lead byte has its continuation bytes, and none stand alone */
+static bool utf8_valid(const char *s) {
+    for (const unsigned char *p = (const unsigned char *)s; *p; ) {
+        int n = *p < 0x80 ? 0 : (*p & 0xE0) == 0xC0 ? 1 : (*p & 0xF0) == 0xE0 ? 2 : (*p & 0xF8) == 0xF0 ? 3 : -1;
+        if (n < 0) return false;
+        p++;
+        for (; n > 0; n--, p++) if ((*p & 0xC0) != 0x80) return false;
+    }
+    return true;
+}
+
+/* ---------- the conversation as quoted text (what the advisor is shown) ---------- */
+static cJSON *tmsg(const char *role, const char *content) {
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddStringToObject(m, "role", role); cJSON_AddStringToObject(m, "content", content);
+    return m;
+}
+static void test_transcript(void) {
+    cJSON *msgs = cJSON_CreateArray();
+    cJSON_AddItemToArray(msgs, tmsg("user", "old request"));
+    cJSON_AddItemToArray(msgs, tmsg("assistant", "old answer"));
+    cJSON_AddItemToArray(msgs, tmsg("user", "fix the parser"));                 /* [2] the request being worked on */
+    cJSON *a = tmsg("assistant", "Let me look.");
+    cJSON *calls = cJSON_AddArrayToObject(a, "tool_calls");
+    cJSON *call = cJSON_CreateObject(); cJSON *fn = cJSON_AddObjectToObject(call, "function");
+    cJSON_AddStringToObject(fn, "name", "read_file");
+    cJSON_AddStringToObject(cJSON_AddObjectToObject(fn, "arguments"), "path", "src/parser.py");
+    cJSON_AddItemToArray(calls, call);
+    cJSON_AddItemToArray(msgs, a);
+    cJSON *t = tmsg("tool", "def parse(): pass\n"); cJSON_AddStringToObject(t, "tool_name", "read_file");
+    cJSON_AddItemToArray(msgs, t);
+    cJSON *ask = tmsg("assistant", "");                                          /* the turn that calls the advisor */
+    calls = cJSON_AddArrayToObject(ask, "tool_calls");
+    call = cJSON_CreateObject(); fn = cJSON_AddObjectToObject(call, "function");
+    cJSON_AddStringToObject(fn, "name", "advisor");
+    cJSON_AddStringToObject(cJSON_AddObjectToObject(fn, "arguments"), "question", "SECRET_QUESTION");
+    cJSON_AddItemToArray(calls, call);
+    cJSON_AddItemToArray(msgs, ask);
+
+    char *x = transcript_text(msgs, 2, 100000);
+    CHECK(strstr(x, "[user]\nold request\n\n[agent]\nold answer\n\n[user]\nfix the parser\n\n") == x);
+    CHECK(strstr(x, "[agent]\nLet me look.\n→ read_file({\"path\":\"src/parser.py\"})\n\n") != NULL);
+    CHECK(strstr(x, "[result of read_file]\ndef parse(): pass\n\n") != NULL);
+    CHECK(!strstr(x, "SECRET_QUESTION") && !strstr(x, "advisor"));   /* the question travels separately; an empty turn is no block */
+    free(x);
+
+    /* too small for everything: the newest blocks win, the request stays, and the gap is named */
+    x = transcript_text(msgs, 2, 140);
+    CHECK(strstr(x, "fix the parser") != NULL && strstr(x, "def parse()") != NULL);
+    CHECK(!strstr(x, "old request") && !strstr(x, "old answer"));
+    CHECK(strstr(x, "[… 2 earlier messages left out to fit …]\n\n[user]\nfix the parser") == x);
+    free(x);
+    x = transcript_text(msgs, -1, 110);   /* nothing pinned: just the tail */
+    CHECK(!strstr(x, "fix the parser") && strstr(x, "def parse()") != NULL);
+    free(x);
+
+    /* a long result loses its middle, on UTF-8 boundaries, and says how much */
+    sbuf big; sb_init(&big);
+    sb_puts(&big, "HEAD-OF-FILE\n"); for (int i = 0; i < 2000; i++) sb_puts(&big, "æøå "); sb_puts(&big, "\nTAIL-OF-FILE");
+    cJSON *bt = tmsg("tool", big.data); cJSON_AddStringToObject(bt, "tool_name", "bash");
+    cJSON_AddItemToArray(msgs, bt);
+    x = transcript_text(msgs, 2, 100000);
+    CHECK(strstr(x, "HEAD-OF-FILE") && strstr(x, "TAIL-OF-FILE") && strstr(x, " bytes cut …]"));
+    CHECK(strlen(x) < 5000);
+    CHECK(utf8_valid(x));
+    free(x); sb_free(&big);
+    /* the cut points have to land inside a character some of the time: shift the text a byte at a time */
+    for (int shift = 0; shift < 7; shift++) {
+        sbuf t; sb_init(&t);
+        for (int i = 0; i < shift; i++) sb_putc(&t, 'x');
+        for (int i = 0; i < 800; i++) sb_puts(&t, "æøå€");   /* 2+2+2+3 bytes */
+        sbuf o; sb_init(&o); sb_put_cut(&o, t.data, 1000);
+        CHECK(utf8_valid(o.data) && o.len < 1100 && strstr(o.data, "bytes cut"));
+        sb_free(&o); sb_free(&t);
+    }
+
+    cJSON *none = cJSON_CreateArray();
+    x = transcript_text(none, -1, 1000); CHECK_STR(x, ""); free(x);
+    cJSON_Delete(none); cJSON_Delete(msgs);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -628,8 +771,8 @@ int main(void) {
         { "sbuf", test_sbuf }, { "util", test_util }, { "markdown", test_md },
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "http", test_http },
-        { "web", test_web }, { "model_info", test_model_info },
-        { "effort", test_effort },
+        { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
+        { "effort", test_effort }, { "advisor", test_advisor },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;
