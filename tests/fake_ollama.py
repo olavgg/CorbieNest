@@ -17,7 +17,18 @@ MODELS = [
      "details": {"parameter_size": "9B"}, "capabilities": ["completion", "tools", "thinking"]},
     {"name": "fake-slow:latest", "model": "fake-slow:latest", "size": 1, "digest": "w",
      "details": {"parameter_size": "30B"}, "capabilities": ["completion", "tools"]},   # /api/ps says: half in GPU memory
+    {"name": "fake-levels:latest", "model": "fake-levels:latest", "size": 1, "digest": "v",
+     "details": {"parameter_size": "20B", "family": "gptoss"}, "capabilities": ["completion", "tools", "thinking"]},   # thinks in levels, like gpt-oss
+    {"name": "fake-stale:latest", "model": "fake-stale:latest", "size": 1, "digest": "t",
+     "details": {"parameter_size": "32B", "family": "fakestale"}, "capabilities": ["completion"]},   # /api/tags is out of date: /api/show knows better
+    {"name": "fake-declared:latest", "model": "fake-declared:latest", "size": 1, "digest": "s",
+     "details": {"parameter_size": "27B", "family": "fakedeclared"}, "capabilities": ["completion", "tools", "thinking"]},   # a newer server: /api/show lists its levels
 ]
+# what /api/show reports when it differs from the (stale) manifest that /api/tags serves
+SHOW_CAPS = {"fake-stale:latest": ["completion", "tools", "thinking"]}
+# thinking.values/default in /api/show (Ollama >= 0.34.3): the levels a model has, in its own names
+SHOW_THINKING = {"fake-declared:latest": {"values": [False, "low", "xhigh"], "default": "low"}}
+LEGACY_LEVELS = ("low", "medium", "high", "max")
 
 REQUEST_LOG = []
 
@@ -192,14 +203,26 @@ class H(BaseHTTPRequestHandler):
         req = json.loads(self.rfile.read(n) or b"{}")
         model = req.get("model", "")
         if self.path == "/api/show":
-            if not any(m["name"] == model for m in MODELS): return self._json(404, {"error": f"model '{model}' not found"})
-            info = {"model_info": {"general.architecture": "fake", "fake.context_length": 65536, "fake.embedding_length": 8}}
+            entry = next((m for m in MODELS if m["name"] == model), None)
+            if not entry: return self._json(404, {"error": f"model '{model}' not found"})
+            info = {"model_info": {"general.architecture": "fake", "fake.context_length": 65536, "fake.embedding_length": 8},
+                    "details": entry["details"], "capabilities": SHOW_CAPS.get(model, entry["capabilities"])}
+            if model in SHOW_THINKING: info["thinking"] = SHOW_THINKING[model]
             if model == "fake-thinker:latest": info["parameters"] = "top_k 20\ndraft_num_predict 4\ntemperature 1"   # ships an MTP draft head
             return self._json(200, info)
         if self.path != "/api/chat": return self._json(404, {"error": "not found"})
         REQUEST_LOG.append(req)   # only chat requests: tests read the last one
-        if not any(m["name"] == model for m in MODELS):
+        entry = next((m for m in MODELS if m["name"] == model), None)
+        if not entry:
             return self._json(404, {"error": f"model '{model}' not found"})
+        # "think" is checked the way the real server (0.33) checks it: a closed set of values,
+        # and anything but false is refused for a model that cannot think
+        think = req.get("think")
+        declared = [v for v in SHOW_THINKING.get(model, {}).get("values", []) if isinstance(v, str)]
+        if isinstance(think, str) and think not in (declared or LEGACY_LEVELS):
+            return self._json(400, {"error": f'invalid think value: "{think}" (must be "high", "medium", "low", "max", true, or false)'})
+        if think and "thinking" not in SHOW_CAPS.get(model, entry["capabilities"]):
+            return self._json(400, {"error": f'"{model}" does not support thinking'})
         msgs = req.get("messages", [])
         # Ollama trims an over-long prompt by dropping whole messages from the front, and its
         # qwen3.8 renderer then refuses a prompt the user's request has fallen out of. Play that

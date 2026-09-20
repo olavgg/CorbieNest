@@ -80,8 +80,9 @@ def check(cond, msg):
     if cond: passed += 1
     else: failed += 1; print(f"  FAIL: {msg}")
 
-def run(args, stdin=b""):
-    p = subprocess.run([BIN] + args, cwd=WORK, env=ENV, input=stdin, capture_output=True, timeout=60)
+def run(args, stdin=b"", env=None):
+    p = subprocess.run([BIN] + args, cwd=WORK, env=env or ENV, input=stdin, capture_output=True, timeout=60)
+    run.err = clean(p.stderr.decode())
     return clean(p.stdout.decode()), p.returncode
 
 def requests(): return json.loads(urllib.request.urlopen(f"{HOST}/_requests").read())
@@ -299,11 +300,11 @@ out, rc = run(["-m", "fake-coder:latest", "--draft", "x", "-p", "hi"]); check(rc
 
 # ---------- interactive via pty ----------
 class Session:
-    def __init__(self, args=(), cols=100, rows=40):
+    def __init__(self, args=(), cols=100, rows=40, env=None):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(WORK)
-            for k, v in ENV.items(): os.environ[k] = v
+            for k, v in (env or ENV).items(): os.environ[k] = v
             os.execv(BIN, ["corbienest"] + list(args))
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self.out = b""; self.mark = 0
@@ -324,8 +325,16 @@ class Session:
         os.write(self.fd, s.encode() if isinstance(s, str) else s); time.sleep(wait)
     def text(self): return clean(self.out.decode("utf-8", "replace"))
     def close(self):
+        """Kill it and wait: a session that is still exiting writes the config one last time,
+        and a test that writes its own config next would lose it to that write."""
         try: os.kill(self.pid, 9)
         except Exception: pass
+        try: os.waitpid(self.pid, 0)
+        except Exception: pass
+        try: os.close(self.fd)
+        except Exception: pass
+
+def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
 
 print("test interactive: banner, echo, editor keys, history")
 s = Session(["-m", "fake-coder:latest"])
@@ -911,10 +920,12 @@ s.send("\x04"); s.close()
 
 print("test interactive: /keepalive, /status placement, GPU placement warning")
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
-s.send("/think high\r"); check(s.expect("level high"), "/think high")
+s.send("/think high\r"); check(s.expect("fake-coder:latest cannot think"), "/think high is /effort high: refused for a model that cannot think")
 s.send("/model fake-thinker:latest\r"); s.expect("model set to fake-thinker")
+s.send("/think high\r"); check(s.expect("effort: high"), "/think high sets the model's effort")
 s.send("level test\r"); check(s.expect("Echo: level test"), "reply"); check(requests()[-1]["think"] == "high", "thinking level sent as a string")
-s.send("/think auto\r"); s.expect("think: auto"); s.send("level test 2\r"); s.expect("Echo: level test 2"); check("think" not in requests()[-1], "/think auto clears the level")
+s.send("/think auto\r"); s.expect("think: auto"); s.send("level test 2\r"); s.expect("Echo: level test 2"); check(requests()[-1]["think"] == "high", "/think auto says when, not how hard: the level stays")
+s.send("/effort default\r"); s.expect("effort: default"); s.send("level test 3\r"); s.expect("Echo: level test 3"); check("think" not in requests()[-1], "/effort default leaves it to the model again")
 s.send("/model fake-coder:latest\r"); s.expect("model set to fake-coder")
 s.send("/keepalive\r"); check(s.expect("keep_alive: 30m"), "/keepalive shows the default")
 s.send("/keepalive 1h\r"); check(s.expect("keep_alive = 1h"), "/keepalive sets it")
@@ -928,6 +939,128 @@ check(s.expect("model is only 50% in GPU memory (4.0 of 8.0 GB)"), f"partly-CPU 
 s.send("again\r"); check(s.expect("Echo: again"), "reply")
 check(s.text().count("only 50% in GPU memory") == 1, "warning shown once per model")
 s.send("/model fake-coder:latest\r"); s.expect("model set to fake-coder")
+s.send("\x04"); s.close()
+
+# ---------- /effort ----------
+# a config directory of its own: what it saves (the per-model efforts) would
+# otherwise follow every test that comes after
+CFG2 = tempfile.mkdtemp(prefix="crowcfg2_")
+ENV2 = dict(ENV, XDG_CONFIG_HOME=CFG2)
+CFG2_FILE = os.path.join(CFG2, "corbienest", "config")
+os.makedirs(os.path.join(CFG2, "corbienest")); open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+def thinks(rs): return [r.get("think", "absent") for r in rs]
+def run_rounds(model, args):
+    """run() in ENV2; returns (out, rc, the requests this run made to `model`) — not the log's last n, which may be an earlier run's"""
+    n0 = len(requests())
+    out, rc = run(args, env=ENV2)
+    return out, rc, [r for r in requests()[n0:] if r["model"] == model]
+
+print("test effort: a level is part of the prompt, so it goes with every call; a model that cannot stop is never told to")
+out, rc, rs = run_rounds("fake-levels:latest", ["-m", "fake-levels:latest", "--yolo", "--effort", "high", "-p", "TOOL_BASH please"])
+check(rc == 0 and thinks(rs) == ["high", "high"], f"--effort high: the first call and the tool round both carry it: {thinks(rs)!r}")
+out, rc, rs = run_rounds("fake-levels:latest", ["-m", "fake-levels:latest", "--yolo", "-p", "TOOL_BASH please"])
+check(rc == 0 and thinks(rs) == ["absent", "absent"], f"no effort set, /think auto: a gpt-oss-like model is not sent think:false for the tool round (it would be ignored, and cost the prompt cache): {thinks(rs)!r}")
+out, rc = run(["-m", "fake-levels:latest", "--no-think", "-p", "hi"], env=ENV2)
+check(requests()[-1].get("think") == "low", f"--no-think on a model that cannot stop: its weakest level: {requests()[-1].get('think')!r}")
+out, rc = run(["-m", "fake-levels:latest", "--effort", "off", "-p", "hi"], env=ENV2)
+check(rc == 2 and "low · medium · high" in run.err, f"--effort off refused for it, with what it does offer: {run.err!r}")
+out, rc = run(["-m", "fake-levels:latest", "--effort", "max", "-p", "hi"], env=ENV2)
+check(rc == 0 and requests()[-1].get("think") == "high", f"--effort max means as hard as it goes: sent as the model's strongest level: {requests()[-1].get('think')!r}")
+out, rc = run(["-m", "fake-levels:latest", "--effort", "ultra", "-p", "hi"], env=ENV2)
+check(rc == 2 and "offers" in run.err, "a name that means nothing is refused")
+out, rc = run(["-m", "fake-levels:latest", "--think", "-p", "hi"], env=ENV2)
+check(requests()[-1].get("think") == "medium", f"--think on a model with levels and no 'true': its default level by name: {requests()[-1].get('think')!r}")
+out, rc = run(["-m", "fake-coder:latest", "--effort", "high", "-p", "hi"], env=ENV2)
+check(rc == 2 and "cannot think" in run.err, f"--effort on a model that cannot think: {run.err!r}")
+out, rc, rs = run_rounds("fake-thinker:latest", ["-m", "fake-thinker:latest", "--yolo", "--effort", "on", "-p", "TOOL_BASH please"])
+check(rc == 0 and thinks(rs) == [True, False], f"an on/off model: on for the request, off for its tool round (/think auto): {thinks(rs)!r}")
+out, rc, rs = run_rounds("fake-thinker:latest", ["-m", "fake-thinker:latest", "--yolo", "--effort", "off", "--think", "-p", "TOOL_BASH please"])
+check(rc == 0 and thinks(rs) == [False, False], f"--effort off wins over --think for that model: {thinks(rs)!r}")
+out, rc, rs = run_rounds("fake-thinker:latest", ["-m", "fake-thinker:latest", "--yolo", "--effort", "high", "-p", "TOOL_BASH please"])
+check(rc == 0 and thinks(rs) == ["high", False], f"a level for an on/off model is passed on (the server takes it as on), and like on it rests for the tool round: {thinks(rs)!r}")
+out, rc = run(["-m", "fake-coder:latest", "--think", "-p", "hi"], env=ENV2)
+check(rc == 0 and "think" not in requests()[-1] and "Echo: hi" in out, f"--think with a model that cannot think: nothing is sent, the request goes through: {out!r}")
+out, rc = run(["-m", "fake-declared:latest", "--effort", "xhigh", "-p", "hi"], env=ENV2)
+check(rc == 0 and requests()[-1].get("think") == "xhigh", "levels the server lists in /api/show are used by the names it gives")
+out, rc = run(["-m", "fake-declared:latest", "--effort", "high", "-p", "hi"], env=ENV2)
+check(rc == 0 and requests()[-1].get("think") == "xhigh", f"'high' saved under an older server is sent as the top level this one has, not left to fall back to medium in silence: {requests()[-1].get('think')!r}")
+out, rc = run(["-m", "fake-declared:latest", "--effort", "medium", "-p", "hi"], env=ENV2)
+check(rc == 2 and "off · low · xhigh" in run.err, f"a level it does not list is refused: {run.err!r}")
+
+out, rc = run(["-m", "fake-coder:latest", "--keep-alive", "inf", "-p", "hi"], env=ENV2)
+check(requests()[-1].get("keep_alive") == "inf", f"only a plain decimal goes out as a number: 'inf' would become null, which the server takes for 'not set' in silence: {requests()[-1].get('keep_alive')!r}")
+out, rc = run(["-m", "deep-thinker", "-p", "hi"], env=ENV2)
+check("not found" in out and "refused" not in out, f"an error that merely quotes a model called …thinker is not taken for a refused think value: {out[-200:]!r}")
+
+print("test capabilities come from /api/show: /api/tags may be out of date")
+out, rc, rs = run_rounds("fake-stale:latest", ["-m", "fake-stale:latest", "--yolo", "--think", "-p", "TOOL_BASH please"])
+check(rc == 0 and len(rs) == 2 and "Tool said: hello-from-tool" in out, f"a model /api/tags calls chat-only gets its tools: {out!r}")
+check(any(t["function"]["name"] == "bash" for t in rs[0].get("tools", [])) and rs[0].get("think") is True, "tools and think:true sent")
+
+print("test effort: the level saved under the old global key goes to the model it was set for")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nmodel=fake-thinker:latest\nthink=1\nthink_level=high\n")
+out, rc = run(["-p", "hi"], env=ENV2)
+check(requests()[-1]["model"] == "fake-thinker:latest" and requests()[-1].get("think") == "high", "think_level=high still read")
+out, rc = run(["-m", "fake-levels:latest", "-p", "hi"], env=ENV2)
+check(requests()[-1].get("think") == "medium", f"but not applied to another model (think=1 alone: that model's default level): {requests()[-1].get('think')!r}")
+s = Session([], env=ENV2); s.expect("Ctrl-D to quit")
+s.send("/temp 0.2\r"); s.expect("temperature = 0.2"); s.send("\x04"); s.close()
+cfg2 = open(CFG2_FILE).read()
+check("effort.fake-thinker:latest=high" in cfg2 and "think_level" not in cfg2, f"the next save writes it per model and drops the old key: {cfg2!r}")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+
+print("test effort: a fresh process reads the levels back from the config")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nmodel=fake-levels:latest\neffort.fake-levels:latest=high\n")
+out, rc, rs = run_rounds("fake-levels:latest", ["--yolo", "-p", "TOOL_BASH please"])
+check(rc == 0 and thinks(rs) == ["high", "high"], f"the model's saved effort: {thinks(rs)!r}")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\neffort.fake-levels:latest=ultra\n")
+s = Session(["-m", "fake-levels:latest"], env=ENV2)
+check(s.expect("effort 'ultra' is saved for fake-levels:latest, which does not offer it"), "a saved effort the model does not offer is said at start-up, and left to the model")
+s.expect("Ctrl-D to quit")
+s.send("hello\r"); s.expect("Echo: hello"); check("think" not in requests()[-1] and "· ultra" not in s.text(), "and neither sent nor shown in the bar")
+s.send("\x04"); s.close()
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+
+print("test interactive: /effort offers what the model has, keeps it per model, shows it in the bar")
+s = Session(["-m", "fake-coder:latest"], env=ENV2); s.expect("Ctrl-D to quit")
+s.send("/effort\r"); check(s.expect("cannot think"), "/effort on a model that cannot think says so")
+s.send("/effort high\r"); check(s.expect("cannot think"), "and sets nothing")
+s.send("/model fake-levels:latest\r"); s.expect("model set to fake-levels")
+s.send("/effort off\r"); check(s.expect("cannot stop thinking"), "/effort off: gpt-oss-like models cannot stop")
+check("low · medium · high" in since_send(s), "with the levels it has")
+s.send("/effort ultra\r"); check(s.expect("has no effort 'ultra'"), "a level it does not have is refused")
+s.send("/effort max\r"); check(s.expect("sent as high, its strongest level"), "max is as hard as it goes, whatever the model calls that")
+s.send("/effort default\r"); s.expect("effort: default")   # so that the picker opens on "default" and the filter has to find "high"
+s.send("/effort\r"); check(s.expect("Effort for fake-levels:latest"), "/effort opens a picker")
+check(s.expect("leave it to the model (medium)"), "default first, with what the model does by itself")
+picker = since_send(s)
+check("low" in picker and "medium" in picker and "high" in picker and "no thinking" not in picker, f"its levels, and no off: {picker[-400:]!r}")
+s.send("hig"); time.sleep(0.2); s.send("\r"); check(s.expect("effort: high"), "picked by filter + Enter")
+check(s.expect("sent with every model call"), "and told why /think auto does not switch it off for the tool rounds")
+check(s.expect("fake-levels:latest · high"), f"the status bar shows the effort with the model: {s.text()[-300:]!r}")
+s.send("hello levels\r"); check(s.expect("Echo: hello levels"), "reply"); check(requests()[-1].get("think") == "high", "level sent")
+check("effort.fake-levels:latest=high" in open(CFG2_FILE).read(), "saved per model")
+s.send("/model fake-thinker:latest\r"); s.expect("model set to fake-thinker")
+s.send("/effort\r"); check(s.expect("Effort for fake-thinker:latest"), "picker for an on/off model")
+check(s.expect("this model has no levels"), "says it has no levels"); s.send("\x1b"); s.expect("effort unchanged")
+s.send("hello thinker\r"); s.expect("Echo: hello thinker"); check("think" not in requests()[-1], "the other model's level does not follow")
+s.send("/status\r"); check(s.expect("effort     default (on)"), f"/status shows the effort: {since_send(s)[-300:]!r}")
+s.send("/model fake-levels:latest\r"); s.expect("model set to fake-levels")
+s.send("back again\r"); s.expect("Echo: back again"); check(requests()[-1].get("think") == "high", "back on the first model its level is still there")
+s.send("/think off\r"); check(s.expect("cannot stop thinking: it is sent its weakest level (low)"), "/think off says what it means for this model"); s.expect("think: off"); s.send("quiet now\r"); s.expect("Echo: quiet now")
+check(requests()[-1].get("think") == "low", "/think off: never think — for this model, as little as it can")
+s.send("/effort medium\r"); check(s.expect("/think was off: now auto"), "setting a level switches thinking back on")
+s.send("SLOW while busy\r"); s.expect("one ")
+s.send("/effort low\r"); check(s.expect("effort: low", 3), "/effort LEVEL runs while the model is working")
+check("queued" not in since_send(s) and "eight" not in since_send(s), "there and then: not queued for after the turn")
+s.send("/effort\r"); check(s.expect("fake-levels:latest offers: low · medium · high", 3), "bare /effort prints the levels while busy")
+check("Effort for" not in since_send(s) and "eight" not in since_send(s), "instead of opening a picker inside a live request")
+check(s.expect("eight", 10), "generation carried on"); s.expect("tok/s")
+s.send("/model fake-thinker:latest\r"); s.expect("model set to fake-thinker")
+s.send("/effort off\r"); s.expect("effort: off"); s.send("/think on\r"); check(s.expect("/effort off for fake-thinker:latest is forgotten"), "/think on takes back an /effort off, or nothing would change")
+s.send("/think auto\r"); s.expect("think: auto"); s.send("/model fake-levels:latest\r"); s.expect("model set to fake-levels")
+s.send("/effort default\r"); check(s.expect("effort: default"), "/effort default")
+check("effort.fake-levels" not in open(CFG2_FILE).read(), "forgotten in the config too")
 s.send("\x04"); s.close()
 
 print("test config persistence")

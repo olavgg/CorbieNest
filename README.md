@@ -77,6 +77,7 @@ corbienest [options] [-p PROMPT]
       --no-memory      don't update .corbienest/memory.md after requests
       --no-web         don't offer web_search/web_fetch (the model cannot look documentation up)
       --think / --no-think / --show-thinking
+      --effort LEVEL   how hard the model thinks: one of the levels it has (off, on, low, medium, high, … — see /effort); default = the model's own
       --draft N        draft_num_predict: speculative-decoding / MTP draft tokens per step (0 = off; default: the model's own,
                        e.g. models that ship an MTP head set 4); changing it makes Ollama reload the model
       --benchmark [N]  measure tokens per second at every context size the model supports (or just the -c size):
@@ -117,7 +118,8 @@ larger ones skipped.)
 | `/rewind` | (or **Esc Esc** at an empty prompt) pick an earlier request and go back: undo the file changes the model made since (files are checkpointed before every `write_file`/`edit_file`), truncate the conversation to just before it (the request text returns to the editor), or both |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
 | `/system [text\|clear]` | extra system instructions |
-| `/think on\|off\|auto`, `/think low\|medium\|high`, `/think show\|hide` | thinking on thinking-capable models: `auto` (default) lets the model think about each request once and turns thinking off for the tool rounds that follow, `on` thinks on every call, `off` never; `low`/`medium`/`high` set the level on models that have one (gpt-oss) |
+| `/think on\|off\|auto`, `/think show\|hide` | *when* a thinking-capable model thinks: `auto` (default) lets it think about each request once and turns thinking off for the tool rounds that follow, `on` thinks on every call, `off` never. *How hard* is `/effort` (`/think low\|medium\|high\|max` still works, as an alias for it) |
+| `/effort [LEVEL\|default]` | how hard **this model** thinks, in the levels it has — see [Effort](#effort). No argument opens a picker of them; `default` leaves it to the model. Kept per model, shown next to the model's name in the status bar |
 | `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (`.corbienest/permissions`) |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
@@ -168,7 +170,7 @@ larger ones skipped.)
 - **Slash commands that only report or set something answer straight away while the model
   works** — they never become a queued message: `/help`, `/status`, `/cost`, `/diff`, `/history`,
   `/pwd`, `/skills`, `/memory`, `/mode`, `/yolo`, `/permissions`, `/tools`, `/max_iters`,
-  `/think`, `/temp`, `/keepalive`. A `/permissions add` or `/mode` typed mid-turn applies to the
+  `/think`, `/effort` (it prints the levels instead of opening the picker), `/temp`, `/keepalive`. A `/permissions add` or `/mode` typed mid-turn applies to the
   tool confirmations still to come, like Shift+Tab, and `/max_iters` to the rounds still to come. Everything that touches the conversation (`/clear`, `/compact`,
   `/rewind`, `/resume`, `/save`, `/system`, `/init`, skills), needs the server (`/model`,
   `/models`, `/ctx`, `/host`, `/memory update`) or asks a question stays queued until the turn ends.
@@ -373,10 +375,43 @@ Three other ways to add instructions: `-s "…"` / `/system …` for the session
 instructions the model should pull in on demand (see [Skills](#skills)), and
 `.corbienest/memory.md`, which the model curates itself (see [Project memory](#project-memory)).
 
+### Effort
+
+Thinking models do not all think in the same way, so how hard one thinks is set **per model**,
+in the levels that model has:
+
+| model | `/effort` offers |
+|---|---|
+| gpt-oss | `low` · `medium` · `high` — it cannot stop thinking, so there is no `off` (`/think off` sends it `low`) |
+| qwen3.8 | `off` · `low` · `medium` · `high` |
+| most other thinking models (qwen3, deepseek-r1, …) | `off` · `on` |
+| a model without the thinking capability | nothing — and it is never sent anything but `think: false`: the server refuses the rest |
+
+Where the list comes from: Ollama 0.34.3 and later say which levels a model has
+(`thinking.values` in `/api/show` — cloud models have their own, e.g. `low` · `high` · `max`), and
+corbienest offers exactly those. Older servers only say *that* a model thinks; for them the
+table above is built in, and any other thinking model is on/off. You can still give such a
+model a level by name (`/effort high`) — it is passed on, and corbienest tells you the server
+will take it as plain "on". `high`, `xhigh` and `max` all mean "as hard as it goes": one of
+them that the model does *not* have is sent as the strongest level it does have, so a saved
+`high` keeps working when a server upgrade renames the top level (qwen3.8's becomes `xhigh` in
+0.34.3, where `high` would quietly mean medium).
+
+`/effort` and `/think` work together: `/think` says **when** the model thinks, `/effort` **how
+hard**. One thing to know: the models that have levels write the level into the *top* of the
+prompt, so a level is sent with **every** call of a request — switching it off for the tool
+rounds, as `/think auto` does for on/off models, would change the top of the prompt and make
+the server read the whole conversation again, twice per request. If that thinking on every
+tool round is too slow, pick a lower level rather than `/think auto`.
+
+Capabilities are read from `/api/show`, not from the model list: `/api/tags` reports them as
+they were when the model was pulled, so a model whose template has learned tools or thinking
+since then (deepseek-r1, for one) shows up there as chat-only.
+
 ### Config
 
-Settings changed with `/model`, `/ctx`, `/think`, `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N` are saved to
-`~/.config/corbienest/config`. Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`.
+Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N` are saved to
+`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`.
 
 ### Running more than one session
 
@@ -416,8 +451,9 @@ make test
   (chunked/content-length/abort against a forked local server), the streaming
   markdown printer, text tool-call recovery, every tool (read/write/edit/list/grep/bash
   including timeouts and non-interactive denial), URL checks and the HTML-to-text and
-  search-result extraction behind `web_fetch`/`web_search`, permission modes, and skills
-  (frontmatter parsing, `$ARGUMENTS`, scaffolding).
+  search-result extraction behind `web_fetch`/`web_search`, permission modes, skills
+  (frontmatter parsing, `$ARGUMENTS`, scaffolding), what each kind of model can be set to and
+  what is sent as `think` for every combination of `/think`, `/effort` and kind of call.
 - `tests/test_integration.py` — runs the real binary against `tests/fake_ollama.py`,
   a tiny scripted Ollama stand-in (no model needed): one-shot mode, the full tool loop
   with results fed back, `--yolo`, XML tool-call recovery, `@file`, errors, and — through a
@@ -427,7 +463,8 @@ make test
   the round and the sub-agent in flight, step past a queued `/command`, and are handed back on
   Ctrl-C), the `/ctx` picker and `/history`,
   Shift+Tab mode cycling (plan / accept-edits behaviour), `/skills`, Ctrl-C interruption,
-  slash commands, the `/model` picker, `!cmd`, `/save`, and config/history persistence.
+  slash commands, the `/model` picker, `!cmd`, `/save`, config/history persistence, and `/effort`
+  (per-model levels, the picker, the status bar).
 
 ## Layout
 
@@ -438,9 +475,9 @@ src/http.c     minimal HTTP/1.1 client (chunked streaming, Ctrl-C interrupt)
 src/term.c     raw mode, key decoding, full-screen mode + status bar, line editor, confirmation menu,
                list picker, markdown printer
 src/tools.c    the tools + permission-mode checks + shell runner
-src/ollama.c   /api/chat streaming, tool-call accumulation, /api/tags
+src/ollama.c   /api/chat streaming, tool-call accumulation, /api/tags, /api/show (capabilities, effort levels)
 src/skills.c   SKILL.md discovery/parsing, /NAME expansion, scaffolding
-src/main.c     REPL, slash commands, system prompt, agent loop
+src/main.c     REPL, slash commands, system prompt, agent loop, sub-agents
 tests/         unit tests, fake Ollama server, pty integration tests
 ```
 
@@ -459,7 +496,7 @@ tests/         unit tests, fake Ollama server, pty integration tests
   `tok/s` is generation speed. Things that help, roughly in order: make sure the whole model
   fits in GPU memory (corbienest warns `⚠ model is only NN% in GPU memory` after the first
   reply when it does not — pick a smaller `/ctx` or model), turn off the per-request memory
-  update (`/memory every 10` or `/memory off`), spend less on thinking (`/think auto` — the default —
+  update (`/memory every 10` or `/memory off`), spend less on thinking (a lower `/effort`; `/think auto` — the default —
   thinks once per request instead of after every tool result; `/think off` never; the stats line shows
   `thought 41s (≈2.1k tok)` per call and `/cost` the session total), keep the model
   loaded (`/keepalive`, default 30m), and `/compact` long conversations. Tool output is capped

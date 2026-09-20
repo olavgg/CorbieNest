@@ -32,8 +32,11 @@
 static bool g_always_write = false, g_always_edit = false, g_always_bash = false, g_always_fetch = false;
 bool tools_no_confirm = false;   /* set by the caller for user-typed "!cmd": no prompt, no plan-mode veto */
 void tools_reset_permissions(void) { g_always_write = g_always_edit = g_always_bash = g_always_fetch = false; }
-const char *tools_summary_line(void) { return g_cfg.web ? "read_file, write_file, edit_file, list_dir, grep, bash, web_search, web_fetch, task"
-                                                        : "read_file, write_file, edit_file, list_dir, grep, bash, task"; }
+const char *tools_summary_line(void) {
+    static char b[160];
+    snprintf(b, sizeof b, "read_file, write_file, edit_file, list_dir, grep, bash, %stask", g_cfg.web ? "web_search, web_fetch, " : "");
+    return b;
+}
 
 /* ---------- persistent project permissions ----------
  * .corbienest/permissions holds one rule per line: "edit" (file writes/edits are fine in
@@ -288,6 +291,7 @@ cJSON *tools_definitions(void) {
         "Delegate a self-contained research or exploration task to a sub-agent with its own fresh context. It can read files, list directories, grep and run read-only shell commands, but cannot modify files, and returns a text report. "
         "Use it for broad searches or investigations whose intermediate output would clutter your context (\"find every place X is handled and summarise\", \"figure out how the build works\"), not for simple one-file lookups.",
         p, (const char*[]){"description", "prompt", NULL}));
+
     return arr;
 }
 

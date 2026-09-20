@@ -119,6 +119,9 @@ static void bar_build(sbuf *o, int cols) {
         default:                icon = "⏵ "; col = C_DIM;    text = "manual mode";     break;
     }
     const char *model = g_cfg.model ? g_cfg.model : "(no model)";
+    char mbuf[384];   /* an effort that was set goes with the model's name: it is a large part of how fast it answers */
+    const char *eff = g_cfg.model ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
+    if (eff) { snprintf(mbuf, sizeof mbuf, "%s · %s", model, eff); model = mbuf; }
     char tin[32], tout[32], ttot[32];
     long out_now = g_session.eval_tokens + g_live_out;
     fmt_tokens(g_session.prompt_tokens, tin, sizeof tin);

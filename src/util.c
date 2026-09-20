@@ -164,10 +164,12 @@ void config_load(void) {
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[4096];
+    char *legacy_level = NULL;   /* think_level=: one level for every model, from before levels were kept per model */
     while (fgets(line, sizeof line, f)) {
         trim(line);
         if (!line[0] || line[0] == '#') continue;
-        char *eq = strchr(line, '=');
+        /* key=value, split at the first '=' — except effort.<model>=<level>, at the last: a model name may hold one, a level never does */
+        char *eq = !strncmp(line, "effort.", 7) ? strrchr(line, '=') : strchr(line, '=');
         if (!eq) continue;
         *eq = 0;
         const char *k = line, *v = eq + 1;
@@ -176,7 +178,8 @@ void config_load(void) {
         else if (!strcmp(k, "num_ctx")) g_cfg.num_ctx = atoi(v);
         else if (!strcmp(k, "temperature")) g_cfg.temperature = atof(v);
         else if (!strcmp(k, "think")) g_cfg.think = atoi(v);
-        else if (!strcmp(k, "think_level")) { free(g_cfg.think_level); g_cfg.think_level = *v ? xstrdup(v) : NULL; }
+        else if (!strcmp(k, "think_level")) { free(legacy_level); legacy_level = *v ? xstrdup(v) : NULL; }
+        else if (!strncmp(k, "effort.", 7)) { if (k[7] && effort_name_ok(v)) effort_set(k + 7, v); }
         else if (!strcmp(k, "show_thinking")) g_cfg.show_thinking = atoi(v) != 0;
         else if (!strcmp(k, "yolo")) { if (atoi(v)) g_cfg.mode = MODE_AUTO; }
         else if (!strcmp(k, "mode")) { int m = mode_parse(v); if (m >= 0) g_cfg.mode = m; }
@@ -189,6 +192,9 @@ void config_load(void) {
         else if (!strcmp(k, "keep_alive")) { free(g_cfg.keep_alive); g_cfg.keep_alive = *v ? xstrdup(v) : NULL; }
     }
     fclose(f);
+    /* the old global level belonged to whatever model was in use when it was set */
+    if (legacy_level && effort_name_ok(legacy_level) && g_cfg.model && !effort_get(g_cfg.model)) effort_set(g_cfg.model, legacy_level);
+    free(legacy_level);
 }
 
 /* The whole file is rewritten on every setting change, and another session may be reading it
@@ -205,7 +211,7 @@ void config_save(void) {
     sb_printf(&b, "num_ctx=%d\n", g_cfg.num_ctx);
     if (g_cfg.temperature >= 0) sb_printf(&b, "temperature=%g\n", g_cfg.temperature);
     sb_printf(&b, "think=%d\n", g_cfg.think);
-    sb_printf(&b, "think_level=%s\n", g_cfg.think_level ? g_cfg.think_level : "");
+    for (int i = 0; i < g_cfg.n_efforts; i++) sb_printf(&b, "effort.%s=%s\n", g_cfg.efforts[i].model, g_cfg.efforts[i].level);
     sb_printf(&b, "show_thinking=%d\n", g_cfg.show_thinking ? 1 : 0);
     sb_printf(&b, "mode=%s\n", mode_name(g_cfg.mode));
     sb_printf(&b, "max_iters=%d\n", g_cfg.max_iters);
@@ -217,6 +223,72 @@ void config_save(void) {
     sb_printf(&b, "keep_alive=%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "");
     write_whole_file_atomic(path, b.data, b.len);
     sb_free(&b);
+}
+
+/* ---------- effort: how hard each model thinks ---------- */
+bool effort_name_ok(const char *s) {
+    if (!s || !*s || strlen(s) >= EFFORT_NAME_MAX) return false;
+    for (; *s; s++) if (!((*s >= 'a' && *s <= 'z') || (*s >= '0' && *s <= '9') || *s == '-' || *s == '_')) return false;
+    return true;
+}
+
+/* "qwen3.8" and "qwen3.8:latest" are one model to the server */
+bool model_same(const char *a, const char *b) {
+    if (!a || !b) return false;
+    size_t la = strlen(a), lb = strlen(b);
+    if (la > 7 && !strcmp(a + la - 7, ":latest")) la -= 7;
+    if (lb > 7 && !strcmp(b + lb - 7, ":latest")) lb -= 7;
+    return la == lb && !strncmp(a, b, la);
+}
+
+const char *effort_get(const char *model) {
+    for (int i = 0; model && i < g_cfg.n_efforts; i++) if (model_same(g_cfg.efforts[i].model, model)) return g_cfg.efforts[i].level;
+    return NULL;
+}
+
+void effort_set(const char *model, const char *level) {
+    if (!model || !*model || strchr(model, '\n')) return;
+    int i = 0;
+    while (i < g_cfg.n_efforts && !model_same(g_cfg.efforts[i].model, model)) i++;
+    if (!level) {   /* forget it */
+        if (i == g_cfg.n_efforts) return;
+        free(g_cfg.efforts[i].model); free(g_cfg.efforts[i].level);
+        g_cfg.efforts[i] = g_cfg.efforts[--g_cfg.n_efforts];
+        return;
+    }
+    if (i == g_cfg.n_efforts) {
+        g_cfg.efforts = xrealloc(g_cfg.efforts, sizeof *g_cfg.efforts * (size_t)(g_cfg.n_efforts + 1));
+        g_cfg.efforts[g_cfg.n_efforts++] = (effort_entry){ xstrdup(model), NULL };
+    }
+    free(g_cfg.efforts[i].level); g_cfg.efforts[i].level = xstrdup(level);
+}
+
+int effort_supported(const model_info *mi, const char *level) {
+    if (!mi->thinking || !effort_name_ok(level)) return 0;
+    if (!strcmp(level, "off")) return mi->think_off;
+    if (!strcmp(level, "on")) return mi->think_on;
+    for (int i = 0; i < mi->n_think_levels; i++) if (!strcmp(mi->think_levels[i], level)) return 1;
+    if (mi->think_declared || mi->n_think_levels) return 0;   /* its levels are known, and this is not one of them */
+    /* an on/off model as far as anyone knows: the server still takes the four names it has always known */
+    return (!strcmp(level, "low") || !strcmp(level, "medium") || !strcmp(level, "high") || !strcmp(level, "max")) ? -1 : 0;
+}
+
+/* What is sent for a saved level: the level itself when the model has it (or may), and for
+ * "as hard as it goes" — high, xhigh, max — the strongest one the model does have. The names of
+ * the top level differ between models and between server versions (qwen3.8: "high" up to
+ * Ollama 0.34.2, "xhigh" from 0.34.3, where "high" quietly means medium), and what the user
+ * meant is the same. NULL = nothing the model can be set to. */
+const char *effort_resolve(const model_info *mi, const char *want, bool *mapped) {
+    if (mapped) *mapped = false;
+    if (!want) return NULL;
+    if (effort_supported(mi, want) != 0) return want;
+    static const char *TOP[] = { "high", "xhigh", "max" };
+    const char *strongest = mi->thinking && mi->n_think_levels ? mi->think_levels[mi->n_think_levels - 1] : NULL;
+    bool want_top = false, has_top = false;
+    for (int i = 0; i < 3; i++) { if (!strcmp(want, TOP[i])) want_top = true; if (strongest && !strcmp(strongest, TOP[i])) has_top = true; }
+    if (!want_top || !has_top) return NULL;
+    if (mapped) *mapped = true;
+    return strongest;
 }
 
 /* ---------- permission modes ---------- */

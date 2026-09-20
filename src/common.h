@@ -66,8 +66,9 @@ char *url_encode(const char *s);                                /* percent-encod
 char *url_decode(const char *s, size_t n);                      /* the reverse, malloc'd */
 /* A search engine's result page as "N. title / url / snippet" lines; *count gets how many */
 char *search_results_text(const char *html, size_t len, const char *engine_url, int max, int *count);
-
 /* ---------- global config ---------- */
+typedef struct { char *model, *level; } effort_entry;   /* level: "off", "on", or one of the model's named levels */
+
 typedef struct {
     char *host;          /* e.g. http://127.0.0.1:11434 */
     char *model;
@@ -76,7 +77,8 @@ typedef struct {
     int   draft;         /* draft_num_predict: speculative/MTP draft tokens per step; -1 = model default, 0 = off */
     double temperature;  /* <0 = unset */
     int   think;         /* -1 auto (server default on the first call of a request, off for tool rounds), 0 off, 1 on for every call */
-    char *think_level;   /* "low"|"medium"|"high" for models with thinking levels (gpt-oss); NULL = plain on/off */
+    effort_entry *efforts; /* how hard each model thinks (/effort), see effort_get(); saved as effort.<model>=<level> */
+    int   n_efforts;
     bool  show_thinking; /* print thinking tokens */
     int   mode;          /* permission mode, see MODE_* */
     bool  no_tools;      /* don't send tools at all */
@@ -292,16 +294,69 @@ typedef struct {
     char   done_reason[16];  /* "stop", "length" (num_predict hit), "" if unknown */
 } chat_stats;
 
+/* What /api/show says about one model. /api/tags lists capabilities too, but from the manifest
+ * as it was pulled: a model whose template learned tools or thinking since then still shows up
+ * without them there, so for the model in use this is the one to believe.
+ *
+ * The think_* fields are what "think" may be set to for this model — its effort levels. Ollama
+ * from 0.34.3 says so itself (thinking.values in /api/show: booleans and/or level names);
+ * older servers only say *that* a model thinks, so for them model_think_profile() knows the
+ * few families that act on a level and treats every other thinking model as on/off. */
+#define EFFORT_LEVELS_MAX 8
+#define EFFORT_NAME_MAX   16
+typedef struct {
+    int  context_length;   /* trained context length, 0 if unknown */
+    int  draft;            /* the model's own draft_num_predict, -1 when it has none */
+    char family[48];       /* details.family ("gptoss", "qwen35", …), "" if unknown */
+    char renderer[32];     /* the Modelfile's RENDERER ("qwen3.8"), "" if none: tells qwen3.8 from its family */
+    bool caps_known;       /* the server sent capabilities[] (older ones do not) */
+    bool tools, thinking;  /* only meaningful when caps_known */
+    bool think_off, think_on;   /* takes false / true as choices of their own (gpt-oss cannot stop thinking) */
+    char think_levels[EFFORT_LEVELS_MAX][EFFORT_NAME_MAX];   /* named levels, weakest first */
+    int  n_think_levels;
+    char think_default[EFFORT_NAME_MAX];   /* what it does when "think" is left out: "off", "on", a level; "" unknown */
+    bool think_declared;   /* the list came from the server rather than from model_think_profile() */
+    bool think_off_top;    /* its "off" is written into the top of the prompt like a level (glimmer: "Reasoning strength: none."), so it may not flip mid-prompt either */
+} model_info;
+void   model_info_parse(const char *json, model_info *mi);      /* the /api/show body (exposed for tests) */
+void   model_think_profile(model_info *mi);   /* fill think_* from family/renderer unless the server declared them; call again after changing `thinking` */
+int    ollama_model_show(const char *model, model_info *mi);    /* 0 ok, -1 unknown model / request failed (*mi is still zeroed) */
+extern model_info g_model_info;   /* the model in use (set by main.c) */
+
+bool  model_same(const char *a, const char *b);   /* one model to the server: equal, a trailing ":latest" aside */
+
+/* ---------- effort: how hard a model thinks (/effort) ----------
+ * Kept per model, because the levels are the model's: gpt-oss has low/medium/high and cannot
+ * stop thinking, qwen3.8 has off/low/medium/high, most others are on or off. "off" and "on" are
+ * the booleans; anything else is a level name, sent as it is. No entry = leave it to the model. */
+const char *effort_get(const char *model);                     /* NULL = nothing saved for it */
+void        effort_set(const char *model, const char *level);  /* NULL = forget it (does not save the config) */
+bool        effort_name_ok(const char *s);                     /* fit to store and to send: a-z 0-9 - _ */
+/* Can this model be set to `level`? 1 yes, 0 no, -1 it cannot be known: the model thinks but
+ * nothing says in what levels, and such a server takes low/medium/high/max as plain "on". */
+int         effort_supported(const model_info *mi, const char *level);
+/* What to send for a saved level: itself, or — for high/xhigh/max, which all mean "as hard as it
+ * goes" — the strongest level the model does have (*mapped). NULL = nothing it can be set to. */
+const char *effort_resolve(const model_info *mi, const char *want, bool *mapped);
+/* What is sent as "think" with one call. `when` is g_cfg.think; `quiet`: the call needs no
+ * thinking (a summary, the memory update); `followup`: it continues the prompt of the call
+ * before it (a tool round, a compaction). That matters because a level is written into the
+ * *top* of the prompt by the models that have them: changing it between two calls makes the
+ * server read the whole conversation again, so a level is never dropped mid-prompt, and a
+ * model that cannot stop thinking is never told to. *level is set for THINK_LEVEL. */
+typedef enum { THINK_OMIT, THINK_FALSE, THINK_TRUE, THINK_LEVEL } think_kind;
+think_kind  think_decide(int when, bool quiet, bool followup, const char *effort, const model_info *mi, const char **level);
+
 /* Per-call overrides for ollama_chat(); set before a call and reset with ollama_call_reset()
  * (like ollama_quiet). Callers that don't touch them get the session defaults. */
 typedef struct {
-    int         think;        /* -1 = use g_cfg.think, 0 = force off (only sent if the model can think), 1 = on */
+    int         think;        /* -1 = as configured, 0 = this call needs no thinking (see think_decide: quiet) */
     int         num_predict;  /* >0 = cap on generated tokens */
     const char *busy;         /* status-bar label while generating (default "generating") */
+    bool        followup;     /* continues the prompt of the call before it (see think_decide) */
 } ollama_call_opts;
 extern ollama_call_opts ollama_call;
 void ollama_call_reset(void);
-extern bool g_model_think;  /* current model advertises the "thinking" capability (set by main.c) */
 
 /* Streams a chat completion. `messages` is a cJSON array (borrowed).
  * On success returns a new cJSON assistant message object (caller owns).

@@ -28,7 +28,7 @@ static char  *g_memory = NULL;                    /* contents of MEMORY_PATH (se
 static char   g_session_id[64];                  /* current session (file stem under config_dir()/sessions) */
 
 static const char *SLASH_CMDS[] = {
-    "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think",
+    "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think", "/effort",
     "/mode", "/yolo", "/tools", "/web", "/max_iters", "/ctx", "/temp", "/host", "/keepalive", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/diff", "/rewind", "/quit", "/exit"
 };
 
@@ -621,7 +621,7 @@ static void cmd_cost(void) {
     printf("  model calls   %d  " C_DIM "(%d request%s · %d tool call%s)" C_RESET "\n", g_session.calls, g_session.turns, g_session.turns == 1 ? "" : "s", g_session.tool_calls, g_session.tool_calls == 1 ? "" : "s");
     printf("  model time    %s  " C_DIM "(%s generating", model, gen);
     if (g_session.eval_seconds > 0) printf(" · %.1f tok/s", g_session.eval_tokens / g_session.eval_seconds);
-    if (g_session.think_chunks) { char tk[32], th[32]; fmt_tokens(g_session.think_chunks, tk, sizeof tk); fmt_dur(g_session.think_seconds, th, sizeof th); printf(" · %s thinking ≈%s tok — /think off or /think auto to spend less", th, tk); }
+    if (g_session.think_chunks) { char tk[32], th[32]; fmt_tokens(g_session.think_chunks, tk, sizeof tk); fmt_dur(g_session.think_seconds, th, sizeof th); printf(" · %s thinking ≈%s tok — a lower /effort, /think auto or /think off spends less", th, tk); }
     printf(")" C_RESET "\n");
     printf("  wall time     %s\n", wall);
     if (g_cfg.num_ctx > 0 && g_session.last_prompt_tokens > 0)
@@ -870,26 +870,34 @@ static void refresh_model_caps(bool quiet) {
             g_cfg.model = xstrdup(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(list, 0), "name")->valuestring);
     }
     if (!g_cfg.model) { cJSON_Delete(list); return; }
+    bool tag_tools = false, tag_think = false;
     cJSON_ArrayForEach(m, list) {
         const char *n = cJSON_GetObjectItemCaseSensitive(m, "name")->valuestring;
         char withtag[512]; snprintf(withtag, sizeof withtag, "%s:latest", g_cfg.model);
         if (!strcmp(n, g_cfg.model) || !strcmp(n, withtag)) {
             found = true;
-            g_model_tools = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "tools"));
-            g_model_think = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "thinking"));
+            tag_tools = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "tools"));
+            tag_think = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "thinking"));
             break;
         }
     }
     cJSON_Delete(list);
-    g_model_max_ctx = ollama_model_context_length(g_cfg.model);
+    /* /api/show knows the model as it is now — and knows cloud models, which /api/tags does not
+     * list; the capabilities in /api/tags are only the fallback for a server too old to send them */
+    bool shown = ollama_model_show(g_cfg.model, &g_model_info) == 0;
+    if (!g_model_info.caps_known) { g_model_info.tools = found ? tag_tools : true; g_model_info.thinking = found && tag_think; model_think_profile(&g_model_info); }
+    g_model_tools = g_model_info.tools;
+    g_model_max_ctx = g_model_info.context_length;
     g_placement_checked = false;
-    if (!found) {
+    if (!found && !shown) {
         g_model_tools = true;   /* unknown (maybe remote/cloud); try */
-        g_model_think = false;
         if (!quiet) printf(C_YELLOW "⚠ model '%s' not found locally — ollama may need to pull it (see /models)" C_RESET "\n", g_cfg.model);
     } else if (!g_model_tools && !quiet) {
         printf(C_YELLOW "⚠ model '%s' does not support tool calling; running in chat-only mode (no file/shell tools)" C_RESET "\n", g_cfg.model);
     }
+    const char *saved = effort_get(g_cfg.model);
+    if (saved && !quiet && !effort_resolve(&g_model_info, saved, NULL))
+        printf(C_YELLOW "⚠ effort '%s' is saved for %s, which does not offer it (any more) — it is left to the model; /effort to pick one" C_RESET "\n", saved, g_cfg.model);
 }
 
 /* ---------- context window ---------- */
@@ -1181,7 +1189,7 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         chat_stats st; bool aborted = false;
         char label[48]; snprintf(label, sizeof label, "sub-agent · round %d", tool_rounds + 1);
         ollama_quiet = true; ollama_call.busy = label;
-        if (g_cfg.think < 0 && iter > 0) ollama_call.think = 0;   /* think=auto: think about the task once, not after every tool result */
+        ollama_call.followup = iter > 0;   /* think=auto: think about the task once, not after every tool result */
         cJSON *reply = ollama_chat(msgs, g_model_tools ? tools : NULL, &st, &aborted);
         ollama_call_reset(); ollama_quiet = false;
         account(&st);
@@ -1327,8 +1335,9 @@ static bool run_turn(void) {
         size_t sent = prompt_bytes();
         chat_stats st; bool aborted = false;
         /* think=auto: let a thinking model think about the request once, not again after every
-         * tool result — that is where most of a task's wall time goes on local models */
-        if (g_cfg.think < 0 && iters > 0) ollama_call.think = 0;
+         * tool result — that is where most of a task's wall time goes on local models
+         * (think_decide() knows when that is not an option) */
+        ollama_call.followup = iters > 0;
         cJSON *reply = ollama_chat(msgs, tools, &st, &aborted);
         ollama_call_reset();
         if (tools && tools != g_tools) cJSON_Delete(tools);
@@ -1525,9 +1534,10 @@ static void cmd_help(void) {
            "  /diff [git args]      show the working-tree diff (stat + patch + untracked), without sending it to the model; e.g. /diff --staged\n"
            "  /rewind               (or Esc Esc at an empty prompt) go back to an earlier request: undo the file changes since, the conversation, or both\n"
            "  /system [text|clear]  show/set extra system instructions\n"
-           "  /think on|off|auto    thinking (thinking-capable models): on = every call, auto = only the first call of a request (default), off\n"
-           "  /think low|medium|high thinking level for models that have them (gpt-oss)\n"
+           "  /think on|off|auto    when a thinking-capable model thinks: on = every call, auto = only the first call of a request (default), off\n"
            "  /think show|hide      show or hide thinking tokens\n"
+           "  /effort [LEVEL]       how hard this model thinks, in the levels it has (gpt-oss: low medium high · qwen3.8: off low medium high · most others: off on);\n"
+           "                        no argument opens a picker, default leaves it to the model. Kept per model; a level is sent with every call\n"
            "  /skills [reload|new NAME]  list skills (SKILL.md files); run one with /NAME [args]\n"
            "  /init                 have the model explore the project and write a CORBIENEST.md (project instructions)\n"
            "  /mode [name]          permission mode: manual · accept-edits · plan · auto (or press shift+tab to cycle)\n"
@@ -1552,7 +1562,7 @@ static void cmd_help(void) {
            "  Enter                 send  ·  Alt+Enter / Ctrl+J / trailing \\ : newline\n"
            "  Enter while busy      queue a message for the model (added between tool rounds or after the turn; Ctrl-C hands it back)\n"
            "                        commands that only report or set something run at once instead: /help /status /cost /diff /history /pwd\n"
-           "                        /skills /memory /mode /yolo /permissions /tools /web /max_iters /think /temp /keepalive\n"
+           "                        /skills /memory /mode /yolo /permissions /tools /web /max_iters /think /effort /temp /keepalive\n"
            "  Ctrl-C                cancel generation / clear line (twice: quit)  ·  Ctrl-L clear screen\n"
            "  PgUp / PgDn           scroll back through the conversation (↑/↓, Home/End inside; Esc/Enter return)\n"
            "  status bar            bottom row shows the permission mode, model, session tokens and context usage\n"
@@ -1561,6 +1571,14 @@ static void cmd_help(void) {
            "  write/edit/bash ask for confirmation: pick with ↑/↓ + enter, or press y (once), a (always this session), p (always in this project), n (deny, with optional reason)\n"
            "  modes: manual asks for everything · accept-edits auto-approves file edits · plan is read-only (model proposes a plan) · auto approves all\n",
            tools_summary_line());
+}
+
+/* " · effort high" for the model in use, when one is set: it came along with the model */
+static const char *model_effort_note(void) {
+    static char b[64];
+    const char *e = effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL);
+    if (e) snprintf(b, sizeof b, C_DIM " · effort %s" C_RESET, e); else b[0] = 0;
+    return b;
 }
 
 static void cmd_models(void) {
@@ -1604,18 +1622,109 @@ static void cmd_model_picker(void) {
     if (r >= 0) {
         free(g_cfg.model); g_cfg.model = xstrdup(names[r]);
         refresh_model_caps(false); config_save();
-        printf(C_GREEN "✓ model set to %s" C_RESET "%s\n", g_cfg.model, g_model_tools ? "" : C_DIM " (chat-only: no tool support)" C_RESET);
+        printf(C_GREEN "✓ model set to %s" C_RESET "%s%s\n", g_cfg.model, g_model_tools ? "" : C_DIM " (chat-only: no tool support)" C_RESET, model_effort_note());
     } else printf(C_DIM "model unchanged: %s" C_RESET "\n", g_cfg.model);
     for (int i = 0; i < n; i++) free(descbuf[i]);
     free(descbuf); free(names); free(descs); cJSON_Delete(list);
 }
 
-static const char *think_label(void) {
-    static char b[64];
-    const char *base = g_cfg.think < 0 ? "auto (first call of a request only)" : g_cfg.think ? "on (every call)" : "off";
-    if (g_cfg.think_level && g_cfg.think) snprintf(b, sizeof b, "%s · level %s", base, g_cfg.think_level); else snprintf(b, sizeof b, "%s", base);
+/* ---------- /effort: how hard a model thinks ----------
+ * /think says *when* the model thinks (every call, the first call of a request, never); /effort
+ * says how hard, in the levels that model has — see model_info and think_decide(). It is kept
+ * per model. */
+static const char *effort_in_use(const char *model, const model_info *mi) {   /* what is sent; NULL = left to the model */
+    return effort_resolve(mi, effort_get(model), NULL);
+}
+
+/* "off · low · medium · high" */
+static void effort_choices(const model_info *mi, sbuf *b) {
+    if (mi->think_off) sb_puts(b, "off");
+    if (mi->think_on) sb_printf(b, "%son", b->len ? " · " : "");
+    for (int i = 0; i < mi->n_think_levels; i++) sb_printf(b, "%s%s", b->len ? " · " : "", mi->think_levels[i]);
+}
+
+static const char *effort_label(const char *model, const model_info *mi) {
+    static char b[96];
+    const char *e = effort_in_use(model, mi);
+    if (!mi->thinking) snprintf(b, sizeof b, "none (the model cannot think)");
+    else if (e) snprintf(b, sizeof b, "%s", e);
+    else snprintf(b, sizeof b, "default%s%s%s", mi->think_default[0] ? " (" : "", mi->think_default, mi->think_default[0] ? ")" : "");
     return b;
 }
+
+static const char *think_label(void) {
+    static char b[160];
+    const char *base = g_cfg.think < 0 ? "auto (first call of a request only)" : g_cfg.think ? "on (every call)" : "off";
+    const char *e = effort_in_use(g_cfg.model, &g_model_info);
+    bool own = e && strcmp(e, "off") && strcmp(e, "on") && effort_supported(&g_model_info, e) == 1;
+    if (own && g_cfg.think < 0) snprintf(b, sizeof b, "auto — but effort %s goes with every call (see /effort)", e);
+    else if (e && g_cfg.think) snprintf(b, sizeof b, "%s · effort %s", base, e);
+    else snprintf(b, sizeof b, "%s", base);
+    return b;
+}
+
+static void effort_report(const char *who, const char *model, const model_info *mi) {
+    if (!mi->thinking) { printf("%seffort: " C_DIM "%s cannot think, so there is nothing to set — models that can are marked 'thinking' in /models" C_RESET "\n", who, model); return; }
+    sbuf c; sb_init(&c); effort_choices(mi, &c);
+    printf("%seffort: " C_BOLD "%s" C_RESET C_DIM " · %s offers: %s%s" C_RESET "\n", who, effort_label(model, mi), model, c.data ? c.data : "",
+           mi->think_declared || mi->n_think_levels ? "" : " (no levels of its own, as far as the server says)");
+    sb_free(&c);
+}
+
+/* Set it, or say why not. Returns true when something was set. */
+static bool effort_apply(const char *who, const char *model, const model_info *mi, const char *level) {
+    if (!strcmp(level, "default") || !strcmp(level, "reset")) {
+        effort_set(model, NULL); config_save();
+        printf(C_GREEN "✓ %seffort: %s" C_RESET C_DIM " — left to %s" C_RESET "\n", who, effort_label(model, mi), model);
+        return true;
+    }
+    bool mapped = false;
+    const char *sent = mi->thinking ? effort_resolve(mi, level, &mapped) : NULL;
+    int ok = sent ? (mapped ? 1 : effort_supported(mi, level)) : 0;
+    if (ok == 0) {
+        sbuf c; sb_init(&c); effort_choices(mi, &c);
+        if (!mi->thinking) printf(C_RED "%s cannot think" C_RESET " — there is no effort to set for it\n", model);
+        else if (!strcmp(level, "off") && !mi->think_off) printf(C_RED "%s cannot stop thinking" C_RESET " — its levels: %s\n", model, c.data ? c.data : "");
+        else printf(C_RED "%s has no effort '%s'" C_RESET " — it offers: %s · default\n", model, level, c.data ? c.data : "");
+        sb_free(&c);
+        return false;
+    }
+    effort_set(model, level);
+    bool woke = false;   /* a level is no use to the model doing the work while /think is off; another model's call never reads /think */
+    if (strcmp(level, "off") && g_cfg.think == 0 && model_same(model, g_cfg.model)) { g_cfg.think = -1; woke = true; }
+    config_save();
+    printf(C_GREEN "✓ %seffort: %s" C_RESET C_DIM " for %s%s" C_RESET "\n", who, level, model, woke ? " · /think was off: now auto" : "");
+    if (mapped) printf(C_DIM "  sent as %s, its strongest level" C_RESET "\n", sent);
+    if (ok < 0) printf(C_DIM "  %s is not known to act on levels: the server takes '%s' as plain on" C_RESET "\n", model, level);
+    else if (strcmp(level, "off") && strcmp(level, "on") && g_cfg.think < 0 && !*who)
+        printf(C_DIM "  sent with every model call: the level is written into the top of the prompt, so dropping it for the tool rounds (/think auto) would make the server read the conversation again each time" C_RESET "\n");
+    return true;
+}
+
+static void effort_command(const char *who, const char *model, const model_info *mi, const char *arg) {
+    if (arg) { effort_apply(who, model, mi, arg); return; }
+    if (!mi->thinking || !g_cfg.interactive || g_while_busy) { effort_report(who, model, mi); return; }
+    const char *items[EFFORT_LEVELS_MAX + 3], *descs[EFFORT_LEVELS_MAX + 3];
+    char dbuf[EFFORT_LEVELS_MAX + 3][160];
+    const char *cur = effort_in_use(model, mi);
+    int n = 0, current = 0;
+    #define ITEM(name, ...) do { items[n] = (name); snprintf(dbuf[n], sizeof dbuf[n], __VA_ARGS__); \
+        if (mi->think_default[0] && !strcmp(mi->think_default, (name))) strncat(dbuf[n], " · what the model does by itself", sizeof dbuf[n] - strlen(dbuf[n]) - 1); \
+        if (cur && !strcmp(cur, (name))) { strncat(dbuf[n], " · current", sizeof dbuf[n] - strlen(dbuf[n]) - 1); current = n; } \
+        descs[n] = dbuf[n]; n++; } while (0)
+    ITEM("default", "leave it to the model%s%s%s", mi->think_default[0] ? " (" : "", mi->think_default, mi->think_default[0] ? ")" : "");
+    if (!cur) strncat(dbuf[0], " · current", sizeof dbuf[0] - strlen(dbuf[0]) - 1);
+    if (mi->think_off) ITEM("off", "no thinking: fastest");
+    if (mi->think_on) ITEM("on", mi->n_think_levels ? "think" : "think — this model has no levels");
+    for (int i = 0; i < mi->n_think_levels; i++)
+        ITEM(mi->think_levels[i], "%s", i == 0 ? "the least thinking" : i == mi->n_think_levels - 1 ? "the most thinking: slowest" : "");
+    #undef ITEM
+    char title[256]; snprintf(title, sizeof title, "%s%sffort for %s", who, *who ? "e" : "E", model);
+    int r = term_select(title, items, descs, n, current);
+    if (r < 0) printf(C_DIM "%seffort unchanged: %s" C_RESET "\n", who, effort_label(model, mi));
+    else effort_apply(who, model, mi, items[r]);
+}
+static void cmd_effort(const char *arg) { effort_command("", g_cfg.model, &g_model_info, arg); }
 static void cmd_status(void) {
     printf(C_BOLD "model      " C_RESET "%s%s\n", g_cfg.model, g_model_tools ? "" : C_DIM " (no tool support)" C_RESET);
     printf(C_BOLD "host       " C_RESET "%s\n", g_cfg.host);
@@ -1628,7 +1737,9 @@ static void cmd_status(void) {
     printf(C_BOLD "tools      " C_RESET "%s%s\n", (g_cfg.no_tools || !g_model_tools) ? "off" : "on",
            (g_cfg.no_tools || !g_model_tools) ? "" : (g_cfg.web ? C_DIM " · web on" C_RESET : C_DIM " · web off" C_RESET));
     printf(C_BOLD "mode       " C_RESET "%s%s" C_RESET "\n", g_cfg.mode == MODE_AUTO ? C_RED : g_cfg.mode == MODE_PLAN ? C_CYAN : g_cfg.mode == MODE_ACCEPT_EDITS ? C_ORANGE : "", mode_label(g_cfg.mode));
-    printf(C_BOLD "think      " C_RESET "%s, %s\n", think_label(), g_cfg.show_thinking ? "shown" : "hidden");
+    printf(C_BOLD "think      " C_RESET "%s, %s\n", g_cfg.think < 0 ? "auto (first call of a request only)" : g_cfg.think ? "on (every call)" : "off", g_cfg.show_thinking ? "shown" : "hidden");
+    { sbuf c; sb_init(&c); effort_choices(&g_model_info, &c);
+      printf(C_BOLD "effort     " C_RESET "%s%s%s" C_RESET "\n", effort_label(g_cfg.model, &g_model_info), c.len ? C_DIM " · /effort: " : "", c.len ? c.data : ""); sb_free(&c); }
     printf(C_BOLD "temp       " C_RESET "%s", g_cfg.temperature < 0 ? "default\n" : ""); if (g_cfg.temperature >= 0) printf("%g\n", g_cfg.temperature);
     printf(C_BOLD "keep_alive " C_RESET "%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "server default (5m)");
     if (g_cfg.draft >= 0) printf(C_BOLD "draft      " C_RESET "%d (draft_num_predict, %s)\n", g_cfg.draft, g_cfg.draft ? "speculative decoding / MTP" : "speculative decoding off");
@@ -1668,7 +1779,7 @@ static bool compact_conversation(bool resuming, const char *request) {
         "decisions made, and what remains to be done. Be specific about file paths and code details. Output only the summary.");
     cJSON_AddItemToArray(msgs, u);
     chat_stats st; bool aborted;
-    ollama_call.think = 0; ollama_call.busy = "compacting";   /* a summary needs no thinking; keep it quick */
+    ollama_call.think = 0; ollama_call.followup = true; ollama_call.busy = "compacting";   /* a summary needs no thinking; keep it quick — but it is the conversation's own prompt */
     cJSON *reply = ollama_chat(msgs, NULL, &st, &aborted);
     ollama_call_reset();
     cJSON_Delete(msgs);
@@ -1751,7 +1862,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/models")) cmd_models();
     else if (!strcmp(cmd, "/model")) {
         if (!arg) cmd_model_picker();
-        else { free(g_cfg.model); g_cfg.model = xstrdup(arg); refresh_model_caps(false); config_save(); printf(C_GREEN "✓ model set to %s" C_RESET "\n", g_cfg.model); }
+        else { free(g_cfg.model); g_cfg.model = xstrdup(arg); refresh_model_caps(false); config_save(); printf(C_GREEN "✓ model set to %s" C_RESET "%s\n", g_cfg.model, model_effort_note()); }
     }
     else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { memory_flush(); cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); g_prev_request_first = -1; tools_reset_permissions(); tools_checkpoint_clear(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
     else if (!strcmp(cmd, "/compact")) { if (cmd_compact()) session_save(); }
@@ -1769,15 +1880,21 @@ static int handle_slash(char *line) {
     }
     else if (!strcmp(cmd, "/think")) {
         if (!arg) printf("think: %s, %s\n", think_label(), g_cfg.show_thinking ? "shown" : "hidden");
-        else if (!strcmp(arg, "on")) { g_cfg.think = 1; free(g_cfg.think_level); g_cfg.think_level = NULL; }
-        else if (!strcmp(arg, "off")) { g_cfg.think = 0; free(g_cfg.think_level); g_cfg.think_level = NULL; }
-        else if (!strcmp(arg, "auto") || !strcmp(arg, "first")) { g_cfg.think = -1; free(g_cfg.think_level); g_cfg.think_level = NULL; }
-        else if (!strcmp(arg, "low") || !strcmp(arg, "medium") || !strcmp(arg, "high")) { free(g_cfg.think_level); g_cfg.think_level = xstrdup(arg); if (g_cfg.think == 0) g_cfg.think = -1; }
+        else if (!strcmp(arg, "low") || !strcmp(arg, "medium") || !strcmp(arg, "high") || !strcmp(arg, "max")) { cmd_effort(arg); return 0; }   /* how hard is /effort's */
+        else if (!strcmp(arg, "on") || !strcmp(arg, "off") || !strcmp(arg, "auto") || !strcmp(arg, "first")) {
+            g_cfg.think = !strcmp(arg, "on") ? 1 : !strcmp(arg, "off") ? 0 : -1;
+            /* asking for thinking takes back an "/effort off" for this model, or nothing would change */
+            const char *e = effort_get(g_cfg.model);
+            if (g_cfg.think && e && !strcmp(e, "off")) { effort_set(g_cfg.model, NULL); printf(C_DIM "  (/effort off for %s is forgotten, or nothing would change)" C_RESET "\n", g_cfg.model); }
+            if (!g_cfg.think && g_model_info.thinking && !g_model_info.think_off)
+                printf(C_DIM "  %s cannot stop thinking: it is sent its weakest level (%s) instead" C_RESET "\n", g_cfg.model, g_model_info.n_think_levels ? g_model_info.think_levels[0] : "none known");
+        }
         else if (!strcmp(arg, "show")) g_cfg.show_thinking = true;
         else if (!strcmp(arg, "hide")) g_cfg.show_thinking = false;
-        else printf("usage: /think on|off|auto|low|medium|high|show|hide\n  auto = think once per request, not after every tool result (default) · low/medium/high = level for models that have them (gpt-oss)\n");
+        else { printf("usage: /think on|off|auto|show|hide\n  auto = think once per request, not after every tool result (default) · how hard the model thinks is /effort\n"); return 0; }
         if (arg) { config_save(); printf(C_GREEN "✓ think: %s, %s" C_RESET "\n", think_label(), g_cfg.show_thinking ? "shown" : "hidden"); }
     }
+    else if (!strcmp(cmd, "/effort")) cmd_effort(arg);
     else if (!strcmp(cmd, "/yolo")) {
         bool on = !arg ? !YOLO() : !strcmp(arg, "on");
         g_cfg.mode = on ? MODE_AUTO : MODE_MANUAL;
@@ -1882,11 +1999,13 @@ static int handle_slash(char *line) {
 static bool slash_runs_while_busy(const char *cmd, const char *arg) {
     static const char *ok[] = {
         "/help", "/?", "/status", "/cost", "/diff", "/history", "/pwd", "/skills",
-        "/mode", "/yolo", "/permissions", "/tools", "/max_iters", "/max-iters", "/think", "/temp",
+        "/mode", "/yolo", "/permissions", "/tools", "/max_iters", "/max-iters", "/think", "/effort", "/temp",
         "/keepalive", "/keep-alive", "/memory", "/web", NULL };
     /* /web with an argument is not just a report: on|off rebuilds the tool list the running
      * turn is holding, and engine writes the config. Bare /web only prints. */
     if (!strcmp(cmd, "/web") && arg) return false;
+    /* /effort never needs the server: what the model offers was read when it was chosen, and
+     * while busy it prints the choices instead of asking. */
     /* /memory update — and "every N" once N requests are pending — runs the extraction call;
      * "idle N" only sets the delay for the next prompt, so it is safe mid-turn */
     if (!strcmp(cmd, "/memory") && arg && strcmp(arg, "on") && strcmp(arg, "off") && strcmp(arg, "clear")
@@ -1938,8 +2057,9 @@ static void banner(void) {
     int w = term_width(); if (w < 40) w = 40;
     printf(C_ORANGE "╭"); for (int i = 0; i < w - 2; i++) printf("─"); printf("╮" C_RESET "\n");
     printf(C_ORANGE "│" C_RESET " " C_BOLD "🐦‍⬛ Corbie Nest" C_RESET " v%s — local coding agent for Ollama\n", CORBIE_VERSION);
-    printf(C_ORANGE "│" C_RESET " " C_DIM "model:" C_RESET " %s%s" C_DIM " · ctx %s%s%s" C_RESET "\n", g_cfg.model ? g_cfg.model : "(none)", g_model_tools ? "" : C_DIM " (chat-only)" C_RESET,
-           fmt_ctx(g_cfg.num_ctx), g_model_max_ctx > 0 ? " of " : "", g_model_max_ctx > 0 ? fmt_ctx(g_model_max_ctx) : "");
+    const char *eff = g_cfg.model ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
+    printf(C_ORANGE "│" C_RESET " " C_DIM "model:" C_RESET " %s%s" C_DIM " · ctx %s%s%s%s%s" C_RESET "\n", g_cfg.model ? g_cfg.model : "(none)", g_model_tools ? "" : C_DIM " (chat-only)" C_RESET,
+           fmt_ctx(g_cfg.num_ctx), g_model_max_ctx > 0 ? " of " : "", g_model_max_ctx > 0 ? fmt_ctx(g_model_max_ctx) : "", eff ? " · effort " : "", eff ? eff : "");
     printf(C_ORANGE "│" C_RESET " " C_DIM "host: " C_RESET " %s %s\n", g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);
     printf(C_ORANGE "│" C_RESET " " C_DIM "cwd:  " C_RESET " %s%s\n", g_cwd, g_project_instructions ? C_DIM " (project instructions loaded)" C_RESET : "");
     if (g_cfg.mode != MODE_MANUAL) printf(C_ORANGE "│" C_RESET " " C_DIM "mode:  " C_RESET " %s%s" C_RESET "\n", g_cfg.mode == MODE_AUTO ? C_RED : g_cfg.mode == MODE_PLAN ? C_CYAN : C_ORANGE, mode_label(g_cfg.mode));
@@ -2133,6 +2253,7 @@ static void usage(void) {
            "      --no-memory      don't update " MEMORY_PATH " after requests\n"
            "      --no-web         don't offer web_search/web_fetch (the model cannot look documentation up)\n"
            "      --think          think on every model call (default: only the first call of a request); --no-think to disable; --show-thinking to display\n"
+           "      --effort LEVEL   how hard the model thinks, one of the levels it has (see /effort): off, on, low, medium, high, …; default = the model's own\n"
            "      --draft N        draft_num_predict: speculative-decoding/MTP draft tokens per step (0 = off; default: the model's own)\n"
            "      --benchmark [N]  measure tokens per second at each context size the model supports (or just -c N):\n"
            "                       N timed runs (default 3) of a fixed prompt (or -p PROMPT) per size, then exit\n"
@@ -2154,7 +2275,7 @@ int main(int argc, char **argv) {
     const char *env_model = getenv("CORBIENEST_MODEL");
     if (env_model && *env_model) { free(g_cfg.model); g_cfg.model = xstrdup(env_model); }
 
-    const char *oneshot = NULL, *resume_id = NULL; bool resume_latest = false, json_out = false, ctx_given = false; int bench_runs = 0;
+    const char *oneshot = NULL, *resume_id = NULL, *cli_effort = NULL; bool resume_latest = false, json_out = false, ctx_given = false; int bench_runs = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         #define NEEDARG() (i + 1 < argc ? argv[++i] : (usage(), exit(2), (char*)NULL))
@@ -2175,6 +2296,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--think")) g_cfg.think = 1;
         else if (!strcmp(a, "--no-think")) g_cfg.think = 0;
         else if (!strcmp(a, "--show-thinking")) g_cfg.show_thinking = true;
+        else if (!strcmp(a, "--effort")) cli_effort = NEEDARG();
         else if (!strcmp(a, "--draft")) { const char *dv = NEEDARG(); if (strspn(dv, "0123456789") != strlen(dv) || !*dv) { fprintf(stderr, "bad draft count %s (a number of tokens, 0 = off)\n", dv); return 2; } g_cfg.draft = atoi(dv); }
         else if (!strcmp(a, "--benchmark")) { bench_runs = 3; if (i + 1 < argc && argv[i+1][0] >= '1' && argv[i+1][0] <= '9' && strspn(argv[i+1], "0123456789") == strlen(argv[i+1])) bench_runs = atoi(argv[++i]); }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
@@ -2194,6 +2316,15 @@ int main(int argc, char **argv) {
     skills_load();
     refresh_model_caps(oneshot != NULL || bench_runs);
     if (!g_cfg.model) { fprintf(stderr, "corbienest: no models found on %s (run `ollama pull <model>`)\n", g_cfg.host); return 1; }
+    if (cli_effort) {   /* only now is it known what the model offers */
+        if (!strcmp(cli_effort, "default")) effort_set(g_cfg.model, NULL);
+        else if (!effort_resolve(&g_model_info, cli_effort, NULL)) {
+            sbuf c; sb_init(&c); effort_choices(&g_model_info, &c);
+            if (!g_model_info.thinking) fprintf(stderr, "corbienest: --effort %s: %s cannot think, so it has no effort to set\n", cli_effort, g_cfg.model);
+            else fprintf(stderr, "corbienest: --effort %s: %s offers %s, or default\n", cli_effort, g_cfg.model, c.data ? c.data : "nothing");
+            sb_free(&c); term_restore(); return 2;
+        } else { effort_set(g_cfg.model, cli_effort); if (strcmp(cli_effort, "off") && g_cfg.think == 0) g_cfg.think = -1; }
+    }
     if (bench_runs) {
         int json_fd = -1;
         if (json_out) {   /* the report is dropped; only the JSON goes to the real stdout */

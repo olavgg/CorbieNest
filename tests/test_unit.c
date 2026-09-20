@@ -505,6 +505,121 @@ static void test_skills(void) {
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
 }
 
+/* ---------- /api/show ---------- */
+static void test_model_info(void) {
+    model_info mi;
+    model_info_parse("{\"model_info\":{\"general.architecture\":\"gptoss\",\"gptoss.context_length\":131072},"
+                     "\"parameters\":\"top_k 20\\ndraft_num_predict              4\\ntemperature 1\","
+                     "\"details\":{\"family\":\"gptoss\",\"parameter_size\":\"20.9B\"},"
+                     "\"capabilities\":[\"completion\",\"tools\",\"thinking\"]}", &mi);
+    CHECK(mi.context_length == 131072 && mi.draft == 4);
+    CHECK_STR(mi.family, "gptoss");
+    CHECK(mi.caps_known && mi.tools && mi.thinking);
+    /* a chat-only model, no draft head */
+    model_info_parse("{\"model_info\":{\"llama.context_length\":8192},\"details\":{\"family\":\"llama\"},\"capabilities\":[\"completion\"]}", &mi);
+    CHECK(mi.context_length == 8192 && mi.draft == -1 && mi.caps_known && !mi.tools && !mi.thinking);
+    /* an older server: no capabilities[] at all — the caller falls back on /api/tags */
+    model_info_parse("{\"model_info\":{\"llama.context_length\":4096}}", &mi);
+    CHECK(mi.context_length == 4096 && !mi.caps_known && !mi.family[0]);
+    /* not JSON, or nothing at all */
+    model_info_parse("<html>502</html>", &mi); CHECK(mi.context_length == 0 && mi.draft == -1 && !mi.caps_known);
+    model_info_parse(NULL, &mi); CHECK(mi.context_length == 0 && mi.draft == -1);
+}
+
+/* ---------- effort: what a model can be set to, and what is sent as "think" ---------- */
+static model_info mi_of(const char *show_json) { model_info mi; model_info_parse(show_json, &mi); return mi; }
+static bool same_level(const char *a, const char *b) { return a && b ? !strcmp(a, b) : a == b; }
+#define THINKS(mi, when, quiet, followup, effort, kind, lvl) do { const char *_l = NULL; \
+    think_kind _k = think_decide((when), (quiet), (followup), (effort), &(mi), &_l); \
+    if (_k == (kind) && same_level(_l, (lvl))) g_pass++; \
+    else { g_fail++; fprintf(stderr, "  FAIL %s:%d: think_decide -> %d \"%s\", wanted %d \"%s\"\n", __FILE__, __LINE__, (int)_k, _l ? _l : "", (int)(kind), (lvl) ? (lvl) : ""); } } while (0)
+static void test_effort(void) {
+    model_info none  = mi_of("{\"capabilities\":[\"completion\",\"tools\"]}");
+    model_info onoff = mi_of("{\"details\":{\"family\":\"qwen3\"},\"capabilities\":[\"completion\",\"thinking\"]}");
+    model_info oss   = mi_of("{\"details\":{\"family\":\"gptoss\"},\"capabilities\":[\"thinking\"]}");
+    model_info q38   = mi_of("{\"details\":{\"family\":\"qwen35\"},\"capabilities\":[\"thinking\"],\"modelfile\":\"# made by ollama\\nFROM /blob\\nRENDERER qwen3.8\\nPARSER qwen3.5\\n\"}");
+    model_info q35   = mi_of("{\"details\":{\"family\":\"qwen35\"},\"capabilities\":[\"thinking\"],\"modelfile\":\"FROM /blob\\nRENDERER qwen3.5\\n\"}");
+    model_info decl  = mi_of("{\"details\":{\"family\":\"qwen35\"},\"capabilities\":[\"thinking\"],\"modelfile\":\"RENDERER qwen3.8\\n\","
+                             "\"thinking\":{\"values\":[false,\"low\",\"medium\",\"xhigh\"],\"default\":\"medium\"}}");
+    model_info cloud = mi_of("{\"capabilities\":[\"completion\"],\"thinking\":{\"values\":[\"low\",\"high\",\"max\"],\"default\":\"max\"}}");
+
+    /* what each offers: the server's list when it sends one, else the table, else on/off */
+    CHECK(!none.thinking && !none.think_off && !none.think_on && none.n_think_levels == 0);
+    CHECK(onoff.think_off && onoff.think_on && onoff.n_think_levels == 0 && !onoff.think_declared); CHECK_STR(onoff.think_default, "on");
+    CHECK(!oss.think_off && !oss.think_on && oss.n_think_levels == 3); CHECK_STR(oss.think_levels[0], "low"); CHECK_STR(oss.think_levels[2], "high"); CHECK_STR(oss.think_default, "medium");
+    CHECK_STR(q38.renderer, "qwen3.8"); CHECK(q38.think_off && !q38.think_on && q38.n_think_levels == 3);
+    CHECK(q35.think_on && q35.n_think_levels == 0);                       /* the same family without that renderer is on/off */
+    CHECK(decl.think_declared && decl.think_off && !decl.think_on && decl.n_think_levels == 3); CHECK_STR(decl.think_levels[2], "xhigh");   /* declared beats the table */
+    CHECK(cloud.thinking && !cloud.think_off && cloud.n_think_levels == 3); CHECK_STR(cloud.think_default, "max");   /* it says how it thinks: it thinks */
+
+    CHECK(effort_name_ok("xhigh") && effort_name_ok("off") && !effort_name_ok("") && !effort_name_ok("High") && !effort_name_ok("a b") && !effort_name_ok("0123456789abcdefg"));
+    CHECK(effort_supported(&oss, "high") == 1 && effort_supported(&oss, "off") == 0 && effort_supported(&oss, "on") == 0 && effort_supported(&oss, "max") == 0);
+    CHECK(effort_supported(&onoff, "off") == 1 && effort_supported(&onoff, "on") == 1 && effort_supported(&onoff, "high") == -1 && effort_supported(&onoff, "xhigh") == 0);
+    CHECK(effort_supported(&none, "off") == 0 && effort_supported(&none, "high") == 0);
+    CHECK(effort_supported(&decl, "xhigh") == 1 && effort_supported(&decl, "high") == 0);
+
+    bool mapped;
+    CHECK_STR(effort_resolve(&decl, "high", &mapped), "xhigh"); CHECK(mapped);    /* saved under 0.33, run under 0.34.3 */
+    CHECK_STR(effort_resolve(&oss, "max", &mapped), "high"); CHECK(mapped);
+    CHECK_STR(effort_resolve(&oss, "low", &mapped), "low"); CHECK(!mapped);
+    CHECK_STR(effort_resolve(&onoff, "high", &mapped), "high"); CHECK(!mapped);   /* passed on as it is */
+    CHECK(effort_resolve(&decl, "ultra", NULL) == NULL && effort_resolve(&oss, "off", NULL) == NULL && effort_resolve(&onoff, "xhigh", NULL) == NULL);
+    CHECK(effort_resolve(&none, "high", NULL) == NULL && effort_resolve(&oss, NULL, NULL) == NULL);
+
+    /* the table of effort entries */
+    CHECK(effort_get("m:7b") == NULL);
+    effort_set("m:7b", "high"); effort_set("reg:5000/ns/other", "off"); effort_set("m:7b", "low");
+    CHECK_STR(effort_get("m:7b"), "low"); CHECK_STR(effort_get("reg:5000/ns/other"), "off"); CHECK(g_cfg.n_efforts == 2);
+    effort_set("plain", "on"); CHECK_STR(effort_get("plain:latest"), "on");   /* one model to the server */
+    effort_set("plain:latest", "off"); CHECK_STR(effort_get("plain"), "off"); CHECK(g_cfg.n_efforts == 3);
+    effort_set("m:7b", NULL); CHECK(effort_get("m:7b") == NULL && g_cfg.n_efforts == 2);
+    effort_set("reg:5000/ns/other", NULL); effort_set("plain", NULL); effort_set("never-set", NULL); CHECK(g_cfg.n_efforts == 0);
+    CHECK(model_same("a:latest", "a") && model_same("a", "a") && !model_same("a:7b", "a") && !model_same("a", NULL) && !model_same("reg:5000/ns/m", "reg:5000/ns/n"));
+
+    /* think_decide(when, quiet, followup, effort): when -1 auto / 0 off / 1 every call */
+    /* a model that cannot think is never sent anything but false */
+    THINKS(none, -1, false, false, NULL, THINK_OMIT, NULL);  THINKS(none, 1, false, false, NULL, THINK_OMIT, NULL);
+    THINKS(none, 0, false, false, NULL, THINK_FALSE, NULL);  THINKS(none, 1, true, false, NULL, THINK_FALSE, NULL);
+    THINKS(none, -1, true, false, NULL, THINK_OMIT, NULL);   THINKS(none, 1, false, false, "high", THINK_OMIT, NULL);
+    /* on/off, nothing set: the old behaviour */
+    THINKS(onoff, -1, false, false, NULL, THINK_OMIT, NULL); THINKS(onoff, -1, false, true, NULL, THINK_FALSE, NULL);
+    THINKS(onoff, 1, false, false, NULL, THINK_TRUE, NULL);  THINKS(onoff, 1, false, true, NULL, THINK_TRUE, NULL);
+    THINKS(onoff, 0, false, false, NULL, THINK_FALSE, NULL); THINKS(onoff, 1, true, false, NULL, THINK_FALSE, NULL);
+    THINKS(onoff, -1, false, false, "on", THINK_TRUE, NULL); THINKS(onoff, -1, false, true, "on", THINK_FALSE, NULL);
+    THINKS(onoff, 1, false, true, "off", THINK_FALSE, NULL);                                /* off for this model beats /think on */
+    /* a name passed on in hope is "on" to such a model: it rests for the tool rounds like on does */
+    THINKS(onoff, -1, false, false, "high", THINK_LEVEL, "high"); THINKS(onoff, -1, false, true, "high", THINK_FALSE, NULL);
+    THINKS(onoff, 1, false, true, "high", THINK_LEVEL, "high");
+    /* a level of the model's own is part of the prompt: every call that shares it carries it */
+    THINKS(q38, -1, false, false, "low", THINK_LEVEL, "low"); THINKS(q38, -1, false, true, "low", THINK_LEVEL, "low");
+    THINKS(q38, -1, true, true, "low", THINK_LEVEL, "low");                                  /* compaction: the conversation's own prompt */
+    THINKS(q38, -1, true, false, "low", THINK_FALSE, NULL);                                  /* the memory update: a prompt of its own */
+    THINKS(q38, 0, false, false, "low", THINK_FALSE, NULL);                                  /* /think off */
+    THINKS(q38, -1, false, false, NULL, THINK_OMIT, NULL); THINKS(q38, -1, false, true, NULL, THINK_FALSE, NULL);
+    THINKS(q38, 1, false, false, NULL, THINK_LEVEL, "medium");                               /* no "true" for it: its default, by name */
+    THINKS(q38, -1, false, false, "max", THINK_LEVEL, "high");                               /* as hard as it goes */
+    THINKS(decl, -1, false, true, "high", THINK_LEVEL, "xhigh");
+    THINKS(decl, -1, false, false, "ultra", THINK_OMIT, NULL);                               /* a saved level it no longer has: left to the model */
+    /* gpt-oss cannot stop: never false, and nothing that changes the prompt between two calls that share it */
+    THINKS(oss, -1, false, false, NULL, THINK_OMIT, NULL); THINKS(oss, -1, false, true, NULL, THINK_OMIT, NULL);
+    THINKS(oss, -1, true, true, NULL, THINK_OMIT, NULL);                                     /* compaction */
+    THINKS(oss, -1, true, false, NULL, THINK_LEVEL, "low");                                  /* memory update: as little as it can */
+    THINKS(oss, 0, false, false, NULL, THINK_LEVEL, "low"); THINKS(oss, 0, false, true, "high", THINK_LEVEL, "low");
+    THINKS(oss, 1, false, false, NULL, THINK_LEVEL, "medium"); THINKS(oss, 1, true, true, NULL, THINK_LEVEL, "medium");
+    THINKS(oss, -1, false, true, "high", THINK_LEVEL, "high"); THINKS(oss, -1, true, true, "high", THINK_LEVEL, "high");
+    THINKS(oss, -1, true, false, "high", THINK_LEVEL, "low");
+    THINKS(oss, -1, false, false, "off", THINK_OMIT, NULL);                                  /* from a hand-edited config: not something it can do, so left to the model */
+    THINKS(cloud, 1, false, false, NULL, THINK_LEVEL, "max");
+    /* glimmer writes its "off" into the top of the prompt like any level ("Reasoning strength: none."): no flip mid-prompt */
+    model_info glim = mi_of("{\"details\":{\"family\":\"muse-glimmer\"},\"capabilities\":[\"thinking\"]}");
+    model_info glimd = mi_of("{\"details\":{\"family\":\"muse-glimmer\"},\"capabilities\":[\"thinking\"],\"thinking\":{\"values\":[false,\"low\",\"medium\",\"high\",\"max\"],\"default\":\"high\"}}");
+    CHECK(glim.think_off && glim.think_off_top && glim.n_think_levels == 4 && glimd.think_off_top && glimd.think_declared && !q38.think_off_top && !onoff.think_off_top);
+    THINKS(glim, -1, false, false, NULL, THINK_OMIT, NULL); THINKS(glim, -1, false, true, NULL, THINK_OMIT, NULL);
+    THINKS(glimd, 1, false, true, NULL, THINK_LEVEL, "high"); THINKS(glimd, 1, true, true, NULL, THINK_LEVEL, "high");   /* compaction under /think on */
+    THINKS(glim, -1, true, false, NULL, THINK_FALSE, NULL);  /* the memory update has a prompt of its own */
+    THINKS(glim, 0, false, true, NULL, THINK_FALSE, NULL);   /* and off for good is the same on every call */
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -513,7 +628,8 @@ int main(void) {
         { "sbuf", test_sbuf }, { "util", test_util }, { "markdown", test_md },
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "http", test_http },
-        { "web", test_web },
+        { "web", test_web }, { "model_info", test_model_info },
+        { "effort", test_effort },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

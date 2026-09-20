@@ -34,9 +34,9 @@ static const char *SPIN[] = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "
 
 bool ollama_quiet = false;
 char ollama_error[512];
-ollama_call_opts ollama_call = { -1, 0, NULL };
-bool g_model_think = false;   /* set by main.c from the model's capabilities */
-void ollama_call_reset(void) { ollama_call.think = -1; ollama_call.num_predict = 0; ollama_call.busy = NULL; }
+ollama_call_opts ollama_call = { .think = -1 };
+model_info g_model_info;      /* set by main.c from /api/show (and /api/tags) */
+void ollama_call_reset(void) { ollama_call = (ollama_call_opts){ .think = -1 }; }
 /* status-bar label: a per-call override (e.g. "updating memory") replaces every phase label */
 static const char *busy_or(const char *def) { return ollama_call.busy ? ollama_call.busy : def; }
 static const char *busy_label(void) { return busy_or("generating"); }
@@ -191,13 +191,45 @@ cJSON *parse_text_tool_calls(const char *content) {
     return arr;
 }
 
+/* ---------- what "think" is set to ----------
+ * See common.h. In short: off is off; a named level goes with every call that shares the
+ * conversation's prompt, because the models that have levels write them into the top of it
+ * (gpt-oss "Reasoning: high", qwen3.8 "Reasoning effort is set to …") and a prompt whose top
+ * changed is read again from the first token; only on/off may flip between the first call of a
+ * request and its tool rounds (/think auto), since that changes nothing but the end of it. */
+think_kind think_decide(int when, bool quiet, bool followup, const char *effort, const model_info *mi, const char **level) {
+    *level = NULL;
+    if (!mi->thinking) return (when == 0 || (quiet && when > 0)) ? THINK_FALSE : THINK_OMIT;   /* never anything but false: the server refuses it */
+    effort = effort_resolve(mi, effort, NULL);   /* NULL when saved against a list the model no longer has */
+    bool off = effort && !strcmp(effort, "off"), on = effort && !strcmp(effort, "on");
+    bool named = effort && !off && !on;
+    bool own = named && effort_supported(mi, effort) == 1;   /* a level of the model's own: that is what is written into the prompt */
+    const char *weakest = mi->n_think_levels ? mi->think_levels[0] : NULL;   /* as near to off as a model that cannot stop gets */
+    /* "think", where no level of its own is set: a name passed on in hope (an on/off model takes
+     * it as on); true; or, for a model that has levels and no "true" (gpt-oss, qwen3.8, some
+     * cloud models), its default level by name — what true does to those is anyone's guess */
+    const char *yes = named ? effort : !mi->think_on && mi->think_default[0] && strcmp(mi->think_default, "on") && strcmp(mi->think_default, "off") ? mi->think_default : NULL;
+    #define THINK_YES()  (yes ? (*level = yes, THINK_LEVEL) : mi->think_on ? THINK_TRUE : THINK_OMIT)
+    #define THINK_FIRST() ((when == 1 || on || named) ? THINK_YES() : THINK_OMIT)   /* asked for, or left to the model */
+    #define THINK_LEAST() (mi->think_off ? THINK_FALSE : weakest ? (*level = weakest, THINK_LEVEL) : THINK_OMIT)
+    if (when == 0 || off) return THINK_LEAST();   /* the same for every call, so nothing flips */
+    if (own && (followup || !quiet)) { *level = effort; return THINK_LEVEL; }   /* part of the prompt: every call that shares it */
+    bool flips = mi->think_off && !mi->think_off_top;   /* false changes nothing but the end of the prompt */
+    if (quiet) return flips || !followup ? THINK_LEAST() : THINK_FIRST();   /* else: do not change the prompt it continues */
+    if (when < 0 && followup) return flips ? THINK_FALSE : THINK_FIRST();   /* /think auto: think about the request once */
+    return THINK_FIRST();
+    #undef THINK_YES
+    #undef THINK_FIRST
+    #undef THINK_LEAST
+}
+
 /* keep_alive is a duration ("30m") or a bare number of seconds — and the server only takes the
- * latter as a JSON number: "-1" or "300" as a string is refused (missing unit in duration).
- * Only a plain decimal is one: strtod also takes "inf", "nan" and "1e400", which cJSON prints
- * as null — "not set" to the server, in silence, where a string at least gets an error back. */
+ * latter as a JSON number: "-1" or "300" as a string is refused (missing unit in duration). */
 static void add_keep_alive(cJSON *req, const char *v) {
     if (!v || !*v) return;
     char *end; double n = strtod(v, &end);
+    /* only a plain decimal is a number: strtod also takes "inf", "nan" and "1e400", which cJSON
+     * prints as null — "not set" to the server, in silence. As a string the server says what is wrong */
     if (end != v && !*end && strspn(v, "+-.0123456789") == strlen(v)) cJSON_AddNumberToObject(req, "keep_alive", n);
     else cJSON_AddStringToObject(req, "keep_alive", v);
 }
@@ -211,12 +243,14 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
     cJSON_AddItemReferenceToObject(req, "messages", messages);
     cJSON_AddBoolToObject(req, "stream", true);
     if (tools && cJSON_GetArraySize(tools) > 0) cJSON_AddItemReferenceToObject(req, "tools", tools);
-    /* thinking: a per-call override wins; "off" is only sent when the model can think at all
-     * (older servers reject the key for models without the capability) */
-    int think = ollama_call.think >= 0 ? ollama_call.think : g_cfg.think;
-    if (think == 1 && g_cfg.think_level) cJSON_AddStringToObject(req, "think", g_cfg.think_level);   /* gpt-oss style levels */
-    else if (think == 1 || (think == 0 && (g_model_think || g_cfg.think >= 0))) cJSON_AddBoolToObject(req, "think", think == 1);
-    else if (think < 0 && g_cfg.think_level && g_model_think) cJSON_AddStringToObject(req, "think", g_cfg.think_level);
+    /* thinking: whether, and how hard, is the model's own business — see think_decide() */
+    const char *level = NULL;
+    switch (think_decide(g_cfg.think, ollama_call.think == 0, ollama_call.followup, effort_get(g_cfg.model), &g_model_info, &level)) {
+        case THINK_FALSE: cJSON_AddBoolToObject(req, "think", false); break;
+        case THINK_TRUE:  cJSON_AddBoolToObject(req, "think", true); break;
+        case THINK_LEVEL: cJSON_AddStringToObject(req, "think", level); break;
+        case THINK_OMIT:  break;
+    }
     add_keep_alive(req, g_cfg.keep_alive);
     cJSON *opts = cJSON_AddObjectToObject(req, "options");
     if (g_cfg.num_ctx > 0) cJSON_AddNumberToObject(opts, "num_ctx", g_cfg.num_ctx);
@@ -260,6 +294,8 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
         printf(C_RED "✗ ollama error (%d): %s" C_RESET "\n", res.status, c.error[0] ? c.error : "unknown");
         if (strstr(c.error, "not found")) printf(C_DIM "  try /models to list, or: ollama pull %s" C_RESET "\n", g_cfg.model);
         if (strstr(c.error, "does not support tools")) printf(C_DIM "  this model has no tool support; use /tools off or pick another model" C_RESET "\n");
+        /* the server's own three complaints about it — not any error that quotes a model called "…-thinking" */
+        if (strstr(c.error, "think value") || strstr(c.error, "think must be") || strstr(c.error, "does not support thinking")) printf(C_DIM "  the server refused the \"think\" value sent to %s — /effort default takes it back" C_RESET "\n", g_cfg.model);
     }
     /* Build the assistant message even on abort (partial content keeps context coherent) */
     if (res.aborted || (rc == 0 && !c.error[0] && res.status < 400)) {
@@ -352,31 +388,86 @@ int ollama_ping(char *ver, size_t verlen) {
     return rc;
 }
 
-/* Maximum context length the model was trained for, from /api/show
- * (model_info."<arch>.context_length"). 0 if unknown. */
-int ollama_model_context_length(const char *model) {
-    if (!model || !*model) return 0;
-    cJSON *req = cJSON_CreateObject();
-    cJSON_AddStringToObject(req, "model", model);
-    char *body = cJSON_PrintUnformatted(req); cJSON_Delete(req);
-    sbuf out; sb_init(&out); http_result res;
-    int rc = plain_request("POST", "/api/show", body, "reading model info", &out, &res);
-    free(body);
-    int ctx = 0;
-    if (rc == 0 && res.status == 200 && out.data) {
-        cJSON *j = cJSON_Parse(out.data);
-        cJSON *info = j ? cJSON_GetObjectItemCaseSensitive(j, "model_info") : NULL;
-        cJSON *k; cJSON_ArrayForEach(k, info) {
-            size_t l = k->string ? strlen(k->string) : 0;
-            if (l >= 15 && !strcmp(k->string + l - 15, ".context_length") && cJSON_IsNumber(k)) { ctx = (int)k->valuedouble; break; }
-        }
-        cJSON_Delete(j);
+/* The /api/show body: the trained context length (model_info."<arch>.context_length"), the
+ * model's own draft_num_predict (the Modelfile PARAMETER lines come as text), its family and
+ * what it can do. */
+void model_info_parse(const char *json, model_info *mi) {
+    memset(mi, 0, sizeof *mi); mi->draft = -1;
+    cJSON *j = cJSON_Parse(json ? json : "");
+    if (!j) return;
+    cJSON *info = cJSON_GetObjectItemCaseSensitive(j, "model_info");
+    cJSON *k; cJSON_ArrayForEach(k, info) {
+        size_t l = k->string ? strlen(k->string) : 0;
+        if (l >= 15 && !strcmp(k->string + l - 15, ".context_length") && cJSON_IsNumber(k)) { mi->context_length = (int)k->valuedouble; break; }
     }
-    sb_free(&out);
-    return ctx;
+    cJSON *p = cJSON_GetObjectItemCaseSensitive(j, "parameters");
+    const char *d = cJSON_IsString(p) ? strstr(p->valuestring, "draft_num_predict") : NULL;
+    if (d) mi->draft = atoi(d + strlen("draft_num_predict"));
+    cJSON *det = cJSON_GetObjectItemCaseSensitive(j, "details");
+    cJSON *fam = det ? cJSON_GetObjectItemCaseSensitive(det, "family") : NULL;
+    if (cJSON_IsString(fam)) snprintf(mi->family, sizeof mi->family, "%s", fam->valuestring);
+    cJSON *caps = cJSON_GetObjectItemCaseSensitive(j, "capabilities"), *cp;
+    if (cJSON_IsArray(caps)) {
+        mi->caps_known = true;
+        cJSON_ArrayForEach(cp, caps) {
+            if (!cJSON_IsString(cp)) continue;
+            if (!strcmp(cp->valuestring, "tools")) mi->tools = true;
+            if (!strcmp(cp->valuestring, "thinking")) mi->thinking = true;
+        }
+    }
+    /* "RENDERER qwen3.8" in the Modelfile: the only thing that tells qwen3.8 (levels) from the
+     * rest of its family (on/off) on a server that does not list the levels */
+    cJSON *mf = cJSON_GetObjectItemCaseSensitive(j, "modelfile");
+    for (const char *l = cJSON_IsString(mf) ? mf->valuestring : NULL; l; l = strchr(l, '\n'), l = l ? l + 1 : NULL)
+        if (!strncmp(l, "RENDERER ", 9)) { sscanf(l + 9, "%31s", mi->renderer); break; }
+    /* thinking: {values: [false, "low", "high", …], default: …} — Ollama ≥ 0.34.3 */
+    cJSON *th = cJSON_GetObjectItemCaseSensitive(j, "thinking");
+    cJSON *vals = th ? cJSON_GetObjectItemCaseSensitive(th, "values") : NULL, *v;
+    if (cJSON_IsArray(vals) && cJSON_GetArraySize(vals) > 0) {
+        mi->think_declared = true;
+        cJSON_ArrayForEach(v, vals) {
+            if (cJSON_IsFalse(v)) mi->think_off = true;
+            else if (cJSON_IsTrue(v)) mi->think_on = true;
+            else if (cJSON_IsString(v) && effort_name_ok(v->valuestring) && mi->n_think_levels < EFFORT_LEVELS_MAX)
+                snprintf(mi->think_levels[mi->n_think_levels++], EFFORT_NAME_MAX, "%s", v->valuestring);
+        }
+        cJSON *d = cJSON_GetObjectItemCaseSensitive(th, "default");
+        if (cJSON_IsBool(d)) snprintf(mi->think_default, EFFORT_NAME_MAX, "%s", cJSON_IsTrue(d) ? "on" : "off");
+        else if (cJSON_IsString(d) && effort_name_ok(d->valuestring)) snprintf(mi->think_default, EFFORT_NAME_MAX, "%s", d->valuestring);
+        if (mi->think_on || mi->n_think_levels) mi->thinking = true;   /* it says how it thinks: it thinks */
+    }
+    cJSON_Delete(j);
+    model_think_profile(mi);
 }
 
-int ollama_model_draft(const char *model) {
+/* A server before 0.34.3 only says *that* a model thinks. These are the ones known to act on a
+ * level (from the server's own renderers and templates); any other thinking model is on/off —
+ * it is sent a level as readily, and takes it as plain "on". */
+void model_think_profile(model_info *mi) {
+    /* glimmer writes every strength into the system message, "none" included: its off is a level like the others */
+    mi->think_off_top = !strcmp(mi->family, "muse-glimmer") || !strcmp(mi->renderer, "glimmer");
+    if (mi->think_declared) return;
+    mi->think_off = mi->think_on = false; mi->n_think_levels = 0; mi->think_default[0] = 0;
+    if (!mi->thinking) return;
+    static const struct { const char *family, *renderer, *levels[EFFORT_LEVELS_MAX]; bool off; const char *dflt; } KNOWN[] = {
+        { "gptoss",       NULL,      { "low", "medium", "high" },        false, "medium" },   /* cannot stop thinking; true/false are ignored */
+        { "gpt-oss",      NULL,      { "low", "medium", "high" },        false, "medium" },
+        { NULL,           "qwen3.8", { "low", "medium", "high" },        true,  "medium" },
+        { "muse-glimmer", "glimmer", { "low", "medium", "high", "max" }, true,  "high" },
+    };
+    for (size_t i = 0; i < sizeof KNOWN / sizeof *KNOWN; i++) {
+        if (!(KNOWN[i].family && !strcmp(mi->family, KNOWN[i].family)) && !(KNOWN[i].renderer && !strcmp(mi->renderer, KNOWN[i].renderer))) continue;
+        for (int k = 0; k < EFFORT_LEVELS_MAX && KNOWN[i].levels[k]; k++) snprintf(mi->think_levels[mi->n_think_levels++], EFFORT_NAME_MAX, "%s", KNOWN[i].levels[k]);
+        mi->think_off = KNOWN[i].off;
+        snprintf(mi->think_default, EFFORT_NAME_MAX, "%s", KNOWN[i].dflt);
+        return;
+    }
+    mi->think_off = mi->think_on = true;
+    snprintf(mi->think_default, EFFORT_NAME_MAX, "on");
+}
+
+int ollama_model_show(const char *model, model_info *mi) {
+    model_info_parse(NULL, mi);
     if (!model || !*model) return -1;
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "model", model);
@@ -384,17 +475,14 @@ int ollama_model_draft(const char *model) {
     sbuf out; sb_init(&out); http_result res;
     int rc = plain_request("POST", "/api/show", body, "reading model info", &out, &res);
     free(body);
-    int draft = -1;
-    if (rc == 0 && res.status == 200 && out.data) {
-        cJSON *j = cJSON_Parse(out.data);
-        cJSON *p = j ? cJSON_GetObjectItemCaseSensitive(j, "parameters") : NULL;   /* Modelfile PARAMETER lines as text */
-        const char *d = cJSON_IsString(p) ? strstr(p->valuestring, "draft_num_predict") : NULL;
-        if (d) draft = atoi(d + strlen("draft_num_predict"));
-        cJSON_Delete(j);
-    }
+    bool ok = rc == 0 && res.status == 200 && out.data;
+    if (ok) model_info_parse(out.data, mi);
     sb_free(&out);
-    return draft;
+    return ok ? 0 : -1;
 }
+
+int ollama_model_context_length(const char *model) { model_info mi; ollama_model_show(model, &mi); return mi.context_length; }
+int ollama_model_draft(const char *model) { model_info mi; ollama_model_show(model, &mi); return mi.draft; }
 
 /* Where the model is loaded (from /api/ps): total size and the part in GPU memory. */
 int ollama_model_placement(const char *model, double *size, double *size_vram) {
