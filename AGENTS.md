@@ -1,22 +1,31 @@
 # AGENTS.md — working on Corbie Nest (corbienest)
 
 corbienest is a Claude-Code-style terminal coding agent for local Ollama models, written in
-plain C11 with no dependencies beyond libc, POSIX and cJSON. Keep it that way: no libcurl,
-no ncurses, no readline. HTTP is raw sockets (`src/http.c`), the UI is ANSI escapes
-(`src/term.c`).
+plain C11 with no dependencies beyond libc, POSIX, cJSON and libcurl. Keep it that way: no
+ncurses, no readline, nothing more. HTTP (and HTTPS, for the hosted APIs the advisor can
+consult) is libcurl behind `src/http.c`, the UI is ANSI escapes (`src/term.c`).
 
 ## Build, run, test
 
 ```sh
-make                 # builds ./corbienest  (needs cc, make, libcjson-dev)
+make                 # builds ./corbienest  (needs cc, make, libcjson-dev, libcurl4-openssl-dev)
 make release         # clean, optimized, stripped build (RELEASE_CFLAGS)
 make test            # C unit tests (tests/test_unit.c) + pty integration tests (tests/test_integration.py)
 ./corbienest           # needs an Ollama at $OLLAMA_HOST or 127.0.0.1:11434
 ```
 
 `make test` needs no real model: `tests/fake_ollama.py` is a scripted stand-in
-(keywords in the user message such as `TOOL_BASH`, `TOOL_WRITE`, `TOOL_FETCH`, `TOOL_SEARCH`, `SLOW`, `ERROR` select a
-canned response). Run the tests after every change to `src/`; both suites must pass and the
+(keywords in the user message such as `TOOL_BASH`, `TOOL_WRITE`, `TOOL_FETCH`, `TOOL_SEARCH`, `TOOL_ADVISOR`, `SLOW`, `ERROR` select a
+canned response; an advisor call is recognised by its system prompt and reads `SLOWADVICE`, `CUTADVICE`,
+`THINKTAG`, `EVICTMAIN` from the brief, and answers a review (before the request ends) or a check (of the
+first change) with a finding unless the request says `APPROVE`. Its models differ in what they can do: `fake-thinker` is on/off,
+`fake-levels` is gpt-oss-like, `fake-declared` lists its levels in `/api/show`, `fake-stale` is
+under-reported by `/api/tags`, `fake-remote:cloud` exists for `/api/show` only and answers 401. It also
+stands in for the hosted APIs — `/xai/v1` and `/openai/v1` (Chat Completions), `/anthropic/v1` (Messages),
+key `test-key`, the requests logged at `/_provider_requests` without the key; `grok-fake`, `gpt-fake`,
+`claude-fake-opus`, `claude-opus-5` (refusal fallbacks) and `claude-fake-haiku` (a thinking budget), which
+read `SLOWADVICE`, `CUTADVICE`, `REFUSEADVICE` — and `fake_ollama.serve(port, cert, key)` serves the same
+behind TLS for the https tests). Run the tests after every change to `src/`; both suites must pass and the
 build must be warning-free with `-Wall -Wextra`.
 
 ## Layout
@@ -24,13 +33,14 @@ build must be warning-free with `-Wall -Wextra`.
 | file | owns |
 |---|---|
 | `src/common.h` | every shared declaration; one header, sectioned per module |
-| `src/util.c` | `sbuf` string buffer, file helpers, config load/save, permission-mode names, URL checks + HTML-to-text + search-result extraction for `web_fetch`/`web_search` (pure logic, so `test_unit` can reach it) |
-| `src/http.c` | minimal HTTP/1.1 client, chunked streaming, interrupt-while-waiting |
+| `src/util.c` | `sbuf` string buffer, file helpers, config load/save, permission-mode names, URL checks + HTML-to-text + search-result extraction for `web_fetch`/`web_search` (pure logic, so `test_unit` can reach it), the per-model effort table (`effort_get`/`effort_set`, saved as `effort.<model>=<level>`; `effort_supported()` 1/0/-1 and `effort_resolve()`, which sends a high/xhigh/max the model lacks as the strongest level it has), and the pure half of the advisor: `transcript_text()` (the conversation as one quoted text), `advisor_brief()`, `advisor_plan_for()` (same model / cloud / hosted API / another local model — window, `keep_alive`, reply cap, byte budget), the guidance levels (`ADVISOR_GUIDANCE`: consultations per request, answer length, brief size, the automatic review and check) and `advisor_approves()` (an `LGTM` answer) |
+| `src/http.c` | the HTTP client over libcurl's multi interface: http and https, streamed line delivery, extra headers (`http_headers`), the interrupt fd watched while waiting, the 100 ms idle tick, a timeout on silence rather than on the whole request, `http_url()` (it never writes a scheme in: a host without one goes to libcurl as written, whose default is http; a portless plain-http host is Ollama's 11434) |
+| `src/provider.c` | the hosted APIs the advisor can be (`xai:`/`grok:`, `openai:`, `anthropic:`/`claude:` + model): keys from `XAI_API_KEY`/`OPENAI_API_KEY`/`ANTHROPIC_API_KEY` and base URLs from `…_BASE_URL`, the model check (`provider_model_info()`: Anthropic's capabilities become a `model_info` — effort levels, adaptive or budget thinking, window), one non-streamed consultation (`provider_chat()`), and its pure halves for the tests (`provider_request_body()`, `provider_parse_reply()`, `provider_parse_model()`) |
 | `src/term.c` | raw mode, key decoding (incl. Shift+Tab = `CSI Z`), full-screen mode (alternate screen, scroll region, and the chrome the app keeps at the bottom — the input field (`field_draw`: a rule, the `❯` prompt, a rule; it grows to `FIELD_MAX_ROWS` and `layout_sync` re-cuts the region — a field that shrinks again wipes the rows it hands back, `g_field_drawn_top`, since nothing else repaints them) and the status bar: mode · model · queued messages · session tokens · ctx · busy spinner via `term_busy()`/`term_busy_tick()`; `chrome_append()` re-appends both after any `\x1b[J`), line editor (draws into the field and owns the cursor there — `g_field_focus`; conversation output from inside it goes through `ed_conv_out()` at `conv_pos()`, the screen row the scrollback model says the transcript reached), prompt history (latest 100, `hist_*`), the message queue (`term_queue_*`: Enter while busy turns type-ahead into a queued message; pending type-ahead is echoed live in the input field and Shift+Tab while busy cycles the mode at once; `term_queue_new()`/`term_queue_mark()` say whether a *plain* message arrived since main.c last looked, which is what stops the work in flight, and `term_queue_pop_plain()` steps over a queued `/`/`!` line to the message behind it), `term_confirm` menu, `term_select` picker, idle work at the prompt (`term_idle_hook`/`term_idle_ms`: `read_key_wait()` gives up after the timeout and `ed_idle_run()` releases the field, runs the hook with the terminal in its during-a-turn state, and redraws — and a message queued while the hook ran is returned as the submitted line, so the REPL runs it right away), streaming markdown printer, scrollback for PgUp/PgDn (stdout is hooked via `fopencookie`/`funopen` in `sb_hook_stdout` and conversation output is modelled as lines — `sb_feed`; the chrome/menus/viewer draw with `sb_pause(true)`, while the submitted line is printed as real output; `scroll_view` is the viewer) |
 | `src/tools.c` | tool definitions + implementations (incl. `task`, which calls back into `main.c`), `confirm()` (mode-aware; 4th menu option saves a rule to `.corbienest/permissions`, `tools_permissions_*`), checkpoints for `/rewind` (`tools_checkpoint_*`: pre-write file states per request), shell runner (`run_shell`, also how `web_get()` drives `curl`/`wget` for `web_fetch`/`web_search`) |
-| `src/ollama.c` | `/api/chat` streaming (options: `num_ctx`, `temperature`, `keep_alive`, per-call `ollama_call` overrides for `think`/`num_predict`/status-bar label used by the memory, compact and sub-agent calls), tool-call accumulation, text tool-call recovery, `/api/ps` model placement |
+| `src/ollama.c` | `/api/chat` streaming (options: `num_ctx`, `temperature`, `keep_alive` — a bare number goes out as a JSON number, the server refuses `"-1"` — and per-call `ollama_call` overrides: `think`/`followup`/`num_predict`/status-bar label for the memory, compact and sub-agent calls, `model`/`info`/`num_ctx`/`keep_alive`/`idle_ms`/`stop_on_message` for a call to another model), `/api/show` (`model_info`: capabilities, family, `RENDERER`, and what `think` may be set to — the server's `thinking.values` from Ollama 0.34.3, else `model_think_profile()`'s small table), `think_decide()` (the one place that says what is sent as `think`), tool-call accumulation, text tool-call recovery, `/api/ps` model placement |
 | `src/skills.c` | SKILL.md discovery, frontmatter parsing, `/NAME` expansion, scaffolding |
-| `src/main.c` | REPL (`process_input`), slash commands, system prompt, sub-agents (`run_subagent`, hooked into `tools.c`'s `task` tool via `tools_subagent`), agent loop (`run_turn`, which injects queued messages via `inject_queued()` between tool rounds — and, when one arrives mid-round (`term_queue_new()`), skips the calls of that round that have not started, each getting a `TOOL_NOT_RUN` result, so the message reaches the model on the very next call — and calls `shrink_context()` before every model call — elide old tool results in place at ≥`ELIDE_PCT` (`elide_old_tool_results()`, also run by `begin_request()`), auto-compact at ≥`AUTO_COMPACT_PCT` (`maybe_auto_compact()` → `compact_conversation(resuming, request)`; mid-turn `resuming` is true, so the compacted conversation ends with a *user* turn — the summary plus `pending_request()`, the user's own words — and the model carries on with the half-done job; at the prompt it ends with an assistant turn instead, so what the user types next follows one) — both judged by `ctx_estimate()`, since a whole tool round lands between two measurements: it adds the bytes appended since the last `prompt_eval_count` divided by `g_bytes_per_token`, which `ctx_measured()` calibrates on each measured call. Overflowing is not a soft failure: Ollama drops messages from the front until the prompt fits, and once the user's own request is gone the model answers a conversation without the question in it (qwen3.8 refuses outright — "no user query found in messages"), so `tool_result_message()` caps any single result at `TOOL_RESULT_PCT` of the window and `run_turn` recovers from that error by eliding, then compacting, and retrying. A reply with neither text nor a tool call (`reply_is_empty()` — Ollama's parser dropping a badly rendered tool call looks like this) would end the request in silence, so `run_turn` says so, drops the empty message and asks once more), `/ctx` picker (model max from `/api/show`), sessions (`session_save()` after each request to `config_dir()/sessions/<id>.json`, `--continue`/`--resume`/`/resume`), project memory (`.corbienest/memory.md`: `load_memory()` into the system prompt; `memory_note()` after each request counts it and `memory_flush()` runs the quiet extraction call (`memory_extract()`, `ollama_quiet` + `ollama_call` overrides) every `memory_every` requests, after `memory_idle` seconds of an untouched prompt (`memory_arm_idle()` sets `term_idle_ms` before each `term_readline()`; the editor calls back into `memory_idle_hook()`), and before the conversation goes away — exit, `/clear`, `/compact`, `/cd`, `/resume`; `/memory`), banner, `--benchmark` (`run_benchmark`: for each size in `ctx_size_list()` — shared with the `/ctx` picker — `bench_ctx()` does a warm-up call (load time, `/api/ps` placement) + N quiet capped generations, tok/s from Ollama's counters; no session, memory or tools; `--draft N` = `options.draft_num_predict`, `ollama_model_draft()` reads the model's own) |
+| `src/main.c` | REPL (`process_input`), slash commands, system prompt, sub-agents (`run_subagent`, hooked into `tools.c`'s `task` tool via `tools_subagent`), agent loop (`run_turn`, which injects queued messages via `inject_queued()` between tool rounds — and, when one arrives mid-round (`term_queue_new()`), skips the calls of that round that have not started, each getting a `TOOL_NOT_RUN` result, so the message reaches the model on the very next call — and calls `shrink_context()` before every model call — elide old tool results in place at ≥`ELIDE_PCT` (`elide_old_tool_results()`, also run by `begin_request()`), auto-compact at ≥`AUTO_COMPACT_PCT` (`maybe_auto_compact()` → `compact_conversation(resuming, request)`; mid-turn `resuming` is true, so the compacted conversation ends with a *user* turn — the summary plus `pending_request()`, the user's own words — and the model carries on with the half-done job; at the prompt it ends with an assistant turn instead, so what the user types next follows one) — both judged by `ctx_estimate()`, since a whole tool round lands between two measurements: it adds the bytes appended since the last `prompt_eval_count` divided by `g_bytes_per_token`, which `ctx_measured()` calibrates on each measured call. Overflowing is not a soft failure: Ollama drops messages from the front until the prompt fits, and once the user's own request is gone the model answers a conversation without the question in it (qwen3.8 refuses outright — "no user query found in messages"), so `tool_result_message()` caps any single result at `TOOL_RESULT_PCT` of the window and `run_turn` recovers from that error by eliding, then compacting, and retrying. A reply with neither text nor a tool call (`reply_is_empty()` — Ollama's parser dropping a badly rendered tool call looks like this) would end the request in silence, so `run_turn` says so, drops the empty message and asks once more), `/ctx` picker (model max from `/api/show`), sessions (`session_save()` after each request to `config_dir()/sessions/<id>.json`, `--continue`/`--resume`/`/resume`), project memory (`.corbienest/memory.md`: `load_memory()` into the system prompt; `memory_note()` after each request counts it and `memory_flush()` runs the quiet extraction call (`memory_extract()`, `ollama_quiet` + `ollama_call` overrides) every `memory_every` requests, after `memory_idle` seconds of an untouched prompt (`memory_arm_idle()` sets `term_idle_ms` before each `term_readline()`; the editor calls back into `memory_idle_hook()`), and before the conversation goes away — exit, `/clear`, `/compact`, `/cd`, `/resume`; `/memory`), `/effort` (`effort_command()`, which also serves `/advisor effort`; `/think` says *when* the model thinks, `/effort` how hard), the advisor (`consult()` — one toolless call to `g_cfg.advisor`, through `ollama_chat()` or `provider_chat()`, that is shown `advisor_brief()`, accounted in the session totals but never in the context estimate — behind `run_advisor()`, hooked into `tools.c`'s `advisor` tool via `tools_advisor` and counted per request in `g_advisor_uses`, and behind the guidance's automatic consultations: `advisor_review()` when a request that changed files ends, `advisor_check()` before its first `write_file`/`edit_file`; `/advisor`, `/advisor guidance`), banner, `--benchmark` (`run_benchmark`: for each size in `ctx_size_list()` — shared with the `/ctx` picker — `bench_ctx()` does a warm-up call (load time, `/api/ps` placement) + N quiet capped generations, tok/s from Ollama's counters; no session, memory or tools; `--draft N` = `options.draft_num_predict`, `ollama_model_draft()` reads the model's own) |
 
 ## Conventions
 
@@ -83,13 +93,49 @@ build must be warning-free with `-Wall -Wextra`.
   `fetch <host>`) and the two labels in `confirm()` — and `/permissions` in `main.c` has to be
   able to name it. Plan mode must stay read-only: `tools_for_mode()` in `main.c` drops
   `write_file`/`edit_file` from what the model sees; `web_fetch` stays, reading is not writing.
-- `web_fetch`/`web_search` shell out to `curl`/`wget` through `web_get()` (`http.c` has no TLS,
-  and a TLS library is a dependency this project does not take). Their URL checks, HTML-to-text
+- `web_fetch`/`web_search` shell out to `curl`/`wget` through `web_get()` — their redirects, size
+  caps and wget fallback predate libcurl in `http.c`, and moving them over is a change of its own.
+  Their URL checks, HTML-to-text
   and result extraction live in `util.c`, not as statics in `tools.c`, because `tests/test_unit`
   links every object but `main.o` and only sees what `common.h` declares — put pure logic there
   so it can be tested. The search engine is a URL template (`search_url`, `%s` = the query), so
   nothing in the code assumes DuckDuckGo: the extractor works off the shape every result page
   has (a link, repeated for the display URL and the snippet, often behind a redirect).
+- What is sent as `think` is decided in `think_decide()` and nowhere else; callers only say what
+  kind of call it is — `ollama_call.think = 0` for one that needs no thinking, `.followup` for one
+  that continues the prompt of the call before it (a tool round, a compaction). The distinction
+  is the prompt cache: the models that have effort levels write the level into the *top* of the
+  prompt (gpt-oss `Reasoning: high`, qwen3.8 `Reasoning effort is set to …`), so a level that
+  changes between two calls makes the server read the whole conversation again. Hence a level
+  of the model's own goes with every call that shares the prompt, a model that cannot stop
+  thinking is never sent `false` mid-prompt, and only on/off flips between the first call of a
+  request and its tool rounds (not for glimmer, `think_off_top`: it writes "none" up there too). A model without the thinking capability is never sent anything
+  but `false` — the server answers anything else with a 400.
+- Capabilities and effort levels come from `/api/show` (`g_model_info`), not `/api/tags`: the
+  list reports a model as it was pulled. A call to another model passes `ollama_call.model`
+  together with that model's own `.info`; never read `g_model_info` for it.
+- The advisor is a tool like `task`, but its failures must never end the turn: every outcome of
+  `run_advisor()` is a tool result. Never remove a tool to enforce a limit — the tool list is
+  part of the prompt, so that would cost the cache mid-task; answer with an error result
+  (`advisor_guidance()->uses`). For the same reason the tool's description says nothing that
+  depends on the guidance: how often it may be consulted is in the system prompt. Its prompt
+  tokens go through `account()` only, never into `last_prompt_tokens`/`ctx_measured()`: that is
+  another model's prompt, and counting it would make auto-compact fire on a conversation that is
+  nowhere near full.
+- A consultation corbienest makes itself (guidance strong/max) enters the conversation as an
+  `advisor` call on the agent's own reply plus its result (`advisor_inject()`, or the held-back
+  change's own tool result) — never as a `user` message: the user did not say it, and a
+  conversation of calls and results is the one shape every chat template renders. Each happens
+  at most once per request (`g_advisor_reviewed`/`g_advisor_checked`, reset in
+  `begin_request()`), whatever comes of it, so it cannot loop.
+- API keys live in the environment only. Never write one into the config, a session, the
+  history, a log or an error message; `provider.c` builds the auth headers for the one request
+  and frees them, and the fake server never logs them either. A key only travels over TLS or to
+  this machine: `base_insecure()` refuses a plain-http (or scheme-less) base URL for any other
+  host — `url_cleartext()`/`url_is_local()` in `util.c`, which the banner's warning about an
+  unencrypted Ollama host uses too. No code writes an `http` scheme into a URL: Ollama's plain
+  HTTP is libcurl's default for a host without one, and a literal "http" in a URL that is being
+  built is what code scanning flags (cpp/non-https-url).
 - Slash commands: add to `SLASH_CMDS`, `handle_slash()`, `cmd_help()` and the README table.
   Unknown `/name` falls through to skills, so keep built-in names distinct from likely skill names.
 - The fake Ollama answers memory-extraction calls with `NO_CHANGE` unless a user message contains
@@ -126,7 +172,7 @@ The same rule is given to the model in corbienest's system prompt (`skills_promp
 
 ## Don'ts
 
-- Don't add dependencies or a build system beyond the Makefile.
+- Don't add dependencies (libcurl is the one there is) or a build system beyond the Makefile.
 - Don't print raw model/tool output without going through the existing preview helpers.
 - Don't block on stdin outside `term.c`.
 - Don't reflow or reformat unrelated code in a change; diffs should stay reviewable.

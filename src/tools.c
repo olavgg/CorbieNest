@@ -32,8 +32,11 @@
 static bool g_always_write = false, g_always_edit = false, g_always_bash = false, g_always_fetch = false;
 bool tools_no_confirm = false;   /* set by the caller for user-typed "!cmd": no prompt, no plan-mode veto */
 void tools_reset_permissions(void) { g_always_write = g_always_edit = g_always_bash = g_always_fetch = false; }
-const char *tools_summary_line(void) { return g_cfg.web ? "read_file, write_file, edit_file, list_dir, grep, bash, web_search, web_fetch, task"
-                                                        : "read_file, write_file, edit_file, list_dir, grep, bash, task"; }
+const char *tools_summary_line(void) {
+    static char b[160];
+    snprintf(b, sizeof b, "read_file, write_file, edit_file, list_dir, grep, bash, %stask%s", g_cfg.web ? "web_search, web_fetch, " : "", g_cfg.advisor ? ", advisor" : "");
+    return b;
+}
 
 /* ---------- persistent project permissions ----------
  * .corbienest/permissions holds one rule per line: "edit" (file writes/edits are fine in
@@ -288,6 +291,16 @@ cJSON *tools_definitions(void) {
         "Delegate a self-contained research or exploration task to a sub-agent with its own fresh context. It can read files, list directories, grep and run read-only shell commands, but cannot modify files, and returns a text report. "
         "Use it for broad searches or investigations whose intermediate output would clutter your context (\"find every place X is handled and summarise\", \"figure out how the build works\"), not for simple one-file lookups.",
         p, (const char*[]){"description", "prompt", NULL}));
+
+    if (g_cfg.advisor) {   /* only with /advisor MODEL: a tool that always fails is worse than none */
+        p = cJSON_CreateObject();
+        prop(p, "question", "string", "Optional. What you most want to know, in a sentence or two: your plan, the decision you face, or the error you cannot explain — and what you already tried. The advisor reads the whole conversation by itself, so do not repeat it.");
+        cJSON_AddItemToArray(arr, mk_tool("advisor",
+            "Consult the advisor: a stronger but much slower model that is shown this whole conversation — the request, every tool call you made and every result — and tells you how to proceed. It has no tools and cannot read files, so read the relevant code before you ask. "
+            "Use it for the hard parts: before you commit to an approach for a non-trivial change (explore first, then ask, then edit), when an error has survived two attempts to fix it or a result makes no sense, and before you call a difficult task done. "
+            "Do not use it for what a tool call can tell you.",   /* how often it may is in the system prompt: the tool list stays the same whatever the guidance */
+            p, (const char*[]){NULL}));
+    }
     return arr;
 }
 
@@ -888,6 +901,17 @@ static tool_status t_task(cJSON *args, sbuf *out) {
     return rc == 0 ? TOOL_OK : TOOL_ERROR;
 }
 
+/* ---------- advisor (a stronger model, consulted) ---------- */
+tools_advisor_fn tools_advisor = NULL;
+static tool_status t_advisor(cJSON *args, sbuf *out) {
+    const char *q = jstr(args, "question", NULL);
+    if (!q) q = jstr(args, "prompt", NULL);
+    if (!q) q = jstr(args, "query", "");
+    if (!tools_advisor || !g_cfg.advisor) { sb_puts(out, "error: no advisor is set in this session (the user can set one with /advisor MODEL). Carry on by yourself."); return TOOL_ERROR; }
+    if (g_in_subagent) { sb_puts(out, "error: the advisor is not available to a sub-agent; report what you found and let the main agent ask"); return TOOL_ERROR; }
+    return tools_advisor(q, out) == 0 ? TOOL_OK : TOOL_ERROR;
+}
+
 /* ---------- dispatch ---------- */
 tool_status tools_execute(const char *name, cJSON *args, sbuf *out) {
     cJSON *tmp = NULL;
@@ -902,6 +926,7 @@ tool_status tools_execute(const char *name, cJSON *args, sbuf *out) {
     else if (!strcmp(name, "web_fetch") || !strcmp(name, "fetch_url") || !strcmp(name, "fetch")) st = t_web_fetch(args, out);
     else if (!strcmp(name, "web_search") || !strcmp(name, "search_web") || !strcmp(name, "search")) st = t_web_search(args, out);
     else if (!strcmp(name, "task")) st = t_task(args, out);
+    else if (!strcmp(name, "advisor")) st = t_advisor(args, out);
     else { sb_printf(out, "error: unknown tool '%s'. Available tools: %s", name, tools_summary_line()); st = TOOL_ERROR; }
     if (tmp) cJSON_Delete(tmp);
     return st;

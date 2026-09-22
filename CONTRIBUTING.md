@@ -6,7 +6,7 @@ small are the most welcome ones.
 ## Build and test
 
 ```sh
-sudo apt install libcjson-dev     # or: brew install cjson
+sudo apt install libcjson-dev libcurl4-openssl-dev     # or: brew install cjson (macOS has libcurl)
 make                              # builds ./corbienest
 make test                         # C unit tests + pty integration tests
 ```
@@ -22,8 +22,8 @@ That is exactly what CI runs.
 
 ## Ground rules
 
-- **No new dependencies.** C11, libc, POSIX and cJSON. No libcurl, no ncurses, no readline.
-  HTTP is raw sockets (`src/http.c`), the UI is ANSI escapes (`src/term.c`).
+- **No new dependencies.** C11, libc, POSIX, cJSON and libcurl. No ncurses, no readline.
+  HTTP is libcurl behind `src/http.c`, the UI is ANSI escapes (`src/term.c`).
 - **Read [AGENTS.md](AGENTS.md) first.** It is the working guide for this codebase: what each
   file owns, and the conventions that are easy to break (width-aware drawing, never reading
   stdin outside `src/term.c`, everything that waits must poll `term_poll_interrupt()`,

@@ -119,6 +119,9 @@ static void bar_build(sbuf *o, int cols) {
         default:                icon = "⏵ "; col = C_DIM;    text = "manual mode";     break;
     }
     const char *model = g_cfg.model ? g_cfg.model : "(no model)";
+    char mbuf[384];   /* an effort that was set goes with the model's name: it is a large part of how fast it answers */
+    const char *eff = g_cfg.model ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
+    if (eff) { snprintf(mbuf, sizeof mbuf, "%s · %s", model, eff); model = mbuf; }
     char tin[32], tout[32], ttot[32];
     long out_now = g_session.eval_tokens + g_live_out;
     fmt_tokens(g_session.prompt_tokens, tin, sizeof tin);
@@ -1759,9 +1762,16 @@ int term_select(const char *title, const char **items, const char **descs, int n
         if (drawn) sb_printf(&o, "\x1b[%dA", drawn);
         sb_puts(&o, "\r\x1b[J");
         int lines = 0;
-        sb_printf(&o, C_BOLD "%s" C_RESET "  " C_DIM "type to filter · ↑/↓ move · enter select · esc cancel" C_RESET "\n", title); lines++;
-        sb_printf(&o, "  " C_DIM "filter:" C_RESET " %s" C_DIM "▏" C_RESET "\n", filter); lines++;
         int w = term_width();
+        /* one row, whatever the width: a title that wraps is still counted as one, and the redraw
+         * then climbs a row too few — a stale row per key, and the transcript drawn over afterwards */
+        static const char HINT[] = "type to filter · ↑/↓ move · enter select · esc cancel";
+        int tw = vis_width(title);
+        if (tw > w - 1) sb_printf(&o, C_BOLD "%.*s…" C_RESET "\n", (int)vis_offset(title, strlen(title), w > 2 ? w - 2 : 0), title);
+        else if (tw + 2 + vis_width(HINT) > w - 1) sb_printf(&o, C_BOLD "%s" C_RESET "\n", title);
+        else sb_printf(&o, C_BOLD "%s" C_RESET "  " C_DIM "%s" C_RESET "\n", title, HINT);
+        lines++;
+        sb_printf(&o, "  " C_DIM "filter:" C_RESET " %s" C_DIM "▏" C_RESET "\n", filter); lines++;
         for (int i = top; i < nvis && i < top + max_show; i++) {
             int idx = vis[i];
             bool is_sel = (i == selpos);
