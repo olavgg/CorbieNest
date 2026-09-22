@@ -77,22 +77,43 @@ void  sb_put_cut(sbuf *b, const char *s, size_t cap);   /* s, without its middle
 #define ADVISOR_CTX_AUTO     16384        /* its window unless /advisor ctx says otherwise (and never more than the main one) */
 #define ADVISOR_CTX_CLOUD    32768        /* what is planned for with a cloud model, which has its own (large) window */
 #define ADVISOR_CTX_UNSET    4096         /* what to plan for when num_ctx is left to the server */
+#define ADVISOR_CTX_API      131072       /* ... and with a hosted API's model whose window it did not say */
 #define ADVISOR_CTX_MIN      4096
 #define ADVISOR_REPLY_MAX    8192         /* tokens it may generate, thinking included */
-#define ADVISOR_BRIEF_MAX    (48 * 1024)  /* bytes of prompt, whatever the window: reading it is what the user waits for */
-#define ADVISOR_BRIEF_MIN    4096         /* and never planned below this, however small the window */
+#define ADVISOR_REPLY_API    16000        /* the same for a hosted API: paid by the token used, not by the cap, and a cut-off answer is the waste */
+#define ADVISOR_BRIEF_MIN    4096         /* bytes of prompt it is never planned below, however small the window */
 #define ADVISOR_RULES_MAX    6000
 #define ADVISOR_QUESTION_MAX 4000
+/* How much the agent leans on the advisor (/advisor guidance). A weak model is a poor judge of
+ * when it needs help, so the upper levels have corbienest ask as well: a review before a request
+ * that changed files ends, and (max) a check of the request's first change before it is made. */
+enum { GUIDANCE_LIGHT, GUIDANCE_NORMAL, GUIDANCE_STRONG, GUIDANCE_MAX, GUIDANCE_COUNT };
 typedef struct {
-    bool same, cloud;          /* it is the main model / one of Ollama's cloud models; neither = another local model */
+    const char *name;
+    int    uses;               /* consultations the agent may ask for in one request */
+    int    words;              /* how long the advice may be */
+    size_t brief_max;          /* bytes it is shown at most, whatever the window: reading it is what the user waits for */
+    bool   review;             /* it reviews a request that changed files before the request ends */
+    bool   check_first_edit;   /* it checks the first change of a request before the change is made */
+    const char *desc;          /* for the picker */
+} advisor_guidance_def;
+extern const advisor_guidance_def ADVISOR_GUIDANCE[GUIDANCE_COUNT];
+const advisor_guidance_def *advisor_guidance(void);   /* the one g_cfg.advisor_guidance says */
+int   advisor_guidance_parse(const char *s);          /* -1 = no such level */
+typedef struct {
+    bool same, cloud;          /* it is the main model / not on this machine (an Ollama cloud model or a hosted API); neither = another local model */
+    bool api;                  /* a hosted API (provider.c): cloud as well */
     int  window;               /* the context window to plan for */
     int  send_ctx;             /* for ollama_call.num_ctx: >0 that size, 0 as the main model's, <0 leave the key out */
     const char *keep_alive;    /* for ollama_call.keep_alive: NULL = the main model's, "" = leave the key out */
-    int  reply;                /* num_predict */
+    int  reply;                /* num_predict / max_tokens */
     size_t budget;             /* bytes the whole prompt may take */
 } advisor_plan;
-void  advisor_plan_for(const char *advisor, int trained_ctx, advisor_plan *p);   /* reads g_cfg.model, .num_ctx, .advisor_ctx */
-char *advisor_brief(cJSON *msgs, int keep, size_t budget, const char *env, bool plan_mode, const char *rules, const char *question);   /* malloc'd */
+void  advisor_plan_for(const char *advisor, int trained_ctx, advisor_plan *p);   /* reads g_cfg.model, .num_ctx, .advisor_ctx, .advisor_guidance */
+/* The one user message of a consultation; `words` is how long the answer may be. malloc'd. */
+char *advisor_brief(cJSON *msgs, int keep, size_t budget, const char *env, bool plan_mode, const char *rules, const char *question, int words);
+#define ADVISOR_REVIEW_OK "LGTM"   /* what the advisor answers a review or a check with when nothing needs to change */
+bool  advisor_approves(const char *advice);   /* the answer is ADVISOR_REVIEW_OK and not much more */
 const char *strip_think_block(const char *s);   /* past a leading <think>…</think> */
 bool  model_same(const char *a, const char *b);   /* equal, a trailing ":latest" aside */
 bool  model_is_cloud(const char *name);           /* NAME:cloud / NAME-cloud */
@@ -112,6 +133,7 @@ typedef struct {
     int   n_efforts;
     char *advisor;       /* the stronger model the agent may consult through the advisor tool (/advisor); NULL = none */
     int   advisor_ctx;   /* num_ctx of an advisor call; 0 = auto (see advisor_plan_for()) */
+    int   advisor_guidance; /* how much the agent leans on it, GUIDANCE_* (/advisor guidance) */
     bool  show_thinking; /* print thinking tokens */
     int   mode;          /* permission mode, see MODE_* */
     bool  no_tools;      /* don't send tools at all */
@@ -176,12 +198,15 @@ extern int http_idle_timeout_ms; /* a request fails when the server sends nothin
 extern int (*http_interrupt_check)(void);   /* called when that fd is readable; nonzero = abort */
 extern http_idle_cb http_idle;
 extern void *http_idle_ud;
+extern const char *const *http_headers;   /* extra request headers ("Name: value"), NULL-terminated; set around one call */
 
-/* Performs request. If line_cb != NULL body is delivered line by line to it,
- * otherwise appended to `out` (may be NULL to discard). Returns 0 ok, <0 error. */
+/* Performs request (libcurl: http:// and https://). If line_cb != NULL body is delivered line by
+ * line to it, otherwise appended to `out` (may be NULL to discard). Returns 0 ok, <0 error; an
+ * interrupt or a callback abort returns 0 with res->aborted set. */
 int http_request(const char *base_url, const char *method, const char *path,
                  const char *body, sbuf *out, http_line_cb line_cb, void *ud,
                  http_result *res);
+char *http_url(const char *base, const char *path);   /* base + path; "host" and "http://host" get Ollama's port 11434 (malloc'd) */
 
 /* ---------- term.h ---------- */
 void term_init(void);
@@ -308,9 +333,7 @@ extern tools_subagent_fn tools_subagent;
  * what the advisor is shown is the conversation. Writes the advice (or why there is none) into
  * out; returns 0 ok, nonzero error. Offered to the model only while g_cfg.advisor is set. */
 typedef int (*tools_advisor_fn)(const char *question, sbuf *out);
-extern tools_advisor_fn tools_advisor;
-#define ADVISOR_MAX 3            /* consultations one request may make: each is slow, and may cost the main model its place in memory */
-#define ADVISOR_MAX_STR "3"
+extern tools_advisor_fn tools_advisor;   /* how many one request may make: advisor_guidance()->uses */
 extern bool tools_no_confirm;   /* while true, tools run without asking (user-typed "!cmd") */
 const char *tools_summary_line(void);   /* short list for help */
 
@@ -363,6 +386,7 @@ typedef struct {
     char think_default[EFFORT_NAME_MAX];   /* what it does when "think" is left out: "off", "on", a level; "" unknown */
     bool think_declared;   /* the list came from the server rather than from model_think_profile() */
     bool think_off_top;    /* its "off" is written into the top of the prompt like a level (glimmer: "Reasoning strength: none."), so it may not flip mid-prompt either */
+    bool think_adaptive, think_budget;   /* a hosted Anthropic model: takes thinking {type: adaptive} / {type: enabled, budget_tokens} (provider.c) */
 } model_info;
 void   model_info_parse(const char *json, model_info *mi);      /* the /api/show body (exposed for tests) */
 void   model_think_profile(model_info *mi);   /* fill think_* from family/renderer unless the server declared them; call again after changing `thinking` */
@@ -415,6 +439,7 @@ void ollama_call_reset(void);
 cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted);
 extern bool ollama_quiet;   /* when set, ollama_chat() does not print the streamed reply (background calls) */
 extern bool ollama_stopped_for_message;   /* the last call was given up for a queued message, not by Esc/Ctrl-C */
+int ollama_poll_or_message(void);         /* http_interrupt_check for such a call: Esc/Ctrl-C, or a newly queued message */
 /* Error text of the most recent ollama_chat() ("" when it succeeded or was interrupted), so the
  * caller can react to a specific server error instead of only seeing a NULL reply. */
 extern char ollama_error[512];
@@ -431,5 +456,37 @@ int    ollama_model_draft(const char *model);
 int    ollama_model_placement(const char *model, double *size, double *size_vram);
 /* Recover tool calls that a model emitted as text (exposed for tests). */
 cJSON *parse_text_tool_calls(const char *content);
+
+/* ---------- provider.c: hosted model APIs, for the advisor ----------
+ * Besides a model on the Ollama server the advisor can be a hosted one, named PROVIDER:MODEL:
+ * "xai:grok-4.7", "openai:gpt-5.2", "anthropic:claude-opus-5" (grok: and claude: work too). The
+ * key comes from the environment and is never saved. */
+typedef enum { PROVIDER_CHAT_COMPLETIONS, PROVIDER_MESSAGES } provider_style;
+typedef struct {
+    const char *name, *alias, *label;      /* "xai", "grok", "xAI" */
+    const char *key_env, *url_env, *url;   /* XAI_API_KEY, XAI_BASE_URL, the base URL otherwise */
+    provider_style style;                  /* Chat Completions (xAI, OpenAI) or Anthropic's Messages API */
+} provider_def;
+const provider_def *provider_find(const char *advisor, const char **model);   /* NULL = a model on the Ollama server */
+const char *provider_base_url(const provider_def *p);
+typedef struct {
+    const char *system, *user;   /* the two messages of a consultation */
+    int         max_tokens;      /* the answer and its thinking together */
+    const char *effort;          /* the saved level (effort_get), resolved against the model_info */
+    const char *busy;            /* status-bar label */
+    int         idle_ms;         /* >0 = how long the server may stay silent */
+} provider_request;
+/* What the model can be set to (effort levels, window), from the API's model endpoint. 0 known,
+ * 1 not checked (unreachable; *mi holds what the provider's models take between them), -1 not
+ * usable (no key, key refused, no such model). err says why for 1 and -1. */
+int   provider_model_info(const char *advisor, model_info *mi, char *err, size_t n);
+/* One consultation. The answer (malloc'd, "" when there is none) or NULL: *aborted when the user
+ * stopped it (ollama_stopped_for_message: by queuing a message), otherwise err says why. */
+char *provider_chat(const char *advisor, const model_info *mi, const provider_request *rq, chat_stats *st, bool *aborted, char *err, size_t n);
+/* the pieces of it, exposed for tests */
+char *provider_request_body(const char *advisor, const model_info *mi, const provider_request *rq);
+char *provider_parse_reply(const char *advisor, const char *json, int status, chat_stats *st, char *err, size_t n);
+void  provider_parse_model(const char *advisor, const char *json, model_info *mi);
+bool  provider_fallbacks(const char *advisor);   /* an Anthropic model with server-side refusal fallbacks (Opus 5, Fable 5.x) */
 
 #endif

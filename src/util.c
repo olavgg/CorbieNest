@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "common.h"
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -182,6 +183,7 @@ void config_load(void) {
         else if (!strncmp(k, "effort.", 7)) { if (k[7] && effort_name_ok(v)) effort_set(k + 7, v); }
         else if (!strcmp(k, "advisor")) { free(g_cfg.advisor); g_cfg.advisor = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "advisor_ctx")) { int n = atoi(v); if (n == 0 || n >= ADVISOR_CTX_MIN) g_cfg.advisor_ctx = n; }
+        else if (!strcmp(k, "advisor_guidance")) { int n = advisor_guidance_parse(v); if (n >= 0) g_cfg.advisor_guidance = n; }
         else if (!strcmp(k, "show_thinking")) g_cfg.show_thinking = atoi(v) != 0;
         else if (!strcmp(k, "yolo")) { if (atoi(v)) g_cfg.mode = MODE_AUTO; }
         else if (!strcmp(k, "mode")) { int m = mode_parse(v); if (m >= 0) g_cfg.mode = m; }
@@ -216,6 +218,7 @@ void config_save(void) {
     for (int i = 0; i < g_cfg.n_efforts; i++) sb_printf(&b, "effort.%s=%s\n", g_cfg.efforts[i].model, g_cfg.efforts[i].level);
     if (g_cfg.advisor) sb_printf(&b, "advisor=%s\n", g_cfg.advisor);
     if (g_cfg.advisor_ctx > 0) sb_printf(&b, "advisor_ctx=%d\n", g_cfg.advisor_ctx);
+    if (g_cfg.advisor_guidance != GUIDANCE_NORMAL) sb_printf(&b, "advisor_guidance=%s\n", advisor_guidance()->name);
     sb_printf(&b, "show_thinking=%d\n", g_cfg.show_thinking ? 1 : 0);
     sb_printf(&b, "mode=%s\n", mode_name(g_cfg.mode));
     sb_printf(&b, "max_iters=%d\n", g_cfg.max_iters);
@@ -806,19 +809,67 @@ char *transcript_text(cJSON *msgs, int keep, size_t budget) {
     return sb_detach(&o);
 }
 
+/* ---------- the advisor: how much it is leaned on ----------
+ * normal is what the advisor always was: the agent asks when it judges the work hard. A small
+ * model is a poor judge of that — it is sure of the wrong approach, and calls a task done that is
+ * not — so strong has corbienest ask as well, before a request that changed files ends, and max
+ * also before the request's first change is made. The advice gets longer and more concrete the
+ * higher it goes: the reader is a model that follows steps better than it follows advice. */
+const advisor_guidance_def ADVISOR_GUIDANCE[GUIDANCE_COUNT] = {
+    { "light",  1, 250, 32 * 1024, false, false, "only when the agent is stuck · 1 consultation per request · short answers" },
+    { "normal", 3, 400, 48 * 1024, false, false, "when the work is hard · 3 per request" },
+    { "strong", 6, 700, 96 * 1024, true,  false, "early and often · 6 per request · concrete steps · reviews the work before a request that changed files ends" },
+    { "max",   10, 900, 96 * 1024, true,  true,  "as strong, 10 per request · and checks the first change of a request before it is made" },
+};
+const advisor_guidance_def *advisor_guidance(void) {
+    int g = g_cfg.advisor_guidance;
+    return &ADVISOR_GUIDANCE[g >= 0 && g < GUIDANCE_COUNT ? g : GUIDANCE_NORMAL];
+}
+int advisor_guidance_parse(const char *s) {
+    for (int i = 0; s && i < GUIDANCE_COUNT; i++) if (!strcasecmp(s, ADVISOR_GUIDANCE[i].name)) return i;
+    return -1;
+}
+
+/* "LGTM", "LGTM.", "LGTM — the change is correct and complete": nothing to act on. "LGTM, but
+ * the test for X is missing" is advice all the same, and goes to the agent. Taking an approval
+ * for advice costs a round of the main model, which on a small machine is minutes; taking advice
+ * for an approval loses what the advisor found — so a short sentence after it is still an
+ * approval, one that objects to anything is not. */
+bool advisor_approves(const char *advice) {
+    while (advice && (*advice == ' ' || *advice == '\n' || *advice == '*')) advice++;
+    if (!advice || strncasecmp(advice, ADVISOR_REVIEW_OK, strlen(ADVISOR_REVIEW_OK))) return false;
+    /* words that object, or make it conditional — not ones an approval uses as readily
+     * ("the fix is right", "the tests still pass", "nothing to add") */
+    static const char *OBJECTIONS[] = { "but", "however", "except", "though", "although", "once", "unless", "until", "missing", "should",
+                                        "must", "need", "needs", "wrong", "not", "bug", "fails", "failing", "instead", NULL };
+    int words = 0;
+    for (const char *c = advice + strlen(ADVISOR_REVIEW_OK); *c; ) {
+        while (*c && !isalnum((unsigned char)*c)) c++;
+        const char *w = c;
+        while (*c && (isalnum((unsigned char)*c) || *c == '\'')) c++;
+        if (c == w) break;
+        if (++words > 15) return false;
+        for (int i = 0; OBJECTIONS[i]; i++)
+            if ((size_t)(c - w) == strlen(OBJECTIONS[i]) && !strncasecmp(w, OBJECTIONS[i], (size_t)(c - w))) return false;
+    }
+    return true;
+}
+
 /* ---------- the advisor: where it runs, and what it is shown ----------
  * Three placements, and they want opposite things. The main model as its own advisor must be
  * called exactly as the main model is: another num_ctx makes the server reload it, and
- * keep_alive 0 would unload it — either way the conversation's cache is gone. A cloud model
- * runs at ollama.com with its own window and no memory of ours to give back, so neither key
- * means anything. Another local model gets a window of its own (a 70B model pays several times
- * the memory per token of context that a small one does) and keep_alive 0, so that its memory is
- * free again when the main model wants it back. */
+ * keep_alive 0 would unload it — either way the conversation's cache is gone. A model that is
+ * not on this machine (one of Ollama's cloud models, or a hosted API) has its own window and no
+ * memory of ours to give back, so neither key means anything. Another local model gets a window
+ * of its own (a 70B model pays several times the memory per token of context that a small one
+ * does) and keep_alive 0, so that its memory is free again when the main model wants it back. */
 void advisor_plan_for(const char *advisor, int trained_ctx, advisor_plan *p) {
     memset(p, 0, sizeof *p);
     p->same = model_same(advisor, g_cfg.model);
-    p->cloud = !p->same && model_is_cloud(advisor);
+    p->api = !p->same && provider_find(advisor, NULL) != NULL;
+    p->cloud = !p->same && (p->api || model_is_cloud(advisor));
     if (p->same) { p->window = g_cfg.num_ctx > 0 ? g_cfg.num_ctx : ADVISOR_CTX_UNSET; }
+    else if (p->api) { p->window = trained_ctx > 0 ? trained_ctx : ADVISOR_CTX_API; p->send_ctx = -1; p->keep_alive = ""; }
     else if (p->cloud) {
         p->window = trained_ctx > 0 && trained_ctx < ADVISOR_CTX_CLOUD ? trained_ctx : ADVISOR_CTX_CLOUD;
         p->send_ctx = -1; p->keep_alive = "";
@@ -828,19 +879,20 @@ void advisor_plan_for(const char *advisor, int trained_ctx, advisor_plan *p) {
         p->window = n > 0 ? n : ADVISOR_CTX_UNSET;   /* left to the server: plan for the little it gives */
         p->send_ctx = n; p->keep_alive = "0";
     }
-    p->reply = p->window / 3 < ADVISOR_REPLY_MAX ? p->window / 3 : ADVISOR_REPLY_MAX;
+    int cap = p->api ? ADVISOR_REPLY_API : ADVISOR_REPLY_MAX;
+    p->reply = p->window / 3 < cap ? p->window / 3 : cap;
     /* bytes for the whole prompt at a careful 3 bytes a token (it is another tokenizer than the
-     * one the context estimate is calibrated on), and no more than ADVISOR_BRIEF_MAX however
-     * large the window: what the advisor has to read first is the wait */
+     * one the context estimate is calibrated on), and no more than the guidance's brief_max
+     * however large the window: what the advisor has to read first is the wait */
     int tokens = p->window - p->reply - 256;
-    size_t room = tokens > 0 ? (size_t)tokens * 3 : 0;
+    size_t room = tokens > 0 ? (size_t)tokens * 3 : 0, most = advisor_guidance()->brief_max;
     if (room < ADVISOR_BRIEF_MIN) room = ADVISOR_BRIEF_MIN;   /* a window too small to plan for (-c 512): a floor, and the server cuts what it must */
-    p->budget = room < ADVISOR_BRIEF_MAX ? room : ADVISOR_BRIEF_MAX;
+    p->budget = room < most ? room : most;
 }
 
 /* The one user message of an advisor call. What matters most stands last — the question, and
  * who the reader is: a server that has to cut an over-long prompt keeps the end of it. */
-char *advisor_brief(cJSON *msgs, int keep, size_t budget, const char *env, bool plan_mode, const char *rules, const char *question) {
+char *advisor_brief(cJSON *msgs, int keep, size_t budget, const char *env, bool plan_mode, const char *rules, const char *question, int words) {
     sbuf b; sb_init(&b);
     sb_printf(&b, "# Environment\n%s\n", env ? env : "");
     if (plan_mode) sb_puts(&b, "The agent is in plan mode: it may only read, and has to present a plan instead of changing files.\n");
@@ -862,8 +914,8 @@ char *advisor_brief(cJSON *msgs, int keep, size_t budget, const char *env, bool 
     sb_puts(&b, "# What the agent asks you\n");
     if (qcap) sb_printf(&b, "%.*s%s\n", (int)qcap, question, qcap < qlen ? "…" : "");
     else sb_puts(&b, "(It did not say. Review where it stands and tell it what to do next.)\n");
-    sb_puts(&b, "\nAnswer the agent now — verdict first, then the steps, under about 400 words. "
-                "You are the advisor, not the agent: do not continue the conversation above and do not call tools.\n");
+    sb_printf(&b, "\nAnswer the agent now — verdict first, then the steps, under about %d words. "
+                  "You are the advisor, not the agent: do not continue the conversation above and do not call tools.\n", words > 0 ? words : 400);
     return sb_detach(&b);
 }
 

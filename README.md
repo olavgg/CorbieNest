@@ -22,23 +22,25 @@ exit your shell is back exactly as it was (use `/save` to keep a transcript).
 
 ## Build
 
-Dependencies: a C11 compiler, `make`, and [cJSON](https://github.com/DaveGamble/cJSON) —
-that's all. No libcurl, no ncurses: HTTP is done over plain POSIX sockets and the UI uses
-ANSI escapes. (`python3` is only needed to run the test suite.)
+Dependencies: a C11 compiler, `make`, [cJSON](https://github.com/DaveGamble/cJSON) and
+[libcurl](https://curl.se/libcurl/) (7.66 or newer) — that's all. No ncurses: the UI uses ANSI
+escapes. libcurl is what speaks HTTPS, for an Ollama behind TLS and for the hosted APIs the
+[advisor](#the-advisor) can consult. (`python3` is only needed to run the test suite, and
+`openssl` for its HTTPS tests.)
 
 ```sh
 # Debian 13 (trixie) / Ubuntu 26.04 (resolute)
-sudo apt install build-essential libcjson-dev
+sudo apt install build-essential libcjson-dev libcurl4-openssl-dev
 
 # Fedora 44
-sudo dnf install gcc make cjson-devel
+sudo dnf install gcc make cjson-devel libcurl-devel
 
 # RHEL 10 / AlmaLinux 10 / Rocky Linux 10 — cjson comes from EPEL
 sudo dnf install epel-release          # on RHEL: dnf install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
-sudo dnf install gcc make cjson-devel
+sudo dnf install gcc make cjson-devel libcurl-devel
 
 # macOS
-brew install cjson
+brew install cjson                     # libcurl comes with macOS
 ```
 
 Then:
@@ -51,7 +53,7 @@ sudo make install          # optional: installs to /usr/local/bin
 ```
 
 On macOS Homebrew installs outside the default search paths, so point the build at it:
-`make CFLAGS="-O2 -std=gnu11 -I$(brew --prefix)/include" LDLIBS="-L$(brew --prefix)/lib -lcjson"`.
+`make CFLAGS="-O2 -std=gnu11 -I$(brew --prefix)/include" LDLIBS="-L$(brew --prefix)/lib -lcjson -lcurl"`.
 
 You need [Ollama](https://ollama.com) running (`ollama serve`) with at least one model
 pulled. For the agentic features (files/shell/git) pick a model with **tool** support,
@@ -78,7 +80,9 @@ corbienest [options] [-p PROMPT]
       --no-web         don't offer web_search/web_fetch (the model cannot look documentation up)
       --think / --no-think / --show-thinking
       --effort LEVEL   how hard the model thinks: one of the levels it has (off, on, low, medium, high, … — see /effort); default = the model's own
-      --advisor MODEL  a stronger model the agent may consult through the advisor tool (see /advisor); off = none
+      --advisor MODEL  a stronger model the agent may consult through the advisor tool (see /advisor); off = none;
+                       xai:MODEL, openai:MODEL, anthropic:MODEL for a hosted one (key from XAI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY)
+      --advisor-guidance LEVEL   how much the agent leans on it: light, normal (default), strong, max (see /advisor guidance)
       --draft N        draft_num_predict: speculative-decoding / MTP draft tokens per step (0 = off; default: the model's own,
                        e.g. models that ship an MTP head set 4); changing it makes Ollama reload the model
       --benchmark [N]  measure tokens per second at every context size the model supports (or just the -c size):
@@ -121,7 +125,7 @@ larger ones skipped.)
 | `/system [text\|clear]` | extra system instructions |
 | `/think on\|off\|auto`, `/think show\|hide` | *when* a thinking-capable model thinks: `auto` (default) lets it think about each request once and turns thinking off for the tool rounds that follow, `on` thinks on every call, `off` never. *How hard* is `/effort` (`/think low\|medium\|high\|max` still works, as an alias for it) |
 | `/effort [LEVEL\|default]` | how hard **this model** thinks, in the levels it has — see [Effort](#effort). No argument opens a picker of them; `default` leaves it to the model. Kept per model, shown next to the model's name in the status bar |
-| `/advisor [MODEL\|off]`, `/advisor effort [LEVEL]`, `/advisor ctx N\|auto` | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud model is set by name: `/advisor gpt-oss:120b-cloud`) |
+| `/advisor [MODEL\|off]`, `/advisor guidance [LEVEL]`, `/advisor effort [LEVEL]`, `/advisor ctx N\|auto` | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud or hosted model is set by name: `/advisor gpt-oss:120b-cloud`, `/advisor anthropic:claude-opus-5`). `guidance` says how much the agent leans on it (`light`, `normal`, `strong`, `max`), `effort` how hard it thinks |
 | `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (`.corbienest/permissions`) |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
@@ -202,7 +206,7 @@ Cycle with **Shift+Tab** at the prompt, or set one with `/mode NAME`, `--mode NA
 | `web_search(query, max_results?)` | yes — shows the query and the engine; "always allow" saves the engine's **host** |
 | `web_fetch(url, offset?, timeout?)` | yes — shows the URL; "always allow" saves the **host** |
 | `task(description, prompt)` | none for the call itself — runs a **sub-agent**: a fresh, read-only agent loop (read_file, list_dir, grep, bash, web_search, web_fetch — with the usual confirmations) that investigates and returns a report as the tool result, keeping the noise out of the main context. Its tool calls are echoed as `⎿ grep(…)` lines and the report is previewed. Sub-agents cannot edit files or start further sub-agents |
-| `advisor(question?)` | none — only on offer after `/advisor MODEL`. Puts the agent's question, and the conversation so far, to a **stronger model** and returns its advice as the tool result; see [The advisor](#the-advisor) |
+| `advisor(question?)` | none — only on offer after `/advisor MODEL`. Puts the agent's question, and the conversation so far, to a **stronger model** (local, Ollama cloud, or a hosted API) and returns its advice as the tool result; see [The advisor](#the-advisor) |
 
 Each confirmation is a small menu:
 
@@ -246,8 +250,8 @@ one line: the two tools' own descriptions carry the rest, and a system prompt is
 every single call. Naming the doc sites you care about in `CORBIENEST.md` makes it concrete —
 see [Project instructions](#project-instructions).
 
-Pages come in through `curl` (or `wget`): corbienest's own HTTP client is plain sockets and
-does not speak TLS, and a TLS library would be a dependency this project does not want. Every
+Pages come in through the `curl` (or `wget`) program, which already brings redirects, size caps
+and a fallback for machines without it. Every
 search and fetch is confirmed like a shell command — a search shows the query, which is what
 leaves your machine — `http(s)` only, and cloud-metadata addresses (`169.254.169.254`,
 `metadata.google.internal`) are refused outright. Approving a host once (`p`) covers the rest of
@@ -414,11 +418,12 @@ since then (deepseek-r1, for one) shows up there as chat-only.
 ### The advisor
 
 `/advisor MODEL` names a stronger model that the agent may **consult** while it works — a bigger
-local model, or one of Ollama's cloud models (`/advisor gpt-oss:120b-cloud`; run `ollama signin`
-once, the local server relays the call). The agent gets an `advisor` tool and is told when to
-use it: before it commits to an approach for a non-trivial change, when an error has survived
-two fixes or a result makes no sense, and before it calls a difficult task done. You can also
-just say so: *"ask the advisor before you continue"*.
+local model, one of Ollama's cloud models (`/advisor gpt-oss:120b-cloud`; run `ollama signin`
+once, the local server relays the call), or a hosted API: xAI's Grok, OpenAI, or Anthropic's
+Claude (see [Hosted advisors](#hosted-advisors)). The agent gets an `advisor` tool and is told
+when to use it: before it commits to an approach for a non-trivial change, when an error has
+survived two fixes or a result makes no sense, and before it calls a difficult task done. You
+can also just say so: *"ask the advisor before you continue"*.
 
 ```
 ● advisor(parse() crashes on the input "1, 2,,3" - what is the smallest corr…)
@@ -438,10 +443,11 @@ just say so: *"ask the advisor before you continue"*.
   conversation again (corbienest says so when it happens). So a consultation runs in a window
   of its own (`/advisor ctx`, default the main window but at most 16k: a 70B model pays several
   times the memory per token that a small one does), the advisor is unloaded as soon as it has
-  answered, and one request may consult it at most **3 times** — after that the tool answers with
-  an error instead. A cloud advisor touches neither your memory nor the main model's prompt
-  cache, which makes it the cheap choice on a small machine; it does mean the conversation is
-  sent to ollama.com with each consultation.
+  answered, and one request may consult it a limited number of times (**3** at the default
+  guidance) — after that the tool answers with an error instead. A cloud or hosted advisor
+  touches neither your memory nor the main model's prompt cache, which makes it the cheap choice
+  on a small machine; it does mean the conversation is sent off the machine with each
+  consultation.
 - `/advisor effort LEVEL` sets how hard *it* thinks (the same levels as `/effort`, kept with its
   model; `/think` does not apply to it). Lower it if consultations run out of tokens while
   thinking. `/advisor MODEL` with the model already doing the work is allowed — a second opinion
@@ -451,10 +457,71 @@ just say so: *"ask the advisor before you continue"*.
   nothing; sub-agents do not get it. Its tokens are part of the session totals, and `/cost`
   shows them on a line of their own.
 
+#### Guidance: how much the agent leans on it
+
+A small model is a poor judge of when it needs help: it is sure of the wrong approach, and calls
+a task done that is not. `/advisor guidance` (or `--advisor-guidance`) sets how much it leans on
+the advisor — more tokens spent on advice, fewer spent on the agent going the wrong way:
+
+| level | consultations per request | the agent is told to ask | advice | corbienest also asks |
+|---|---|---|---|---|
+| `light` | 1 | only when it is stuck | ≤ ~250 words | — |
+| `normal` (default) | 3 | when the work is hard (above) | ≤ ~400 words | — |
+| `strong` | 6 | after reading the code and before committing to an approach, before each non-trivial change, when a build or test fails in a way it does not understand | ≤ ~700 words, concrete: file, function, the lines to change | a **review** before a request that changed files ends |
+| `max` | 10 | as `strong` | ≤ ~900 words, as concrete | the review, and a **check** of the request's first change before it is made |
+
+The review and the check do not count against the agent's consultations, and each happens at
+most once per request. They enter the conversation the way a consultation does — as an
+`advisor` call and its result — so the agent reads them as advice, not as something you said:
+
+```
+● write_file(src/parse.py)
+  ⤷ advisor anthropic:claude-opus-5 · checks the first change before it is made · 6 KB of the conversation · esc skips it
+    ⎿ advice · 2.4k tokens · 9s:
+  ⎿  Not yet: the fix belongs in split_fields(), not in parse() — …
+  ⎿  held back — the advisor sees a problem with it
+```
+
+When the advisor finds nothing to change it answers `LGTM`, and the change is made or the
+request ends there (`⎿ nothing to change`). Otherwise the agent gets its answer and one more
+round to act on it; where the files or a command's output show the advisor is wrong, the agent
+is told to say so. Higher levels also show the advisor more of the conversation (up to 96 KB
+instead of 48). Changing the level changes the agent's instructions, so its next reply reads the
+conversation again.
+
+#### Hosted advisors
+
+`/advisor PROVIDER:MODEL` consults a hosted API directly — no Ollama in between:
+
+| provider | name it | key | base URL (override) | API |
+|---|---|---|---|---|
+| xAI (Grok) | `xai:grok-4.7` (or `grok:…`) | `XAI_API_KEY` | `https://api.x.ai/v1` (`XAI_BASE_URL`) | Chat Completions |
+| OpenAI | `openai:gpt-5.2` | `OPENAI_API_KEY` | `https://api.openai.com/v1` (`OPENAI_BASE_URL`) | Chat Completions |
+| Anthropic (Claude) | `anthropic:claude-opus-5` (or `claude:…`) | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` (`ANTHROPIC_BASE_URL`) | Messages |
+
+- **Keys come from the environment only** — export one before starting corbienest. They are
+  never written to the config, a session or the history. An API key from the provider's
+  console is what is needed; a chat subscription (grok.com, ChatGPT, claude.ai) is not one.
+- `/advisor NAME` asks the provider's model endpoint first, so a wrong key or an unknown model
+  is refused there and then. Consultations are billed to that key — `/cost` shows what they
+  took.
+- **Effort.** For Anthropic models the levels come from the API itself (`low` … `max`, or a
+  thinking budget `on`/`off` for models that have no levels), and thinking is always adaptive.
+  xAI and OpenAI do not say per model, so `/advisor effort` offers what their models take between
+  them (OpenAI: `minimal` … `max`; xAI: `low` … `xhigh`; `off` goes out as `none`); a level the
+  model lacks is refused by the server, which says so — `/advisor effort default` leaves it to the
+  model.
+- An Anthropic model with server-side refusal fallbacks (Opus 5, Fable 5.x) is asked with
+  `fallbacks: "default"`: a consultation its safety classifiers decline — security tooling can
+  look like that — is answered by the fallback model instead of not at all. A refusal that
+  stands is reported as one, and the turn carries on.
+- The base URLs can point at a proxy or a compatible server. `https_proxy`/`no_proxy` are
+  honoured (never for this machine), and `CURL_CA_BUNDLE` or `SSL_CERT_FILE` names a private CA.
+
 ### Config
 
-Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/advisor`, `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N` are saved to
-`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=` and `advisor_ctx=`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`.
+Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N` are saved to
+`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, and for a hosted advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
 
 ### Running more than one session
 
@@ -491,13 +558,15 @@ make test
 ```
 
 - `tests/test_unit.c` — C unit tests: string buffer, file helpers, the HTTP client
-  (chunked/content-length/abort against a forked local server), the streaming
+  (chunked/content-length/abort/extra headers against a forked local server, and what a host
+  setting becomes as a URL), the streaming
   markdown printer, text tool-call recovery, every tool (read/write/edit/list/grep/bash
   including timeouts and non-interactive denial), URL checks and the HTML-to-text and
   search-result extraction behind `web_fetch`/`web_search`, permission modes, skills
   (frontmatter parsing, `$ARGUMENTS`, scaffolding), what each kind of model can be set to and
-  what is sent as `think` for every combination of `/think`, `/effort` and kind of call, and
-  where an advisor consultation runs and what it is shown.
+  what is sent as `think` for every combination of `/think`, `/effort` and kind of call,
+  where an advisor consultation runs and what it is shown at each guidance level, and what goes
+  to and comes back from the hosted APIs (request bodies, answers, refusals, errors).
 - `tests/test_integration.py` — runs the real binary against `tests/fake_ollama.py`,
   a tiny scripted Ollama stand-in (no model needed): one-shot mode, the full tool loop
   with results fed back, `--yolo`, XML tool-call recovery, `@file`, errors, and — through a
@@ -508,19 +577,24 @@ make test
   Ctrl-C), the `/ctx` picker and `/history`,
   Shift+Tab mode cycling (plan / accept-edits behaviour), `/skills`, Ctrl-C interruption,
   slash commands, the `/model` picker, `!cmd`, `/save`, config/history persistence, `/effort`
-  (per-model levels, the picker, the status bar) and `/advisor` (the consultation, its limit,
-  a missing or signed-out advisor, Esc and a queued message during one).
+  (per-model levels, the picker, the status bar), `/advisor` (the consultation, its limit,
+  a missing or signed-out advisor, Esc and a queued message during one; xAI, OpenAI and
+  Anthropic through the fake's stand-ins for them — keys, effort, refusals, a missing or wrong
+  key, and that the key is written nowhere), `/advisor guidance` (the review before a request
+  ends, the check of its first change) and HTTPS (an Ollama and a hosted API behind TLS, and a
+  certificate nobody vouches for refused).
 
 ## Layout
 
 ```
 src/common.h   shared declarations
 src/util.c     string buffer, file helpers, config, URL checks + HTML-to-text + search results
-src/http.c     minimal HTTP/1.1 client (chunked streaming, Ctrl-C interrupt)
+src/http.c     the HTTP(S) client over libcurl (streaming, Esc interrupt, idle timeout)
 src/term.c     raw mode, key decoding, full-screen mode + status bar, line editor, confirmation menu,
                list picker, markdown printer
 src/tools.c    the tools + permission-mode checks + shell runner
 src/ollama.c   /api/chat streaming, tool-call accumulation, /api/tags, /api/show (capabilities, effort levels)
+src/provider.c the hosted APIs the advisor can consult: xAI, OpenAI (Chat Completions), Anthropic (Messages)
 src/skills.c   SKILL.md discovery/parsing, /NAME expansion, scaffolding
 src/main.c     REPL, slash commands, system prompt, agent loop, sub-agents, the advisor
 tests/         unit tests, fake Ollama server, pty integration tests
@@ -548,9 +622,9 @@ tests/         unit tests, fake Ollama server, pty integration tests
   (`read_file` 2000 lines / 64 KB, `bash`/`grep` 32 KB, `web_search`/`web_fetch` 24 KB) so a single tool round cannot fill the
   context; the model is told to page with `offset`/`limit`.
 - Models without tool support still work as a plain chat (`/models` shows which is which).
-- Only `http://` hosts are supported for the Ollama API itself: corbienest's HTTP client is
-  plain POSIX sockets with no TLS, and Ollama's local API is plain HTTP anyway. `web_search`/`web_fetch` are
-  not affected — they shell out to `curl`/`wget` and read `https://` pages fine.
+- The Ollama host may be `http://` or `https://` (an Ollama behind a TLS proxy); a host given
+  without a port is Ollama's 11434 for `http`, 443 for `https`. The certificate is checked
+  against the system's CAs, or the file `CURL_CA_BUNDLE`/`SSL_CERT_FILE` names.
 
 ## Safety
 
@@ -562,7 +636,11 @@ first, and `plan` mode is read-only (a fetch is still allowed there: reading the
 plan gets the API right) — but `--yolo` / `/mode auto` approves everything, and rules saved to
 `.corbienest/permissions` stay approved for that project. Run it on code you can restore
 (a git working tree), and remember that a local model is still a model: it can be talked into
-things by the content of the files it reads.
+things by the content of the files it reads. An advisor that is not on your machine (an Ollama
+cloud model, or `xai:`/`openai:`/`anthropic:`) is sent the conversation — file contents and
+command output the agent has seen included — with every consultation, and at guidance `strong`
+or `max` corbienest consults it without the agent asking; pick a local advisor for code that
+must not leave the machine.
 
 ## Contributing
 

@@ -1164,7 +1164,194 @@ s.send("SLOW and then\r"); s.expect("one ")
 s.send("/advisor off\r"); time.sleep(0.5); check("advisor off" not in since_send(s), "/advisor with an argument waits for the turn: it asks the server and rebuilds the tool list")
 check(s.expect("advisor off", 15), "and runs after it")
 s.send("\x04"); s.close()
+
+# ---------- the advisor on a hosted API: xAI, OpenAI, Anthropic ----------
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+KEYS = dict(XAI_API_KEY="test-key", OPENAI_API_KEY="test-key", ANTHROPIC_API_KEY="test-key",
+            XAI_BASE_URL=f"{HOST}/xai/v1", OPENAI_BASE_URL=f"{HOST}/openai/v1", ANTHROPIC_BASE_URL=f"{HOST}/anthropic")
+ENVK = dict(ENV2, **KEYS)
+def preqs(): return json.loads(urllib.request.urlopen(f"{HOST}/_provider_requests").read())
+def last_preq(prov): return [r for r in preqs() if r["provider"] == prov][-1]
+def key_nowhere():
+    """the key is never written anywhere: not the config, not a session, not the history"""
+    for root, _, files in os.walk(CFG2):
+        for f in files:
+            if "test-key" in open(os.path.join(root, f), errors="replace").read(): return os.path.join(root, f)
+    return None
+
+print("test advisor on a hosted API: xAI and OpenAI through Chat Completions")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+check(rc == 0 and "⤷ advisor xai:grok-fake" in out and "Tool said: ADVICE: read hay.txt" in out, f"consulted, and the agent carries on with the advice: {out[-400:]!r}")
+r = last_preq("xai")
+check(r["path"] == "/xai/v1/chat/completions" and [m["role"] for m in r["body"]["messages"]] == ["system", "user"], f"one request, a system and a user message: {r['path']!r}")
+check(r["body"]["messages"][0]["content"].startswith("You are the advisor") and "# What the agent asks you\nWhy does the needle test fail" in r["body"]["messages"][1]["content"], "the same brief an Ollama advisor gets")
+check(r["body"]["max_completion_tokens"] == 16000 and "max_tokens" not in r["body"] and "reasoning_effort" not in r["body"], f"the cap by the name reasoning models take; no effort unless set: {r['body'].keys()!r}")
+check("stream" not in r["body"] and "tools" not in r["body"] and "keep_alive" not in r["body"] and "options" not in r["body"], "not streamed, no tools, nothing of Ollama's")
+main_last = requests()[-1]
+check("advice from xai:grok-fake" in main_last["messages"][-1]["content"], "the advice is the tool result")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "--output-format", "json", "-p", "TOOL_ADVISOR please"], env=ENVK)
+j = json.loads(out); check(j["advisor_calls"] == 1 and j["prompt_tokens"] >= 2000, f"its tokens are counted: {j}")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\neffort.openai:gpt-fake=high\n")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+check(rc == 0 and last_preq("openai")["body"].get("reasoning_effort") == "high" and "Tool said: ADVICE" in out, "OpenAI, with the effort saved for that model")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\neffort.openai:gpt-fake=max\n")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+check(rc == 0 and "OpenAI answered 400: Unsupported value: 'max'" in out and "/advisor effort default" in out, f"an effort the model does not take: the server's words, and the way back: {out[-400:]!r}")
+check("Tool said: error: the advisor (openai:gpt-fake) could not be reached" in out, "and the turn carries on")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "-p", "TOOL_ADVISOR CUTADVICE"], env=ENVK)
+check("ran out of tokens while still thinking" in out and "Tool said: error: the advisor gave no answer" in out, f"spent on thinking: said as such: {out[-300:]!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo", "-p", "TOOL_ADVISOR REFUSEADVICE"], env=ENVK)
+check(rc == 0 and "gpt-fake declined to answer" in out, f"a refusal is an answer of its own kind: {out[-300:]!r}")
+
+print("test advisor on a hosted API: Anthropic's Messages API")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\neffort.anthropic:claude-fake-opus=xhigh\n")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-fake-opus", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+r = last_preq("anthropic")
+check(rc == 0 and "Tool said: ADVICE: read hay.txt" in out, f"consulted: {out[-300:]!r}")
+check(r["path"] == "/anthropic/v1/messages" and r["headers"].get("anthropic-version") == "2023-06-01", f"the Messages API, versioned: {r['path']!r} {r['headers']!r}")
+b = r["body"]
+check(b["system"].startswith("You are the advisor") and [m["role"] for m in b["messages"]] == ["user"] and b["max_tokens"] == 16000, "the system prompt on its own, one user message")
+check(b.get("thinking") == {"type": "adaptive"} and b.get("output_config") == {"effort": "xhigh"} and "fallbacks" not in b, f"adaptive thinking, the effort it has; no fallbacks where the model has none: {b.get('thinking')!r} {b.get('output_config')!r}")
+check("anthropic-beta" not in r["headers"], "and no beta header for them")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-opus-5", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+r = last_preq("anthropic")
+check(rc == 0 and r["body"].get("fallbacks") == "default" and r["headers"].get("anthropic-beta") == "server-side-fallback-2026-07-01", f"Opus 5: a declined request is answered by the fallback model: {r['body'].get('fallbacks')!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-fake-opus", "--yolo", "-p", "TOOL_ADVISOR REFUSEADVICE"], env=ENVK)
+check(rc == 0 and "declined to answer (refusal: cyber)" in out, f"a refusal says its category, and the turn goes on: {out[-300:]!r}")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\neffort.anthropic:claude-fake-haiku=on\n")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-fake-haiku", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+b = last_preq("anthropic")["body"]
+check(rc == 0 and b.get("thinking") == {"type": "enabled", "budget_tokens": 8000} and "output_config" not in b, f"a model with a thinking budget and no effort levels: {b.get('thinking')!r}")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+
+print("test advisor on a hosted API: no key, a wrong key, no such model")
+noenv = {k: v for k, v in ENVK.items() if k != "XAI_API_KEY"}
+n0 = len(preqs())
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=noenv)
+check(rc == 0 and "⎿ no advice: XAI_API_KEY is not set — export it before starting corbienest" in out and "Tool said: error: the advisor (xai:grok-fake) cannot be used" in out,
+      f"no key: said, to the user and to the agent: {out[-300:]!r}")
+check(len(preqs()) == n0, "and nothing is sent")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=dict(ENVK, XAI_API_KEY="wrong-key"))
+check(rc == 0 and "xAI refused the key in XAI_API_KEY (400" in out and "wrong-key" not in out, f"a wrong key (xAI says so with a 400): said, without printing it: {out[-300:]!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=dict(ENVK, OPENAI_API_KEY="sk-secret-wxyz"))
+check(rc == 0 and "OpenAI refused the key in OPENAI_API_KEY (401" in out and "wxyz" not in out and "wxyz" not in json.dumps(requests()[-1]), f"not even the masked piece of it OpenAI quotes back: {out[-300:]!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-nope", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+check(rc == 0 and "Anthropic does not know a model 'claude-nope'" in out, f"no such model: {out[-300:]!r}")
+check(key_nowhere() is None, f"the key was written nowhere: {key_nowhere()!r}")
+
+print("test interactive: /advisor with a hosted API")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
+s.send("/advisor xai:grok-nope\r"); check(s.expect("xAI does not know a model 'grok-nope'"), "the model endpoint is asked: an unknown model is refused")
+s.send("/advisor xai:grok-fake\r"); check(s.expect("advisor: xai:grok-fake"), "/advisor PROVIDER:MODEL")
+check(s.expect(f"sent to {HOST}/xai/v1 with each consultation, billed to the key in XAI_API_KEY"), f"with where the conversation goes: {since_send(s)[-300:]!r}")
+cfg = open(CFG2_FILE).read(); check("advisor=xai:grok-fake" in cfg and "test-key" not in cfg, "saved, without the key")
+s.send("/advisor effort\r"); check(s.expect("advisor effort for xai:grok-fake"), "/advisor effort offers its levels"); check(s.expect("xhigh"), "the ones xAI's models take")
+s.send("\x1b"); s.expect("unchanged")
+s.send("/advisor effort max\r"); check(s.expect("sent as xhigh, its strongest level"), "max is as hard as it goes, in xAI's name")
+s.send("TOOL_ADVISOR now\r"); check(s.expect("Tool said: ADVICE"), "consulted"); check(last_preq("xai")["body"].get("reasoning_effort") == "xhigh", "with that effort")
+s.send("TOOL_ADVISOR SLOWADVICE\r"); check(s.expect("⤷ advisor xai:grok-fake"), "a slow consultation")
+time.sleep(0.8); s.send("never mind, do this\r")
+check(s.expect("stopped — your message goes first", 10), f"a queued message stops a hosted consultation too: {s.text()[-400:]!r}")
+check(s.expect("Echo: never mind, do this", 15), "and reaches the model")
+s.send("TOOL_ADVISOR SLOWADVICE again\r"); s.expect("⤷ advisor"); time.sleep(0.8); s.send("\x1b")
+check(s.expect("⎿ interrupted", 10), "Esc skips it"); check(s.expect("Tool said: error: the consultation was interrupted", 15), "and the turn carries on")
+s.send("/cost\r"); check(s.expect("advisor       1 consultation "), f"/cost counts the one that gave advice (the stopped and the skipped one did not): {since_send(s)[-300:]!r}")
+s.send("/advisor anthropic:claude-fake-haiku\r"); check(s.expect("advisor: anthropic:claude-fake-haiku"), "switched to Anthropic")
+s.send("/advisor effort on\r"); check(s.expect("advisor effort: on"), "a thinking budget, on")
+s.send("\x04"); s.close()
+check(key_nowhere() is None, f"still nowhere: {key_nowhere()!r}")
+
+# ---------- /advisor guidance: how much the agent leans on it ----------
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+def guided(level, prompt, advisor="fake-big:latest"):
+    n0, p0 = len(requests()), len(preqs())
+    out, rc = run(["-m", "fake-coder:latest", "--advisor", advisor, "--advisor-guidance", level, "--yolo", "-p", prompt], env=ENVK)
+    return out, rc, requests()[n0:]
+
+print("test advisor guidance: light and normal leave it to the agent")
+out, rc, rs = guided("light", "TOOL_ADVISOR ADVISOR_LOOP")
+sysmsg = rs[0]["messages"][0]["content"]
+check("Consult it only when you are stuck" in sysmsg and "at most once per request" in sysmsg, f"light: only when stuck, once: {sysmsg[-600:]!r}")
+check(len([r for r in rs if r["model"] == "fake-big:latest"]) == 1 and "consulted 1 time in this request" in out, f"and stopped after one: {out[-300:]!r}")
+adv = [r for r in rs if r["model"] == "fake-big:latest"][0]
+check("under about 250 words" in adv["messages"][0]["content"] and "under about 250 words" in adv["messages"][1]["content"], "and asked for a short answer")
+if os.path.exists(os.path.join(WORK, "made.txt")): os.remove(os.path.join(WORK, "made.txt"))
+out, rc, rs = guided("normal", "TOOL_WRITE please")
+check("reviews the work" not in out and os.path.exists(os.path.join(WORK, "made.txt")), "normal: no review of its own")
+check(not any(r["model"] == "fake-big:latest" for r in rs), "and no consultation the agent did not ask for")
+
+print("test advisor guidance strong: the work is reviewed before the request ends")
+os.remove(os.path.join(WORK, "made.txt"))
+out, rc, rs = guided("strong", "TOOL_WRITE please")
+check(rc == 0 and "⤷ advisor fake-big:latest · reviews the work before the request ends" in out, f"a request that changed files is reviewed: {out[-600:]!r}")
+check("Tool said: ADVICE: REVIEW-FINDING" in out, f"and what it finds goes to the agent, which gets another round: {out[-300:]!r}")
+main = [r for r in rs if r["model"] == "fake-coder:latest"]
+m = main[-1]["messages"]
+check(m[-1]["role"] == "tool" and m[-1]["tool_name"] == "advisor" and "REVIEW-FINDING" in m[-1]["content"] and "corbienest asked it, not you" in m[-1]["content"],
+      f"as the result of an advisor call: {m[-1]!r}")
+check(m[-2]["role"] == "assistant" and m[-2]["tool_calls"][-1]["function"]["name"] == "advisor", "that the agent's last reply now carries")
+check(len(main) == 3, f"one more round, not a loop: {len(main)}")
+sysmsg = main[0]["messages"][0]["content"]
+check("Lean on it" in sysmsg and "at most 6 times per request" in sysmsg and "It reviews your work by itself" in sysmsg, f"the agent is told how to lean on it: {sysmsg[-700:]!r}")
+adv = [r for r in rs if r["model"] == "fake-big:latest"][0]
+check("under about 700 words" in adv["messages"][0]["content"] and "exact steps" in adv["messages"][0]["content"], "the advisor is asked for concrete steps")
+os.remove(os.path.join(WORK, "made.txt"))
+out, rc, rs = guided("strong", "TOOL_WRITE APPROVE")
+check("reviews the work" in out and "nothing to change" in out and len([r for r in rs if r["model"] == "fake-coder:latest"]) == 2, f"LGTM: the request ends there, no extra round: {out[-300:]!r}")
+out, rc, rs = guided("strong", "hello there")
+check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), "a request that changed nothing is not reviewed")
+os.remove(os.path.join(WORK, "made.txt"))
+out, rc, rs = guided("strong", "TOOL_WRITE please", advisor="anthropic:claude-fake-opus")
+check("reviews the work before the request ends" in out and "Tool said: ADVICE: REVIEW-FINDING" in out, "a hosted advisor reviews the same way")
+check("The agent has ended its turn" in last_preq("anthropic")["body"]["messages"][0]["content"], "and is asked the same")
+
+print("test advisor guidance max: the first change is checked before it is made")
+os.remove(os.path.join(WORK, "made.txt"))
+out, rc, rs = guided("max", "TOOL_WRITE please")
+check("checks the first change before it is made" in out and "held back — the advisor sees a problem with it" in out, f"checked, and held back: {out[-600:]!r}")
+check(not os.path.exists(os.path.join(WORK, "made.txt")), "the change was not made")
+m = [r for r in rs if r["model"] == "fake-coder:latest"][-1]["messages"]
+check(m[-1]["role"] == "tool" and m[-1]["tool_name"] == "write_file" and m[-1]["content"].startswith("not applied: the advisor") and "CHECK-FINDING" in m[-1]["content"], f"the agent is told why: {m[-1]!r}")
+check("reviews the work" not in out, "nothing was changed, so there is nothing to review")
+out, rc, rs = guided("max", "TOOL_WRITE APPROVE")
+check("checks the first change" in out and "go ahead" in out and os.path.exists(os.path.join(WORK, "made.txt")), f"LGTM: the change is made: {out[-600:]!r}")
+check("reviews the work before the request ends" in out, "and reviewed before the request ends")
+check("and checks the first change of a request before it is made" in rs[0]["messages"][0]["content"], "the agent is told so")
+
+print("test interactive: /advisor guidance")
+s = Session(["-m", "fake-coder:latest", "--advisor", "fake-big:latest"], env=ENVK); s.expect("Ctrl-D to quit")
+s.send("/advisor guidance\r"); check(s.expect("Advisor guidance: how much the agent leans on it"), "a picker"); check(s.expect("normal") and "current" in since_send(s), "on the current level")
+s.send("stro"); time.sleep(0.2); s.send("\r"); check(s.expect("advisor guidance: strong"), "picked by filter")
+check("advisor_guidance=strong" in open(CFG2_FILE).read(), "saved")
+s.send("/advisor guidance bogus\r"); check(s.expect("usage: /advisor guidance"), "a level that is not one")
+s.send("/status\r"); check(s.expect("guidance strong"), "/status shows it")
+s.send("/advisor guidance normal\r"); s.expect("advisor guidance: normal")
+check("advisor_guidance" not in open(CFG2_FILE).read(), "the default is not written")
+s.send("\x04"); s.close()
 shutil.rmtree(CFG2, ignore_errors=True)
+
+# ---------- https: Ollama behind TLS, and a hosted API over it ----------
+print("test https: the same client over TLS, with the certificate checked")
+if shutil.which("openssl"):
+    TLS = tempfile.mkdtemp(prefix="crowtls_")
+    cert, key = os.path.join(TLS, "cert.pem"), os.path.join(TLS, "key.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-days", "1",
+                    "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"], capture_output=True, check=True)
+    TLS_PORT = free_port()
+    threading.Thread(target=fake_ollama.serve, args=(TLS_PORT, cert, key), daemon=True).start()
+    time.sleep(0.5)
+    TENV = {k: v for k, v in ENV.items() if k not in ("CURL_CA_BUNDLE", "SSL_CERT_FILE")}
+    out, rc = run(["-H", f"https://localhost:{TLS_PORT}", "-m", "fake-coder:latest", "-p", "hello over tls"], env=dict(TENV, CURL_CA_BUNDLE=cert))
+    check(rc == 0 and "Echo: hello over tls" in out, f"an Ollama behind TLS: streamed as over http: {out[-300:]!r}")
+    out, rc = run(["-H", f"https://localhost:{TLS_PORT}", "-m", "fake-coder:latest", "-p", "hello over tls"], env=TENV)
+    check("TLS:" in out and "certificate" in out and "Echo:" not in out, f"a certificate nobody vouches for is refused: {out[-300:]!r}")
+    out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-fake-opus", "--yolo", "-p", "TOOL_ADVISOR please"],
+                  env=dict(TENV, ANTHROPIC_API_KEY="test-key", ANTHROPIC_BASE_URL=f"https://localhost:{TLS_PORT}/anthropic", SSL_CERT_FILE=cert))
+    check(rc == 0 and "Tool said: ADVICE: read hay.txt" in out, f"a hosted advisor over https (SSL_CERT_FILE names the CA): {out[-300:]!r}")
+    shutil.rmtree(TLS, ignore_errors=True)
+else:
+    print("  (skipped: no openssl to make a certificate with)")
 
 print("test config persistence")
 cfg = open(os.path.join(CFG, "corbienest", "config")).read()

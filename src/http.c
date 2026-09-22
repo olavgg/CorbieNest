@@ -1,18 +1,16 @@
-/* Minimal HTTP/1.1 client over POSIX sockets: enough for Ollama's local API.
- * Supports chunked and content-length bodies, streamed line delivery, and
- * an interrupt fd (Ctrl-C) checked while waiting. */
+/* HTTP client over libcurl: plain http:// for Ollama, https:// for the hosted model APIs the
+ * advisor may consult (and an Ollama behind TLS). Streamed line delivery, an interrupt fd
+ * (Esc/Ctrl-C) watched while waiting, an idle callback that keeps the spinner alive, and a
+ * timeout on *silence* rather than on the whole request: a model may think for many minutes, but
+ * a server that has sent nothing at all for ten is gone. */
 #define _GNU_SOURCE
 #include "common.h"
-#include <ctype.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
+#include <curl/curl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/time.h>
+#include <strings.h>
+#include <time.h>
 #include <unistd.h>
 
 int http_interrupt_fd = -1;
@@ -20,6 +18,7 @@ int http_idle_timeout_ms = 600 * 1000;
 int (*http_interrupt_check)(void) = NULL;
 http_idle_cb http_idle = NULL;
 void *http_idle_ud = NULL;
+const char *const *http_headers = NULL;
 
 typedef struct {
     http_line_cb cb;
@@ -46,206 +45,168 @@ static void sink_finish(body_sink *s) {
     }
 }
 
-static int parse_url(const char *url, char *host, size_t hl, char *port, size_t pl) {
-    const char *p = url;
-    if (!strncasecmp(p, "http://", 7)) p += 7;
-    else if (!strncasecmp(p, "https://", 8)) return -1;   /* not supported */
-    const char *end = strchr(p, '/');
-    size_t n = end ? (size_t)(end - p) : strlen(p);
-    char hp[256];
-    if (n >= sizeof hp) return -1;
-    memcpy(hp, p, n); hp[n] = 0;
-    char *colon = strrchr(hp, ':');
-    if (colon && !strchr(colon, ']')) {   /* host:port */
-        *colon = 0;
-        snprintf(port, pl, "%s", colon + 1);
-    } else snprintf(port, pl, "11434");
-    /* strip IPv6 brackets */
-    if (hp[0] == '[' && hp[strlen(hp)-1] == ']') { hp[strlen(hp)-1] = 0; snprintf(host, hl, "%s", hp + 1); }
-    else snprintf(host, hl, "%s", hp);
-    if (!host[0]) snprintf(host, hl, "127.0.0.1");
-    return 0;
+/* base + path as one URL. The base is what the user gave as the host, so it may lack the scheme
+ * ("localhost:11434", "0.0.0.0") and, the way OLLAMA_HOST is written, the port: plain http
+ * without one means Ollama's 11434, not 80. An https base keeps its own default (443). A base
+ * path ("https://api.x.ai/v1") stays in front of `path`. */
+char *http_url(const char *base, const char *path) {
+    if (!base) base = "";
+    while (*base == ' ') base++;
+    const char *sep = strstr(base, "://");
+    const char *scheme = sep ? base : "http";
+    size_t scheme_len = sep ? (size_t)(sep - base) : 4;
+    const char *auth = sep ? sep + 3 : base;
+    size_t auth_len = strcspn(auth, "/?#");
+    const char *rest = auth + auth_len;
+    size_t rest_len = strlen(rest);
+    while (rest_len && rest[rest_len - 1] == '/') rest_len--;
+    bool has_port = auth[0] == '['
+        ? (memchr(auth, ']', auth_len) && ((const char *)memchr(auth, ']', auth_len))[1] == ':')
+        : memchr(auth, ':', auth_len) != NULL;
+    bool http = scheme_len == 4 && !strncasecmp(scheme, "http", 4);
+    sbuf u; sb_init(&u);
+    sb_append(&u, scheme, scheme_len); sb_puts(&u, "://");
+    if (auth_len == 0 || auth[0] == ':') sb_puts(&u, "127.0.0.1");   /* ":11434" = this machine */
+    sb_append(&u, auth, auth_len);
+    if (http && !has_port) sb_puts(&u, ":11434");
+    sb_append(&u, rest, rest_len);
+    if (path && *path && *path != '/') sb_putc(&u, '/');
+    if (path) sb_puts(&u, path);
+    return sb_detach(&u);
 }
 
-static int connect_timeout(const char *host, const char *port, int timeout_ms, char *err, size_t errlen) {
-    struct addrinfo hints = {0}, *res = NULL, *ai;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    int rc = getaddrinfo(host, port, &hints, &res);
-    if (rc != 0) { snprintf(err, errlen, "resolve %s: %s", host, gai_strerror(rc)); return -1; }
-    int fd = -1;
-    for (ai = res; ai; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
-        int fl = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-        rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
-        if (rc < 0 && errno == EINPROGRESS) {
-            /* wait in 100ms slices so the idle callback keeps the spinner alive */
-            int left = timeout_ms;
-            for (;;) {
-                fd_set wf; FD_ZERO(&wf); FD_SET(fd, &wf);
-                struct timeval tv = { 0, (left > 100 ? 100 : left) * 1000 };
-                rc = select(fd + 1, NULL, &wf, NULL, &tv);
-                if (rc < 0 && errno == EINTR) continue;
-                if (rc != 0) break;
-                left -= 100;
-                if (left <= 0) break;
-                if (http_idle) http_idle(http_idle_ud);
-            }
-            if (rc > 0) {
-                int soerr = 0; socklen_t sl = sizeof soerr;
-                getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl);
-                if (soerr == 0) rc = 0; else { errno = soerr; rc = -1; }
-            } else if (rc == 0) { errno = ETIMEDOUT; rc = -1; }
-        }
-        if (rc == 0) { fcntl(fd, F_SETFL, fl); break; }
-        snprintf(err, errlen, "connect %s:%s: %s", host, port, strerror(errno));
-        close(fd); fd = -1;
-    }
-    freeaddrinfo(res);
-    if (fd < 0 && !err[0]) snprintf(err, errlen, "connect %s:%s failed", host, port);
-    return fd;
-}
-
-static int send_all(int fd, const char *p, size_t n) {
-    while (n) {
-        ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
-        if (w < 0) { if (errno == EINTR) continue; return -1; }
-        p += w; n -= (size_t)w;
-    }
-    return 0;
-}
-
-/* Wait for socket readable; also watch interrupt fd. Returns 1 data, 0 interrupted, -1 error/timeout */
-static int wait_readable(int fd, int idle_ms) {
-    for (;;) {
-        fd_set rf; FD_ZERO(&rf); FD_SET(fd, &rf);
-        int mx = fd;
-        if (http_interrupt_fd >= 0) { FD_SET(http_interrupt_fd, &rf); if (http_interrupt_fd > mx) mx = http_interrupt_fd; }
-        struct timeval tv = { 0, 100 * 1000 };
-        int rc = select(mx + 1, &rf, NULL, NULL, &tv);
-        if (rc < 0) { if (errno == EINTR) continue; return -1; }
-        if (rc == 0) {
-            if (http_idle) http_idle(http_idle_ud);
-            idle_ms -= 100;
-            if (idle_ms <= 0) { errno = ETIMEDOUT; return -1; }
-            continue;
-        }
-        if (http_interrupt_fd >= 0 && FD_ISSET(http_interrupt_fd, &rf)) {
-            if (http_interrupt_check) { if (http_interrupt_check()) return 0; }
-            else { unsigned char kb[64]; ssize_t k = read(http_interrupt_fd, kb, sizeof kb); for (ssize_t i = 0; i < k; i++) if (kb[i] == 3) return 0; }
-            if (!FD_ISSET(fd, &rf)) continue;
-        }
-        if (FD_ISSET(fd, &rf)) return 1;
-    }
+static long long now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 typedef struct {
-    body_sink *sink;
-    bool chunked, done;
-    long content_len, body_got;
-    long chunk_left;
-    int chunk_state;   /* 0 size line, 1 data, 2 trailing CRLF */
-    sbuf cline;
-} body_parser;
+    body_sink sink;
+    long long last_rx;   /* when the server last sent anything: headers count */
+} xfer;
 
-static void body_feed(body_parser *b, const char *p, size_t n) {
-    if (!b->chunked) {
-        sink_deliver(b->sink, p, n);
-        b->body_got += (long)n;
-        if (b->content_len >= 0 && b->body_got >= b->content_len) b->done = true;
-        return;
-    }
-    while (n && !b->done && !b->sink->abort) {
-        if (b->chunk_state == 0) {
-            while (n) { char c = *p++; n--; sb_putc(&b->cline, c); if (c == '\n') break; }
-            if (b->cline.len && b->cline.data[b->cline.len - 1] == '\n') {
-                b->chunk_left = strtol(b->cline.data, NULL, 16);
-                sb_clear(&b->cline);
-                if (b->chunk_left == 0) b->done = true; else b->chunk_state = 1;
-            }
-        } else if (b->chunk_state == 1) {
-            size_t take = n < (size_t)b->chunk_left ? n : (size_t)b->chunk_left;
-            sink_deliver(b->sink, p, take);
-            p += take; n -= take; b->chunk_left -= (long)take;
-            if (b->chunk_left == 0) b->chunk_state = 2;
-        } else {
-            while (n && (*p == '\r' || *p == '\n')) {
-                bool nl = (*p == '\n'); p++; n--;
-                if (nl) { b->chunk_state = 0; break; }
-            }
-        }
-    }
+static size_t on_body(char *p, size_t size, size_t n, void *ud) {
+    xfer *x = ud; size_t len = size * n;
+    x->last_rx = now_ms();
+    sink_deliver(&x->sink, p, len);
+    return x->sink.abort ? 0 : len;   /* anything but len: libcurl stops the transfer */
+}
+static size_t on_header(char *p, size_t size, size_t n, void *ud) {
+    (void)p; xfer *x = ud; x->last_rx = now_ms();
+    return size * n;
+}
+
+static bool curl_ready(void) {
+    static int state = 0;   /* 0 not yet, 1 ok, -1 failed */
+    if (!state) state = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK ? 1 : -1;
+    return state > 0;
+}
+
+/* Ctrl-C among the keys typed, for callers that did not set http_interrupt_check */
+static int ctrl_c_pending(void) {
+    unsigned char kb[64]; ssize_t k = read(http_interrupt_fd, kb, sizeof kb);
+    for (ssize_t i = 0; i < k; i++) if (kb[i] == 3) return 1;
+    return 0;
 }
 
 int http_request(const char *base_url, const char *method, const char *path,
                  const char *body, sbuf *out, http_line_cb line_cb, void *ud,
                  http_result *res) {
     memset(res, 0, sizeof *res);
-    char host[256], port[16];
-    if (parse_url(base_url, host, sizeof host, port, sizeof port) != 0) {
-        snprintf(res->err, sizeof res->err, "bad host url: %s (only http:// supported)", base_url);
-        return -1;
+    if (!curl_ready()) { snprintf(res->err, sizeof res->err, "libcurl could not be initialised"); return -1; }
+    CURL *h = curl_easy_init();
+    CURLM *m = curl_multi_init();
+    if (!h || !m) { if (h) curl_easy_cleanup(h); if (m) curl_multi_cleanup(m); snprintf(res->err, sizeof res->err, "libcurl could not be initialised"); return -1; }
+    char *url = http_url(base_url, path);
+    char errbuf[CURL_ERROR_SIZE] = "";
+    xfer x; memset(&x, 0, sizeof x);
+    x.sink.cb = line_cb; x.sink.ud = ud; x.sink.out = out; sb_init(&x.sink.linebuf);
+
+    struct curl_slist *hdrs = curl_slist_append(NULL, "Accept: application/json");
+    if (body) hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+    hdrs = curl_slist_append(hdrs, "Expect:");              /* no 100-continue round trip for a big brief */
+    /* a server that serves one connection at a time (a test's) is not held up; over TLS the
+     * connection may be HTTP/2, where the header is not allowed (FORBID_REUSE closes it anyway) */
+    if (!strncasecmp(url, "http://", 7)) hdrs = curl_slist_append(hdrs, "Connection: close");
+    for (const char *const *e = http_headers; e && *e; e++) hdrs = curl_slist_append(hdrs, *e);
+
+    char ua[64]; snprintf(ua, sizeof ua, "corbienest/%s", CORBIE_VERSION);
+    curl_easy_setopt(h, CURLOPT_URL, url);
+    curl_easy_setopt(h, CURLOPT_USERAGENT, ua);
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
+    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(h, CURLOPT_FORBID_REUSE, 1L);
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+    curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);          /* a long silent wait (an answer that is not streamed) through a NAT */
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, on_body);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &x);
+    curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, on_header);
+    curl_easy_setopt(h, CURLOPT_HEADERDATA, &x);
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(h, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(h, CURLOPT_PROTOCOLS, (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
+    /* the proxy variables are honoured, but never for this machine: a local Ollama is not
+     * something to send through a corporate proxy */
+    const char *np = getenv("no_proxy"); if (!np || !*np) np = getenv("NO_PROXY");
+    char noproxy[1024]; snprintf(noproxy, sizeof noproxy, "%s%slocalhost,127.0.0.1,::1", np && *np ? np : "", np && *np ? "," : "");
+    curl_easy_setopt(h, CURLOPT_NOPROXY, noproxy);
+    /* where the trusted certificates are, the way the curl program is told (a private CA, a test's own) */
+    const char *ca = getenv("CURL_CA_BUNDLE"); if (!ca || !*ca) ca = getenv("SSL_CERT_FILE");
+    if (ca && *ca) curl_easy_setopt(h, CURLOPT_CAINFO, ca);
+    if (body || !strcmp(method, "POST")) {
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, body ? body : "");
+        curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, (long)(body ? strlen(body) : 0));
     }
-    int fd = connect_timeout(host, port, 5000, res->err, sizeof res->err);
-    if (fd < 0) return -1;
+    if (strcmp(method, "GET") && strcmp(method, "POST")) curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
+    else if (!strcmp(method, "GET") && !body) curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
 
-    sbuf req; sb_init(&req);
-    size_t blen = body ? strlen(body) : 0;
-    sb_printf(&req, "%s %s HTTP/1.1\r\nHost: %s:%s\r\nUser-Agent: corbienest/%s\r\nAccept: application/json\r\nConnection: close\r\n",
-              method, path, host, port, CORBIE_VERSION);
-    if (body) sb_printf(&req, "Content-Type: application/json\r\nContent-Length: %zu\r\n", blen);
-    sb_puts(&req, "\r\n");
-    if (body) sb_append(&req, body, blen);
-    if (send_all(fd, req.data, req.len) != 0) {
-        snprintf(res->err, sizeof res->err, "send: %s", strerror(errno));
-        sb_free(&req); close(fd); return -1;
+    curl_multi_add_handle(m, h);
+    long long t0 = now_ms(), last_tick = t0;
+    x.last_rx = t0;
+    bool interrupted = false, silent = false;
+    int running = 1, rv = 0;
+    CURLcode cc = CURLE_OK;
+    while (running) {
+        CURLMcode mc = curl_multi_perform(m, &running);
+        if (mc != CURLM_OK) { snprintf(res->err, sizeof res->err, "libcurl: %s", curl_multi_strerror(mc)); rv = -1; break; }
+        if (!running || x.sink.abort) break;
+        struct curl_waitfd w = { http_interrupt_fd, CURL_WAIT_POLLIN, 0 };
+        bool watch = http_interrupt_fd >= 0;
+        mc = curl_multi_poll(m, watch ? &w : NULL, watch ? 1u : 0u, 100, NULL);
+        if (mc != CURLM_OK) { snprintf(res->err, sizeof res->err, "libcurl: %s", curl_multi_strerror(mc)); rv = -1; break; }
+        if (watch && (w.revents & CURL_WAIT_POLLIN) && (http_interrupt_check ? http_interrupt_check() : ctrl_c_pending())) { interrupted = true; break; }
+        long long t = now_ms();
+        /* the idle callback runs when the server has been quiet for 100 ms, as it always has:
+         * while text streams in, the spinner is not drawn over it */
+        if (t - (x.last_rx > last_tick ? x.last_rx : last_tick) >= 100) { if (http_idle) http_idle(http_idle_ud); last_tick = t; }
+        if (t - x.last_rx >= http_idle_timeout_ms) { silent = true; break; }
     }
-    sb_free(&req);
-
-    body_sink sink = { line_cb, ud, out, {0}, 0 };
-    sb_init(&sink.linebuf);
-    body_parser bp = { &sink, false, false, -1, 0, 0, 0, {0} };
-    sb_init(&bp.cline);
-
-    sbuf hdr; sb_init(&hdr);
-    bool have_hdr = false;
-    int rv = 0;
-    char buf[16384];
-
-    for (;;) {
-        int w = wait_readable(fd, http_idle_timeout_ms);
-        if (w == 0) { res->aborted = true; break; }
-        if (w < 0) { snprintf(res->err, sizeof res->err, "recv: %s", strerror(errno)); rv = -1; break; }
-        ssize_t n = recv(fd, buf, sizeof buf, 0);
-        if (n < 0) { if (errno == EINTR) continue; snprintf(res->err, sizeof res->err, "recv: %s", strerror(errno)); rv = -1; break; }
-        if (n == 0) break;   /* EOF */
-        const char *p = buf; size_t left = (size_t)n;
-
-        if (!have_hdr) {
-            sb_append(&hdr, p, left);
-            char *e = strstr(hdr.data, "\r\n\r\n");
-            if (!e) { if (hdr.len > 65536) { snprintf(res->err, sizeof res->err, "header too large"); rv = -1; break; } continue; }
-            *e = 0;
-            size_t hlen = (size_t)(e - hdr.data) + 4;
-            const char *sp = strchr(hdr.data, ' ');
-            res->status = sp ? atoi(sp + 1) : 0;
-            for (char *l = strstr(hdr.data, "\r\n"); l; l = strstr(l + 2, "\r\n")) {
-                const char *h = l + 2;
-                if (!strncasecmp(h, "transfer-encoding:", 18) && strcasestr(h, "chunked")) bp.chunked = true;
-                else if (!strncasecmp(h, "content-length:", 15)) bp.content_len = atol(h + 15);
-            }
-            have_hdr = true;
-            p = hdr.data + hlen; left = hdr.len - hlen;
-        }
-        body_feed(&bp, p, left);
-        if (sink.abort) { res->aborted = true; break; }
-        if (bp.done) break;
+    if (!running && rv == 0) {
+        int left; CURLMsg *msg;
+        while ((msg = curl_multi_info_read(m, &left))) if (msg->msg == CURLMSG_DONE && msg->easy_handle == h) cc = msg->data.result;
     }
-    if (!res->aborted && rv == 0) sink_finish(&sink);
-    if (!have_hdr && rv == 0 && !res->aborted) { snprintf(res->err, sizeof res->err, "empty response from server"); rv = -1; }
-    close(fd);
-    sb_free(&hdr); sb_free(&bp.cline); sb_free(&sink.linebuf);
+    long code = 0; curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+    res->status = (int)code;
+    if (rv != 0) {}
+    else if (interrupted || x.sink.abort) res->aborted = true;
+    else if (silent) { snprintf(res->err, sizeof res->err, "recv: timed out — the server sent nothing for %d s", http_idle_timeout_ms / 1000); rv = -1; }
+    else if (cc != CURLE_OK) {
+        const char *why = errbuf[0] ? errbuf : curl_easy_strerror(cc);
+        if (cc == CURLE_GOT_NOTHING) snprintf(res->err, sizeof res->err, "empty response from server");
+        else if (cc == CURLE_COULDNT_CONNECT || cc == CURLE_COULDNT_RESOLVE_HOST || cc == CURLE_COULDNT_RESOLVE_PROXY || (cc == CURLE_OPERATION_TIMEDOUT && !code))
+            snprintf(res->err, sizeof res->err, "%s%s", strcasestr(why, "connect") ? "" : "cannot connect: ", why);
+        else if (cc == CURLE_PEER_FAILED_VERIFICATION || cc == CURLE_SSL_CONNECT_ERROR || cc == CURLE_SSL_CACERT_BADFILE || cc == CURLE_SSL_CERTPROBLEM)
+            snprintf(res->err, sizeof res->err, "TLS: %s", why);
+        else snprintf(res->err, sizeof res->err, "%s", why);
+        rv = -1;
+    }
+    if (rv == 0 && !res->aborted) sink_finish(&x.sink);
+    curl_multi_remove_handle(m, h);
+    curl_easy_cleanup(h); curl_multi_cleanup(m);
+    curl_slist_free_all(hdrs);
+    free(url); sb_free(&x.sink.linebuf);
     return rv;
 }

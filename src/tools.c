@@ -298,7 +298,7 @@ cJSON *tools_definitions(void) {
         cJSON_AddItemToArray(arr, mk_tool("advisor",
             "Consult the advisor: a stronger but much slower model that is shown this whole conversation — the request, every tool call you made and every result — and tells you how to proceed. It has no tools and cannot read files, so read the relevant code before you ask. "
             "Use it for the hard parts: before you commit to an approach for a non-trivial change (explore first, then ask, then edit), when an error has survived two attempts to fix it or a result makes no sense, and before you call a difficult task done. "
-            "Do not use it for what a tool call can tell you. At most " ADVISOR_MAX_STR " consultations per request.",
+            "Do not use it for what a tool call can tell you.",   /* how often it may is in the system prompt: the tool list stays the same whatever the guidance */
             p, (const char*[]){NULL}));
     }
     return arr;

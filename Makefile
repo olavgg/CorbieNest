@@ -1,9 +1,9 @@
 CC      ?= cc
 CFLAGS  ?= -O2 -g -Wall -Wextra -std=gnu11
-LDLIBS  += -lcjson
+LDLIBS  += -lcjson -lcurl
 PREFIX  ?= /usr/local
 
-SRC := src/main.c src/util.c src/http.c src/term.c src/tools.c src/ollama.c src/skills.c
+SRC := src/main.c src/util.c src/http.c src/term.c src/tools.c src/ollama.c src/provider.c src/skills.c
 OBJ := $(SRC:.c=.o)
 
 corbienest: $(OBJ)

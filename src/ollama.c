@@ -237,7 +237,7 @@ static void add_keep_alive(cJSON *req, const char *v) {
 /* A call that is one long wait and not what the user is after (the advisor's answer) gives way
  * to a message they queue meanwhile, the way a shell command and a sub-agent do. */
 bool ollama_stopped_for_message = false;
-static int poll_or_message(void) {
+int ollama_poll_or_message(void) {
     if (term_poll_interrupt()) return 1;
     if (term_queue_new()) { ollama_stopped_for_message = true; return 1; }
     return 0;
@@ -286,7 +286,7 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
     term_raw(true);
     ollama_stopped_for_message = false;
     http_interrupt_fd = g_cfg.interactive ? STDIN_FILENO : -1;
-    http_interrupt_check = ollama_call.stop_on_message ? poll_or_message : term_poll_interrupt;
+    http_interrupt_check = ollama_call.stop_on_message ? ollama_poll_or_message : term_poll_interrupt;
     http_idle = on_idle; http_idle_ud = &c;
     term_busy(busy_or("waiting for model"));
     on_idle(&c);

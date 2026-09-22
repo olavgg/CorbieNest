@@ -28,6 +28,8 @@ static char  *g_memory = NULL;                    /* contents of MEMORY_PATH (se
 static char   g_session_id[64];                  /* current session (file stem under config_dir()/sessions) */
 static int    g_advisor_uses = 0;                /* consultations of the advisor in the current request (see run_advisor) */
 static bool   g_advisor_said = false;            /* run_advisor() printed what came of the tool call in hand (see run_turn) */
+static bool   g_advisor_reviewed = false;        /* this request's review before it ends has been had (guidance strong and up) */
+static bool   g_advisor_checked = false;         /* and the check of its first change (max) */
 
 static const char *SLASH_CMDS[] = {
     "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think", "/effort", "/advisor",
@@ -166,7 +168,7 @@ static int begin_request(void) {
     int first = cJSON_GetArraySize(g_messages);
     if (g_prev_request_first >= 0 && g_prev_request_first <= first) elide_old_tool_results(g_prev_request_first);
     g_prev_request_first = first;
-    g_advisor_uses = 0;
+    g_advisor_uses = 0; g_advisor_reviewed = g_advisor_checked = false;
     tools_checkpoint_turn(first);
     return first;
 }
@@ -807,12 +809,24 @@ static char *build_system_prompt(void) {
         sb_puts(&b,
             "- Use task to hand a broad, self-contained investigation (\"find all places that…\", \"how does X work across the code\") to a read-only sub-agent "
             "and get back a report, keeping the noise out of this conversation; give it a complete prompt, it knows nothing of this chat.\n");
-        if (g_cfg.advisor) sb_puts(&b,   /* no model name in it: changing the advisor leaves the prompt, and its cache, alone */
-            "- advisor is a stronger but much slower model that is shown this whole conversation and tells you how to proceed. Consult it when the work is hard: "
-            "before you commit to an approach for a non-trivial change (explore first, then ask — put your plan in the question — then edit), when the same error has survived two fixes "
-            "or a result makes no sense, and before you call a difficult task done (after the build or the tests have run, so it sees their output). "
-            "Not for what a tool call can tell you, and at most " ADVISOR_MAX_STR " times per request. Weigh its advice seriously, but it cannot look at anything itself: "
-            "where a file or a command's output contradicts it, they are right — say so and carry on.\n");
+        if (g_cfg.advisor) {   /* no model name in it: changing the advisor leaves the prompt, and its cache, alone (the guidance does not) */
+            const advisor_guidance_def *g = advisor_guidance();
+            sb_puts(&b, "- advisor is a stronger but much slower model that is shown this whole conversation and tells you how to proceed. ");
+            if (g_cfg.advisor_guidance == GUIDANCE_LIGHT)
+                sb_puts(&b, "Consult it only when you are stuck: when the same error has survived two fixes or a result makes no sense. ");
+            else if (g_cfg.advisor_guidance == GUIDANCE_NORMAL)
+                sb_puts(&b, "Consult it when the work is hard: "
+                    "before you commit to an approach for a non-trivial change (explore first, then ask — put your plan in the question — then edit), when the same error has survived two fixes "
+                    "or a result makes no sense, and before you call a difficult task done (after the build or the tests have run, so it sees their output). ");
+            else
+                sb_printf(&b, "Lean on it: once you have read the code involved, ask before you commit to an approach (put your plan in the question), again before each non-trivial change, "
+                    "and whenever a build or a test fails in a way you do not understand at once. It reviews your work by itself before a request in which you changed files ends%s. ",
+                    g->check_first_edit ? ", and checks the first change of a request before it is made" : "");
+            if (g->uses == 1) sb_puts(&b, "Not for what a tool call can tell you, and at most once per request. ");
+            else sb_printf(&b, "Not for what a tool call can tell you, and at most %d times per request. ", g->uses);
+            sb_puts(&b, "Weigh its advice seriously, but it cannot look at anything itself: "
+                "where a file or a command's output contradicts it, they are right — say so and carry on.\n");
+        }
     } else {
         sb_puts(&b, "\n(No tools are available in this session; if you need file contents or command output, ask the user to provide them.)\n");
     }
@@ -1270,32 +1284,50 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
 }
 
 /* ---------- the advisor (/advisor, the `advisor` tool) ----------
- * A stronger model the agent may consult when the work is hard — a bigger local model, or one
- * of Ollama's cloud models (NAME-cloud, which the local server relays once `ollama signin` is
- * done). It is not part of the conversation: it is *shown* it, as one quoted text
- * (transcript_text()) with the agent's question under it, has no tools, and what comes back is
- * advice — the tool result. A weak model writes a poor brief, which is why the transcript goes
- * along whatever the question says.
+ * A stronger model the agent may consult when the work is hard — a bigger local model, one of
+ * Ollama's cloud models (NAME-cloud, which the local server relays once `ollama signin` is done),
+ * or a hosted API (xai:MODEL, openai:MODEL, anthropic:MODEL — provider.c). It is not part of the
+ * conversation: it is *shown* it, as one quoted text (transcript_text()) with the agent's question
+ * under it, has no tools, and what comes back is advice — the tool result. A weak model writes a
+ * poor brief, which is why the transcript goes along whatever the question says.
  *
  * What it costs is time, and on one machine more than that: a second local model may push the
  * main one out of memory, and the main model's next call then reloads it and reads the whole
- * conversation again. Hence ADVISOR_MAX per request, a window of its own (a 70B model pays
- * several times the memory per token of context that a small one does) and keep_alive 0, so
- * that its memory is free again when the main model wants it back. Its tokens are counted in
- * the session totals, but never in the context estimate: that is another model's prompt. */
+ * conversation again. Hence a limit per request (the guidance's), a window of its own (a 70B
+ * model pays several times the memory per token of context that a small one does) and
+ * keep_alive 0, so that its memory is free again when the main model wants it back. Its tokens
+ * are counted in the session totals, but never in the context estimate: that is another
+ * model's prompt.
+ *
+ * How much it is leaned on is /advisor guidance (ADVISOR_GUIDANCE in util.c): from strong up,
+ * corbienest consults it as well — it reviews a request that changed files before the request
+ * ends, and at max it checks the request's first change before the change is made. Those two
+ * come as a tool call of the agent's own (advisor_inject()), so the conversation keeps the shape
+ * every chat template knows, and they do not count against the agent's consultations. */
 static const char *effort_label(const char *model, const model_info *mi);
 static void effort_command(const char *who, const char *model, const model_info *mi, const char *arg);
 #define ADVISOR_IDLE_MS (30 * 60 * 1000)   /* a cold 30B model loading and then reading 12k tokens on a CPU is past http.c's ten minutes */
 static model_info g_advisor_info;
 static char *g_advisor_info_for = NULL;   /* the model g_advisor_info describes (fetched on first use; per host) */
+static char g_advisor_err[400];           /* why advisor_info() said no — or, when it said yes, why the model could not be checked */
 
 static bool advisor_is_main(void) { return model_same(g_cfg.advisor, g_cfg.model); }
 
-/* /api/show of the advisor model; false when the server does not know it */
+/* What the advisor model can be set to: /api/show, or a hosted API's model endpoint. False when
+ * it cannot be used (the server does not know it; a hosted API without a key, refusing the key,
+ * or without such a model) — g_advisor_err says which. */
 static bool advisor_info(void) {
     if (g_advisor_info_for && !strcmp(g_advisor_info_for, g_cfg.advisor)) return true;
     free(g_advisor_info_for); g_advisor_info_for = NULL;
-    if (ollama_model_show(g_cfg.advisor, &g_advisor_info) != 0) return false;
+    g_advisor_err[0] = 0;
+    if (provider_find(g_cfg.advisor, NULL)) {
+        int r = provider_model_info(g_cfg.advisor, &g_advisor_info, g_advisor_err, sizeof g_advisor_err);
+        if (r < 0) return false;
+        if (r > 0) return true;   /* not checked (unreachable): usable with what its provider's models take, and asked again next time */
+    } else if (ollama_model_show(g_cfg.advisor, &g_advisor_info) != 0) {
+        snprintf(g_advisor_err, sizeof g_advisor_err, "the server does not know a model '%s'", g_cfg.advisor);
+        return false;
+    }
     g_advisor_info_for = xstrdup(g_cfg.advisor);
     return true;
 }
@@ -1304,118 +1336,245 @@ static void advisor_plan_now(advisor_plan *p) {
     advisor_plan_for(g_cfg.advisor, known ? g_advisor_info.context_length : 0, p);
 }
 
-static const char *ADVISOR_SYSTEM =
-    "You are the advisor to a coding agent called Corbie Nest. A smaller, faster model is doing the work in the user's terminal — "
-    "reading and editing files, running commands — and has stopped to consult you, because you are the stronger model. "
-    "You are shown its conversation so far: what the user asked for, what the agent said, the tools it called and what they returned "
-    "(long outputs are cut in the middle, and old messages may be left out). You have no tools and see nothing beyond that transcript, "
-    "so never claim to have checked a file or run anything.\n\n"
-    "Answer the agent, not the user. Be concrete and brief — under about 400 words, since your answer goes straight into the agent's small context:\n"
-    "- Start with the verdict: whether the agent is on the right track, and which approach you recommend. Then the steps, in order, naming the files, functions and commands.\n"
-    "- If the agent is on the wrong track, misread an error, or skipped a check, say so plainly. Do not agree with it because it sounds sure of itself.\n"
-    "- If the transcript does not tell you enough, say exactly what the agent should read or run to find out — do not guess at what a file contains.\n"
-    "- Keep to the project's rules when they are shown to you; advice that breaks them is of no use to the agent.\n"
-    "- If the work looks finished and correct, say so in a sentence and name what is still worth verifying.\n"
-    "No preamble, and no recap of the transcript.";
+/* its system prompt: only ever sent to the advisor, so it may follow the guidance freely */
+static void advisor_system(sbuf *b) {
+    const advisor_guidance_def *g = advisor_guidance();
+    sb_puts(b,
+        "You are the advisor to a coding agent called Corbie Nest. A smaller, faster model is doing the work in the user's terminal — "
+        "reading and editing files, running commands — and has stopped to consult you, because you are the stronger model. "
+        "You are shown its conversation so far: what the user asked for, what the agent said, the tools it called and what they returned "
+        "(long outputs are cut in the middle, and old messages may be left out). You have no tools and see nothing beyond that transcript, "
+        "so never claim to have checked a file or run anything.\n\n");
+    sb_printf(b, "Answer the agent, not the user. Be concrete and brief — under about %d words, since your answer goes straight into the agent's small context:\n", g->words);
+    sb_puts(b,
+        "- Start with the verdict: whether the agent is on the right track, and which approach you recommend. Then the steps, in order, naming the files, functions and commands.\n"
+        "- If the agent is on the wrong track, misread an error, or skipped a check, say so plainly. Do not agree with it because it sounds sure of itself.\n"
+        "- If the transcript does not tell you enough, say exactly what the agent should read or run to find out — do not guess at what a file contains.\n"
+        "- Keep to the project's rules when they are shown to you; advice that breaks them is of no use to the agent.\n"
+        "- If the work looks finished and correct, say so in a sentence and name what is still worth verifying.\n");
+    if (g_cfg.advisor_guidance >= GUIDANCE_STRONG)
+        sb_puts(b, "- The agent is a much smaller model: it follows exact steps far better than general advice. Give each step its file and function, "
+                   "and where a change is small, write it out — the lines to replace and what replaces them.\n");
+    sb_puts(b, "No preamble, and no recap of the transcript.");
+}
 
-/* The tool. Every outcome is one ⎿ line here (run_turn prints nothing more for this tool) and
- * one result for the model; none of them ends the turn. */
-static int run_advisor(const char *question, sbuf *out) {
-    g_advisor_said = true;
-    if (g_advisor_uses >= ADVISOR_MAX) {   /* the tool stays on offer: taking it away would change the prompt, and with it the cache */
-        sb_printf(out, "error: the advisor has been consulted %d times in this request, which is the limit. Carry on with the advice you have; if you are still stuck, tell the user where and why.", ADVISOR_MAX);
-        printf("  " C_DIM "⎿ not asked: %d consultations per request is the limit" C_RESET "\n", ADVISOR_MAX);
-        return 1;
-    }
+enum { CONSULT_ASKED, CONSULT_REVIEW, CONSULT_CHECK };                /* the agent asked; corbienest did (guidance strong/max) */
+enum { ADVICE_GIVEN, ADVICE_NONE, ADVICE_STOPPED, ADVICE_SKIPPED };  /* what came of it */
+
+/* One consultation. Prints the ⤷ line and one ⎿ line for whatever comes of it; the advice (for
+ * ADVICE_GIVEN, and what there was of it for ADVICE_STOPPED) goes into `advice`, and for
+ * ADVICE_NONE the tool result that says why there is none into `why`. `what` is the middle of
+ * the ⤷ line ("consultation 1 of 3 in this request"). */
+static int consult(const char *question, const char *what, sbuf *advice, sbuf *why) {
     bool known = advisor_info();
     advisor_plan plan; advisor_plan_now(&plan);
+    const advisor_guidance_def *g = advisor_guidance();
     struct utsname un; uname(&un);
     sbuf env; sb_init(&env);
     sb_printf(&env, "Working directory: %s · %s %s · git repository: %s", g_cwd, un.sysname, un.machine, is_dir(".git") ? "yes" : "no");
+    sbuf sys; sb_init(&sys); advisor_system(&sys);
     /* after a compaction in mid-turn nothing points at the request any more: it is in message 0, under the summary */
-    size_t sys_len = strlen(ADVISOR_SYSTEM);
-    char *brief = advisor_brief(g_messages, g_prev_request_first >= 0 ? g_prev_request_first : 0, plan.budget > sys_len + 2048 ? plan.budget - sys_len : 2048,
-                                env.data, g_cfg.mode == MODE_PLAN, g_project_instructions, question);
+    char *brief = advisor_brief(g_messages, g_prev_request_first >= 0 ? g_prev_request_first : 0, plan.budget > sys.len + 2048 ? plan.budget - sys.len : 2048,
+                                env.data, g_cfg.mode == MODE_PLAN, g_project_instructions, question, g->words);
     sb_free(&env);
-    cJSON *msgs = cJSON_CreateArray();
-    cJSON *m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "system"); cJSON_AddStringToObject(m, "content", ADVISOR_SYSTEM); cJSON_AddItemToArray(msgs, m);
-    m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", brief); cJSON_AddItemToArray(msgs, m);
-
-    int k = ++g_advisor_uses;   /* whatever comes of it: a consultation that ends in nothing took its minutes as well */
-    printf("  " C_CYAN "⤷ advisor" C_RESET " " C_BOLD "%s" C_RESET C_DIM " · consultation %d of %d in this request · %zu KB of the conversation · esc skips it" C_RESET "\n",
-           g_cfg.advisor, k, ADVISOR_MAX, (strlen(brief) + 1023) / 1024);
-    free(brief);
+    printf("  " C_CYAN "⤷ advisor" C_RESET " " C_BOLD "%s" C_RESET C_DIM " · %s · %zu KB of the conversation · esc skips it" C_RESET "\n",
+           g_cfg.advisor, what, (strlen(brief) + 1023) / 1024);
     /* another local model may push the main one out of memory; say so when it did, since the
      * wait that follows would otherwise look like a fault */
     double sz, vram; bool watch = !plan.same && !plan.cloud && g_cfg.interactive;
     bool main_was_loaded = watch && ollama_model_placement(g_cfg.model, &sz, &vram) == 0;
 
     char label[96]; snprintf(label, sizeof label, "advisor · %.70s", g_cfg.advisor);
-    chat_stats st; bool aborted = false;
-    ollama_quiet = true;
-    ollama_call.busy = label; ollama_call.num_predict = plan.reply; ollama_call.stop_on_message = true; ollama_call.idle_ms = ADVISOR_IDLE_MS;
-    ollama_call.model = g_cfg.advisor; ollama_call.info = known ? &g_advisor_info : NULL;
-    ollama_call.num_ctx = plan.send_ctx; ollama_call.keep_alive = plan.keep_alive;
-    cJSON *r = ollama_chat(msgs, NULL, &st, &aborted);
-    ollama_call_reset(); ollama_quiet = false;
-    cJSON_Delete(msgs);
+    chat_stats st; memset(&st, 0, sizeof st);
+    bool aborted = false, not_found = false, signin = false, unusable = false;
+    char *answer = NULL;          /* NULL: it failed, and err says why */
+    char err[512] = "";
+    if (plan.api) {
+        provider_request rq = { sys.data, brief, plan.reply, effort_get(g_cfg.advisor), label, ADVISOR_IDLE_MS };
+        if (known) answer = provider_chat(g_cfg.advisor, &g_advisor_info, &rq, &st, &aborted, err, sizeof err);
+        else { snprintf(err, sizeof err, "%s", g_advisor_err); unusable = true; }   /* no key, the key refused, no such model */
+    } else {
+        cJSON *msgs = cJSON_CreateArray();
+        cJSON *m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "system"); cJSON_AddStringToObject(m, "content", sys.data); cJSON_AddItemToArray(msgs, m);
+        m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", brief); cJSON_AddItemToArray(msgs, m);
+        ollama_quiet = true;
+        ollama_call.busy = label; ollama_call.num_predict = plan.reply; ollama_call.stop_on_message = true; ollama_call.idle_ms = ADVISOR_IDLE_MS;
+        ollama_call.model = g_cfg.advisor; ollama_call.info = known ? &g_advisor_info : NULL;
+        ollama_call.num_ctx = plan.send_ctx; ollama_call.keep_alive = plan.keep_alive;
+        cJSON *r = ollama_chat(msgs, NULL, &st, &aborted);
+        ollama_call_reset(); ollama_quiet = false;
+        cJSON_Delete(msgs);
+        cJSON *c = r ? cJSON_GetObjectItemCaseSensitive(r, "content") : NULL;
+        if (r) answer = xstrdup(cJSON_IsString(c) ? c->valuestring : "");
+        else { snprintf(err, sizeof err, "%s", ollama_error[0] ? ollama_error : "request failed"); not_found = strstr(ollama_error, "not found") != NULL; signin = strcasestr(ollama_error, "unauthorized") != NULL; }
+        if (r) cJSON_Delete(r);
+    }
+    free(brief); sb_free(&sys);
     account(&st);
     g_session.advisor_tokens += st.prompt_tokens + st.eval_tokens; g_session.advisor_seconds += st.total_seconds;
     g_session.advisor_eval_tokens += st.eval_tokens; g_session.advisor_eval_seconds += st.eval_seconds;
     term_status_refresh();
 
-    int rc = 1;
-    cJSON *c = r ? cJSON_GetObjectItemCaseSensitive(r, "content") : NULL;
-    const char *advice = strip_think_block(cJSON_IsString(c) ? c->valuestring : "");
+    int res = ADVICE_NONE;
+    const char *text = strip_think_block(answer ? answer : "");
     bool cut = !strcmp(st.done_reason, "length");
     if (aborted && ollama_stopped_for_message) {
-        g_advisor_uses--;   /* the user cut in: that is not the agent's consultation spent */
-        sb_puts(out, "The advisor was not heard out: the user sent a message, and that comes first. Read it; consult the advisor again afterwards if you still need to.");
-        if (*advice) sb_printf(out, "\nWhat it had written so far:\n%s", advice);
+        if (*text) sb_puts(advice, text);
         printf("    " C_YELLOW "⎿ stopped — your message goes first" C_RESET "\n");
-        rc = 0;
+        res = ADVICE_STOPPED;
     } else if (aborted) {
-        sb_puts(out, "error: the consultation was interrupted by the user — carry on without it, and do not consult the advisor again for this request unless the user asks");
         printf("    " C_RED "⎿ interrupted" C_RESET "\n");
-    } else if (!r && strstr(ollama_error, "not found")) {
-        sb_printf(out, "error: the advisor model %s is not installed on %s. Carry on without it.", g_cfg.advisor, g_cfg.host);
+        res = ADVICE_SKIPPED;
+    } else if (!answer && not_found) {
+        sb_printf(why, "error: the advisor model %s is not installed on %s. Carry on without it.", g_cfg.advisor, g_cfg.host);
         printf("    " C_YELLOW "⎿ advisor '%s' not found — /advisor picks another, /advisor off stops offering it" C_RESET "\n", g_cfg.advisor);
-    } else if (!r) {
-        sb_printf(out, "error: the advisor (%s) could not be reached: %s. Carry on without it.", g_cfg.advisor, ollama_error[0] ? ollama_error : "request failed");
-        if (strcasestr(ollama_error, "unauthorized")) printf("    " C_YELLOW "⎿ a cloud model needs an account: run \"ollama signin\" in a shell, then ask again" C_RESET "\n");
-        else printf("    " C_RED "⎿ no advice: %s" C_RESET "\n", ollama_error[0] ? ollama_error : "request failed");
-    } else if (!*advice) {
-        sb_printf(out, "error: the advisor gave no answer%s. Carry on without it, or ask something narrower.", cut ? " — it was still thinking when it ran out of tokens" : "");
+    } else if (!answer) {
+        sb_printf(why, "error: the advisor (%s) %s: %s. Carry on without it.", g_cfg.advisor, unusable ? "cannot be used" : "could not be reached", err);
+        if (signin) printf("    " C_YELLOW "⎿ a cloud model needs an account: run \"ollama signin\" in a shell, then ask again" C_RESET "\n");
+        else printf("    " C_RED "⎿ no advice: %s" C_RESET "\n", err);
+        if (plan.api && effort_get(g_cfg.advisor) && strstr(err, "answered 400")) printf(C_DIM "      if it is the effort the model does not take: /advisor effort default leaves it to the model" C_RESET "\n");
+    } else if (!*text) {
+        sb_printf(why, "error: the advisor gave no answer%s. Carry on without it, or ask something narrower.", cut ? " — it was still thinking when it ran out of tokens" : "");
         printf("    " C_RED "⎿ no answer" C_RESET C_DIM "%s" C_RESET "\n", cut ? " — it ran out of tokens while still thinking: lower /advisor effort, or enlarge /advisor ctx" : "");
     } else {
         g_session.advisor_calls++;
-        sb_printf(out, "%s%s\n\n[advice from %s — consultation %d of %d in this request. Weigh it seriously, but where the files or a command's output contradict it, they are right: say so and adapt.]",
-                  advice, cut ? "\n[… the answer was cut off here: the advisor ran out of tokens]" : "", g_cfg.advisor, k, ADVISOR_MAX);
+        sb_puts(advice, text);
+        if (cut) sb_puts(advice, "\n[… the answer was cut off here: the advisor ran out of tokens]");
         char tk[32]; fmt_tokens(st.prompt_tokens + st.eval_tokens, tk, sizeof tk);
         printf("    " C_DIM "⎿ advice · %s tokens · %.0fs%s:" C_RESET "\n", tk, st.total_seconds, st.load_seconds >= 1 ? " (of which loading the model)" : "");
-        print_result_preview(advice, 12);
-        rc = 0;
+        print_result_preview(text, 12);
+        res = ADVICE_GIVEN;
     }
     if (main_was_loaded && !aborted && ollama_model_placement(g_cfg.model, &sz, &vram) != 0)
         printf("    " C_YELLOW "⎿ %s was unloaded to make room: its next reply reloads it and reads the conversation again" C_RESET "\n", g_cfg.model);
-    if (r) cJSON_Delete(r);
+    free(answer);
+    return res;
+}
+
+/* The tool. Every outcome is one ⎿ line (run_turn prints nothing more for this tool) and one
+ * result for the model; none of them ends the turn. */
+static int run_advisor(const char *question, sbuf *out) {
+    g_advisor_said = true;
+    int most = advisor_guidance()->uses;
+    if (g_advisor_uses >= most) {   /* the tool stays on offer: taking it away would change the prompt, and with it the cache */
+        sb_printf(out, "error: the advisor has been consulted %d time%s in this request, which is the limit. Carry on with the advice you have; if you are still stuck, tell the user where and why.", most, most == 1 ? "" : "s");
+        printf("  " C_DIM "⎿ not asked: %d consultation%s per request is the limit (/advisor guidance)" C_RESET "\n", most, most == 1 ? "" : "s");
+        return 1;
+    }
+    int k = ++g_advisor_uses;   /* whatever comes of it: a consultation that ends in nothing took its minutes as well */
+    char what[64]; snprintf(what, sizeof what, "consultation %d of %d in this request", k, most);
+    sbuf advice, why; sb_init(&advice); sb_init(&why);
+    int rc = 1;
+    switch (consult(question, what, &advice, &why)) {
+    case ADVICE_GIVEN:
+        sb_printf(out, "%s\n\n[advice from %s — consultation %d of %d in this request. Weigh it seriously, but where the files or a command's output contradict it, they are right: say so and adapt.]",
+                  advice.data, g_cfg.advisor, k, most);
+        rc = 0; break;
+    case ADVICE_STOPPED:
+        g_advisor_uses--;   /* the user cut in: that is not the agent's consultation spent */
+        sb_puts(out, "The advisor was not heard out: the user sent a message, and that comes first. Read it; consult the advisor again afterwards if you still need to.");
+        if (advice.len) sb_printf(out, "\nWhat it had written so far:\n%s", advice.data);
+        rc = 0; break;
+    case ADVICE_SKIPPED:
+        sb_puts(out, "error: the consultation was interrupted by the user — carry on without it, and do not consult the advisor again for this request unless the user asks");
+        break;
+    default:
+        sb_puts(out, why.data ? why.data : "error: no advice. Carry on without it.");
+    }
+    sb_free(&advice); sb_free(&why);
     return rc;
 }
 
+/* An advisor call the agent did not make, put into the conversation as if it had: its reply
+ * `reply` (already in g_messages) gets the call, and the advice follows as the call's result. A
+ * conversation of that shape is one every chat template renders, and the advice is a tool result
+ * like any other advice — where a note from the "user" would be neither. */
+static void advisor_inject(cJSON *reply, const char *label, const char *result) {
+    cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
+    if (!calls) calls = cJSON_AddArrayToObject(reply, "tool_calls");
+    cJSON *call = cJSON_CreateObject(), *fn = cJSON_AddObjectToObject(call, "function");
+    cJSON_AddStringToObject(fn, "name", "advisor");
+    cJSON *a = cJSON_AddObjectToObject(fn, "arguments"); cJSON_AddStringToObject(a, "question", label);
+    cJSON_AddItemToArray(calls, call);
+    cJSON_AddItemToArray(g_messages, tool_result_message("advisor", result));
+}
+
+/* guidance strong and up: before a request that changed files ends, the advisor looks at it */
+static bool advisor_review_due(void) {
+    return g_cfg.advisor && advisor_guidance()->review && !g_advisor_reviewed && g_model_tools && !g_cfg.no_tools
+        && g_cfg.mode != MODE_PLAN && g_prev_request_first >= 0 && tools_checkpoint_files(g_prev_request_first, NULL) > 0;
+}
+
+/* The review. True when it found something: the advice is in the conversation and the agent
+ * gets another round to act on it. Once per request, whatever comes of it. */
+static bool advisor_review(cJSON *reply) {
+    g_advisor_reviewed = true;
+    printf("\n");
+    sbuf advice, why; sb_init(&advice); sb_init(&why);
+    int r = consult("The agent has ended its turn with the reply above, and the request goes back to the user unless you object. "
+                    "Review the work against what the user asked for: is it done, correct, and verified (built, tested) where it can be? "
+                    "If nothing needs to change, answer with " ADVISOR_REVIEW_OK " alone. Otherwise say what is wrong or missing, and what the agent should do about it.",
+                    "reviews the work before the request ends", &advice, &why);
+    bool more = r == ADVICE_GIVEN && !advisor_approves(advice.data);
+    if (more) {
+        sbuf res; sb_init(&res);
+        sb_printf(&res, "%s\n\n[the advisor (%s) reviewed the work before the request ended — corbienest asked it, not you. Act on what it says, "
+                        "or where the files or a command's output show it is wrong, say so; then finish.]", advice.data, g_cfg.advisor);
+        advisor_inject(reply, "(review of the work before the request ends)", res.data);
+        sb_free(&res);
+        printf("\n");
+    } else if (r == ADVICE_GIVEN) printf("    " C_GREEN "⎿ nothing to change" C_RESET "\n");
+    sb_free(&advice); sb_free(&why);
+    return more;
+}
+
+/* guidance max: the first change of a request is looked at before it is made */
+static bool advisor_check_due(const char *tool) {
+    return g_cfg.advisor && advisor_guidance()->check_first_edit && !g_advisor_checked && g_cfg.mode != MODE_PLAN
+        && (!strcmp(tool, "write_file") || !strcmp(tool, "edit_file"));
+}
+
+/* The check. ADVICE_GIVEN with objections: the change is held back and *out is the tool result
+ * that says why; ADVICE_STOPPED: the user's message goes first; anything else: go ahead. */
+static int advisor_check(const char *tool, cJSON *args, sbuf *out) {
+    g_advisor_checked = true;
+    char *a = args ? cJSON_PrintUnformatted(args) : xstrdup("{}");
+    sbuf q; sb_init(&q);
+    sb_printf(&q, "The agent is about to make the first change of this request: the last tool call in the transcript, %s. It has not been made yet. "
+                  "Is it the right change, in the right place, and complete? If it is, answer with " ADVISOR_REVIEW_OK " alone. "
+                  "If not, say what is wrong and what to do instead.\nThe call in full: ", tool);
+    sb_put_cut(&q, a, 3000);
+    free(a);
+    sbuf advice, why; sb_init(&advice); sb_init(&why);
+    int r = consult(q.data, "checks the first change before it is made", &advice, &why);
+    sb_free(&q);
+    if (r == ADVICE_GIVEN && !advisor_approves(advice.data))
+        sb_printf(out, "not applied: the advisor (%s) checked this change before it was made — corbienest asked it, not you — and says:\n%s\n\n"
+                       "[Reconsider, then make the change you settle on: this one again if the files or a command's output show the advisor is wrong.]", g_cfg.advisor, advice.data);
+    else if (r == ADVICE_GIVEN) { printf("    " C_GREEN "⎿ go ahead" C_RESET "\n"); r = ADVICE_NONE; }
+    else if (r != ADVICE_STOPPED) r = ADVICE_NONE;
+    sb_free(&advice); sb_free(&why);
+    return r;
+}
+
 static void advisor_report(void) {
-    if (!g_cfg.advisor) { printf("advisor: " C_DIM "none — /advisor MODEL lets the agent consult a stronger model when the work is hard (a bigger local one, or a NAME-cloud model)" C_RESET "\n"); return; }
+    const advisor_guidance_def *g = advisor_guidance();
+    if (!g_cfg.advisor) { printf("advisor: " C_DIM "none — /advisor MODEL lets the agent consult a stronger model when the work is hard (a bigger local one, a NAME-cloud model, or xai:MODEL, openai:MODEL, anthropic:MODEL)" C_RESET "\n"); return; }
     printf("advisor: " C_BOLD "%s" C_RESET, g_cfg.advisor);
     if (g_advisor_info_for && !strcmp(g_advisor_info_for, g_cfg.advisor)) printf(C_DIM " · effort %s" C_RESET, effort_label(g_cfg.advisor, &g_advisor_info));
     else if (effort_get(g_cfg.advisor)) printf(C_DIM " · effort %s" C_RESET, effort_get(g_cfg.advisor));
     advisor_plan p; advisor_plan_now(&p);
-    printf(C_DIM " · ctx %s%s · %d consultation%s this session · at most %d per request" C_RESET "\n", p.cloud ? "its own" : fmt_ctx(p.send_ctx > 0 ? p.send_ctx : g_cfg.num_ctx),
-           p.same ? " (the main model's)" : p.cloud ? " (a cloud model)" : g_cfg.advisor_ctx > 0 ? "" : " (auto)", g_session.advisor_calls, g_session.advisor_calls == 1 ? "" : "s", ADVISOR_MAX);
+    printf(C_DIM " · ctx %s%s · guidance %s · %d consultation%s this session · at most %d per request" C_RESET "\n", p.cloud ? "its own" : fmt_ctx(p.send_ctx > 0 ? p.send_ctx : g_cfg.num_ctx),
+           p.same ? " (the main model's)" : p.api ? " (a hosted API)" : p.cloud ? " (a cloud model)" : g_cfg.advisor_ctx > 0 ? "" : " (auto)", g->name,
+           g_session.advisor_calls, g_session.advisor_calls == 1 ? "" : "s", g->uses);
 }
 
 /* what this advisor costs, said once when it is chosen */
 static void advisor_caveat(void) {
     advisor_plan p; advisor_plan_now(&p);
+    const provider_def *pv = provider_find(g_cfg.advisor, NULL);
     if (p.same) printf(C_DIM "  it is the model doing the work: a second opinion, not a stronger one — and each consultation makes its next reply read the conversation again (one prompt cache)" C_RESET "\n");
+    else if (pv) printf(C_DIM "  a hosted model: the conversation is sent to %s with each consultation, billed to the key in %s" C_RESET "\n", provider_base_url(pv), pv->key_env);
     else if (p.cloud) printf(C_DIM "  a cloud model: the conversation is sent to ollama.com with each consultation, and the Ollama daemon has to be signed in (ollama signin)" C_RESET "\n");
     else printf(C_DIM "  a local advisor may push %s out of memory: its next call then reloads it and reads the conversation again" C_RESET "\n", g_cfg.model);
 }
@@ -1431,24 +1590,68 @@ static void advisor_set(const char *model) {
         return;
     }
     char *old = g_cfg.advisor; g_cfg.advisor = xstrdup(model);
+    bool hosted = provider_find(model, NULL) != NULL;
     if (!advisor_info()) {   /* /api/show knows cloud models too, which /models does not list */
-        printf(C_RED "✗ the server does not know a model '%s'" C_RESET C_DIM " — /models lists what is installed; a cloud model is named like gpt-oss:120b-cloud" C_RESET "\n", model);
+        if (hosted) printf(C_RED "✗ %s" C_RESET "\n", g_advisor_err);
+        else printf(C_RED "✗ the server does not know a model '%s'" C_RESET C_DIM " — /models lists what is installed; a cloud model is named like gpt-oss:120b-cloud, a hosted one like xai:grok-4.7" C_RESET "\n", model);
         free(g_cfg.advisor); g_cfg.advisor = old;
         return;
     }
     free(old); config_save(); advisor_tools_changed();
     printf(C_GREEN "✓ advisor: %s" C_RESET C_DIM " · effort %s%s" C_RESET "\n", g_cfg.advisor, effort_label(g_cfg.advisor, &g_advisor_info),
            g_model_tools && !g_cfg.no_tools ? "" : " · idle for now: the agent needs tools to ask it");
-    printf(C_DIM "  consulted through the advisor tool when the work is hard, at most %d times per request" C_RESET "\n", ADVISOR_MAX);
+    if (g_advisor_err[0]) printf(C_YELLOW "  not checked: %s" C_RESET C_DIM " — it is tried at the first consultation" C_RESET "\n", g_advisor_err);
+    const advisor_guidance_def *g = advisor_guidance();
+    printf(C_DIM "  consulted through the advisor tool, at most %d time%s per request · guidance %s (/advisor guidance)" C_RESET "\n", g->uses, g->uses == 1 ? "" : "s", g->name);
     advisor_caveat();
+}
+
+static void guidance_set(int n) {
+    g_cfg.advisor_guidance = n; config_save();
+    const advisor_guidance_def *g = advisor_guidance();
+    printf(C_GREEN "✓ advisor guidance: %s" C_RESET C_DIM " — %s" C_RESET "\n", g->name, g->desc);
+    if (!g_cfg.advisor) printf(C_DIM "  no advisor is set yet: /advisor MODEL" C_RESET "\n");
+    else if (cJSON_GetArraySize(g_messages) > 0) printf(C_DIM "  the agent's instructions say how to use it, so its next reply reads the conversation again" C_RESET "\n");
+}
+
+static void cmd_advisor_guidance(const char *v) {
+    if (*v) {
+        int n = advisor_guidance_parse(v);
+        if (n < 0) { printf("usage: /advisor guidance light|normal|strong|max   (how much the agent leans on the advisor)\n"); return; }
+        guidance_set(n);
+        return;
+    }
+    if (!g_cfg.interactive || g_while_busy) {
+        printf("advisor guidance: " C_BOLD "%s" C_RESET C_DIM " — %s" C_RESET "\n", advisor_guidance()->name, advisor_guidance()->desc);
+        for (int i = 0; i < GUIDANCE_COUNT; i++) printf(C_DIM "  %-7s %s" C_RESET "\n", ADVISOR_GUIDANCE[i].name, ADVISOR_GUIDANCE[i].desc);
+        return;
+    }
+    const char *names[GUIDANCE_COUNT], *descs[GUIDANCE_COUNT]; char dbuf[GUIDANCE_COUNT][200];
+    for (int i = 0; i < GUIDANCE_COUNT; i++) {
+        names[i] = ADVISOR_GUIDANCE[i].name;
+        snprintf(dbuf[i], sizeof dbuf[i], "%s%s", ADVISOR_GUIDANCE[i].desc, i == g_cfg.advisor_guidance ? " · current" : "");
+        descs[i] = dbuf[i];
+    }
+    int r = term_select("Advisor guidance: how much the agent leans on it", names, descs, GUIDANCE_COUNT, g_cfg.advisor_guidance);
+    if (r < 0) printf(C_DIM "advisor guidance unchanged: %s" C_RESET "\n", advisor_guidance()->name);
+    else guidance_set(r);
 }
 
 static void cmd_advisor(const char *arg) {
     if (arg && (!strcmp(arg, "off") || !strcmp(arg, "none"))) { advisor_set(NULL); return; }
+    if (arg && !strncmp(arg, "guidance", 8) && (arg[8] == ' ' || !arg[8])) {
+        const char *v = arg + 8; while (*v == ' ') v++;
+        cmd_advisor_guidance(v);
+        return;
+    }
     if (arg && !strncmp(arg, "effort", 6) && (arg[6] == ' ' || !arg[6])) {
         const char *v = arg + 6; while (*v == ' ') v++;
         if (!g_cfg.advisor) { printf(C_DIM "no advisor is set — /advisor MODEL first" C_RESET "\n"); return; }
-        if (!advisor_info()) { printf(C_RED "✗ the server does not know the advisor model '%s'" C_RESET "\n", g_cfg.advisor); return; }
+        if (!advisor_info()) {
+            if (provider_find(g_cfg.advisor, NULL)) printf(C_RED "✗ %s" C_RESET "\n", g_advisor_err);
+            else printf(C_RED "✗ the server does not know the advisor model '%s'" C_RESET "\n", g_cfg.advisor);
+            return;
+        }
         effort_command("advisor ", g_cfg.advisor, &g_advisor_info, *v ? v : NULL);
         if (*v && advisor_is_main()) printf(C_DIM "  (the advisor is the model doing the work: this is its effort there too)" C_RESET "\n");
         return;
@@ -1460,7 +1663,7 @@ static void cmd_advisor(const char *arg) {
         g_cfg.advisor_ctx = n; config_save();
         advisor_plan p; advisor_plan_now(&p);
         printf(C_GREEN "✓ advisor context window: %s%s" C_RESET "%s\n", n ? fmt_ctx(n) : "auto", n && p.send_ctx > 0 && p.send_ctx != n ? " (the model takes less)" : "",
-               p.same ? C_DIM " — not used while the advisor is the main model: it keeps the main window" C_RESET : p.cloud ? C_DIM " — not used with a cloud model: it has its own" C_RESET : "");
+               p.same ? C_DIM " — not used while the advisor is the main model: it keeps the main window" C_RESET : p.cloud ? C_DIM " — not used with a model that is not on this machine: it has its own" C_RESET : "");
         return;
     }
     if (arg) { advisor_set(arg); return; }
@@ -1483,7 +1686,7 @@ static void cmd_advisor(const char *arg) {
         own[i + 1] = sb_detach(&d); descs[i + 1] = own[i + 1];
         if (cur) current = i + 1;
     }
-    printf(C_DIM "a stronger model the agent may consult — a cloud model is not listed: /advisor NAME-cloud" C_RESET "\n");
+    printf(C_DIM "a stronger model the agent may consult — not listed: a cloud model (/advisor NAME-cloud) or a hosted one (/advisor xai:MODEL, openai:MODEL, anthropic:MODEL)" C_RESET "\n");
     int r = term_select("Select advisor", names, descs, n + 1, current);
     if (r < 0) printf(C_DIM "advisor unchanged: %s" C_RESET "\n", g_cfg.advisor ? g_cfg.advisor : "none");
     else if (r == 0) advisor_set(NULL);
@@ -1618,6 +1821,9 @@ static bool run_turn(void) {
                 return false;
             }
             print_stats(&st);
+            /* guidance strong and up: the advisor looks at a request that changed files before it
+             * ends; what it finds goes to the agent, which gets another round for it */
+            if (!aborted && advisor_review_due() && advisor_review(reply)) { round_first = cJSON_GetArraySize(g_messages) - 1; inject_queued(); continue; }
             if (!aborted) { check_model_placement(false); maybe_auto_compact(false, NULL); }
             return aborted;
         }
@@ -1649,6 +1855,17 @@ static bool run_turn(void) {
             if (summ[0]) printf(C_DIM "(%s)" C_RESET, summ);
             printf("\n");
             sbuf out; sb_init(&out);
+            if (advisor_check_due(name)) {   /* guidance max: the advisor looks at the request's first change before it is made */
+                int v = advisor_check(name, args, &out);
+                if (v != ADVICE_NONE) {
+                    if (v == ADVICE_STOPPED) { cut = true; sb_clear(&out); sb_puts(&out, TOOL_NOT_RUN); }
+                    else printf("  ⎿  " C_YELLOW "held back — the advisor sees a problem with it" C_RESET "\n");
+                    cJSON_AddItemToArray(g_messages, tool_result_message(name, out.data));
+                    sb_free(&out);
+                    if (parsed) cJSON_Delete(parsed);
+                    continue;
+                }
+            }
             g_session.tool_calls++;
             g_advisor_said = false;
             tool_status ts = tools_execute(name, args, &out);
@@ -1778,9 +1995,12 @@ static void cmd_help(void) {
            "  /think show|hide      show or hide thinking tokens\n"
            "  /effort [LEVEL]       how hard this model thinks, in the levels it has (gpt-oss: low medium high · qwen3.8: off low medium high · most others: off on);\n"
            "                        no argument opens a picker, default leaves it to the model. Kept per model; a level is sent with every call\n"
-           "  /advisor [MODEL|off]  a stronger model the agent may consult when the work is hard (advisor tool, at most " ADVISOR_MAX_STR " times per request): a bigger local model\n"
-           "                        or a cloud one (NAME-cloud, after `ollama signin`). It is shown the conversation and answers with advice; it has no tools.\n"
-           "                        /advisor effort [LEVEL] · /advisor ctx N|auto (its context window; auto = the main one, at most 16k)\n"
+           "  /advisor [MODEL|off]  a stronger model the agent may consult when the work is hard (the advisor tool): a bigger local model, a cloud one\n"
+           "                        (NAME-cloud, after `ollama signin`) or a hosted API: xai:MODEL, openai:MODEL, anthropic:MODEL (key from XAI_API_KEY,\n"
+           "                        OPENAI_API_KEY, ANTHROPIC_API_KEY). It is shown the conversation and answers with advice; it has no tools.\n"
+           "                        /advisor guidance light|normal|strong|max (how much the agent leans on it: consultations per request, how\n"
+           "                        detailed; strong+ also reviews the work before a request ends, max checks the first change before it is made)\n"
+           "                        /advisor effort [LEVEL] (how hard it thinks) · /advisor ctx N|auto (its context window; auto = the main one, at most 16k)\n"
            "  /skills [reload|new NAME]  list skills (SKILL.md files); run one with /NAME [args]\n"
            "  /init                 have the model explore the project and write a CORBIENEST.md (project instructions)\n"
            "  /mode [name]          permission mode: manual · accept-edits · plan · auto (or press shift+tab to cycle)\n"
@@ -1983,7 +2203,7 @@ static void cmd_status(void) {
     printf(C_BOLD "think      " C_RESET "%s, %s\n", g_cfg.think < 0 ? "auto (first call of a request only)" : g_cfg.think ? "on (every call)" : "off", g_cfg.show_thinking ? "shown" : "hidden");
     { sbuf c; sb_init(&c); effort_choices(&g_model_info, &c);
       printf(C_BOLD "effort     " C_RESET "%s%s%s" C_RESET "\n", effort_label(g_cfg.model, &g_model_info), c.len ? C_DIM " · /effort: " : "", c.len ? c.data : ""); sb_free(&c); }
-    if (g_cfg.advisor) printf(C_BOLD "advisor    " C_RESET "%s" C_DIM " · %d consultation%s this session%s" C_RESET "\n", g_cfg.advisor,
+    if (g_cfg.advisor) printf(C_BOLD "advisor    " C_RESET "%s" C_DIM " · guidance %s · %d consultation%s this session%s" C_RESET "\n", g_cfg.advisor, advisor_guidance()->name,
                               g_session.advisor_calls, g_session.advisor_calls == 1 ? "" : "s", g_model_tools && !g_cfg.no_tools ? "" : " · idle: the agent has no tools to ask it with");
     printf(C_BOLD "temp       " C_RESET "%s", g_cfg.temperature < 0 ? "default\n" : ""); if (g_cfg.temperature >= 0) printf("%g\n", g_cfg.temperature);
     printf(C_BOLD "keep_alive " C_RESET "%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "server default (5m)");
@@ -2308,7 +2528,8 @@ static void banner(void) {
     const char *eff = g_cfg.model ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
     printf(C_ORANGE "│" C_RESET " " C_DIM "model:" C_RESET " %s%s" C_DIM " · ctx %s%s%s%s%s" C_RESET "\n", g_cfg.model ? g_cfg.model : "(none)", g_model_tools ? "" : C_DIM " (chat-only)" C_RESET,
            fmt_ctx(g_cfg.num_ctx), g_model_max_ctx > 0 ? " of " : "", g_model_max_ctx > 0 ? fmt_ctx(g_model_max_ctx) : "", eff ? " · effort " : "", eff ? eff : "");
-    if (g_cfg.advisor) printf(C_ORANGE "│" C_RESET " " C_DIM "advisor:" C_RESET " %s\n", g_cfg.advisor);
+    if (g_cfg.advisor) printf(C_ORANGE "│" C_RESET " " C_DIM "advisor:" C_RESET " %s%s%s\n", g_cfg.advisor,
+                              g_cfg.advisor_guidance != GUIDANCE_NORMAL ? C_DIM " · guidance " C_RESET : "", g_cfg.advisor_guidance != GUIDANCE_NORMAL ? advisor_guidance()->name : "");
     printf(C_ORANGE "│" C_RESET " " C_DIM "host: " C_RESET " %s %s\n", g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);
     printf(C_ORANGE "│" C_RESET " " C_DIM "cwd:  " C_RESET " %s%s\n", g_cwd, g_project_instructions ? C_DIM " (project instructions loaded)" C_RESET : "");
     if (g_cfg.mode != MODE_MANUAL) printf(C_ORANGE "│" C_RESET " " C_DIM "mode:  " C_RESET " %s%s" C_RESET "\n", g_cfg.mode == MODE_AUTO ? C_RED : g_cfg.mode == MODE_PLAN ? C_CYAN : C_ORANGE, mode_label(g_cfg.mode));
@@ -2503,7 +2724,9 @@ static void usage(void) {
            "      --no-web         don't offer web_search/web_fetch (the model cannot look documentation up)\n"
            "      --think          think on every model call (default: only the first call of a request); --no-think to disable; --show-thinking to display\n"
            "      --effort LEVEL   how hard the model thinks, one of the levels it has (see /effort): off, on, low, medium, high, …; default = the model's own\n"
-           "      --advisor MODEL  a stronger model the agent may consult through the advisor tool (see /advisor); off = none\n"
+           "      --advisor MODEL  a stronger model the agent may consult through the advisor tool (see /advisor); off = none;\n"
+           "                       xai:MODEL, openai:MODEL, anthropic:MODEL for a hosted one (key from XAI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY)\n"
+           "      --advisor-guidance LEVEL   how much the agent leans on it: light, normal (default), strong, max (see /advisor guidance)\n"
            "      --draft N        draft_num_predict: speculative-decoding/MTP draft tokens per step (0 = off; default: the model's own)\n"
            "      --benchmark [N]  measure tokens per second at each context size the model supports (or just -c N):\n"
            "                       N timed runs (default 3) of a fixed prompt (or -p PROMPT) per size, then exit\n"
@@ -2514,7 +2737,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15;
+    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.advisor_guidance = GUIDANCE_NORMAL;
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();
@@ -2548,6 +2771,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--show-thinking")) g_cfg.show_thinking = true;
         else if (!strcmp(a, "--effort")) cli_effort = NEEDARG();
         else if (!strcmp(a, "--advisor")) { const char *av = NEEDARG(); free(g_cfg.advisor); g_cfg.advisor = strcmp(av, "off") && strcmp(av, "none") ? xstrdup(av) : NULL; }
+        else if (!strcmp(a, "--advisor-guidance")) { const char *gv = NEEDARG(); int n = advisor_guidance_parse(gv); if (n < 0) { fprintf(stderr, "bad advisor guidance %s (light, normal, strong or max)\n", gv); return 2; } g_cfg.advisor_guidance = n; }
         else if (!strcmp(a, "--draft")) { const char *dv = NEEDARG(); if (strspn(dv, "0123456789") != strlen(dv) || !*dv) { fprintf(stderr, "bad draft count %s (a number of tokens, 0 = off)\n", dv); return 2; } g_cfg.draft = atoi(dv); }
         else if (!strcmp(a, "--benchmark")) { bench_runs = 3; if (i + 1 < argc && argv[i+1][0] >= '1' && argv[i+1][0] <= '9' && strspn(argv[i+1], "0123456789") == strlen(argv[i+1])) bench_runs = atoi(argv[++i]); }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
