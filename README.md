@@ -515,8 +515,10 @@ conversation again.
   `fallbacks: "default"`: a consultation its safety classifiers decline — security tooling can
   look like that — is answered by the fallback model instead of not at all. A refusal that
   stands is reported as one, and the turn carries on.
-- The base URLs can point at a proxy or a compatible server. `https_proxy`/`no_proxy` are
-  honoured (never for this machine), and `CURL_CA_BUNDLE` or `SSL_CERT_FILE` names a private CA.
+- The base URLs can point at a proxy or a compatible server. A plain `http://` one is refused
+  unless it is this machine (`localhost`, `127.x`, `[::1]`): the key would cross the network
+  unencrypted. `https_proxy`/`no_proxy` are honoured (never for this machine), and
+  `CURL_CA_BUNDLE` or `SSL_CERT_FILE` names a private CA.
 
 ### Config
 

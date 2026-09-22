@@ -130,7 +130,10 @@ build must be warning-free with `-Wall -Wextra`.
   `begin_request()`), whatever comes of it, so it cannot loop.
 - API keys live in the environment only. Never write one into the config, a session, the
   history, a log or an error message; `provider.c` builds the auth headers for the one request
-  and frees them, and the fake server never logs them either.
+  and frees them, and the fake server never logs them either. A key only travels over TLS or to
+  this machine: `base_insecure()` refuses a plain `http://` base URL for any other host. The
+  plain-http default in `http_url()` is Ollama's (its API has no TLS) and stays — code scanning
+  flags it, and it is dismissed as intended.
 - Slash commands: add to `SLASH_CMDS`, `handle_slash()`, `cmd_help()` and the README table.
   Unknown `/name` falls through to skills, so keep built-in names distinct from likely skill names.
 - The fake Ollama answers memory-extraction calls with `NO_CHANGE` unless a user message contains

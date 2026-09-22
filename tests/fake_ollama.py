@@ -395,7 +395,8 @@ class H(BaseHTTPRequestHandler):
 def serve(port, certfile=None, keyfile=None):
     srv = HTTPServer(("127.0.0.1", port), H)
     if certfile:   # the same server behind TLS: https:// for Ollama and for the hosted APIs
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(certfile, keyfile)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(certfile, keyfile)
         srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     srv.serve_forever()
 

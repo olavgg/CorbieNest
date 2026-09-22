@@ -48,7 +48,12 @@ static void sink_finish(body_sink *s) {
 /* base + path as one URL. The base is what the user gave as the host, so it may lack the scheme
  * ("localhost:11434", "0.0.0.0") and, the way OLLAMA_HOST is written, the port: plain http
  * without one means Ollama's 11434, not 80. An https base keeps its own default (443). A base
- * path ("https://api.x.ai/v1") stays in front of `path`. */
+ * path ("https://api.x.ai/v1") stays in front of `path`.
+ *
+ * No scheme means http on purpose: Ollama's API is plain HTTP (it has no TLS of its own), and
+ * that is what OLLAMA_HOST=gpu-box means to every other Ollama client. https is used whenever
+ * the host says so. What must not travel in the clear — a hosted API's key — is refused over
+ * plain http to another machine in provider.c, before any request is made. */
 char *http_url(const char *base, const char *path) {
     if (!base) base = "";
     while (*base == ' ') base++;

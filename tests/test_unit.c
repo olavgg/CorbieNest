@@ -929,6 +929,24 @@ static void test_provider(void) {
     t = provider_parse_reply("openai:gpt-5.2", "<html>bad gateway</html>", 502, &st, err, sizeof err);
     CHECK(!t && strstr(err, "answered 502") && strstr(err, "bad gateway"));
 
+    /* a key goes over TLS or stays on this machine */
+    setenv("OPENAI_API_KEY", "sk-test", 1);
+    setenv("OPENAI_BASE_URL", "http://proxy.lan:4000/v1", 1);
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == -1 && strstr(err, "OPENAI_BASE_URL is plain http:// to another machine (proxy.lan)") && strstr(err, "unencrypted"));
+    bool ab0; t = provider_chat("openai:gpt-5.2", &oai, &rq, &st, &ab0, err, sizeof err);
+    CHECK(!t && !ab0 && strstr(err, "unencrypted"));
+    setenv("OPENAI_BASE_URL", "http://10.0.0.5/v1", 1);
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == -1 && strstr(err, "(10.0.0.5)"));
+    setenv("OPENAI_BASE_URL", "http://[fd00::1]:8080/v1", 1);
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == -1 && strstr(err, "([fd00::1])"));
+    setenv("OPENAI_BASE_URL", "http://localhost:1/v1", 1);   /* this machine: allowed, and so it is tried (and nothing listens there) */
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == 1 && !strstr(err, "unencrypted"));
+    setenv("OPENAI_BASE_URL", "http://[::1]:1/v1", 1);
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == 1 && !strstr(err, "unencrypted"));
+    setenv("OPENAI_BASE_URL", "https://127.0.0.1:1/v1", 1);
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == 1 && !strstr(err, "unencrypted"));
+    unsetenv("OPENAI_BASE_URL"); unsetenv("OPENAI_API_KEY");
+
     /* without a key there is no request at all */
     unsetenv("XAI_API_KEY");
     CHECK(provider_model_info("xai:grok-4.7", &mi, err, sizeof err) == -1 && strstr(err, "XAI_API_KEY is not set"));

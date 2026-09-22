@@ -1236,6 +1236,10 @@ out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo"
 check(rc == 0 and "xAI refused the key in XAI_API_KEY (400" in out and "wrong-key" not in out, f"a wrong key (xAI says so with a 400): said, without printing it: {out[-300:]!r}")
 out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=dict(ENVK, OPENAI_API_KEY="sk-secret-wxyz"))
 check(rc == 0 and "OpenAI refused the key in OPENAI_API_KEY (401" in out and "wxyz" not in out and "wxyz" not in json.dumps(requests()[-1]), f"not even the masked piece of it OpenAI quotes back: {out[-300:]!r}")
+t0 = time.time()
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=dict(ENVK, OPENAI_BASE_URL="http://192.0.2.1/v1"))
+check(rc == 0 and "OPENAI_BASE_URL is plain http:// to another machine (192.0.2.1)" in out and time.time() - t0 < 4,
+      f"a key is not sent in the clear to another machine — refused before any connection: {out[-300:]!r}")
 out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-nope", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
 check(rc == 0 and "Anthropic does not know a model 'claude-nope'" in out, f"no such model: {out[-300:]!r}")
 check(key_nowhere() is None, f"the key was written nowhere: {key_nowhere()!r}")

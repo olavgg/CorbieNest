@@ -247,6 +247,22 @@ static void auth_headers(const provider_def *p, const char *advisor, const char 
 
 static void idle_tick(void *ud) { (void)ud; term_busy_tick(); }
 
+/* A key goes over TLS, or stays on this machine. The defaults are all https; a base URL set to
+ * plain http:// for another host (a proxy on the LAN, a typo) would hand the key to anyone on
+ * the way, so it is refused rather than used. */
+static bool base_insecure(const provider_def *p, char *err, size_t n) {
+    const char *u = provider_base_url(p);
+    if (strncasecmp(u, "http://", 7)) return false;
+    char host[256] = "";
+    if (url_host(u, host, sizeof host)) {
+        char *c = host[0] == '[' ? strchr(host, ']') : strrchr(host, ':');   /* the port goes */
+        if (host[0] == '[') { if (c) c[1] = 0; } else if (c) *c = 0;
+        if (!strcmp(host, "localhost") || !strncmp(host, "127.", 4) || !strcmp(host, "[::1]")) return false;
+    }
+    snprintf(err, n, "%s is plain http:// to another machine (%s): the key in %s would cross the network unencrypted — use https://", p->url_env, host, p->key_env);
+    return true;
+}
+
 int provider_model_info(const char *advisor, model_info *mi, char *err, size_t n) {
     err[0] = 0;
     const char *model; const provider_def *p = provider_find(advisor, &model);
@@ -254,6 +270,7 @@ int provider_model_info(const char *advisor, model_info *mi, char *err, size_t n
     if (!p) { snprintf(err, n, "'%s' is not a hosted model", advisor ? advisor : ""); return -1; }
     const char *key = getenv(p->key_env);
     if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest", p->key_env); return -1; }
+    if (base_insecure(p, err, n)) return -1;
     const char *hdrs[4]; sbuf keep; auth_headers(p, advisor, key, hdrs, &keep);
     char *id = url_encode(model);
     sbuf path; sb_init(&path); sb_printf(&path, "%s/models/%s", p->style == PROVIDER_MESSAGES ? "/v1" : "", id); free(id);
@@ -284,6 +301,7 @@ char *provider_chat(const char *advisor, const model_info *mi, const provider_re
     if (!p) { snprintf(err, n, "'%s' is not a hosted model", advisor ? advisor : ""); return NULL; }
     const char *key = getenv(p->key_env);
     if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest", p->key_env); return NULL; }
+    if (base_insecure(p, err, n)) return NULL;
     char *body = provider_request_body(advisor, mi, rq);
     const char *hdrs[4]; sbuf keep; auth_headers(p, advisor, key, hdrs, &keep);
     struct timeval t0, t1; gettimeofday(&t0, NULL);
