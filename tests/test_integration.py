@@ -6,7 +6,7 @@ config/env handling, and — via a pseudo-terminal — the interactive editor,
 confirmations, Ctrl-C interruption, type-ahead, slash commands and the /model
 picker. Requires only python3 (stdlib). No real Ollama needed.
 """
-import json, os, pty, re, select, shutil, socket, struct, subprocess, sys, tempfile, termios, fcntl, time, threading, urllib.request
+import inspect, json, os, pty, re, select, shutil, socket, struct, subprocess, sys, tempfile, termios, fcntl, time, threading, urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +63,12 @@ threading.Thread(target=HTTPServer(("127.0.0.1", DOC_PORT), _Docs).serve_forever
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[78]")   # CSI sequences, DECSC/DECRC
 def clean(s): return ANSI.sub("", s).replace("\r", "")
+# During a turn the input field and the status bar are redrawn between DECSC and DECRC — at the
+# bottom of the screen on a real terminal, but in the middle of whatever was streaming in the
+# byte stream a test reads: "Echo: " <the bar> "hello" never contains "Echo: hello". Every
+# DECSC/DECRC pair in term.c wraps chrome and nothing else, so without them this is the transcript.
+CHROME = re.compile(r"\x1b7.*?\x1b8", re.S)
+def transcript(s): return clean(CHROME.sub("", s))
 
 WORK = tempfile.mkdtemp(prefix="crowtest_")
 CFG = tempfile.mkdtemp(prefix="crowcfg_")
@@ -78,7 +84,7 @@ passed = failed = 0
 def check(cond, msg):
     global passed, failed
     if cond: passed += 1
-    else: failed += 1; print(f"  FAIL: {msg}")
+    else: failed += 1; print(f"  FAIL: {msg} (line {inspect.currentframe().f_back.f_lineno})")
 
 def run(args, stdin=b"", env=None):
     p = subprocess.run([BIN] + args, cwd=WORK, env=env or ENV, input=stdin, capture_output=True, timeout=60)
@@ -318,7 +324,8 @@ class Session:
                 except OSError: return False
                 if not d: return False
                 self.out += d
-            if pat in clean(self.out[self.mark:].decode("utf-8", "replace")): return True
+            t = self.out[self.mark:].decode("utf-8", "replace")
+            if pat in clean(t) or pat in transcript(t): return True   # the chrome is read on purpose too ("1 queued", the bar's effort)
         return False
     def send(self, s, wait=0.15):
         self.mark = len(self.out)
