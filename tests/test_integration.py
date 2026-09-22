@@ -224,6 +224,8 @@ out, rc = run(["-m", "nope:latest", "-p", "hi"])
 check("not found" in out, f"unknown model error: {out!r}")
 out = clean(subprocess.run([BIN, "-H", "http://127.0.0.1:1", "-p", "hi"], cwd=WORK, env=ENV, capture_output=True, timeout=30).stdout.decode())
 check("connect" in out or "no models" in out, "unreachable host reported")
+out, rc = run(["-H", f"localhost:{PORT}", "-m", "fake-coder:latest", "-p", "no scheme"])
+check(rc == 0 and "Echo: no scheme" in out, f"a host written the way OLLAMA_HOST is (no scheme) is plain http: {out[-200:]!r}")
 
 print("test chat-only model gets no tools; thinking flag")
 out, rc = run(["-m", "fake-chat:latest", "-p", "hi"])
@@ -343,9 +345,15 @@ class Session:
 
 def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
 
+print("test interactive: an Ollama on another machine over plain http is said to be one")
+s = Session(["-H", "http://ollama.invalid:9", "-m", "fake-coder:latest"])
+check(s.expect("⚠ plain http to ollama.invalid: the conversation crosses the network unencrypted", 20), f"another machine over plain http: the banner says so: {s.text()[-300:]!r}")
+s.close()
+
 print("test interactive: banner, echo, editor keys, history")
 s = Session(["-m", "fake-coder:latest"])
 check(s.expect("Ctrl-D to quit"), "banner"); check("● connected" in s.text(), "connected marker")
+check("plain http to" not in s.text(), "no unencrypted-host warning for an Ollama on this machine")
 raw = s.out.decode("utf-8", "replace")
 check("\x1b[?1049h" in raw, "alternate screen entered (full screen)")
 check(re.search(r"\x1b\[1;36r", raw) is not None, "scroll region reserves the input field and the status bar")
@@ -1245,7 +1253,7 @@ out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yol
 check(rc == 0 and "OpenAI refused the key in OPENAI_API_KEY (401" in out and "wxyz" not in out and "wxyz" not in json.dumps(requests()[-1]), f"not even the masked piece of it OpenAI quotes back: {out[-300:]!r}")
 t0 = time.time()
 out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=dict(ENVK, OPENAI_BASE_URL="http://192.0.2.1/v1"))
-check(rc == 0 and "OPENAI_BASE_URL is plain http:// to another machine (192.0.2.1)" in out and time.time() - t0 < 4,
+check(rc == 0 and "OPENAI_BASE_URL is plain http to another machine (192.0.2.1)" in out and time.time() - t0 < 4,
       f"a key is not sent in the clear to another machine — refused before any connection: {out[-300:]!r}")
 out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-nope", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
 check(rc == 0 and "Anthropic does not know a model 'claude-nope'" in out, f"no such model: {out[-300:]!r}")

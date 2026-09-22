@@ -261,6 +261,13 @@ static void test_http(void) {
     /* connection refused */
     rc = http_request("http://127.0.0.1:1", "GET", "/", NULL, NULL, NULL, NULL, &res);
     CHECK(rc < 0); CHECK(strstr(res.err, "connect") != NULL);
+    /* a host without a scheme, the way OLLAMA_HOST is written: plain http */
+    p = start_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}", &port, &reqpath);
+    snprintf(url, sizeof url, "127.0.0.1:%d", port);
+    sbuf got; sb_init(&got);
+    rc = http_request(url, "GET", "/api/version", NULL, &got, NULL, NULL, &res);
+    CHECK(rc == 0 && res.status == 200); CHECK_STR(got.data, "{}");
+    waitpid(p, NULL, 0); sb_free(&got);
     /* https goes through the same client: refused like plain http, not "unsupported" */
     rc = http_request("https://127.0.0.1:1", "GET", "/", NULL, NULL, NULL, NULL, &res);
     CHECK(rc < 0); CHECK(strstr(res.err, "connect") != NULL);
@@ -280,13 +287,23 @@ static void test_http(void) {
     free(req);
     unlink(reqpath);
 
+    /* where a host setting points, and whether the way there is encrypted */
+    char hn[64];
+    CHECK(url_hostname("gpu-box:11434", hn, sizeof hn) && !strcmp(hn, "gpu-box"));
+    CHECK(url_hostname("https://user@API.example.org:8443/v1", hn, sizeof hn) && !strcmp(hn, "api.example.org"));
+    CHECK(url_hostname("http://[fd00::1]:8080/v1", hn, sizeof hn) && !strcmp(hn, "[fd00::1]"));
+    CHECK(!url_hostname(":11434", hn, sizeof hn));
+    CHECK(url_is_local("localhost") && url_is_local("http://127.0.0.1:11434") && url_is_local("[::1]:9") && url_is_local("0.0.0.0") && url_is_local(":11434") && url_is_local("http://LOCALHOST"));
+    CHECK(!url_is_local("gpu-box:11434") && !url_is_local("http://10.0.0.5") && !url_is_local("http://127.evil.example/") && !url_is_local("https://api.x.ai/v1"));
+    CHECK(url_cleartext("gpu-box:11434") && url_cleartext("http://x") && url_cleartext("HTTP://x") && !url_cleartext("https://x") && !url_cleartext("HTTPS://x"));
     /* what the host setting becomes: Ollama's port when http has none, the scheme's own for https */
     char *u;
     u = http_url("http://127.0.0.1:11434", "/api/chat"); CHECK_STR(u, "http://127.0.0.1:11434/api/chat"); free(u);
-    u = http_url("localhost", "/api/tags"); CHECK_STR(u, "http://localhost:11434/api/tags"); free(u);
+    u = http_url("localhost", "/api/tags"); CHECK_STR(u, "localhost:11434/api/tags"); free(u);   /* no scheme written in: libcurl's default is http */
     u = http_url("http://gpu-box", "/api/tags"); CHECK_STR(u, "http://gpu-box:11434/api/tags"); free(u);
-    u = http_url("0.0.0.0:8080", "/x"); CHECK_STR(u, "http://0.0.0.0:8080/x"); free(u);
-    u = http_url(":11500", "/x"); CHECK_STR(u, "http://127.0.0.1:11500/x"); free(u);
+    u = http_url("0.0.0.0:8080", "/x"); CHECK_STR(u, "0.0.0.0:8080/x"); free(u);
+    u = http_url(":11500", "/x"); CHECK_STR(u, "127.0.0.1:11500/x"); free(u);
+    u = http_url("gpu-box", "/api/chat"); CHECK_STR(u, "gpu-box:11434/api/chat"); free(u);
     u = http_url("http://[::1]", "/x"); CHECK_STR(u, "http://[::1]:11434/x"); free(u);
     u = http_url("http://[::1]:9000/", "/x"); CHECK_STR(u, "http://[::1]:9000/x"); free(u);
     u = http_url("https://ollama.example.org", "/api/chat"); CHECK_STR(u, "https://ollama.example.org/api/chat"); free(u);
@@ -932,7 +949,12 @@ static void test_provider(void) {
     /* a key goes over TLS or stays on this machine */
     setenv("OPENAI_API_KEY", "sk-test", 1);
     setenv("OPENAI_BASE_URL", "http://proxy.lan:4000/v1", 1);
-    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == -1 && strstr(err, "OPENAI_BASE_URL is plain http:// to another machine (proxy.lan)") && strstr(err, "unencrypted"));
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == -1 && strstr(err, "OPENAI_BASE_URL is plain http to another machine (proxy.lan)") && strstr(err, "unencrypted"));
+    setenv("OPENAI_BASE_URL", "proxy.lan:4000/v1", 1);   /* no scheme: libcurl would send it as http */
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == -1 && strstr(err, "(proxy.lan)"));
+    setenv("OPENAI_BASE_URL", "http://127.evil.example/v1", 1);   /* a name that merely starts like a loopback address */
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == -1 && strstr(err, "(127.evil.example)"));
+    setenv("OPENAI_BASE_URL", "http://proxy.lan:4000/v1", 1);
     bool ab0; t = provider_chat("openai:gpt-5.2", &oai, &rq, &st, &ab0, err, sizeof err);
     CHECK(!t && !ab0 && strstr(err, "unencrypted"));
     setenv("OPENAI_BASE_URL", "http://10.0.0.5/v1", 1);

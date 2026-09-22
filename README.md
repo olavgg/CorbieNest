@@ -515,9 +515,9 @@ conversation again.
   `fallbacks: "default"`: a consultation its safety classifiers decline — security tooling can
   look like that — is answered by the fallback model instead of not at all. A refusal that
   stands is reported as one, and the turn carries on.
-- The base URLs can point at a proxy or a compatible server. A plain `http://` one is refused
-  unless it is this machine (`localhost`, `127.x`, `[::1]`): the key would cross the network
-  unencrypted. `https_proxy`/`no_proxy` are honoured (never for this machine), and
+- The base URLs can point at a proxy or a compatible server. A plain-http one (or one without a
+  scheme, which is plain http too) is refused unless it is this machine (`localhost`, `127.x`,
+  `[::1]`): the key would cross the network unencrypted. `https_proxy`/`no_proxy` are honoured (never for this machine), and
   `CURL_CA_BUNDLE` or `SSL_CERT_FILE` names a private CA.
 
 ### Config
@@ -624,9 +624,12 @@ tests/         unit tests, fake Ollama server, pty integration tests
   (`read_file` 2000 lines / 64 KB, `bash`/`grep` 32 KB, `web_search`/`web_fetch` 24 KB) so a single tool round cannot fill the
   context; the model is told to page with `offset`/`limit`.
 - Models without tool support still work as a plain chat (`/models` shows which is which).
-- The Ollama host may be `http://` or `https://` (an Ollama behind a TLS proxy); a host given
-  without a port is Ollama's 11434 for `http`, 443 for `https`. The certificate is checked
-  against the system's CAs, or the file `CURL_CA_BUNDLE`/`SSL_CERT_FILE` names.
+- The Ollama host may be `http://` or `https://` (an Ollama behind a TLS proxy), or written the
+  way `OLLAMA_HOST` is (`gpu-box:11434`, which is plain http); a host given without a port is
+  Ollama's 11434 for `http`, 443 for `https`. The certificate is checked against the system's
+  CAs, or the file `CURL_CA_BUNDLE`/`SSL_CERT_FILE` names. When the host is another machine and
+  the way there is plain http, the banner says so: Ollama has no TLS of its own, so the whole
+  conversation — code, file contents, command output — crosses the network unencrypted.
 
 ## Safety
 

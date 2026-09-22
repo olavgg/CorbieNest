@@ -61,6 +61,9 @@ int   is_file(const char *path);
 /* URLs and HTML, for the web_fetch tool (in util.c so the unit tests can reach them) */
 bool  url_ok(const char *url);                                  /* http(s), sane, not cloud metadata */
 bool  url_host(const char *url, char *out, size_t n);           /* "host[:port]", lowercased */
+bool  url_hostname(const char *url, char *out, size_t n);       /* just the host, of a URL or a host setting ("gpu-box:11434"), lowercased */
+bool  url_is_local(const char *url);                            /* the host is this machine (localhost, 127.x, ::1, 0.0.0.0, none) */
+bool  url_cleartext(const char *url);                           /* not https (no scheme = http) */
 char *html_to_text(const char *html, size_t len, const char *base);  /* readable text, malloc'd; base = "scheme://host" for rooted links */
 char *url_encode(const char *s);                                /* percent-encoding for a query value */
 char *url_decode(const char *s, size_t n);                      /* the reverse, malloc'd */

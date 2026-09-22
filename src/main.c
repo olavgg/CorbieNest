@@ -2319,6 +2319,7 @@ static void cmd_history(const char *arg) {
 }
 
 /* returns 1 to quit, -1 if a skill's model turn was interrupted */
+static void host_warning(const char *lead);
 static int handle_slash(char *line) {
     char *cmd = line, *arg = strchr(line, ' ');
     if (arg) { *arg++ = 0; while (*arg == ' ') arg++; if (!*arg) arg = NULL; }
@@ -2422,7 +2423,7 @@ static int handle_slash(char *line) {
                printf(C_GREEN "✓ keep_alive = %s" C_RESET " (applies from the next request)\n", g_cfg.keep_alive ? g_cfg.keep_alive : "server default"); }
     }
     else if (!strcmp(cmd, "/host")) {
-        if (!arg) printf("host: %s\n", g_cfg.host); else { free(g_cfg.host); g_cfg.host = xstrdup(arg); config_save(); free(g_advisor_info_for); g_advisor_info_for = NULL; refresh_model_caps(false); printf(C_GREEN "✓ host = %s" C_RESET "\n", g_cfg.host); }
+        if (!arg) printf("host: %s\n", g_cfg.host); else { free(g_cfg.host); g_cfg.host = xstrdup(arg); config_save(); free(g_advisor_info_for); g_advisor_info_for = NULL; refresh_model_caps(false); printf(C_GREEN "✓ host = %s" C_RESET "\n", g_cfg.host); host_warning("  "); }
     }
     else if (!strcmp(cmd, "/save")) cmd_save(arg);
     else if (!strcmp(cmd, "/history")) cmd_history(arg);
@@ -2519,6 +2520,14 @@ static void handle_bang(const char *cmd) {
     sb_free(&m); sb_free(&out); cJSON_Delete(a);
 }
 
+/* the conversation goes to the Ollama host whole: say so when that is another machine and the
+ * way there is not encrypted (Ollama has no TLS of its own; a TLS proxy in front of it does) */
+static void host_warning(const char *lead) {
+    if (!url_cleartext(g_cfg.host) || url_is_local(g_cfg.host)) return;
+    char h[256] = ""; url_hostname(g_cfg.host, h, sizeof h);
+    printf("%s" C_YELLOW "⚠ plain http to %s: the conversation crosses the network unencrypted" C_RESET C_DIM " (an https:// host keeps it private)" C_RESET "\n", lead, h);
+}
+
 static void banner(void) {
     char ver[128];
     int ok = ollama_ping(ver, sizeof ver);
@@ -2531,6 +2540,7 @@ static void banner(void) {
     if (g_cfg.advisor) printf(C_ORANGE "│" C_RESET " " C_DIM "advisor:" C_RESET " %s%s%s\n", g_cfg.advisor,
                               g_cfg.advisor_guidance != GUIDANCE_NORMAL ? C_DIM " · guidance " C_RESET : "", g_cfg.advisor_guidance != GUIDANCE_NORMAL ? advisor_guidance()->name : "");
     printf(C_ORANGE "│" C_RESET " " C_DIM "host: " C_RESET " %s %s\n", g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);
+    host_warning(C_ORANGE "│" C_RESET " ");
     printf(C_ORANGE "│" C_RESET " " C_DIM "cwd:  " C_RESET " %s%s\n", g_cwd, g_project_instructions ? C_DIM " (project instructions loaded)" C_RESET : "");
     if (g_cfg.mode != MODE_MANUAL) printf(C_ORANGE "│" C_RESET " " C_DIM "mode:  " C_RESET " %s%s" C_RESET "\n", g_cfg.mode == MODE_AUTO ? C_RED : g_cfg.mode == MODE_PLAN ? C_CYAN : C_ORANGE, mode_label(g_cfg.mode));
     printf(C_ORANGE "╰"); for (int i = 0; i < w - 2; i++) printf("─"); printf("╯" C_RESET "\n");
@@ -2744,7 +2754,6 @@ int main(int argc, char **argv) {
     const char *env_host = getenv("OLLAMA_HOST");
     if (env_host && *env_host && !g_cfg.host) g_cfg.host = xstrdup(env_host);
     if (!g_cfg.host) g_cfg.host = xstrdup("http://127.0.0.1:11434");
-    if (strncmp(g_cfg.host, "http", 4) != 0) { sbuf b; sb_init(&b); sb_printf(&b, "http://%s", g_cfg.host); free(g_cfg.host); g_cfg.host = sb_detach(&b); }
     const char *env_model = getenv("CORBIENEST_MODEL");
     if (env_model && *env_model) { free(g_cfg.model); g_cfg.model = xstrdup(env_model); }
 

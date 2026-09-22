@@ -50,16 +50,17 @@ static void sink_finish(body_sink *s) {
  * without one means Ollama's 11434, not 80. An https base keeps its own default (443). A base
  * path ("https://api.x.ai/v1") stays in front of `path`.
  *
- * No scheme means http on purpose: Ollama's API is plain HTTP (it has no TLS of its own), and
- * that is what OLLAMA_HOST=gpu-box means to every other Ollama client. https is used whenever
- * the host says so. What must not travel in the clear — a hosted API's key — is refused over
- * plain http to another machine in provider.c, before any request is made. */
+ * No scheme is ever written in. A host without one goes to libcurl as it is, and libcurl's
+ * default is http — Ollama's API is plain HTTP, it has no TLS of its own, and that is what
+ * OLLAMA_HOST=gpu-box means to every other Ollama client. (libcurl takes a first label of
+ * ftp., dict., ldap., imap., pop3. or smtp. for that protocol instead, which is refused here:
+ * only http and https are allowed.) https is used whenever the host says so; the banner says
+ * when the conversation goes to another machine unencrypted, and a hosted API's key is not sent
+ * that way at all (provider.c). */
 char *http_url(const char *base, const char *path) {
     if (!base) base = "";
     while (*base == ' ') base++;
     const char *sep = strstr(base, "://");
-    const char *scheme = sep ? base : "http";
-    size_t scheme_len = sep ? (size_t)(sep - base) : 4;
     const char *auth = sep ? sep + 3 : base;
     size_t auth_len = strcspn(auth, "/?#");
     const char *rest = auth + auth_len;
@@ -68,12 +69,12 @@ char *http_url(const char *base, const char *path) {
     bool has_port = auth[0] == '['
         ? (memchr(auth, ']', auth_len) && ((const char *)memchr(auth, ']', auth_len))[1] == ':')
         : memchr(auth, ':', auth_len) != NULL;
-    bool http = scheme_len == 4 && !strncasecmp(scheme, "http", 4);
+    bool ollama = !sep || (sep - base == 4 && !strncasecmp(base, "http", 4));   /* plain http, said or not */
     sbuf u; sb_init(&u);
-    sb_append(&u, scheme, scheme_len); sb_puts(&u, "://");
+    if (sep) sb_append(&u, base, (size_t)(auth - base));   /* the scheme as the user wrote it */
     if (auth_len == 0 || auth[0] == ':') sb_puts(&u, "127.0.0.1");   /* ":11434" = this machine */
     sb_append(&u, auth, auth_len);
-    if (http && !has_port) sb_puts(&u, ":11434");
+    if (ollama && !has_port) sb_puts(&u, ":11434");
     sb_append(&u, rest, rest_len);
     if (path && *path && *path != '/') sb_putc(&u, '/');
     if (path) sb_puts(&u, path);
@@ -132,7 +133,7 @@ int http_request(const char *base_url, const char *method, const char *path,
     hdrs = curl_slist_append(hdrs, "Expect:");              /* no 100-continue round trip for a big brief */
     /* a server that serves one connection at a time (a test's) is not held up; over TLS the
      * connection may be HTTP/2, where the header is not allowed (FORBID_REUSE closes it anyway) */
-    if (!strncasecmp(url, "http://", 7)) hdrs = curl_slist_append(hdrs, "Connection: close");
+    if (strncasecmp(url, "https://", 8)) hdrs = curl_slist_append(hdrs, "Connection: close");
     for (const char *const *e = http_headers; e && *e; e++) hdrs = curl_slist_append(hdrs, *e);
 
     char ua[64]; snprintf(ua, sizeof ua, "corbienest/%s", CORBIE_VERSION);

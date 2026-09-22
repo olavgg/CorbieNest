@@ -248,18 +248,13 @@ static void auth_headers(const provider_def *p, const char *advisor, const char 
 static void idle_tick(void *ud) { (void)ud; term_busy_tick(); }
 
 /* A key goes over TLS, or stays on this machine. The defaults are all https; a base URL set to
- * plain http:// for another host (a proxy on the LAN, a typo) would hand the key to anyone on
- * the way, so it is refused rather than used. */
+ * plain http for another host — or to one without a scheme, which libcurl sends as http — would
+ * hand the key to anyone on the way (a proxy on the LAN, a typo), so it is refused, not used. */
 static bool base_insecure(const provider_def *p, char *err, size_t n) {
     const char *u = provider_base_url(p);
-    if (strncasecmp(u, "http://", 7)) return false;
-    char host[256] = "";
-    if (url_host(u, host, sizeof host)) {
-        char *c = host[0] == '[' ? strchr(host, ']') : strrchr(host, ':');   /* the port goes */
-        if (host[0] == '[') { if (c) c[1] = 0; } else if (c) *c = 0;
-        if (!strcmp(host, "localhost") || !strncmp(host, "127.", 4) || !strcmp(host, "[::1]")) return false;
-    }
-    snprintf(err, n, "%s is plain http:// to another machine (%s): the key in %s would cross the network unencrypted — use https://", p->url_env, host, p->key_env);
+    if (!url_cleartext(u) || url_is_local(u)) return false;
+    char host[256] = ""; url_hostname(u, host, sizeof host);
+    snprintf(err, n, "%s is plain http to another machine (%s): the key in %s would cross the network unencrypted — use https://", p->url_env, host, p->key_env);
     return true;
 }
 

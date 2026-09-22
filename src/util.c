@@ -343,6 +343,38 @@ bool url_host(const char *url, char *out, size_t n) {
     return out[0] != 0;
 }
 
+/* The host of a URL, or of a host setting as the user writes one — scheme, user@ and port all
+ * optional ("gpu-box:11434", "http://[::1]:8080/v1") — lowercased, without the port. */
+bool url_hostname(const char *url, char *out, size_t n) {
+    if (!url || !n) return false;
+    out[0] = 0;
+    const char *p = strstr(url, "://"); p = p ? p + 3 : url;
+    while (*p == ' ') p++;
+    size_t len = strcspn(p, "/?#");
+    for (size_t i = len; i > 0; i--) if (p[i - 1] == '@') { p += i; len -= i; break; }
+    size_t h = p[0] == '[' ? (memchr(p, ']', len) ? (size_t)((const char *)memchr(p, ']', len) - p) + 1 : len) : strcspn(p, ":/?#");
+    if (h > len) h = len;
+    if (h >= n) h = n - 1;
+    for (size_t i = 0; i < h; i++) out[i] = (p[i] >= 'A' && p[i] <= 'Z') ? (char)(p[i] - 'A' + 'a') : p[i];
+    out[h] = 0;
+    return out[0] != 0;
+}
+
+/* This machine: localhost, an IPv4 loopback address (a literal one — "127.evil.example" is a
+ * name like any other), ::1, 0.0.0.0, or no host at all (":11434"). */
+bool url_is_local(const char *url) {
+    char h[256];
+    if (!url_hostname(url, h, sizeof h)) return true;
+    if (!strcmp(h, "localhost") || !strcmp(h, "[::1]") || !strcmp(h, "::1") || !strcmp(h, "0.0.0.0")) return true;
+    return !strncmp(h, "127.", 4) && strspn(h, "0123456789.") == strlen(h);
+}
+
+/* Not encrypted on the way: anything but https — a host without a scheme is plain http */
+bool url_cleartext(const char *url) {
+    while (url && *url == ' ') url++;
+    return !url || strncasecmp(url, "https://", 8) != 0;
+}
+
 /* Is this a URL we are willing to hand to curl? http(s) only, sane length, no control
  * characters or whitespace (it goes through sh_quote, but a URL with a newline in it is
  * never what the user meant). The cloud metadata addresses are refused outright: the model
