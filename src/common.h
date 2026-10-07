@@ -234,6 +234,7 @@ extern const char *const *http_headers;   /* extra request headers ("Name: value
 int http_request(const char *base_url, const char *method, const char *path,
                  const char *body, sbuf *out, http_line_cb line_cb, void *ud,
                  http_result *res);
+bool http_busy(void);   /* a request is in flight: do not start another (their settings are globals) */
 char *http_url(const char *base, const char *path);   /* base + path; "host" and "http://host" get Ollama's port 11434 (malloc'd) */
 
 /* ---------- term.h ---------- */
@@ -484,6 +485,7 @@ int ollama_poll_or_message(void);         /* http_interrupt_check for such a cal
 extern char ollama_error[512];
 /* Fetch model names. Returns cJSON array of strings (caller owns) or NULL. */
 cJSON *ollama_list_models(void);
+cJSON *ollama_list_models_quiet(int wait_ms);   /* the same, silently: for the suggestions */
 int    ollama_ping(char *ver, size_t verlen);
 /* Context length the model was trained for (from /api/show), 0 if unknown. */
 int    ollama_model_context_length(const char *model);
@@ -498,14 +500,14 @@ cJSON *parse_text_tool_calls(const char *content);
 
 /* ---------- provider.c: hosted model APIs, for the advisor ----------
  * Besides a model on the Ollama server the advisor can be a hosted one, named PROVIDER:MODEL:
- * "xai:grok-4.7", "openai:gpt-5.2", "anthropic:claude-opus-5" (grok: and claude: work too). The
+ * "xai:grok-4.7", "openai:gpt-5.2", "anthropic:claude-opus-5" (grok:, chatgpt: and claude: work too). The
  * key comes from the environment and is never saved. */
 typedef enum { PROVIDER_CHAT_COMPLETIONS, PROVIDER_MESSAGES } provider_style;
 typedef struct {
     const char *name, *alias, *label;      /* "xai", "grok", "xAI" */
     const char *key_env, *url_env, *url;   /* XAI_API_KEY, XAI_BASE_URL, the base URL otherwise */
     provider_style style;                  /* Chat Completions (xAI, OpenAI) or Anthropic's Messages API */
-    const char *example;                   /* a model of theirs, for /advisor's explanation */
+    const char *example, *known_as;        /* a model of theirs and what people call them ("Grok"), for /advisor's explanation and suggestions */
 } provider_def;
 const provider_def *provider_at(int i);   /* the providers in turn, NULL past the last */
 const provider_def *provider_find(const char *advisor, const char **model);   /* NULL = a model on the Ollama server */
@@ -528,6 +530,8 @@ char *provider_chat(const char *advisor, const model_info *mi, const provider_re
 char *provider_request_body(const char *advisor, const model_info *mi, const provider_request *rq);
 char *provider_parse_reply(const char *advisor, const char *json, int status, chat_stats *st, char *err, size_t n);
 void  provider_parse_model(const char *advisor, const char *json, model_info *mi);
+cJSON *provider_parse_models(const char *json);                    /* a model list as [{"id","name"}], NULL if it is not one */
+cJSON *provider_list_models(const provider_def *p, int wait_ms);   /* what the key can use, asked silently; NULL without a key or an answer */
 bool  provider_fallbacks(const char *advisor);   /* an Anthropic model with server-side refusal fallbacks (Opus 5, Fable 5.x) */
 
 #endif

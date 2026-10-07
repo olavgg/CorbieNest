@@ -487,7 +487,10 @@ since then (deepseek-r1, for one) shows up there as chat-only.
 `/advisor MODEL` names a stronger model that the agent may **consult** while it works — a bigger
 local model, one of Ollama's cloud models (`/advisor gpt-oss:120b-cloud`; run `ollama signin`
 once, the local server relays the call), or a hosted API: xAI's Grok, OpenAI, or Anthropic's
-Claude (see [Hosted advisors](#hosted-advisors)). Bare `/advisor` lists the three kinds, with
+Claude (see [Hosted advisors](#hosted-advisors)). As you type `/advisor ` the list under the input field offers the hosted providers (`xai:`,
+`openai:`, `anthropic:` — typing `grok`, `chatgpt` or `claude` finds them too) and the installed
+models, and behind a provider's prefix the models its key can use, asked from the provider's
+own model list. Bare `/advisor` lists the three kinds, with
 the key each hosted provider wants and whether it is set, and what `guidance` and `effort` do,
 above its picker. The agent gets an `advisor` tool and is told
 when to use it: before it commits to an approach for a non-trivial change, when an error has
@@ -565,7 +568,7 @@ conversation again.
 | provider | name it | key | base URL (override) | API |
 |---|---|---|---|---|
 | xAI (Grok) | `xai:grok-4.7` (or `grok:…`) | `XAI_API_KEY` | `https://api.x.ai/v1` (`XAI_BASE_URL`) | Chat Completions |
-| OpenAI | `openai:gpt-5.2` | `OPENAI_API_KEY` | `https://api.openai.com/v1` (`OPENAI_BASE_URL`) | Chat Completions |
+| OpenAI | `openai:gpt-5.2` (or `chatgpt:…`) | `OPENAI_API_KEY` | `https://api.openai.com/v1` (`OPENAI_BASE_URL`) | Chat Completions |
 | Anthropic (Claude) | `anthropic:claude-opus-5` (or `claude:…`) | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` (`ANTHROPIC_BASE_URL`) | Messages |
 
 - **Keys come from the environment only** — export one before starting corbienest. They are

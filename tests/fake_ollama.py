@@ -280,6 +280,9 @@ class H(BaseHTTPRequestHandler):
         return None
     def _provider_get(self, prov, rest):
         if self._provider_auth(prov): return
+        if rest.split("?")[0] == "/models":   # the list: what /advisor's suggestions are made of
+            return self._json(200, {"data": [dict({"id": k, "object": "model"}, **({"display_name": k.replace("-", " ").title()} if prov == "anthropic" else {}))
+                                             for k in PROVIDER_MODELS[prov]], "has_more": False})
         mid = rest[len("/models/"):] if rest.startswith("/models/") else None
         entry = PROVIDER_MODELS[prov].get(mid) if mid else None
         if entry is None:

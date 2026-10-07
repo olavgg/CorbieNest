@@ -976,7 +976,15 @@ static void test_provider(void) {
     p = provider_find("grok:grok-4.7", &model); CHECK(p && !strcmp(p->name, "xai"));
     p = provider_find("claude:claude-opus-5", &model); CHECK(p && p->style == PROVIDER_MESSAGES); CHECK_STR(model, "claude-opus-5");
     CHECK(provider_find("OpenAI:gpt-5.2", NULL) != NULL);
+    p = provider_find("chatgpt:gpt-5.2", &model); CHECK(p && !strcmp(p->name, "openai")); CHECK_STR(model, "gpt-5.2");
     CHECK(!provider_find("qwen3:32b", NULL) && !provider_find("gpt-oss:120b-cloud", NULL) && !provider_find("xai:", NULL) && !provider_find(NULL, NULL));
+    CHECK(provider_at(0) && !strcmp(provider_at(0)->name, "xai") && provider_at(0)->example && !provider_at(99) && !provider_at(-1));
+    cJSON *ml = provider_parse_models("{\"data\":[{\"id\":\"claude-opus-5\",\"display_name\":\"Claude Opus 5\"},{\"id\":\"gpt-5.2\"},{\"object\":\"model\"}],\"has_more\":false}");
+    CHECK(ml && cJSON_GetArraySize(ml) == 2);
+    CHECK_STR(jstr_at(cJSON_GetArrayItem(ml, 0), "id"), "claude-opus-5"); CHECK_STR(jstr_at(cJSON_GetArrayItem(ml, 0), "name"), "Claude Opus 5");
+    CHECK_STR(jstr_at(cJSON_GetArrayItem(ml, 1), "id"), "gpt-5.2"); CHECK(!jstr_at(cJSON_GetArrayItem(ml, 1), "name"));
+    cJSON_Delete(ml);
+    CHECK(!provider_parse_models("{\"error\":{\"message\":\"nope\"}}") && !provider_parse_models("not json") && !provider_parse_models(NULL));
     p = provider_find("openai:x", NULL);
     unsetenv("OPENAI_BASE_URL"); CHECK_STR(provider_base_url(p), "https://api.openai.com/v1");
     setenv("OPENAI_BASE_URL", "http://127.0.0.1:9/v1", 1); CHECK_STR(provider_base_url(p), "http://127.0.0.1:9/v1"); unsetenv("OPENAI_BASE_URL");

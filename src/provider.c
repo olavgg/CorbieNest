@@ -18,10 +18,10 @@
 #include <unistd.h>
 
 static const provider_def PROVIDERS[] = {
-    { "xai",       "grok",   "xAI",       "XAI_API_KEY",       "XAI_BASE_URL",       "https://api.x.ai/v1",       PROVIDER_CHAT_COMPLETIONS, "grok-4.7" },
-    { "openai",    NULL,     "OpenAI",    "OPENAI_API_KEY",    "OPENAI_BASE_URL",    "https://api.openai.com/v1", PROVIDER_CHAT_COMPLETIONS, "gpt-5.2" },
+    { "xai",       "grok",   "xAI",       "XAI_API_KEY",       "XAI_BASE_URL",       "https://api.x.ai/v1",       PROVIDER_CHAT_COMPLETIONS, "grok-4.7", "Grok" },
+    { "openai",    "chatgpt","OpenAI",    "OPENAI_API_KEY",    "OPENAI_BASE_URL",    "https://api.openai.com/v1", PROVIDER_CHAT_COMPLETIONS, "gpt-5.2", "ChatGPT" },
     /* no /v1 in the base: ANTHROPIC_BASE_URL is written that way for the SDKs (and Claude Code) */
-    { "anthropic", "claude", "Anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "https://api.anthropic.com", PROVIDER_MESSAGES,         "claude-opus-5" },
+    { "anthropic", "claude", "Anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "https://api.anthropic.com", PROVIDER_MESSAGES,         "claude-opus-5", "Claude" },
 };
 
 const provider_def *provider_at(int i) {
@@ -291,6 +291,41 @@ int provider_model_info(const char *advisor, model_info *mi, char *err, size_t n
     }
     sb_free(&out); sb_free(&path); sb_free(&keep);
     return ret;
+}
+
+/* A provider's model list — {"data":[{"id":…}]} at all three, Anthropic's with a display_name —
+ * as an array of {"id","name"}, in the order given. NULL when the answer is not a list. */
+cJSON *provider_parse_models(const char *json) {
+    cJSON *j = cJSON_Parse(json ? json : ""), *data = cJSON_GetObjectItemCaseSensitive(j, "data"), *m;
+    if (!cJSON_IsArray(data)) { cJSON_Delete(j); return NULL; }
+    cJSON *arr = cJSON_CreateArray();
+    cJSON_ArrayForEach(m, data) {
+        cJSON *id = cJSON_GetObjectItemCaseSensitive(m, "id"), *dn = cJSON_GetObjectItemCaseSensitive(m, "display_name");
+        if (!cJSON_IsString(id) || !id->valuestring[0]) continue;
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "id", id->valuestring);
+        if (cJSON_IsString(dn)) cJSON_AddStringToObject(o, "name", dn->valuestring);
+        cJSON_AddItemToArray(arr, o);
+    }
+    cJSON_Delete(j);
+    return arr;
+}
+
+/* The models the key in the environment can use, for the suggestions under the input field:
+ * asked silently, given up on after wait_ms, NULL without a key or an answer. */
+cJSON *provider_list_models(const provider_def *p, int wait_ms) {
+    char err[400];
+    const char *key = getenv(p->key_env);
+    if (!key || !*key || base_insecure(p, err, sizeof err)) return NULL;
+    const char *hdrs[4]; sbuf keep; auth_headers(p, "", key, hdrs, &keep);
+    sbuf out; sb_init(&out); http_result res;
+    int idle_was = http_idle_timeout_ms, fd_was = http_interrupt_fd;
+    http_headers = hdrs; http_idle_timeout_ms = wait_ms; http_interrupt_fd = -1;
+    int rc = http_request(provider_base_url(p), "GET", p->style == PROVIDER_MESSAGES ? "/v1/models?limit=1000" : "/models", NULL, &out, NULL, NULL, &res);
+    http_headers = NULL; http_idle_timeout_ms = idle_was; http_interrupt_fd = fd_was;
+    cJSON *arr = rc == 0 && res.status == 200 ? provider_parse_models(out.data) : NULL;
+    sb_free(&out); sb_free(&keep);
+    return arr;
 }
 
 char *provider_chat(const char *advisor, const model_info *mi, const provider_request *rq, chat_stats *st, bool *aborted, char *err, size_t n) {

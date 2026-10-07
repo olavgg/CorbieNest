@@ -115,6 +115,11 @@ static int ctrl_c_pending(void) {
     return 0;
 }
 
+/* The settings of a request are globals (http_headers, http_idle, …), so one must not be started
+ * from inside another — which code that runs in the poll of a live request can only know by asking. */
+static int g_http_depth = 0;
+bool http_busy(void) { return g_http_depth > 0; }
+
 int http_request(const char *base_url, const char *method, const char *path,
                  const char *body, sbuf *out, http_line_cb line_cb, void *ud,
                  http_result *res) {
@@ -125,6 +130,7 @@ int http_request(const char *base_url, const char *method, const char *path,
     if (!h || !m) { if (h) curl_easy_cleanup(h); if (m) curl_multi_cleanup(m); snprintf(res->err, sizeof res->err, "libcurl could not be initialised"); return -1; }
     char *url = http_url(base_url, path);
     char errbuf[CURL_ERROR_SIZE] = "";
+    g_http_depth++;
     xfer x; memset(&x, 0, sizeof x);
     x.sink.cb = line_cb; x.sink.ud = ud; x.sink.out = out; sb_init(&x.sink.linebuf);
 
@@ -214,5 +220,6 @@ int http_request(const char *base_url, const char *method, const char *path,
     curl_easy_cleanup(h); curl_multi_cleanup(m);
     curl_slist_free_all(hdrs);
     free(url); sb_free(&x.sink.linebuf);
+    g_http_depth--;
     return rv;
 }

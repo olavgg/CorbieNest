@@ -42,7 +42,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/system", "extra system instructions: TEXT, or clear" },
     { "/think", "when the model thinks: on, off, auto · show or hide it" },
     { "/effort", "how hard this model thinks" },
-    { "/advisor", "a stronger model the agent may consult: MODEL, off, guidance, effort, ctx" },
+    { "/advisor", "a stronger model the agent may consult: a local one, or Claude, ChatGPT, Grok by API key" },
     { "/mode", "permission mode: manual, accept-edits, plan, auto" },
     { "/yolo", "auto mode on or off: every tool call approved" },
     { "/tools", "tool calling on or off" },
@@ -2634,6 +2634,75 @@ static void sug_add(term_sug **v, int *n, const char *text, const char *desc, bo
     (*v)[(*n)++] = (term_sug){ xstrdup(text), desc && *desc ? xstrdup(desc) : NULL, open };
 }
 
+/* The model lists behind /advisor's suggestions: slot 0 is the Ollama server's, 1 + i that of
+ * hosted provider i. Asked for when a name is first typed and kept for a minute — an answer that
+ * did not come too, so a server that is down costs one wait and not one per letter. The hook
+ * runs inside the poll of a live request as well, where a second request must not start: there
+ * it gets what is already known. */
+#define MODEL_LIST_SECS 60
+#define MODEL_LIST_WAIT_MS 3000
+#define MODEL_LISTS 8
+#define MODEL_SUG_MAX 60
+static struct { cJSON *list; char *from; time_t at; } g_model_lists[MODEL_LISTS];
+
+static cJSON *model_list_get(int slot, const provider_def *p) {
+    if (slot >= MODEL_LISTS) return NULL;
+    const char *from = p ? provider_base_url(p) : g_cfg.host;
+    bool same = g_model_lists[slot].from && !strcmp(g_model_lists[slot].from, from);
+    if (http_busy() || (same && time(NULL) - g_model_lists[slot].at <= MODEL_LIST_SECS)) return same ? g_model_lists[slot].list : NULL;
+    cJSON_Delete(g_model_lists[slot].list); free(g_model_lists[slot].from);
+    g_model_lists[slot].list = p ? provider_list_models(p, MODEL_LIST_WAIT_MS) : ollama_list_models_quiet(MODEL_LIST_WAIT_MS);
+    g_model_lists[slot].from = xstrdup(from); g_model_lists[slot].at = time(NULL);
+    return g_model_lists[slot].list;
+}
+
+static void sug_add(term_sug **v, int *n, const char *text, const char *desc, bool open);
+
+/* What /advisor could be given besides its options: an installed model, or a hosted provider's
+ * prefix — and behind the prefix, the models its key can use. The providers come before the
+ * installed models (those can be many, and a hosted one is what nobody would guess is there);
+ * of the models, names that start with what was typed come first, then those that contain it. */
+static void suggest_advisor(const char *word, term_sug **items, int *n) {
+    size_t wl = strlen(word);
+    const char *colon = strchr(word, ':');
+    const provider_def *pv = NULL, *p;
+    if (colon) {   /* "xai:" is a provider as much as "xai:grok" is */
+        sbuf probe; sb_init(&probe); sb_append(&probe, word, (size_t)(colon - word) + 1); sb_putc(&probe, 'x');
+        pv = provider_find(probe.data, NULL);
+        sb_free(&probe);
+    }
+    cJSON *m;
+    if (pv) {
+        int slot = 1; while (provider_at(slot - 1) != pv) slot++;
+        cJSON *list = model_list_get(slot, pv);
+        const char *rest = colon + 1; size_t rl = strlen(rest);
+        for (int pass = 0; pass < 2; pass++) cJSON_ArrayForEach(m, list) {
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(m, "id"), *name = cJSON_GetObjectItemCaseSensitive(m, "name");
+            bool starts = !strncasecmp(id->valuestring, rest, rl);
+            if (*n >= MODEL_SUG_MAX || (pass == 0 ? !starts : starts || rl < 2 || !strcasestr(id->valuestring, rest))) continue;
+            sbuf t; sb_init(&t); sb_append(&t, word, (size_t)(colon - word) + 1); sb_puts(&t, id->valuestring);
+            sug_add(items, n, t.data, cJSON_IsString(name) ? name->valuestring : NULL, false);
+            sb_free(&t);
+        }
+        return;
+    }
+    for (int i = 0; (p = provider_at(i)); i++) {   /* by either name: "grok", "chatgpt" and "claude" are what people type */
+        char pre[48], desc[128]; snprintf(pre, sizeof pre, "%s:", p->name);
+        if (strncasecmp(pre, word, wl) && (!p->alias || strncasecmp(p->alias, word, wl))) continue;
+        const char *key = getenv(p->key_env);
+        snprintf(desc, sizeof desc, "%s (%s), a hosted API · %s %s", p->label, p->known_as, p->key_env, key && *key ? "set" : "not set");
+        sug_add(items, n, pre, desc, true);
+    }
+    cJSON *list = model_list_get(0, NULL);
+    for (int pass = 0; pass < 2; pass++) cJSON_ArrayForEach(m, list) {
+        const char *name = cJSON_GetObjectItemCaseSensitive(m, "name")->valuestring, *size = cJSON_GetObjectItemCaseSensitive(m, "size")->valuestring;
+        bool starts = !strncasecmp(name, word, wl);
+        if (*n >= MODEL_SUG_MAX || (pass == 0 ? !starts : starts || wl < 2 || !strcasestr(name, word))) continue;
+        char desc[96]; snprintf(desc, sizeof desc, "%s%s%s", size, *size && model_same(name, g_cfg.model) ? " · " : "", model_same(name, g_cfg.model) ? "the model doing the work" : "");
+        sug_add(items, n, name, desc, false);
+    }
+}
+
 static int suggest_files(const char *typed, bool dirs_only, term_sug **items) {
     file_match *m;
     int n = file_complete(typed, dirs_only, 50, &m), k = 0;
@@ -2737,6 +2806,7 @@ static int suggest(const char *buf, size_t cur, size_t *from, term_sug **items) 
         }
         break;
     }
+    if (!strcmp(before, "/advisor")) suggest_advisor(word, items, &n);
     free(before); free(word);
     return n;
 }
