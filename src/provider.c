@@ -268,7 +268,7 @@ int provider_model_info(const char *advisor, model_info *mi, char *err, size_t n
     provider_parse_model(advisor, NULL, mi);   /* what it generally takes, until the API says more */
     if (!p) { snprintf(err, n, "'%s' is not a hosted model", advisor ? advisor : ""); return -1; }
     const char *key = getenv(p->key_env);
-    if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest", p->key_env); return -1; }
+    if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest (a NAME=value line without `export` is not passed on)", p->key_env); return -1; }
     if (base_insecure(p, err, n)) return -1;
     const char *hdrs[4]; sbuf keep; auth_headers(p, advisor, key, hdrs, &keep);
     char *id = url_encode(model);
@@ -312,11 +312,13 @@ cJSON *provider_parse_models(const char *json) {
 }
 
 /* The models the key in the environment can use, for the suggestions under the input field:
- * asked silently, given up on after wait_ms, NULL without a key or an answer. */
-cJSON *provider_list_models(const provider_def *p, int wait_ms) {
-    char err[400];
+ * asked silently, given up on after wait_ms, NULL without a key or an answer — err then says
+ * which, in the few words a row of that list has room for. */
+cJSON *provider_list_models(const provider_def *p, int wait_ms, char *err, size_t n) {
+    err[0] = 0;
     const char *key = getenv(p->key_env);
-    if (!key || !*key || base_insecure(p, err, sizeof err)) return NULL;
+    if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest", p->key_env); return NULL; }
+    if (base_insecure(p, err, n)) return NULL;
     const char *hdrs[4]; sbuf keep; auth_headers(p, "", key, hdrs, &keep);
     sbuf out; sb_init(&out); http_result res;
     int idle_was = http_idle_timeout_ms, fd_was = http_interrupt_fd;
@@ -324,6 +326,9 @@ cJSON *provider_list_models(const provider_def *p, int wait_ms) {
     int rc = http_request(provider_base_url(p), "GET", p->style == PROVIDER_MESSAGES ? "/v1/models?limit=1000" : "/models", NULL, &out, NULL, NULL, &res);
     http_headers = NULL; http_idle_timeout_ms = idle_was; http_interrupt_fd = fd_was;
     cJSON *arr = rc == 0 && res.status == 200 ? provider_parse_models(out.data) : NULL;
+    if (rc != 0) snprintf(err, n, "no model list: %s", res.err);
+    else if (res.status == 404 || (res.status == 200 && !arr)) snprintf(err, n, "%s has no model list at %s", p->label, provider_base_url(p));
+    else if (res.status != 200) status_error(p, "", res.status, out.data, err, n);
     sb_free(&out); sb_free(&keep);
     return arr;
 }
@@ -334,7 +339,7 @@ char *provider_chat(const char *advisor, const model_info *mi, const provider_re
     const char *model; const provider_def *p = provider_find(advisor, &model);
     if (!p) { snprintf(err, n, "'%s' is not a hosted model", advisor ? advisor : ""); return NULL; }
     const char *key = getenv(p->key_env);
-    if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest", p->key_env); return NULL; }
+    if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest (a NAME=value line without `export` is not passed on)", p->key_env); return NULL; }
     if (base_insecure(p, err, n)) return NULL;
     char *body = provider_request_body(advisor, mi, rq);
     const char *hdrs[4]; sbuf keep; auth_headers(p, advisor, key, hdrs, &keep);

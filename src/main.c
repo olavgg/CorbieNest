@@ -62,6 +62,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/permissions", "the project's saved \"always allow\" rules: add, remove, clear" },
     { "/init", "have the model write AGENTS.md for this project" },
     { "/cost", "tokens, model calls and time of this session" },
+    { "/usage", "tokens per model, the advisor's too, and the estimated cost of the hosted ones" },
     { "/diff", "the working-tree diff, without sending it to the model" },
     { "/rewind", "go back to an earlier request: files, conversation or both" },
     { "/quit", "leave" },
@@ -85,6 +86,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/advisor", "off:no advisor|guidance:how much the agent leans on it|effort:how hard it thinks|ctx:its context window" },
     { "/advisor guidance", "light:consulted rarely|normal:the default|strong:also reviews the work before a request ends|max:also checks the first change before it is made" },
     { "/advisor ctx", "auto:the main window, within the advisor's bounds" },
+    { "/usage", "price:what a model costs per million tokens — MODEL IN OUT, or MODEL default" },
     { "/skills", "reload:read the SKILL.md files again|new:scaffold a skill: /skills new NAME" },
     { "/system", "clear:remove the extra instructions" },
     { "/keepalive", "default:the server's own|30m:half an hour|-1:forever|0:unload right away" },
@@ -92,8 +94,29 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/resume", "all:sessions of every directory, not only this one" },
 };
 
-/* one model call finished: fold its stats into the session totals */
-static void account(const chat_stats *st) {
+/* what each model was sent and gave in this session: /usage, and what it estimates the cost from */
+typedef struct { char *model; long in, out; int calls; } usage_row;
+static usage_row *g_usage = NULL;
+static int g_n_usage = 0;
+static void usage_add(const char *model, long in, long out, int calls) {
+    if (!model || !*model) model = "(no model)";
+    int i = 0;
+    while (i < g_n_usage && strcmp(g_usage[i].model, model)) i++;
+    if (i == g_n_usage) {
+        g_usage = xrealloc(g_usage, sizeof *g_usage * (size_t)(g_n_usage + 1));
+        g_usage[g_n_usage++] = (usage_row){ xstrdup(model), 0, 0, 0 };
+    }
+    g_usage[i].in += in; g_usage[i].out += out; g_usage[i].calls += calls;
+}
+static void usage_clear(void) {
+    for (int i = 0; i < g_n_usage; i++) free(g_usage[i].model);
+    free(g_usage); g_usage = NULL; g_n_usage = 0;
+}
+
+/* one model call finished: fold its stats into the session totals — account() for the model
+ * doing the work, account_as() for a call to another one (the advisor) */
+static void account_as(const char *model, const chat_stats *st) {
+    usage_add(model, st->prompt_tokens, st->eval_tokens, 1);
     g_session.prompt_tokens += st->prompt_tokens;
     g_session.eval_tokens += st->eval_tokens;
     g_session.model_seconds += st->total_seconds;
@@ -101,6 +124,7 @@ static void account(const chat_stats *st) {
     g_session.think_seconds += st->think_seconds; g_session.think_chunks += st->think_chunks;
     g_session.calls++;
 }
+static void account(const chat_stats *st) { account_as(g_cfg.model, st); }
 
 /* ---------- how full the context is ----------
  * Ollama reports prompt_eval_count, but only for calls that have already happened: everything
@@ -534,6 +558,14 @@ static void session_save(void) {
     char *title = session_title_of(g_messages); cJSON_AddStringToObject(o, "title", title); free(title);
     cJSON_AddNumberToObject(o, "prompt_tokens", (double)g_session.prompt_tokens);
     cJSON_AddNumberToObject(o, "eval_tokens", (double)g_session.eval_tokens);
+    cJSON *us = cJSON_AddArrayToObject(o, "usage");   /* per model, for /usage after a --resume */
+    for (int i = 0; i < g_n_usage; i++) {
+        cJSON *u = cJSON_CreateObject();
+        cJSON_AddStringToObject(u, "model", g_usage[i].model);
+        cJSON_AddNumberToObject(u, "in", (double)g_usage[i].in); cJSON_AddNumberToObject(u, "out", (double)g_usage[i].out);
+        cJSON_AddNumberToObject(u, "calls", g_usage[i].calls);
+        cJSON_AddItemToArray(us, u);
+    }
     cJSON_AddItemReferenceToObject(o, "messages", g_messages);
     char *txt = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
@@ -599,6 +631,11 @@ static bool session_load(const char *id) {
     cJSON *pt = cJSON_GetObjectItemCaseSensitive(o, "prompt_tokens"), *et = cJSON_GetObjectItemCaseSensitive(o, "eval_tokens");
     g_session.prompt_tokens = cJSON_IsNumber(pt) ? (long)pt->valuedouble : 0;
     g_session.eval_tokens = cJSON_IsNumber(et) ? (long)et->valuedouble : 0;
+    usage_clear();   /* the totals are the resumed session's from here on, and so is what /usage lists */
+    cJSON *u; cJSON_ArrayForEach(u, cJSON_GetObjectItemCaseSensitive(o, "usage")) {
+        cJSON *um = cJSON_GetObjectItemCaseSensitive(u, "model"), *ui = cJSON_GetObjectItemCaseSensitive(u, "in"), *uo = cJSON_GetObjectItemCaseSensitive(u, "out"), *uc = cJSON_GetObjectItemCaseSensitive(u, "calls");
+        if (cJSON_IsString(um) && cJSON_IsNumber(ui) && cJSON_IsNumber(uo)) usage_add(um->valuestring, (long)ui->valuedouble, (long)uo->valuedouble, cJSON_IsNumber(uc) ? (int)uc->valuedouble : 0);
+    }
     g_session.last_prompt_tokens = 0;
     cJSON *cwd = cJSON_GetObjectItemCaseSensitive(o, "cwd");
     /* recap: title, size, and how the last exchange ended */
@@ -646,6 +683,70 @@ static void cmd_resume(const char *arg) {
     free(bufs); free(items); free(descs); sessions_free(v, n);
 }
 
+/* ---------- /usage: tokens per model, and what the hosted ones cost ----------
+ * The tokens are the ones each API reported for the calls of this session; the money is those
+ * tokens at a price per million (model_price()). It is an estimate: the providers only tell
+ * what was really billed to an admin key, and then for the whole organisation, not this session. */
+static void fmt_usd(double v, char *out, size_t n) { snprintf(out, n, v > 0 && v < 0.01 ? "$%.4f" : "$%.2f", v); }
+
+/* what the session's hosted calls come to at their prices; *priced says whether any had one */
+static double usage_cost_total(bool *priced) {
+    double total = 0, pi, po;
+    *priced = false;
+    for (int i = 0; i < g_n_usage; i++)
+        if (model_price(g_usage[i].model, &pi, &po)) { total += ((double)g_usage[i].in * pi + (double)g_usage[i].out * po) / 1e6; *priced = true; }
+    return total;
+}
+
+static void usage_price(const char *v) {
+    char model[200], word[32]; double pi, po;
+    while (*v == ' ') v++;
+    if (sscanf(v, "%199s %lf %lf", model, &pi, &po) == 3 && pi >= 0 && po >= 0) {
+        price_set(model, pi, po); config_save();
+        printf(C_GREEN "✓ %s: $%g in · $%g out per million tokens" C_RESET "\n", model, pi, po);
+    } else if (sscanf(v, "%199s %31s", model, word) == 2 && !strcmp(word, "default")) {
+        price_set(model, -1, -1); config_save();
+        if (model_price(model, &pi, &po)) printf(C_GREEN "✓ %s: back to the list price, $%g in · $%g out per million tokens" C_RESET "\n", model, pi, po);
+        else printf(C_GREEN "✓ %s: no price" C_RESET "\n", model);
+    } else {
+        printf("usage: /usage price MODEL IN OUT   (USD per million input and output tokens, e.g. /usage price openai:gpt-5.2 1.75 14)\n"
+               "       /usage price MODEL default  (back to the built-in list price)\n");
+        for (int i = 0; i < g_cfg.n_prices; i++) printf(C_DIM "  %s  $%g in · $%g out" C_RESET "\n", g_cfg.prices[i].model, g_cfg.prices[i].in, g_cfg.prices[i].out);
+    }
+}
+
+static void cmd_usage(const char *arg) {
+    if (arg && !strncmp(arg, "price", 5) && (arg[5] == ' ' || !arg[5])) { usage_price(arg + 5); return; }
+    if (arg) { printf("usage: /usage   ·   /usage price MODEL IN OUT   ·   /usage price MODEL default\n"); return; }
+    if (!g_n_usage) { printf(C_DIM "no model has been called in this session yet" C_RESET "\n"); return; }
+    printf(C_BOLD "usage" C_RESET C_DIM " (this session: the tokens each API counted, input ↑ and output ↓)" C_RESET "\n");
+    int w = 0;
+    for (int i = 0; i < g_n_usage; i++) { int l = (int)strlen(g_usage[i].model); if (l > w) w = l; }
+    if (w > 40) w = 40;
+    double total = 0; bool priced = false, unknown = false;
+    for (int i = 0; i < g_n_usage; i++) {
+        const usage_row *u = &g_usage[i];
+        char tin[32], tout[32], usd[32]; fmt_tokens(u->in, tin, sizeof tin); fmt_tokens(u->out, tout, sizeof tout);
+        double pi = 0, po = 0; int known = model_price(u->model, &pi, &po);
+        printf("  %-*s  %4d call%s  ↑%-6s ↓%-6s  ", w, u->model, u->calls, u->calls == 1 ? " " : "s", tin, tout);
+        if (known) {
+            double cost = ((double)u->in * pi + (double)u->out * po) / 1e6;
+            total += cost; priced = true;
+            fmt_usd(cost, usd, sizeof usd);
+            printf("≈ %s" C_DIM "  ($%g in · $%g out per million, %s)" C_RESET "\n", usd, pi, po, known == 2 ? "set with /usage price" : "list price");
+        } else if (provider_find(u->model, NULL)) {
+            unknown = true;
+            printf(C_YELLOW "no price known" C_RESET C_DIM " — /usage price %s IN OUT" C_RESET "\n", u->model);
+        } else if (model_is_cloud(u->model)) printf(C_DIM "an Ollama cloud model: on your ollama.com plan" C_RESET "\n");
+        else printf(C_DIM "local: no charge" C_RESET "\n");
+    }
+    if (priced) {
+        char usd[32]; fmt_usd(total, usd, sizeof usd);
+        printf("  estimated cost  " C_BOLD "≈ %s" C_RESET "%s\n", usd, unknown ? C_DIM "  (without the models that have no price)" C_RESET : "");
+        printf(C_DIM "  an estimate from token counts and prices per million tokens — what the provider bills is on its own usage page" C_RESET "\n");
+    }
+}
+
 /* ---------- /cost ---------- */
 static void fmt_dur(double sec, char *out, size_t n) {
     if (sec < 60) snprintf(out, n, "%.1fs", sec);
@@ -660,7 +761,8 @@ static void cmd_cost(void) {
     fmt_dur(difftime(time(NULL), g_session.started), wall, sizeof wall);
     fmt_dur(g_session.model_seconds, model, sizeof model);
     fmt_dur(g_session.eval_seconds, gen, sizeof gen);
-    printf(C_BOLD "session cost" C_RESET C_DIM " (local model: no money, just tokens and time)" C_RESET "\n");
+    bool priced; double money = usage_cost_total(&priced);
+    printf(C_BOLD "session cost" C_RESET C_DIM " (%s)" C_RESET "\n", priced ? "the local model: tokens and time; the hosted one: money too" : "local model: no money, just tokens and time");
     printf("  tokens        %s  " C_DIM "(↑%s in · ↓%s out)" C_RESET "\n", ttot, tin, tout);
     printf("  model calls   %d  " C_DIM "(%d request%s · %d tool call%s)" C_RESET "\n", g_session.calls, g_session.turns, g_session.turns == 1 ? "" : "s", g_session.tool_calls, g_session.tool_calls == 1 ? "" : "s");
     printf("  model time    %s  " C_DIM "(%s generating", model, gen);
@@ -672,6 +774,7 @@ static void cmd_cost(void) {
         char at[32], ad[32]; fmt_tokens(g_session.advisor_tokens, at, sizeof at); fmt_dur(g_session.advisor_seconds, ad, sizeof ad);
         printf("  advisor       %d consultation%s  " C_DIM "(%s tokens · %s · %s — included in the figures above)" C_RESET "\n", g_session.advisor_calls, g_session.advisor_calls == 1 ? "" : "s", at, ad, g_cfg.advisor ? g_cfg.advisor : "off now");
     }
+    if (priced) { char usd[32]; fmt_usd(money, usd, sizeof usd); printf("  est. cost     ≈ %s  " C_DIM "(the hosted models' tokens at their price per million — /usage has it per model)" C_RESET "\n", usd); }
     printf("  wall time     %s\n", wall);
     if (g_cfg.num_ctx > 0 && g_session.last_prompt_tokens > 0)
         printf("  context       %d of %d tokens (%d%%)\n", g_session.last_prompt_tokens, g_cfg.num_ctx, (int)(100.0 * g_session.last_prompt_tokens / g_cfg.num_ctx));
@@ -1449,7 +1552,7 @@ static int consult(const char *question, const char *what, sbuf *advice, sbuf *w
         if (r) cJSON_Delete(r);
     }
     free(brief); sb_free(&sys);
-    account(&st);
+    account_as(g_cfg.advisor, &st);
     g_session.advisor_tokens += st.prompt_tokens + st.eval_tokens; g_session.advisor_seconds += st.total_seconds;
     g_session.advisor_eval_tokens += st.eval_tokens; g_session.advisor_eval_seconds += st.eval_seconds;
     term_status_refresh();
@@ -1480,7 +1583,9 @@ static int consult(const char *question, const char *what, sbuf *advice, sbuf *w
         sb_puts(advice, text);
         if (cut) sb_puts(advice, "\n[… the answer was cut off here: the advisor ran out of tokens]");
         char tk[32]; fmt_tokens(st.prompt_tokens + st.eval_tokens, tk, sizeof tk);
-        printf("    " C_DIM "⎿ advice · %s tokens · %.0fs%s:" C_RESET "\n", tk, st.total_seconds, st.load_seconds >= 1 ? " (of which loading the model)" : "");
+        char cost[48] = ""; double pi, po;   /* a model with a price: what this one consultation came to, estimated as /usage does */
+        if (model_price(g_cfg.advisor, &pi, &po)) { char usd[32]; fmt_usd(((double)st.prompt_tokens * pi + (double)st.eval_tokens * po) / 1e6, usd, sizeof usd); snprintf(cost, sizeof cost, " · ≈ %s", usd); }
+        printf("    " C_DIM "⎿ advice · %s tokens · %.0fs%s%s:" C_RESET "\n", tk, st.total_seconds, cost, st.load_seconds >= 1 ? " (of which loading the model)" : "");
         print_result_preview(text, 12);
         res = ADVICE_GIVEN;
     }
@@ -2056,6 +2161,8 @@ static void cmd_help(void) {
            "  /memory [on|off|clear|update|every N|idle N]  show the project memory (" MEMORY_PATH ", curated by the model every N requests, after N seconds idle at the prompt, and at exit; default every 5 / 15s idle), toggle it, run the update now, set the cadence, or delete it\n"
            "  /status               show model, context usage, settings\n"
            "  /cost                 tokens, model calls, model time and wall time of this session\n"
+           "  /usage                tokens per model in this session — the advisor's too — and the estimated cost of the hosted ones;\n"
+           "                        /usage price MODEL IN OUT sets a price (USD per million tokens), /usage price MODEL default takes the built-in one\n"
            "  /diff [git args]      show the working-tree diff (stat + patch + untracked), without sending it to the model; e.g. /diff --staged\n"
            "  /rewind               (or Esc Esc at an empty prompt) go back to an earlier request: undo the file changes since, the conversation, or both\n"
            "  /system [text|clear]  show/set extra system instructions\n"
@@ -2094,7 +2201,7 @@ static void cmd_help(void) {
            "  # fact                remember something: appended to " MEMORY_PATH " (pick the section from a menu), no model call\n"
            "  Enter                 send  ·  Alt+Enter / Ctrl+J / trailing \\ : newline\n"
            "  Enter while busy      queue a message for the model (added between tool rounds or after the turn; Ctrl-C hands it back)\n"
-           "                        commands that only report or set something run at once instead: /help /status /cost /diff /history /pwd\n"
+           "                        commands that only report or set something run at once instead: /help /status /cost /usage /diff /history /pwd\n"
            "                        /skills /memory /mode /yolo /permissions /tools /web /max_iters /think /effort /advisor /temp /keepalive\n"
            "  Ctrl-C                cancel generation / clear line (twice: quit)  ·  Ctrl-L clear screen\n"
            "  mouse wheel, PgUp/PgDn  scroll back through the conversation, also while the model works (at the prompt ↑/↓ and Home/End\n"
@@ -2411,6 +2518,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
     else if (!strcmp(cmd, "/cost")) cmd_cost();
+    else if (!strcmp(cmd, "/usage")) cmd_usage(arg);
     else if (!strcmp(cmd, "/diff")) cmd_diff(arg);
     else if (!strcmp(cmd, "/rewind")) return cmd_rewind();
     else if (!strcmp(cmd, "/init")) return cmd_init();
@@ -2541,7 +2649,7 @@ static int handle_slash(char *line) {
  * anything (the pickers), or change the ground under the running turn (/cd). */
 static bool slash_runs_while_busy(const char *cmd, const char *arg) {
     static const char *ok[] = {
-        "/help", "/?", "/status", "/cost", "/diff", "/history", "/pwd", "/skills",
+        "/help", "/?", "/status", "/cost", "/usage", "/diff", "/history", "/pwd", "/skills",
         "/mode", "/yolo", "/permissions", "/tools", "/max_iters", "/max-iters", "/think", "/effort", "/temp",
         "/keepalive", "/keep-alive", "/memory", "/web", NULL };
     /* /web with an argument is not just a report: on|off rebuilds the tool list the running
@@ -2643,16 +2751,23 @@ static void sug_add(term_sug **v, int *n, const char *text, const char *desc, bo
 #define MODEL_LIST_WAIT_MS 3000
 #define MODEL_LISTS 8
 #define MODEL_SUG_MAX 60
-static struct { cJSON *list; char *from; time_t at; } g_model_lists[MODEL_LISTS];
+static struct { cJSON *list; char *from; time_t at; char why[240]; } g_model_lists[MODEL_LISTS];   /* why: what kept a provider's list away */
 
-static cJSON *model_list_get(int slot, const provider_def *p) {
+static cJSON *model_list_get(int slot, const provider_def *p, const char **why) {
+    if (why) *why = NULL;
     if (slot >= MODEL_LISTS) return NULL;
     const char *from = p ? provider_base_url(p) : g_cfg.host;
     bool same = g_model_lists[slot].from && !strcmp(g_model_lists[slot].from, from);
-    if (http_busy() || (same && time(NULL) - g_model_lists[slot].at <= MODEL_LIST_SECS)) return same ? g_model_lists[slot].list : NULL;
+    const char *key = p ? getenv(p->key_env) : NULL;   /* a key that is missing is not an answer to keep: it costs nothing to look again */
+    if (http_busy() || (same && time(NULL) - g_model_lists[slot].at <= MODEL_LIST_SECS && (!p || g_model_lists[slot].list || (key && *key)))) {
+        if (why && same && g_model_lists[slot].why[0]) *why = g_model_lists[slot].why;
+        return same ? g_model_lists[slot].list : NULL;
+    }
     cJSON_Delete(g_model_lists[slot].list); free(g_model_lists[slot].from);
-    g_model_lists[slot].list = p ? provider_list_models(p, MODEL_LIST_WAIT_MS) : ollama_list_models_quiet(MODEL_LIST_WAIT_MS);
+    g_model_lists[slot].why[0] = 0;
+    g_model_lists[slot].list = p ? provider_list_models(p, MODEL_LIST_WAIT_MS, g_model_lists[slot].why, sizeof g_model_lists[slot].why) : ollama_list_models_quiet(MODEL_LIST_WAIT_MS);
     g_model_lists[slot].from = xstrdup(from); g_model_lists[slot].at = time(NULL);
+    if (why && g_model_lists[slot].why[0]) *why = g_model_lists[slot].why;
     return g_model_lists[slot].list;
 }
 
@@ -2674,8 +2789,15 @@ static void suggest_advisor(const char *word, term_sug **items, int *n) {
     cJSON *m;
     if (pv) {
         int slot = 1; while (provider_at(slot - 1) != pv) slot++;
-        cJSON *list = model_list_get(slot, pv);
+        const char *why;
+        cJSON *list = model_list_get(slot, pv, &why);
         const char *rest = colon + 1; size_t rl = strlen(rest);
+        if (!list && why) {   /* an empty list would look like a prefix nothing is known about: say what is in the way, on a row that changes nothing when taken */
+            char *pre = xstrndup(word, (size_t)(colon - word) + 1);
+            sug_add(items, n, pre, why, true);
+            free(pre);
+            return;
+        }
         for (int pass = 0; pass < 2; pass++) cJSON_ArrayForEach(m, list) {
             cJSON *id = cJSON_GetObjectItemCaseSensitive(m, "id"), *name = cJSON_GetObjectItemCaseSensitive(m, "name");
             bool starts = !strncasecmp(id->valuestring, rest, rl);
@@ -2693,7 +2815,7 @@ static void suggest_advisor(const char *word, term_sug **items, int *n) {
         snprintf(desc, sizeof desc, "%s (%s), a hosted API · %s %s", p->label, p->known_as, p->key_env, key && *key ? "set" : "not set");
         sug_add(items, n, pre, desc, true);
     }
-    cJSON *list = model_list_get(0, NULL);
+    cJSON *list = model_list_get(0, NULL, NULL);
     for (int pass = 0; pass < 2; pass++) cJSON_ArrayForEach(m, list) {
         const char *name = cJSON_GetObjectItemCaseSensitive(m, "name")->valuestring, *size = cJSON_GetObjectItemCaseSensitive(m, "size")->valuestring;
         bool starts = !strncasecmp(name, word, wl);

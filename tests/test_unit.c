@@ -559,6 +559,18 @@ static void test_files(void) {
     /* which word is a mention: an '@' that starts a word, up to the cursor */
     CHECK(mention_start("look at @src/te", 15) == 9);
     CHECK(mention_start("@", 1) == 1);
+    {   /* what the input field colours: the mentions that name something that is there */
+        char dir[] = "/tmp/corbie_span_XXXXXX"; CHECK(mkdtemp(dir) != NULL);
+        sbuf f, t; sb_init(&f); sb_init(&t); sb_printf(&f, "%s/a.c", dir);
+        write_whole_file(f.data, "x", 1);
+        sb_printf(&t, "see @%s, and @%s/nope.c or mail@%s @ @%s", f.data, dir, f.data, dir);
+        size_t sp[4][2]; int n = mention_spans(t.data, t.len, sp, 4);
+        CHECK(n == 2);
+        CHECK(sp[0][0] == 4 && sp[0][1] == 5 + f.len);                 /* from the '@', without the comma */
+        CHECK(sp[1][1] == t.len && t.data[sp[1][0]] == '@');           /* a directory counts; "mail@…" and a lone '@' do not */
+        CHECK(mention_spans(t.data, t.len, sp, 1) == 1 && mention_spans("", 0, sp, 4) == 0);
+        remove(f.data); rmdir(dir); sb_free(&f); sb_free(&t);
+    }
     CHECK(mention_start("@a b", 4) == -1);                   /* the cursor is in the next word */
     CHECK(mention_start("@a b", 2) == 1);                    /* ... or still in the mention */
     CHECK(mention_start("mail me at a@b.org", 18) == -1);    /* not at the start of a word */
@@ -985,6 +997,21 @@ static void test_provider(void) {
     CHECK_STR(jstr_at(cJSON_GetArrayItem(ml, 1), "id"), "gpt-5.2"); CHECK(!jstr_at(cJSON_GetArrayItem(ml, 1), "name"));
     cJSON_Delete(ml);
     CHECK(!provider_parse_models("{\"error\":{\"message\":\"nope\"}}") && !provider_parse_models("not json") && !provider_parse_models(NULL));
+    {   /* prices: the list by name or dated snapshot, and what /usage price sets */
+        double pi = 0, po = 0;
+        CHECK(model_price("anthropic:claude-opus-5", &pi, &po) == 1 && pi == 5 && po == 25);
+        CHECK(model_price("claude:claude-opus-5-5", &pi, &po) == 1 && pi == 4 && po == 20);            /* the longer name wins, under either provider name */
+        CHECK(model_price("anthropic:claude-haiku-5-5-20260901", &pi, &po) == 1 && pi == 0.10 && po == 0.50);
+        CHECK(model_price("openai:gpt-5-mini", &pi, &po) == 1 && pi == 0.25 && po == 2);
+        CHECK(model_price("openai:gpt-5-2025-08-07", &pi, &po) == 1 && pi == 1.25);
+        CHECK(model_price("openai:gpt-5.9", &pi, &po) == 0 && model_price("openai:gpt-5-turbo", &pi, &po) == 0);   /* "gpt-5" says nothing about these */
+        CHECK(model_price("xai:grok-4.7", &pi, &po) == 1 && pi == 2 && po == 6);
+        CHECK(model_price("qwen3:32b", &pi, &po) == 0 && model_price("anthropic:claude-opus-5x", &pi, &po) == 0 && model_price(NULL, &pi, &po) == 0);
+        price_set("grok:grok-4.7", 3, 9);
+        CHECK(model_price("xai:grok-4.7", &pi, &po) == 2 && pi == 3 && po == 9);
+        price_set("xai:grok-4.7", -1, -1);
+        CHECK(model_price("xai:grok-4.7", &pi, &po) == 1 && pi == 2);
+    }
     p = provider_find("openai:x", NULL);
     unsetenv("OPENAI_BASE_URL"); CHECK_STR(provider_base_url(p), "https://api.openai.com/v1");
     setenv("OPENAI_BASE_URL", "http://127.0.0.1:9/v1", 1); CHECK_STR(provider_base_url(p), "http://127.0.0.1:9/v1"); unsetenv("OPENAI_BASE_URL");

@@ -417,6 +417,27 @@ static void view_note(sbuf *o, int row) {
 
 static int field_top(void) { return g_fs_rows - g_field_rows - 2 - g_sug_rows; }   /* row of the upper rule */
 
+/* Append text[from, from + n) with the "@path" mentions that name something that is there in
+ * colour: a mention that took is one the message will carry, and one that did not is a typo
+ * seen before it is sent. The escapes take no columns, so the wrapping worked out for the plain
+ * text still holds. A "/command" or a "!line" has no mentions: those are not expanded. */
+#define MENTION_MAX 16
+static int field_mentions(const char *text, size_t len, size_t (*sp)[2]) {
+    return len && text[0] != '/' && text[0] != '!' ? mention_spans(text, len, sp, MENTION_MAX) : 0;
+}
+static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_t (*sp)[2], int ns) {
+    size_t at = from, end = from + n;
+    for (int i = 0; i < ns && at < end; i++) {
+        if (sp[i][1] <= at) continue;
+        if (sp[i][0] >= end) break;
+        size_t a = sp[i][0] > at ? sp[i][0] : at, b = sp[i][1] < end ? sp[i][1] : end;
+        sb_append(o, text + at, a - at);
+        sb_puts(o, C_CYAN); sb_append(o, text + a, b - a); sb_puts(o, "\x1b[39m");
+        at = b;
+    }
+    if (at < end) sb_append(o, text + at, end - at);
+}
+
 /* Draw the field with absolute moves. `typed` is the type-ahead shown when the editor
  * is not the one holding the field (i.e. the model is working). A field that shrinks hands
  * its upper rows back to the conversation; layout_sync() paints those again, so nothing the
@@ -443,11 +464,13 @@ static void field_draw(sbuf *o, const char *typed) {
             while (*p && ((unsigned char)*p & 0xC0) == 0x80) p++;
             sb_puts(o, "…");
         }
-        sb_puts(o, p); sb_puts(o, C_DIM "▏" C_RESET);
+        size_t sp[MENTION_MAX][2]; int ns = field_mentions(t, strlen(t), sp);
+        put_mentions(o, t, (size_t)(p - t), strlen(p), sp, ns); sb_puts(o, C_DIM "▏" C_RESET);
         free(t);
     } else if (g_field_len) {
         int plen = vis_width(field_prompt());
         size_t from = field_row_start(width, plen, g_field_view);
+        size_t sp[MENTION_MAX][2]; int ns = field_mentions(g_field_text, g_field_len, sp);
         for (int i = 0; i < g_field_rows; i++) {
             size_t to = field_row_start(width, plen, g_field_view + i + 1);
             if (from >= g_field_len && i) break;
@@ -456,7 +479,7 @@ static void field_draw(sbuf *o, const char *typed) {
             if (i == 0 && g_field_view == 0) sb_puts(o, field_prompt());
             size_t n = to > from ? to - from : 0;
             while (n && g_field_text[from + n - 1] == '\n') n--;
-            sb_append(o, g_field_text + from, n);
+            put_mentions(o, g_field_text, from, n, sp, ns);
             sb_puts(o, C_RESET "\x1b[K");
             from = to;
         }

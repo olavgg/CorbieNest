@@ -69,6 +69,9 @@ int   is_file(const char *path);
  * or more than one — *count says how many, and `names` (if given) lists the first few. */
 typedef struct { char *path; bool dir; } file_match;
 long  mention_start(const char *buf, size_t cur);
+/* The "@path" mentions in buf[0..len) that name a file or a directory that is there, as
+ * [start, end) byte ranges from the '@' on: what the input field colours. At most max. */
+int   mention_spans(const char *buf, size_t len, size_t (*spans)[2], int max);
 int   file_complete(const char *typed, bool dirs_only, int max, file_match **out);
 void  file_matches_free(file_match *m, int n);
 char *file_find_named(const char *name, int *count, sbuf *names);
@@ -147,6 +150,7 @@ bool  model_same(const char *a, const char *b);   /* equal, a trailing ":latest"
 bool  model_is_cloud(const char *name);           /* NAME:cloud / NAME-cloud */
 
 /* ---------- global config ---------- */
+typedef struct { char *model; double in, out; } price_entry;   /* USD per million tokens, set with /usage price */
 typedef struct { char *model, *level; } effort_entry;   /* level: "off", "on", or one of the model's named levels */
 
 typedef struct {
@@ -159,6 +163,8 @@ typedef struct {
     int   think;         /* -1 auto (server default on the first call of a request, off for tool rounds), 0 off, 1 on for every call */
     effort_entry *efforts; /* how hard each model thinks (/effort), see effort_get(); saved as effort.<model>=<level> */
     int   n_efforts;
+    price_entry *prices;   /* what a model costs where the built-in list does not know or is out of date; saved as price.<model>=<in>/<out> */
+    int   n_prices;
     char *advisor;       /* the stronger model the agent may consult through the advisor tool (/advisor); NULL = none */
     int   advisor_ctx;   /* num_ctx of an advisor call; 0 = auto (see advisor_plan_for()) */
     int   advisor_guidance; /* how much the agent leans on it, GUIDANCE_* (/advisor guidance) */
@@ -433,6 +439,13 @@ void   model_think_profile(model_info *mi);   /* fill think_* from family/render
 int    ollama_model_show(const char *model, model_info *mi);    /* 0 ok, -1 unknown model / request failed (*mi is still zeroed) */
 extern model_info g_model_info;   /* the model in use (set by main.c) */
 
+/* ---------- prices: what /usage estimates the cost with ----------
+ * USD per million input and output tokens. model_price() says what a model costs: 2 = a price
+ * set with /usage price, 1 = the provider's list price as built in (hosted models only, by the
+ * name or a dated snapshot of it), 0 = not known. */
+int  model_price(const char *model, double *in, double *out);
+void price_set(const char *model, double in, double out);   /* in < 0 = forget it (does not save the config) */
+
 /* ---------- effort: how hard a model thinks (/effort) ----------
  * Kept per model, because the levels are the model's: gpt-oss has low/medium/high and cannot
  * stop thinking, qwen3.8 has off/low/medium/high, most others are on or off. "off" and "on" are
@@ -531,7 +544,7 @@ char *provider_request_body(const char *advisor, const model_info *mi, const pro
 char *provider_parse_reply(const char *advisor, const char *json, int status, chat_stats *st, char *err, size_t n);
 void  provider_parse_model(const char *advisor, const char *json, model_info *mi);
 cJSON *provider_parse_models(const char *json);                    /* a model list as [{"id","name"}], NULL if it is not one */
-cJSON *provider_list_models(const provider_def *p, int wait_ms);   /* what the key can use, asked silently; NULL without a key or an answer */
+cJSON *provider_list_models(const provider_def *p, int wait_ms, char *err, size_t n);   /* what the key can use, asked silently; NULL without a key or an answer, and err says which */
 bool  provider_fallbacks(const char *advisor);   /* an Anthropic model with server-side refusal fallbacks (Opus 5, Fable 5.x) */
 
 #endif
