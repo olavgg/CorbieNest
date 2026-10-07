@@ -655,6 +655,17 @@ void term_clear_screen(void) {
 #define SB_MAX_LINES 8000
 static sbuf *g_sb = NULL;             /* logical lines */
 static int   g_sb_n = 0, g_sb_cap = 0;
+/* Folds: a long result is one line that stays (the head, with a ▸) and a body that is in the
+ * model but not on screen until the head is clicked. A body line is `hidden`: sb_rows() leaves
+ * it out, so the region, the viewer and conv_pos() all see the transcript without it, and the
+ * cursor movements step over it. */
+enum { SB_PLAIN, SB_FOLD_HEAD, SB_FOLD_BODY };
+typedef struct { int fold; unsigned char kind; bool hidden; } sb_meta;
+static sb_meta *g_sb_meta = NULL;     /* one per line of g_sb */
+static int   g_fold_seq = 0;          /* the last fold's number */
+static int   g_fold_rec = 0;          /* the fold whose body is being written (term_fold_begin…end): recorded, not painted */
+static int   g_click_row = 0;         /* a left click on this row of the conversation is waiting to be acted on (fold_click) */
+static bool sb_hidden(int line) { return line >= 0 && line < g_sb_n && g_sb_meta[line].hidden; }
 static int   g_sb_line = 0;           /* cursor: line index ... */
 /* g_sb_col: visual column in that line (>= width means a wrapped row), declared with the field */
 /* g_sb_pause (not conversation output: don't record) is declared at the top: the layout code uses it */
@@ -688,13 +699,18 @@ static int vis_width_n(const char *s, size_t len) {
 static void sb_ensure_line(void) {
     if (g_sb_n == 0) { g_sb_line = 0; g_sb_col = 0; }
     while (g_sb_line >= g_sb_n) {
-        if (g_sb_n == g_sb_cap) { g_sb_cap = g_sb_cap ? g_sb_cap * 2 : 256; g_sb = xrealloc(g_sb, sizeof *g_sb * (size_t)g_sb_cap); }
+        if (g_sb_n == g_sb_cap) {
+            g_sb_cap = g_sb_cap ? g_sb_cap * 2 : 256;
+            g_sb = xrealloc(g_sb, sizeof *g_sb * (size_t)g_sb_cap); g_sb_meta = xrealloc(g_sb_meta, sizeof *g_sb_meta * (size_t)g_sb_cap);
+        }
+        g_sb_meta[g_sb_n] = (sb_meta){ g_fold_rec, g_fold_rec ? SB_FOLD_BODY : SB_PLAIN, g_fold_rec != 0 };
         sb_init(&g_sb[g_sb_n]); sb_append(&g_sb[g_sb_n], "", 0); g_sb_n++;
     }
     if (g_sb_n > SB_MAX_LINES) {   /* drop the oldest quarter */
         int drop = SB_MAX_LINES / 4;
         for (int i = 0; i < drop; i++) sb_free(&g_sb[i]);
         memmove(g_sb, g_sb + drop, sizeof *g_sb * (size_t)(g_sb_n - drop));
+        memmove(g_sb_meta, g_sb_meta + drop, sizeof *g_sb_meta * (size_t)(g_sb_n - drop));
         g_sb_n -= drop; g_sb_line -= drop; if (g_sb_line < 0) g_sb_line = 0;
     }
 }
@@ -718,6 +734,7 @@ static void sb_cursor_up(int n) {
         n -= vrow + 1;
         if (g_sb_line == 0) { g_sb_col = col; return; }
         g_sb_line--;
+        while (g_sb_line > 0 && sb_hidden(g_sb_line)) g_sb_line--;   /* a folded body is not on screen */
         sb_ensure_line();
         int pw = vis_width_n(g_sb[g_sb_line].data, g_sb[g_sb_line].len);
         int prow = pw == 0 ? 0 : (pw - 1) / width;
@@ -730,13 +747,17 @@ static void sb_cursor_down(int n) {
         int w = vis_width_n(g_sb[g_sb_line].data, g_sb[g_sb_line].len);
         int lastrow = w == 0 ? 0 : (w - 1) / width, vrow = g_sb_col == 0 ? 0 : (g_sb_col - 1) / width;
         if (vrow < lastrow) { g_sb_col += width; continue; }
-        if (g_sb_line + 1 >= g_sb_n) return;
-        g_sb_line++; g_sb_col = g_sb_col - vrow * width;
+        int next = g_sb_line + 1;
+        while (sb_hidden(next)) next++;
+        if (next >= g_sb_n) return;
+        g_sb_line = next; g_sb_col = g_sb_col - vrow * width;
     }
 }
 static void sb_newline(void) {
     sb_ensure_line();
-    if (g_sb_line + 1 < g_sb_n) { g_sb_line++; g_sb_col = 0; return; }   /* (a "\n" after cursor-up: move down) */
+    int next = g_sb_line + 1;
+    while (!g_fold_rec && sb_hidden(next)) next++;
+    if (next < g_sb_n) { g_sb_line = next; g_sb_col = 0; return; }   /* (a "\n" after cursor-up: move down) */
     g_sb_line = g_sb_n; g_sb_col = 0; sb_ensure_line();
 }
 static void sb_escape_done(void) {
@@ -797,7 +818,7 @@ static ssize_t sb_write_fn(void *cookie, const char *buf, size_t n) {
     (void)cookie;
     /* Scrolled back: the screen shows an earlier window, so conversation output is only
      * recorded. Leaving the viewer paints what came meanwhile from the record (conv_repaint). */
-    if (g_view_top >= 0 && !g_sb_pause) { trace_bytes('H', buf, n); sb_feed(buf, n); return (ssize_t)n; }
+    if ((g_view_top >= 0 || g_fold_rec) && !g_sb_pause) { trace_bytes('H', buf, n); sb_feed(buf, n); return (ssize_t)n; }   /* (or it is the body of a fold) */
     trace_bytes('O', buf, n);
     size_t off = 0;
     while (off < n) { ssize_t w = write(STDOUT_FILENO, buf + off, n - off); if (w < 0) { if (errno == EINTR) continue; return off ? (ssize_t)off : -1; } off += (size_t)w; }
@@ -839,6 +860,7 @@ static sb_row *sb_rows(int width, int *count) {
     if (width < 1) width = 1;
     int cap = 256, n = 0; sb_row *r = xmalloc(sizeof *r * (size_t)cap);
     for (int i = 0; i < g_sb_n; i++) {
+        if (g_sb_meta[i].hidden) continue;
         const char *d = g_sb[i].data; size_t len = g_sb[i].len, off = 0;
         do {
             size_t end = vis_offset(d + off, len - off, width) + off;
@@ -857,11 +879,9 @@ static sb_row *sb_rows(int width, int *count) {
  * wherever the terminal counts a character wider than the model does. The rows themselves are
  * painted with autowrap off for the same reason — one the terminal finds too wide is clipped at
  * the margin rather than spilling into the row below. */
-static void conv_repaint(sbuf *o) {
-    fflush(stdout);   /* the model only sees what left stdio's buffer */
-    int region = fs_region(), cols = g_fs_cols > 0 ? g_fs_cols : 1, n = 0;
-    sb_row *r = sb_rows(cols, &n);
-    int cur = n ? n - 1 : 0, ccol = g_sb_col;   /* the cursor's visual row, and its column in that row */
+/* which of the model's rows is the region's first on the live screen; *cur and *ccol: the cursor's row, and its column in it */
+static int conv_first(const sb_row *r, int n, int region, int cols, int *cur_out, int *ccol_out) {
+    int cur = n ? n - 1 : 0, ccol = g_sb_col;
     for (int i = 0; i < n; i++) if (r[i].line == g_sb_line) {
         cur = i;
         while (ccol > cols && cur + 1 < n && r[cur + 1].line == g_sb_line) { cur++; ccol -= cols; }
@@ -870,6 +890,16 @@ static void conv_repaint(sbuf *o) {
     if (ccol > cols) ccol = cols;
     int first = n > region ? n - region : 0;
     if (cur < first) first = cur;
+    if (cur_out) *cur_out = cur;
+    if (ccol_out) *ccol_out = ccol;
+    return first;
+}
+static void conv_repaint(sbuf *o) {
+    fflush(stdout);   /* the model only sees what left stdio's buffer */
+    int region = fs_region(), cols = g_fs_cols > 0 ? g_fs_cols : 1, n = 0;
+    sb_row *r = sb_rows(cols, &n);
+    int cur, ccol;   /* the cursor's visual row, and its column in that row */
+    int first = conv_first(r, n, region, cols, &cur, &ccol);
     sb_puts(o, "\x1b[?7l");
     for (int i = 0; i < region; i++) {
         int idx = first + i;
@@ -953,6 +983,58 @@ static void view_scroll(int delta) {
     view_paint();
 }
 
+
+/* ---------- folds ----------
+ * term_fold_begin(head) prints `head` — one line, with TERM_FOLD_CLOSED in it — and from there
+ * to term_fold_end() what is printed goes into the model as that line's body without being
+ * painted. A left click on the head (mouse_key notes the row, fold_click acts on it, at the
+ * prompt, in the viewer and while the model works alike) shows or hides the body and turns the
+ * mark; the region is then painted again from the model, as after a resize. False = no folds
+ * here (no full-screen mode, so no model and no mouse): the caller prints a preview instead. */
+bool term_fold_begin(const char *head) {
+    if (!g_fs || !g_sb_active) return false;
+    fflush(stdout);
+    if (g_sb_col > 0) fputs("\n", stdout);
+    fputs(head, stdout); fflush(stdout);
+    sb_ensure_line();
+    g_sb_meta[g_sb_line] = (sb_meta){ ++g_fold_seq, SB_FOLD_HEAD, false };
+    fputs("\n", stdout); fflush(stdout);
+    g_fold_rec = g_fold_seq;
+    sb_ensure_line();
+    g_sb_meta[g_sb_line] = (sb_meta){ g_fold_rec, SB_FOLD_BODY, true };
+    return true;
+}
+void term_fold_end(void) {
+    if (!g_fold_rec) return;
+    fflush(stdout);
+    if (g_sb_col > 0) sb_feed("\n", 1);
+    g_fold_rec = 0;
+    sb_ensure_line();
+    g_sb_meta[g_sb_line] = (sb_meta){ 0, SB_PLAIN, false };   /* the line output continues on is no part of the body */
+}
+static void fold_click(void) {
+    int row = g_click_row; g_click_row = 0;
+    if (!row || !g_fs || !g_sb_active || g_fold_rec || row > fs_region()) return;
+    fflush(stdout);
+    int n; sb_row *r = sb_rows(g_fs_cols, &n);
+    int first = g_view_top >= 0 ? g_view_top : conv_first(r, n, fs_region(), g_fs_cols > 0 ? g_fs_cols : 1, NULL, NULL);
+    int idx = first + row - 1, line = idx >= 0 && idx < n ? r[idx].line : -1;
+    free(r);
+    if (line < 0 || g_sb_meta[line].kind != SB_FOLD_HEAD) return;
+    int id = g_sb_meta[line].fold; bool open = false;
+    for (int i = line + 1; i < g_sb_n && g_sb_meta[i].fold == id && g_sb_meta[i].kind == SB_FOLD_BODY; i++) { g_sb_meta[i].hidden = !g_sb_meta[i].hidden; open = !g_sb_meta[i].hidden; }
+    char *mark = strstr(g_sb[line].data, open ? TERM_FOLD_CLOSED : TERM_FOLD_OPEN);   /* the two marks are as long as each other */
+    if (mark) memcpy(mark, open ? TERM_FOLD_OPEN : TERM_FOLD_CLOSED, strlen(TERM_FOLD_OPEN));
+    trace_note('F', "fold %d %s (row %d)", id, open ? "opened" : "closed", row);
+    if (g_view_top >= 0) view_paint();
+    else {
+        bool was = g_sb_pause; sb_pause(true);
+        sbuf o; sb_init(&o); conv_repaint(&o);
+        fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o);
+        sb_pause(was);
+    }
+    term_status_refresh();   /* the chrome, and the editor's cursor back in the field */
+}
 
 /* Type-ahead: bytes typed while the model was generating are kept here so
  * they are not lost; read_key() consumes them before touching stdin. */
@@ -1121,6 +1203,7 @@ static void ta_submit(void) {
  * a trailing backslash) submits the pending text as a queued message. */
 static int csi_key(const char *params, int fin);
 static int mouse_key(int cb, int row);
+static void fold_click(void);
 static void ta_act(int k) {
     int page = view_rows() - 1;
     switch (k) {
@@ -1129,6 +1212,7 @@ static void ta_act(int k) {
         case K_WHEEL_DOWN: view_scroll(WHEEL_ROWS); break;
         case K_PGUP:       view_scroll(page > 1 ? -page : -1); break;
         case K_PGDN:       view_scroll(page > 1 ? page : 1); break;
+        case K_MOUSE:      fold_click(); break;
         default: break;
     }
 }
@@ -1260,6 +1344,7 @@ static int read_byte_timeout(int ms) {
  * and only over the conversation — over the input field and the bar it does nothing, their keys
  * are the keyboard's. Clicks, releases and drags are reported too (there is no wheel-only mode). */
 static int mouse_key(int cb, int row) {
+    g_click_row = (cb & 0xE3) == 0 && g_fs && row >= 1 && row <= fs_region() ? row : 0;   /* the left button, pressed, not dragged: whoever reads the key may act on it (fold_click) */
     if ((cb & 0xC0) != 64 || (cb & 2)) return K_MOUSE;   /* not the vertical wheel */
     if (g_fs && row > fs_region()) return K_MOUSE;
     return (cb & 1) ? K_WHEEL_DOWN : K_WHEEL_UP;
@@ -1270,7 +1355,8 @@ static int csi_key(const char *params, int fin) {
     if (params[0] == '<') {   /* SGR mouse report: <button;column;row, M = pressed, m = released */
         int cb = 0, x = 0, y = 0;
         if ((fin != 'M' && fin != 'm') || sscanf(params + 1, "%d;%d;%d", &cb, &x, &y) != 3) return K_ESC;
-        return fin == 'M' ? mouse_key(cb, y) : K_MOUSE;
+        if (fin == 'm') { g_click_row = 0; return K_MOUSE; }
+        return mouse_key(cb, y);
     }
     switch (fin) {
         case 'M': return params[0] ? K_ESC : K_MOUSE_X10;   /* a terminal without SGR reports */
@@ -1380,7 +1466,7 @@ static void scroll_view(int delta) {
     while (g_view_top >= 0) {
         int k = read_key();
         if (k == -2) { view_paint(); continue; }
-        if (k == K_MOUSE) continue;
+        if (k == K_MOUSE) { fold_click(); continue; }
         int page = view_rows() - 1; if (page < 1) page = 1;
         if (k == K_PGUP) view_scroll(-page);
         else if (k == K_PGDN || k == ' ') view_scroll(page);
@@ -1872,7 +1958,8 @@ static char *readline_impl(const char *prompt, bool in_field) {
     while (!done) {
         if (g_view_top >= 0) { scroll_view(0); e.prev_cursor_row = 0; ed_refresh(&e); continue; }
         int k = idle_armed && e.buf.len == 0 ? read_key_wait(term_idle_ms) : read_key();
-        if (k == K_MOUSE || k == K_WHEEL_DOWN) continue;   /* a click, or the wheel with nothing below to scroll to */
+        if (k == K_MOUSE) { fold_click(); continue; }      /* a click: on the head of a fold it opens or closes it */
+        if (k == K_WHEEL_DOWN) continue;                   /* the wheel with nothing below to scroll to */
         if (k == K_IDLE) {
             idle_armed = false;
             ed_idle_run(&e);

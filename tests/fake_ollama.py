@@ -57,6 +57,14 @@ EFFORTS = {"xai": ("none", "low", "medium", "high", "xhigh"), "openai": ("none",
 def advisor_text(brief):
     """What the fake advisor says, whichever way it is reached. A review (before the request
     ends) and a check (of the first change) find something unless the request says APPROVE."""
+    if "# PLAN this request" in brief:   # /orchestrate: the plan, in the markdown a real model wraps it in
+        if "NOPLAN" in brief: return "I would rather talk this through first."
+        one = "TASK 1: make the file\nTOOL_WRITE the file made.txt.\nDONE WHEN: made.txt exists"
+        if "ONETASK" in brief: return one
+        return "Here is the plan.\n\n## " + one + "\n\n## **TASK 2:** say that it is there\nJust reply.\nDONE WHEN: you replied\n"
+    if "# REVIEW this task" in brief:    # ... and the review of a task: sent back once for REJECT, always for NEVERACCEPT
+        if "NEVERACCEPT" in brief or ("REJECT" in brief and "(attempt 1 of" in brief): return "REVIEW-FINDING the file should say who made it; check that."
+        return "LGTM"
     if "The agent has ended its turn" in brief:
         return "LGTM" if "APPROVE" in brief else "ADVICE: REVIEW-FINDING the test for the empty field is missing; add it."
     if "about to make the first change" in brief:
@@ -99,7 +107,7 @@ def script(model, messages, req):
             yield chunk(model, "NO_CHANGE")
         yield chunk(model, done=True)
         return
-    if messages[0]["role"] == "system" and "You are the advisor" in messages[0]["content"]:
+    if messages[0]["role"] == "system" and ("You are the advisor" in messages[0]["content"] or "You are the orchestrator" in messages[0]["content"]):
         # the advisor: one toolless call that is shown the conversation. Keywords sit in the
         # transcript it is handed (the user's request is quoted in it).
         brief = messages[-1]["content"]
@@ -188,6 +196,10 @@ def script(model, messages, req):
     if "TOOL_BIG" in text:
         # a tool round with a big result (300 numbered lines), for the elision test
         yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "seq -f 'line-%04g' 1 300"}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_MANY" in text:   # a result of several lines: folded in the transcript
+        yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "printf 'fold-line-%s\\n' 1 2 3 4 5"}}}])
         yield chunk(model, done=True)
         return
     if "TOOL_BASH" in text:

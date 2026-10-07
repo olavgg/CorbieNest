@@ -981,6 +981,27 @@ static cJSON *jget(cJSON *o, const char *path) {   /* "a.b.0.c" */
 }
 static const char *jstr_at(cJSON *o, const char *path) { cJSON *v = jget(o, path); return cJSON_IsString(v) ? v->valuestring : NULL; }
 
+static void test_orchestrate(void) {
+    orch_task *t = NULL;
+    int n = orch_parse_plan("Here is the plan.\n\nTASK 1: add the flag\nEdit src/a.c: add --dry.\nDONE WHEN: make passes\n\n"
+                            "## **Task 2:** document it\nTask 2 depends on the flag being there.\n- README.md\n\ntask 7 - run the tests\nmake test\n", &t);
+    CHECK(n == 3);
+    CHECK_STR(t[0].title, "add the flag"); CHECK_STR(t[0].body, "Edit src/a.c: add --dry.\nDONE WHEN: make passes");
+    CHECK_STR(t[1].title, "document it"); CHECK(strstr(t[1].body, "Task 2 depends on the flag") && strstr(t[1].body, "- README.md"));   /* a sentence is not a header, markdown is no obstacle */
+    CHECK_STR(t[2].title, "run the tests"); CHECK_STR(t[2].body, "make test");                                                       /* numbered as they come */
+    orch_tasks_free(t, n);
+    n = orch_parse_plan("TASK 1\nJust the instructions.\n\nTASK 2: —\n", &t);
+    CHECK(n == 2); CHECK_STR(t[0].title, ""); CHECK_STR(t[0].body, "Just the instructions.");
+    orch_tasks_free(t, n);
+    CHECK(orch_parse_plan("I would rather talk first.\nThe task is unclear.", &t) == 0 && t == NULL);
+    CHECK(orch_parse_plan("", &t) == 0 && orch_parse_plan(NULL, &t) == 0);
+    sbuf many; sb_init(&many);
+    for (int i = 1; i <= ORCH_MAX_TASKS + 3; i++) sb_printf(&many, "TASK %d: step %d\ndo %d\n", i, i, i);
+    n = orch_parse_plan(many.data, &t);
+    CHECK(n == ORCH_MAX_TASKS); CHECK_STR(t[n - 1].body, "do 12");   /* no more than that, and the last one kept whole */
+    orch_tasks_free(t, n); sb_free(&many);
+}
+
 static void test_provider(void) {
     const char *model = NULL;
     const provider_def *p = provider_find("xai:grok-4.7", &model);
@@ -1151,7 +1172,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider },
+        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "orchestrate", test_orchestrate },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

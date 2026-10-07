@@ -1,5 +1,5 @@
 [38;5;208m╭──────────────────────────────────────────────────────────────╮[0m
-[38;5;208m│[0m [1m🐦‍⬛ Corbie Nest[0m v0.1.0 — local coding agent for Ollama
+[38;5;208m│[0m [1m🐦‍⬛ Corbie Nest[0m v0.2.0 — local coding agent for Ollama
 [38;5;208m│[0m [2mmodel:[0m qwen3-coder:30b
 [38;5;208m│[0m [2mhost: [0m http://127.0.0.1:11434 [32m● connected[0m
 [38;5;208m│[0m [2mcwd:  [0m ~/projects/myapp

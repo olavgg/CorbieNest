@@ -351,6 +351,13 @@ class Session:
         except Exception: pass
 
 def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
+def click_rows(sess, rows=40):
+    """Left-click every row of the screen, top to bottom, and return what was drawn in answer:
+    a pty has no screen to say where a line is, and a click only acts on the head of a fold."""
+    at = len(sess.out)
+    for y in range(1, rows + 1): sess.send(f"\x1b[<0;5;{y}M\x1b[<0;5;{y}m", wait=0.01)
+    time.sleep(0.5); sess.expect("(no such text)", 0.3)
+    return clean(sess.out[at:].decode("utf-8", "replace"))
 def scrolled(sess):
     """Whether the chrome as last drawn says the conversation is scrolled back: the line for that
     is drawn right above the input field's upper rule. (The status bar says nothing about it —
@@ -482,7 +489,8 @@ check(s3.expect("Fetch this page?"), f"confirmation shown: {s3.text()[-300:]!r}"
 check(DOC_URL in s3.text(), "the whole url is shown before it is fetched")
 check(s3.expect(f"3. Yes, and always allow fetching from 127.0.0.1:{DOC_PORT} in this project"), f"per-host rule offered: {s3.text()[-400:]!r}")
 s3.send("p"); check(s3.expect(f"saved to .corbienest/permissions: fetch 127.0.0.1:{DOC_PORT}"), "host rule saved")
-check(s3.expect("Fake Docs", 15), "the page text is previewed"); s3.expect("tok/s")
+check(s3.expect("lines ·", 15), "the page text is folded under one line"); s3.expect("tok/s")
+check("Fake Docs" in click_rows(s3), "and a click on that line shows it")
 s3.send(f"TOOL_FETCH {DOC_URL}\r")
 check(s3.expect(f"auto-approved (project rule: fetch 127.0.0.1:{DOC_PORT})"), "the host is not asked about again"); s3.expect("tok/s")
 s3.send("/permissions\r"); check(s3.expect(f"web pages from 127.0.0.1:{DOC_PORT}"), "/permissions lists the host")
@@ -490,7 +498,8 @@ s3.send("/permissions clear\r"); s3.expect("permissions cleared")   # else that 
 s3.send("TOOL_SEARCH keycloak\r")
 check(s3.expect("Search the web?"), f"a search is confirmed too: {s3.text()[-300:]!r}")
 check(s3.expect(f"⌕ keycloak") and f"127.0.0.1:{DOC_PORT}" in s3.text(), "the query and the engine are shown")
-s3.send("y"); check(s3.expect("Keycloak Admin REST API", 15), "results previewed"); s3.expect("tok/s")
+s3.send("y"); check(s3.expect("lines ·", 15), "the results are folded too"); s3.expect("tok/s")
+check("Keycloak Admin REST API" in click_rows(s3), "and there on a click")
 s3.send("/web\r"); check(s3.expect(f"engine: http://127.0.0.1:{DOC_PORT}/search?q=%s"), "/web shows the engine")
 s3.send("/web engine https://example.org/s?q=%s\r"); check(s3.expect("✓ engine: https://example.org/s?q=%s"), "/web engine sets it")
 s3.send("/web engine default\r"); check(s3.expect("✓ engine: https://html.duckduckgo.com"), "/web engine default resets it")
@@ -1645,6 +1654,95 @@ s.send("/status\r"); check(s.expect("guidance strong"), "/status shows it")
 s.send("/advisor guidance normal\r"); s.expect("advisor guidance: normal")
 check("advisor_guidance" not in open(CFG2_FILE).read(), "the default is not written")
 s.send("\x04"); s.close()
+shutil.rmtree(CFG2, ignore_errors=True)
+
+# ---------- folds: a long tool result is one line until it is clicked ----------
+print("test interactive: a tool result of several lines is folded, and a click unfolds it")
+s = Session(["-m", "fake-coder:latest", "--yolo"]); s.expect("Ctrl-D to quit")
+s.send("TOOL_MANY\r"); check(s.expect("▸ 6 lines · fold-line-1"), f"one line says how much there is and how it begins: {since_send(s)[-300:]!r}")
+check(s.expect("Tool said:") and s.expect("tok/s"), "the model gets the whole result all the same")
+check("fold-line-5" in requests()[-1]["messages"][-1]["content"], "all of it")
+check("     fold-line-3" not in s.text(), "the rest is not on screen")
+view = click_rows(s)
+check("▾ 6 lines · fold-line-1" in view and "     fold-line-3" in view and "     fold-line-5" in view, f"a click on the line shows the rest and turns the mark: {view[-400:]!r}")
+s.send("after the fold\r"); check(s.expect("Echo: after the fold"), "output goes on under an open fold")
+view = click_rows(s)
+check("▸ 6 lines · fold-line-1" in view and "     fold-line-3" not in view and "Echo: after the fold" in view, f"another click hides it again, and what came after is still there: {view[-400:]!r}")
+s.send("\x1b[5~"); time.sleep(0.3); view = click_rows(s)
+check("fold-line-3" in view, "scrolled back it works the same")
+s.send("\x1b"); s.send("\x04"); s.close()
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_MANY"])
+check("fold-line-3" in out and "▸" not in out, "without a screen to click on, the first lines are shown as before")
+
+# ---------- /orchestrate: the advisor model plans and reviews, the main model does the tasks ----------
+print("test interactive: /orchestrate")
+MADE = os.path.join(WORK, "made.txt")
+if os.path.exists(MADE): os.remove(MADE)
+os.makedirs(os.path.join(CFG2, "corbienest"), exist_ok=True)
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2); s.expect("Ctrl-D to quit")
+s.send("/orchestrate build it\r"); check(s.expect("no advisor is set"), "without an advisor there is nobody to plan")
+s.send("/advisor fake-big:latest\r"); s.expect("advisor: fake-big:latest")
+s.send("/orchestrate\r"); check(s.expect("usage: /orchestrate REQUEST"), "bare: what it does")
+n0 = len(requests())
+s.send("/orchestrate build the thing\r")
+check(s.expect("⤷ orchestrator fake-big:latest") and s.expect("plans the request"), "the advisor model is asked for a plan")
+check(s.expect("plan · 2 tasks") and s.expect("1. make the file") and s.expect("2. say that it is there"), f"the tasks of its plan are listed, markdown or not: {since_send(s)[-400:]!r}")
+check(s.expect("⤷ worker 1/2") and s.expect("write_file"), "the first task runs as a worker that may write")
+check(s.expect("reviews task 1/2") and s.expect("⎿ accepted"), "and is reviewed")
+check(s.expect("⤷ worker 2/2") and s.expect("reviews task 2/2"), "then the second")
+check(s.expect("orchestrated: 2 of 2 tasks accepted", 20) and s.expect("files written: made.txt"), f"the run ends with what came of it: {since_send(s)[-400:]!r}")
+check(open(MADE).read() == "made by fake\n", "the worker's file is there")
+reqs = requests()[n0:]
+plan_rq = [r for r in reqs if r["model"] == "fake-big:latest" and "# PLAN this request" in r["messages"][-1]["content"]]
+check(len(plan_rq) == 1 and "tools" not in plan_rq[0] and "build the thing" in plan_rq[0]["messages"][-1]["content"], "one plan call, toolless, with the request")
+rev = [r["messages"][-1]["content"] for r in reqs if r["model"] == "fake-big:latest" and "# REVIEW this task" in r["messages"][-1]["content"]]
+check(len(rev) == 2 and "+made by fake" in rev[0] and "b/made.txt" in rev[0] and "Tool said" in rev[0], f"the review is shown the task's diff and the worker's report: {rev[0][-500:] if rev else None!r}")
+check("(it wrote no file)" in rev[1] and "+made by fake" not in rev[1], "and the second task's review only what that task wrote")
+wk = [r for r in reqs if r["model"] == "fake-coder:latest" and "You are a worker agent" in r["messages"][0]["content"]]
+names = [t["function"]["name"] for t in wk[0].get("tools", [])]
+check("write_file" in names and "task" not in names and "advisor" not in names, f"a worker has the tools to change files, but no agents or advisor of its own: {names!r}")
+w2 = [r for r in wk if "# Your task (2 of 2)" in r["messages"][1]["content"]]
+check(w2 and "# Done before you" in w2[0]["messages"][1]["content"] and "TOOL_WRITE" not in w2[0]["messages"][1]["content"] and len(w2[0]["messages"]) == 2, "the second worker starts fresh: its task and the first one's report, not its transcript")
+s.send("and now?\r"); check(s.expect("Echo: and now?"), "the conversation goes on")
+roles = [m["role"] for m in requests()[-1]["messages"]]
+check(roles == ["system", "user", "assistant", "user"] and "[/orchestrate:" in requests()[-1]["messages"][2]["content"] and "## Task 1 of 2: make the file — accepted" in requests()[-1]["messages"][2]["content"],
+      f"in which the run is the request and one reply that says what came of each task: {roles!r}")
+s.send("/usage\r"); check(s.expect("usage") and s.expect("3 calls"), f"/usage counts the orchestrator's three calls — a plan and two reviews: {since_send(s)[-300:]!r}")
+os.remove(MADE)
+s.send("/orchestrate ONETASK REJECT it once\r")
+check(s.expect("plan · 1 task ·") and s.expect("⎿ sent back") and s.expect("REVIEW-FINDING"), "a task the reviewer does not accept is sent back with what it said")
+check(s.expect("second attempt") and s.expect("⎿ accepted") and s.expect("orchestrated: 1 of 1 task accepted", 20), f"and accepted when the worker has dealt with it: {since_send(s)[-400:]!r}")
+back = [r for r in requests() if r["model"] == "fake-coder:latest" and r["messages"][-1]["role"] == "user" and "does not accept it yet" in r["messages"][-1]["content"]]
+check(back and "REVIEW-FINDING" in back[-1]["messages"][-1]["content"] and len(back[-1]["messages"]) > 3, "the worker gets the reviewer's words in the conversation it already has")
+s.send("/orchestrate ONETASK NEVERACCEPT this\r")
+check(s.expect("last attempt", 20) and s.expect("orchestrated: 0 of 1 task accepted", 20) and s.expect("/rewind undoes what was written"), f"three attempts, then it stops and says so: {since_send(s)[-400:]!r}")
+s.send("/orchestrate NOPLAN please\r"); check(s.expect("no tasks in its answer") and s.expect("talk this through"), "an answer without a plan runs nothing")
+os.remove(MADE)
+s.send("/clear\r"); s.expect("new conversation")   # (the fake reads its keywords from the whole brief, and that has the conversation before in it)
+s.send("/mode plan\r"); s.expect("mode: plan")
+s.send("/orchestrate ONETASK in plan mode\r"); check(s.expect("plan · 1 task ·") and s.expect("plan mode: the tasks are not run"), "plan mode shows the plan and runs nothing")
+check(not os.path.exists(MADE), "nothing was written")
+s.send("/clear\r"); s.expect("new conversation"); s.send("/mode manual\r"); s.expect("mode: manual")
+s.send("/orchestrate ONETASK ask me first\r"); check(s.expect("Run this task with fake-coder:latest?"), "outside auto mode the plan is put to the user first")
+s.send("n"); time.sleep(0.3); s.send("\r"); check(s.expect("the plan was not run"), f"and No leaves it at that: {since_send(s)[-300:]!r}")
+check(not os.path.exists(MADE), "nothing was written then either")
+s.send("\x04"); s.close()
+print("test interactive: /orchestrate with a hosted model, and the banner")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nadvisor=xai:grok-fake\n")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2)
+check(s.expect("advisor: xai:grok-fake") and s.expect("XAI_API_KEY is not set"), "the banner names the saved advisor, and says when its key is missing")
+s.expect("Ctrl-D to quit"); s.send("\x04"); s.close()
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
+check("advisor: xai:grok-fake" in s.text() and "is not set" not in s.text(), "with the key there it is just named")
+np = len(preqs())
+s.send("/orchestrate ONETASK through the API\r")
+check(s.expect("⤷ orchestrator xai:grok-fake") and s.expect("orchestrated: 1 of 1 task accepted", 20), f"a hosted model plans and reviews the same way: {since_send(s)[-400:]!r}")
+bodies = [r["body"]["messages"] for r in preqs()[np:] if r["provider"] == "xai"]
+check(len(bodies) == 2 and "You are the orchestrator" in bodies[0][0]["content"] and "# PLAN this request" in bodies[0][-1]["content"] and "+made by fake" in bodies[1][-1]["content"], "two calls to it: the plan, and the review with the diff")
+check(key_nowhere() is None, f"and the key was written nowhere: {key_nowhere()!r}")
+s.send("\x04"); s.close()
+os.remove(MADE)
 shutil.rmtree(CFG2, ignore_errors=True)
 
 # ---------- https: Ollama behind TLS, and a hosted API over it ----------

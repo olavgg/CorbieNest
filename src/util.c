@@ -485,6 +485,65 @@ bool model_is_cloud(const char *name) {
     return l > 6 && (!strcmp(name + l - 6, ":cloud") || !strcmp(name + l - 6, "-cloud"));
 }
 
+/* ---------- /orchestrate: reading the plan ---------- */
+/* "TASK 3: title" at the start of a line, with whatever markdown a model puts around it ("## Task 3 —",
+ * "**TASK 3.** title"): returns the title's start, NULL for any other line. A sentence of the
+ * instructions that begins "Task 3 depends on …" is not one: the number must end in a separator. */
+static const char *plan_header(const char *line, size_t len, size_t *title_len) {
+    const char *p = line, *end = line + len;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '#' || *p == '*' || *p == '_' || *p == '-' || *p == '>')) p++;
+    if (end - p < 5 || strncasecmp(p, "task", 4)) return NULL;
+    p += 4;
+    while (p < end && *p == ' ') p++;
+    if (p == end || !isdigit((unsigned char)*p)) return NULL;
+    while (p < end && isdigit((unsigned char)*p)) p++;
+    while (p < end && (*p == ' ' || *p == '*' || *p == '_')) p++;
+    if (p < end) {
+        if (*p == ':' || *p == '.' || *p == ')' || *p == '-') p++;
+        else if (!strncmp(p, "—", 3) || !strncmp(p, "–", 3)) p += 3;
+        else return NULL;
+    }
+    while (p < end && (*p == ' ' || *p == '*' || *p == '_')) p++;
+    while (end > p && (end[-1] == ' ' || end[-1] == '*' || end[-1] == '_' || end[-1] == '\r' || end[-1] == ':')) end--;
+    *title_len = (size_t)(end - p);
+    return p;
+}
+
+int orch_parse_plan(const char *text, orch_task **tasks) {
+    *tasks = NULL;
+    int n = 0;
+    sbuf body; sb_init(&body);
+    for (const char *p = text ? text : ""; *p; ) {
+        size_t len = strcspn(p, "\n"), tl = 0;
+        const char *title = plan_header(p, len, &tl);
+        if (title) {
+            if (n) { (*tasks)[n - 1].body = xstrdup(body.data ? body.data : ""); trim((*tasks)[n - 1].body); }
+            body.len = 0; if (body.data) body.data[0] = 0;
+            if (n == ORCH_MAX_TASKS) { n++; break; }   /* (counted to say so, never stored) */
+            *tasks = xrealloc(*tasks, sizeof **tasks * (size_t)(n + 1));
+            (*tasks)[n++] = (orch_task){ xstrndup(title, tl), NULL };
+        } else if (n) { sb_append(&body, p, len); sb_putc(&body, '\n'); }
+        p += len; if (*p == '\n') p++;
+    }
+    if (n > ORCH_MAX_TASKS) n = ORCH_MAX_TASKS;
+    else if (n) { (*tasks)[n - 1].body = xstrdup(body.data ? body.data : ""); trim((*tasks)[n - 1].body); }
+    sb_free(&body);
+    /* a header with nothing to it — no title and no instructions — is not a task */
+    int keep = 0;
+    for (int i = 0; i < n; i++) {
+        if (!(*tasks)[i].body) (*tasks)[i].body = xstrdup("");
+        if (!(*tasks)[i].title[0] && !(*tasks)[i].body[0]) { free((*tasks)[i].title); free((*tasks)[i].body); continue; }
+        (*tasks)[keep++] = (*tasks)[i];
+    }
+    if (!keep) { free(*tasks); *tasks = NULL; }
+    return keep;
+}
+
+void orch_tasks_free(orch_task *t, int n) {
+    for (int i = 0; i < n; i++) { free(t[i].title); free(t[i].body); }
+    free(t);
+}
+
 /* ---------- prices ----------
  * The providers' list prices, USD per million input / output tokens, as their pricing pages had
  * them in October 2026. Prices move and models come and go: /usage says which price it used, and

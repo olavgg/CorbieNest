@@ -8,7 +8,7 @@
 #include <stddef.h>
 #include <cjson/cJSON.h>
 
-#define CORBIE_VERSION "0.1.0"
+#define CORBIE_VERSION "0.2.0"
 
 /* ---------- ANSI colours ---------- */
 #define C_RESET   "\x1b[0m"
@@ -310,6 +310,13 @@ void        term_queue_mark(void);        /* everything queued so far is account
  * to end: when Enter is pressed while busy, term.c offers the line to this hook first and
  * only queues it as a message when the hook returns 0. Set by main.c. */
 extern int (*term_run_while_busy)(const char *line);
+/* A long result, folded: `head` is the one line that stays on screen and has TERM_FOLD_CLOSED in
+ * it; what is printed between the two calls is its body, out of sight until the head is clicked.
+ * False = no folding here (not in full-screen mode): print a preview instead. */
+#define TERM_FOLD_CLOSED "▸"
+#define TERM_FOLD_OPEN   "▾"
+bool        term_fold_begin(const char *head);
+void        term_fold_end(void);
 void        term_line_break(void);        /* start a fresh line if output is mid-line (the model may be mid-sentence) */
 void        term_editor_prefill(const char *text);   /* text appears in the editor at the next prompt (e.g. after /rewind) */
 char       *term_keys_to_text(const unsigned char *keys, size_t n);   /* raw keystrokes -> trimmed text (malloc'd) */
@@ -368,6 +375,8 @@ void        tools_permissions_clear(void);                /* removes the file */
 /* Checkpoints for /rewind: file states before write_file/edit_file, tagged with the request
  * ("turn" = index into the conversation) they happened in. */
 void tools_checkpoint_turn(int turn);              /* main.c: a request starts */
+void tools_checkpoint_step(int step);              /* a part of it that is looked at by itself (a task of /orchestrate); 0 = none */
+int  tools_checkpoint_diff(int turn, int step, sbuf *out);   /* what that step did to the files it wrote, as unified diffs; returns files that differ */
 int  tools_checkpoint_files(int turn, sbuf *names);/* files changed in that request or later */
 int  tools_checkpoint_restore(int turn);           /* put them back; returns files restored */
 void tools_checkpoint_clear(void);
@@ -438,6 +447,16 @@ void   model_info_parse(const char *json, model_info *mi);      /* the /api/show
 void   model_think_profile(model_info *mi);   /* fill think_* from family/renderer unless the server declared them; call again after changing `thinking` */
 int    ollama_model_show(const char *model, model_info *mi);    /* 0 ok, -1 unknown model / request failed (*mi is still zeroed) */
 extern model_info g_model_info;   /* the model in use (set by main.c) */
+
+/* ---------- /orchestrate: the pure half ----------
+ * The plan the orchestrating model writes is text — "TASK 1: title", the instructions under it,
+ * the next "TASK 2: …" — because that is what every model can write, markdown around it or not.
+ * orch_parse_plan() reads it: the tasks in order (at most ORCH_MAX_TASKS, numbered as they come,
+ * whatever numbers the model gave them), malloc'd; 0 when the text holds no task. */
+#define ORCH_MAX_TASKS 12
+typedef struct { char *title, *body; } orch_task;
+int  orch_parse_plan(const char *text, orch_task **tasks);
+void orch_tasks_free(orch_task *t, int n);
 
 /* ---------- prices: what /usage estimates the cost with ----------
  * USD per million input and output tokens. model_price() says what a model costs: 2 = a price

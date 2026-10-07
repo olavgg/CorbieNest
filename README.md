@@ -121,6 +121,7 @@ larger ones skipped.)
 | `/status` | model, context usage, settings |
 | `/diff [git args]` | show `git diff` of the working tree (stat, patch, untracked files) for you only — nothing is added to the conversation; `/diff --staged`, `/diff HEAD~1` … pass through |
 | `/rewind` | (or **Esc Esc** at an empty prompt) pick an earlier request and go back: undo the file changes the model made since (files are checkpointed before every `write_file`/`edit_file`), truncate the conversation to just before it (the request text returns to the editor), or both |
+| `/orchestrate REQUEST` | the advisor model in charge: it plans the request as tasks, the main model does them one by one as workers, and the advisor reviews each — see [Orchestrating](#orchestrating) |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
 | `/usage`, `/usage price MODEL IN OUT\|default` | tokens per model in this session — the main model, the advisor — and the **estimated cost** of the hosted ones, at the provider's list price per million tokens (built in, as of October 2026) or the one you set with `price`. The same estimate is on each consultation's result line (`⎿ advice · 4.2k tokens · 12s · ≈ $0.03`) and in `/cost`. An estimate: what was billed is on the provider's usage page |
 | `/system [text\|clear]` | extra system instructions |
@@ -172,6 +173,11 @@ larger ones skipped.)
   to (Project / User / Feedback / Reference) and the line is appended, no model call involved.
 - Enter sends; Alt+Enter, Ctrl+J or a trailing `\` inserts a newline. Bracketed paste works.
 - Ctrl-C (or Esc) cancels a running generation / clears the line (twice on an empty line quits).
+- **Tool results are folded.** What `grep`, `cat` or a build prints is for the model; in the
+  transcript a result of more than one line is a single line — `▸ 42 lines · how it begins` — and
+  a **click on that line** shows the rest (`▾`), another click hides it again. It works at the
+  prompt, scrolled back and while the model is working. Without the full-screen UI (`-p`, a pipe)
+  the first lines are shown instead, as there is nothing to click.
 - The **mouse wheel** and PgUp/PgDn scroll back through the conversation (the alternate screen has
   no scrollback of its own, so corbienest keeps one) — at the prompt and while the model works:
   what arrives meanwhile is kept and shown when you scroll back down, and Esc returns to the
@@ -561,6 +567,41 @@ round to act on it; where the files or a command's output show the advisor is wr
 is told to say so. Higher levels also show the advisor more of the conversation (up to 96 KB
 instead of 48). Changing the level changes the agent's instructions, so its next reply reads the
 conversation again.
+
+#### Orchestrating
+
+`/orchestrate REQUEST` turns the advisor round: the stronger model (the one `/advisor` names —
+hosted, cloud or a bigger local one) is in charge, and the model doing the work is its hands.
+
+```
+› /orchestrate add a --dry-run flag to the importer, with a test
+  ⤷ orchestrator anthropic:claude-opus-5 · plans the request · 5 KB · esc stops the run
+    ⎿ plan · 3 tasks · 3.1k tokens · 14s · ≈ $0.04:
+      1. Find where the importer writes
+      2. Add the flag
+      3. Test it
+  ⤷ worker 1/3 Find where the importer writes
+    ⎿ grep(write_row)
+    ⎿ report after 2 tool rounds: …
+  ⤷ orchestrator anthropic:claude-opus-5 · reviews task 1/3 · 1 KB · esc stops the run
+    ⎿ accepted · 1.2k tokens · 4s · ≈ $0.01
+  …
+✓ orchestrated: 3 of 3 tasks accepted · files written: src/import.c, tests/test_import.c
+```
+
+- **Plan.** The orchestrator is shown the request (with its `@files`), the project instructions,
+  a listing of the directory and the conversation so far, and answers with up to 12 tasks. It has
+  no tools, so a plan that needs to know the code first begins with a task that explores.
+  Outside auto mode you are asked before the tasks run; in plan mode they are only shown.
+- **Work.** Each task is an agent of its own on the main model, with a fresh context: its task
+  and the reports of the tasks before it. It has every tool but `task` and `advisor`, and its
+  writes go through the permission mode like any other.
+- **Review.** The orchestrator sees the task, the worker's report and the diff of the files it
+  wrote, and accepts it or sends it back with what to do — twice at most. A task that is still
+  not accepted stops the run: the next one would build on it. `/rewind` undoes the whole run.
+- **One at a time.** The workers do not run in parallel. A queued message or Esc stops the run.
+- The expensive model never reads a worker's transcript — only plans, reports and diffs — so
+  its tokens stay few; `/usage` shows what they came to.
 
 #### Hosted advisors
 
