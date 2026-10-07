@@ -1701,7 +1701,7 @@ check(len(rev) == 2 and "+made by fake" in rev[0] and "b/made.txt" in rev[0] and
 check("(it wrote no file)" in rev[1] and "+made by fake" not in rev[1], "and the second task's review only what that task wrote")
 wk = [r for r in reqs if r["model"] == "fake-coder:latest" and "You are a worker agent" in r["messages"][0]["content"]]
 names = [t["function"]["name"] for t in wk[0].get("tools", [])]
-check("write_file" in names and "task" not in names and "advisor" not in names, f"a worker has the tools to change files, but no agents or advisor of its own: {names!r}")
+check(wk[0].get("stream") is False and "write_file" in names and "task" not in names and "advisor" not in names, f"a worker has the tools to change files, but no agents or advisor of its own: {names!r}")
 w2 = [r for r in wk if "# Your task (2 of 2)" in r["messages"][1]["content"]]
 check(w2 and "# Done before you" in w2[0]["messages"][1]["content"] and "TOOL_WRITE" not in w2[0]["messages"][1]["content"] and len(w2[0]["messages"]) == 2, "the second worker starts fresh: its task and the first one's report, not its transcript")
 s.send("and now?\r"); check(s.expect("Echo: and now?"), "the conversation goes on")
@@ -1720,6 +1720,37 @@ check(s.expect("last attempt", 20) and s.expect("orchestrated: 0 of 1 task accep
 s.send("/orchestrate NOPLAN please\r"); check(s.expect("no tasks in its answer") and s.expect("talk this through"), "an answer without a plan runs nothing")
 os.remove(MADE)
 s.send("/clear\r"); s.expect("new conversation")   # (the fake reads its keywords from the whole brief, and that has the conversation before in it)
+# tasks that do not wait for each other run at the same time: their model calls, each on a thread
+s.send("/workers\r"); check(s.expect("workers: 3"), "three at a time unless told otherwise")
+urllib.request.urlopen(f"{HOST}/_inflight").read()
+t0 = time.time(); s.send("/orchestrate PARALLEL work\r")
+check(s.expect("plan · 3 tasks") and s.expect("2. second slow thing  with the tasks before it") and s.expect("3. wrap it up  after 1 2"), f"the plan says what may overlap: {since_send(s)[-400:]!r}")
+check(s.expect("⤷ worker 1/3") and s.expect("⤷ worker 2/3"), "both start at once")
+check(s.expect("orchestrated: 3 of 3 tasks accepted", 30), f"and the run comes to its end: {since_send(s)[-500:]!r}")
+took = time.time() - t0
+most = json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"]
+check(most == 2, f"the two model calls were under way at the same time: {most}")
+check(took < 6.2, f"so the two slow tasks took the time of one, not of two (3.2 s each): {took:.1f}s")
+out3 = since_send(s)
+check(out3.index("⤷ worker 3/3") > out3.index("reviews task 2/3") and out3.index("⤷ worker 3/3") > out3.index("reviews task 1/3"), "the task that waits for both starts when both are accepted")
+w3 = [r for r in requests() if r["model"] == "fake-coder:latest" and len(r["messages"]) > 1 and "# Your task (3 of 3)" in r["messages"][1]["content"]]
+check(w3 and "## Task 1: first slow thing — accepted" in w3[0]["messages"][1]["content"] and "## Task 2: second slow thing — accepted" in w3[0]["messages"][1]["content"], "and is told what the two did")
+check(open(MADE).read() == "made by fake\n", "its file is written")
+os.remove(MADE)
+s.send("/clear\r"); s.expect("new conversation")
+s.send("/workers 1\r"); check(s.expect("workers = 1") and "workers=1" in open(CFG2_FILE).read(), "/workers N, saved")
+urllib.request.urlopen(f"{HOST}/_inflight").read()
+s.send("/orchestrate PARALLEL in turn\r"); check(s.expect("orchestrated: 3 of 3 tasks accepted", 40), "with one worker the same plan runs in turn")
+check(json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"] == 1, "one call at a time")
+os.remove(MADE)
+s.send("/workers 9\r"); check(s.expect("usage: /workers N"), "a number out of range is refused")
+s.send("/workers 3\r"); s.expect("workers = 3")
+s.send("/clear\r"); s.expect("new conversation")
+s.send("/orchestrate PARALLEL then stop\r"); s.expect("⤷ worker 2/3"); time.sleep(0.8); s.send("\x1b")
+check(s.expect("the run was stopped", 10) and s.expect("orchestrated: 0 of 3 tasks accepted", 10), f"Esc stops every worker that is under way: {since_send(s)[-400:]!r}")
+s.send("still there?\r"); check(s.expect("Echo: still there?", 10), "and the prompt is back at once")
+check("stopped by the user before it was finished" in requests()[-1]["messages"][-2]["content"] and "not started: the run was stopped" in requests()[-1]["messages"][-2]["content"], "with what came of each task in the conversation")
+s.send("/clear\r"); s.expect("new conversation")
 s.send("/mode plan\r"); s.expect("mode: plan")
 s.send("/orchestrate ONETASK in plan mode\r"); check(s.expect("plan · 1 task ·") and s.expect("plan mode: the tasks are not run"), "plan mode shows the plan and runs nothing")
 check(not os.path.exists(MADE), "nothing was written")

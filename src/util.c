@@ -413,6 +413,7 @@ void config_load(void) {
         else if (!strncmp(k, "price.", 6)) { double pi, po; if (k[6] && sscanf(v, "%lf/%lf", &pi, &po) == 2 && pi >= 0 && po >= 0) price_set(k + 6, pi, po); }
         else if (!strcmp(k, "advisor")) { free(g_cfg.advisor); g_cfg.advisor = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "advisor_ctx")) { int n = atoi(v); if (n == 0 || n >= ADVISOR_CTX_MIN) g_cfg.advisor_ctx = n; }
+        else if (!strcmp(k, "workers")) { int n = atoi(v); if (n >= 1 && n <= ORCH_WORKERS_MAX) g_cfg.workers = n; }
         else if (!strcmp(k, "advisor_guidance")) { int n = advisor_guidance_parse(v); if (n >= 0) g_cfg.advisor_guidance = n; }
         else if (!strcmp(k, "show_thinking")) g_cfg.show_thinking = atoi(v) != 0;
         else if (!strcmp(k, "yolo")) { if (atoi(v)) g_cfg.mode = MODE_AUTO; }
@@ -449,6 +450,7 @@ void config_save(void) {
     for (int i = 0; i < g_cfg.n_prices; i++) sb_printf(&b, "price.%s=%g/%g\n", g_cfg.prices[i].model, g_cfg.prices[i].in, g_cfg.prices[i].out);
     if (g_cfg.advisor) sb_printf(&b, "advisor=%s\n", g_cfg.advisor);
     if (g_cfg.advisor_ctx > 0) sb_printf(&b, "advisor_ctx=%d\n", g_cfg.advisor_ctx);
+    if (g_cfg.workers > 0) sb_printf(&b, "workers=%d\n", g_cfg.workers);
     if (g_cfg.advisor_guidance != GUIDANCE_NORMAL) sb_printf(&b, "advisor_guidance=%s\n", advisor_guidance()->name);
     sb_printf(&b, "show_thinking=%d\n", g_cfg.show_thinking ? 1 : 0);
     sb_printf(&b, "mode=%s\n", mode_name(g_cfg.mode));
@@ -509,31 +511,65 @@ static const char *plan_header(const char *line, size_t len, size_t *title_len) 
     return p;
 }
 
+/* "AFTER: 1, 3" / "AFTER: none" among a task's instructions: which tasks it waits for, by the
+ * numbers the plan gave them. Returns false for any other line; *none says the list was empty. */
+static bool plan_after(const char *line, size_t len, int *nums, int *n, bool *none) {
+    const char *p = line, *end = line + len;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '*' || *p == '_' || *p == '-' || *p == '>')) p++;
+    if (end - p < 5 || strncasecmp(p, "after", 5)) return false;
+    p += 5;
+    while (p < end && (*p == ' ' || *p == '*' || *p == '_')) p++;
+    if (p == end || *p != ':') return false;
+    *n = 0;
+    for (p++; p < end; ) {
+        if (isdigit((unsigned char)*p)) { int v = 0; while (p < end && isdigit((unsigned char)*p)) v = v * 10 + (*p++ - '0'); if (*n < ORCH_MAX_TASKS) nums[(*n)++] = v; }
+        else p++;
+    }
+    *none = *n == 0;
+    return true;
+}
+
 int orch_parse_plan(const char *text, orch_task **tasks) {
     *tasks = NULL;
     int n = 0;
+    int num[ORCH_MAX_TASKS + 1] = { 0 };                 /* the number the plan gave each task */
+    int dep[ORCH_MAX_TASKS + 1][ORCH_MAX_TASKS], ndep[ORCH_MAX_TASKS + 1]; bool said[ORCH_MAX_TASKS + 1];
+    memset(ndep, 0, sizeof ndep); memset(said, 0, sizeof said);
     sbuf body; sb_init(&body);
     for (const char *p = text ? text : ""; *p; ) {
         size_t len = strcspn(p, "\n"), tl = 0;
         const char *title = plan_header(p, len, &tl);
+        bool none;
         if (title) {
             if (n) { (*tasks)[n - 1].body = xstrdup(body.data ? body.data : ""); trim((*tasks)[n - 1].body); }
             body.len = 0; if (body.data) body.data[0] = 0;
             if (n == ORCH_MAX_TASKS) { n++; break; }   /* (counted to say so, never stored) */
             *tasks = xrealloc(*tasks, sizeof **tasks * (size_t)(n + 1));
-            (*tasks)[n++] = (orch_task){ xstrndup(title, tl), NULL };
-        } else if (n) { sb_append(&body, p, len); sb_putc(&body, '\n'); }
+            const char *d = p; while (d < title && !isdigit((unsigned char)*d)) d++;
+            num[n] = atoi(d);
+            (*tasks)[n++] = (orch_task){ xstrndup(title, tl), NULL, 0 };
+        } else if (n && plan_after(p, len, dep[n - 1], &ndep[n - 1], &none)) said[n - 1] = true;   /* (not part of the instructions) */
+        else if (n) { sb_append(&body, p, len); sb_putc(&body, '\n'); }
         p += len; if (*p == '\n') p++;
     }
     if (n > ORCH_MAX_TASKS) n = ORCH_MAX_TASKS;
     else if (n) { (*tasks)[n - 1].body = xstrdup(body.data ? body.data : ""); trim((*tasks)[n - 1].body); }
     sb_free(&body);
     /* a header with nothing to it — no title and no instructions — is not a task */
-    int keep = 0;
+    int keep = 0, at[ORCH_MAX_TASKS];   /* at[i]: where task i ended up, -1 = dropped */
     for (int i = 0; i < n; i++) {
         if (!(*tasks)[i].body) (*tasks)[i].body = xstrdup("");
-        if (!(*tasks)[i].title[0] && !(*tasks)[i].body[0]) { free((*tasks)[i].title); free((*tasks)[i].body); continue; }
-        (*tasks)[keep++] = (*tasks)[i];
+        if (!(*tasks)[i].title[0] && !(*tasks)[i].body[0]) { free((*tasks)[i].title); free((*tasks)[i].body); at[i] = -1; continue; }
+        at[i] = keep; (*tasks)[keep++] = (*tasks)[i];
+    }
+    /* what each waits for: the tasks its AFTER line names — earlier ones only, so nothing can wait
+     * in a circle — or, having none, the task before it: a plan that says nothing runs in order */
+    for (int i = 0; i < n; i++) {
+        if (at[i] < 0) continue;
+        unsigned after = 0;
+        if (!said[i]) { for (int j = i - 1; j >= 0; j--) if (at[j] >= 0) { after = 1u << at[j]; break; } }
+        else for (int k = 0; k < ndep[i]; k++) for (int j = 0; j < i; j++) if (at[j] >= 0 && num[j] == dep[i][k]) after |= 1u << at[j];
+        (*tasks)[at[i]].after = after;
     }
     if (!keep) { free(*tasks); *tasks = NULL; }
     return keep;

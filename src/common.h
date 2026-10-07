@@ -168,6 +168,7 @@ typedef struct {
     char *advisor;       /* the stronger model the agent may consult through the advisor tool (/advisor); NULL = none */
     int   advisor_ctx;   /* num_ctx of an advisor call; 0 = auto (see advisor_plan_for()) */
     int   advisor_guidance; /* how much the agent leans on it, GUIDANCE_* (/advisor guidance) */
+    int   workers;       /* tasks of /orchestrate that may run at the same time (/workers); 0 = ORCH_WORKERS_DEFAULT */
     bool  show_thinking; /* print thinking tokens */
     int   mode;          /* permission mode, see MODE_* */
     bool  no_tools;      /* don't send tools at all */
@@ -240,6 +241,13 @@ extern const char *const *http_headers;   /* extra request headers ("Name: value
 int http_request(const char *base_url, const char *method, const char *path,
                  const char *body, sbuf *out, http_line_cb line_cb, void *ud,
                  http_result *res);
+/* A POST that a thread of its own performs — the model call of one of several workers. Started
+ * and collected on the main thread; see http.c for what the thread may touch (its own handle). */
+typedef struct http_job http_job;
+http_job *http_job_start(const char *base_url, const char *path, const char *body);   /* NULL = it could not be started */
+bool      http_job_done(http_job *j);
+void      http_job_cancel(http_job *j);                               /* it ends soon after, as aborted */
+int       http_job_finish(http_job *j, sbuf *out, http_result *res);  /* waits for it and frees it; returns as http_request() does */
 bool http_busy(void);   /* a request is in flight: do not start another (their settings are globals) */
 char *http_url(const char *base, const char *path);   /* base + path; "host" and "http://host" get Ollama's port 11434 (malloc'd) */
 
@@ -454,7 +462,13 @@ extern model_info g_model_info;   /* the model in use (set by main.c) */
  * orch_parse_plan() reads it: the tasks in order (at most ORCH_MAX_TASKS, numbered as they come,
  * whatever numbers the model gave them), malloc'd; 0 when the text holds no task. */
 #define ORCH_MAX_TASKS 12
-typedef struct { char *title, *body; } orch_task;
+#define ORCH_WORKERS_DEFAULT 3   /* tasks that may run at the same time, unless /workers says otherwise */
+#define ORCH_WORKERS_MAX 8
+typedef struct {
+    char *title, *body;
+    unsigned after;   /* the tasks (bit i = task i, earlier ones only) that must be accepted before this one starts: an
+                       * "AFTER: 1, 3" or "AFTER: none" line of the plan — and without one, the task before it */
+} orch_task;
 int  orch_parse_plan(const char *text, orch_task **tasks);
 void orch_tasks_free(orch_task *t, int n);
 
@@ -516,6 +530,8 @@ int ollama_poll_or_message(void);         /* http_interrupt_check for such a cal
  * caller can react to a specific server error instead of only seeing a NULL reply. */
 extern char ollama_error[512];
 /* Fetch model names. Returns cJSON array of strings (caller owns) or NULL. */
+char  *ollama_chat_request(cJSON *messages, cJSON *tools);   /* the body of a call that is not streamed (ollama_call applies); malloc'd */
+cJSON *ollama_chat_reply(const char *json, int status, bool tools, chat_stats *st, char *err, size_t n);   /* its answer as the assistant message; NULL + err */
 cJSON *ollama_list_models(void);
 cJSON *ollama_list_models_quiet(int wait_ms);   /* the same, silently: for the suggestions */
 int    ollama_ping(char *ver, size_t verlen);

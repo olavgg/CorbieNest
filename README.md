@@ -121,7 +121,8 @@ larger ones skipped.)
 | `/status` | model, context usage, settings |
 | `/diff [git args]` | show `git diff` of the working tree (stat, patch, untracked files) for you only — nothing is added to the conversation; `/diff --staged`, `/diff HEAD~1` … pass through |
 | `/rewind` | (or **Esc Esc** at an empty prompt) pick an earlier request and go back: undo the file changes the model made since (files are checkpointed before every `write_file`/`edit_file`), truncate the conversation to just before it (the request text returns to the editor), or both |
-| `/orchestrate REQUEST` | the advisor model in charge: it plans the request as tasks, the main model does them one by one as workers, and the advisor reviews each — see [Orchestrating](#orchestrating) |
+| `/orchestrate REQUEST` | the advisor model in charge: it plans the request as tasks, the main model does them as workers — several at a time where the plan allows — and the advisor reviews each; see [Orchestrating](#orchestrating) |
+| `/workers [N]` | how many tasks of `/orchestrate` may run at the same time (default 3, `1` = one after another) |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
 | `/usage`, `/usage price MODEL IN OUT\|default` | tokens per model in this session — the main model, the advisor — and the **estimated cost** of the hosted ones, at the provider's list price per million tokens (built in, as of October 2026) or the one you set with `price`. The same estimate is on each consultation's result line (`⎿ advice · 4.2k tokens · 12s · ≈ $0.03`) and in `/cost`. An estimate: what was billed is on the provider's usage page |
 | `/system [text\|clear]` | extra system instructions |
@@ -581,8 +582,8 @@ hosted, cloud or a bigger local one) is in charge, and the model doing the work 
       2. Add the flag
       3. Test it
   ⤷ worker 1/3 Find where the importer writes
-    ⎿ grep(write_row)
-    ⎿ report after 2 tool rounds: …
+    [1] ⎿ grep(write_row)
+    [1] ⎿ report after 2 tool rounds: …
   ⤷ orchestrator anthropic:claude-opus-5 · reviews task 1/3 · 1 KB · esc stops the run
     ⎿ accepted · 1.2k tokens · 4s · ≈ $0.01
   …
@@ -598,8 +599,16 @@ hosted, cloud or a bigger local one) is in charge, and the model doing the work 
   writes go through the permission mode like any other.
 - **Review.** The orchestrator sees the task, the worker's report and the diff of the files it
   wrote, and accepts it or sends it back with what to do — twice at most. A task that is still
-  not accepted stops the run: the next one would build on it. `/rewind` undoes the whole run.
-- **One at a time.** The workers do not run in parallel. A queued message or Esc stops the run.
+  not accepted takes the tasks that wait for it with it; the others go on. `/rewind` undoes the
+  whole run.
+- **Several at a time.** The planner may mark tasks that do not need each other and write
+  different files (`AFTER: none`, `AFTER: 1, 2`); those run at the same time, up to `/workers`
+  of them (default 3). What overlaps is the model calls — each on a thread of its own — while
+  the workers' tools, the confirmations and the reviews still happen one at a time, so their
+  lines in the transcript are tagged `[2]` with the task they belong to. A plan that marks
+  nothing runs in order. Whether it is faster is up to the server: Ollama answers parallel
+  calls to one model only with `OLLAMA_NUM_PARALLEL` above 1 (and the memory for it), and
+  queues them otherwise. A queued message or Esc stops every worker.
 - The expensive model never reads a worker's transcript — only plans, reports and diffs — so
   its tokens stay few; `/usage` shows what they came to.
 

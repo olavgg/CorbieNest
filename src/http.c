@@ -6,6 +6,9 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include <curl/curl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,32 +118,17 @@ static int ctrl_c_pending(void) {
     return 0;
 }
 
-/* The settings of a request are globals (http_headers, http_idle, …), so one must not be started
- * from inside another — which code that runs in the poll of a live request can only know by asking. */
-static int g_http_depth = 0;
-bool http_busy(void) { return g_http_depth > 0; }
-
-int http_request(const char *base_url, const char *method, const char *path,
-                 const char *body, sbuf *out, http_line_cb line_cb, void *ud,
-                 http_result *res) {
-    memset(res, 0, sizeof *res);
-    if (!curl_ready()) { snprintf(res->err, sizeof res->err, "libcurl could not be initialised"); return -1; }
-    CURL *h = curl_easy_init();
-    CURLM *m = curl_multi_init();
-    if (!h || !m) { if (h) curl_easy_cleanup(h); if (m) curl_multi_cleanup(m); snprintf(res->err, sizeof res->err, "libcurl could not be initialised"); return -1; }
-    char *url = http_url(base_url, path);
-    char errbuf[CURL_ERROR_SIZE] = "";
-    g_http_depth++;
-    xfer x; memset(&x, 0, sizeof x);
-    x.sink.cb = line_cb; x.sink.ud = ud; x.sink.out = out; sb_init(&x.sink.linebuf);
-
+/* What every request sets on its handle, whoever runs it: the URL, the headers (returned, to be
+ * freed when the transfer is over), the protocols, the proxy and CA rules, the body. It reads the
+ * environment, so it is called on the main thread — also for a request a thread then performs. */
+static struct curl_slist *easy_setup(CURL *h, const char *url, const char *method, const char *body, const char *const *extra, char *errbuf) {
     struct curl_slist *hdrs = curl_slist_append(NULL, "Accept: application/json");
     if (body) hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
     hdrs = curl_slist_append(hdrs, "Expect:");              /* no 100-continue round trip for a big brief */
     /* a server that serves one connection at a time (a test's) is not held up; over TLS the
      * connection may be HTTP/2, where the header is not allowed (FORBID_REUSE closes it anyway) */
     if (strncasecmp(url, "https://", 8)) hdrs = curl_slist_append(hdrs, "Connection: close");
-    for (const char *const *e = http_headers; e && *e; e++) hdrs = curl_slist_append(hdrs, *e);
+    for (const char *const *e = extra; e && *e; e++) hdrs = curl_slist_append(hdrs, *e);
 
     char ua[64]; snprintf(ua, sizeof ua, "corbienest/%s", CORBIE_VERSION);
     curl_easy_setopt(h, CURLOPT_URL, url);
@@ -151,10 +139,6 @@ int http_request(const char *base_url, const char *method, const char *path,
     curl_easy_setopt(h, CURLOPT_FORBID_REUSE, 1L);
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);          /* a long silent wait (an answer that is not streamed) through a NAT */
-    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, on_body);
-    curl_easy_setopt(h, CURLOPT_WRITEDATA, &x);
-    curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, on_header);
-    curl_easy_setopt(h, CURLOPT_HEADERDATA, &x);
 #if LIBCURL_VERSION_NUM >= 0x075500
     curl_easy_setopt(h, CURLOPT_PROTOCOLS_STR, "http,https");
 #else
@@ -174,6 +158,34 @@ int http_request(const char *base_url, const char *method, const char *path,
     }
     if (strcmp(method, "GET") && strcmp(method, "POST")) curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
     else if (!strcmp(method, "GET") && !body) curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
+
+    return hdrs;
+}
+
+/* The settings of a request are globals (http_headers, http_idle, …), so one must not be started
+ * from inside another — which code that runs in the poll of a live request can only know by asking. */
+static int g_http_depth = 0;
+bool http_busy(void) { return g_http_depth > 0; }
+
+int http_request(const char *base_url, const char *method, const char *path,
+                 const char *body, sbuf *out, http_line_cb line_cb, void *ud,
+                 http_result *res) {
+    memset(res, 0, sizeof *res);
+    if (!curl_ready()) { snprintf(res->err, sizeof res->err, "libcurl could not be initialised"); return -1; }
+    CURL *h = curl_easy_init();
+    CURLM *m = curl_multi_init();
+    if (!h || !m) { if (h) curl_easy_cleanup(h); if (m) curl_multi_cleanup(m); snprintf(res->err, sizeof res->err, "libcurl could not be initialised"); return -1; }
+    char *url = http_url(base_url, path);
+    char errbuf[CURL_ERROR_SIZE] = "";
+    g_http_depth++;
+    xfer x; memset(&x, 0, sizeof x);
+    x.sink.cb = line_cb; x.sink.ud = ud; x.sink.out = out; sb_init(&x.sink.linebuf);
+
+    struct curl_slist *hdrs = easy_setup(h, url, method, body, http_headers, errbuf);
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, on_body);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &x);
+    curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, on_header);
+    curl_easy_setopt(h, CURLOPT_HEADERDATA, &x);
 
     curl_multi_add_handle(m, h);
     long long t0 = now_ms(), last_tick = t0;
@@ -221,5 +233,94 @@ int http_request(const char *base_url, const char *method, const char *path,
     curl_slist_free_all(hdrs);
     free(url); sb_free(&x.sink.linebuf);
     g_http_depth--;
+    return rv;
+}
+
+/* ---------- requests on a thread of their own ----------
+ * The one place corbienest has threads. /orchestrate runs several workers at once, and what a
+ * worker waits for is its model call: a POST that is answered in one piece minutes later. Such
+ * a call is a job — prepared here on the main thread, performed by a thread that touches nothing
+ * but its own handle and its own buffer, and collected on the main thread again. Everything else
+ * a worker does (its tools, the screen, the accounting) stays on the main thread, which is why
+ * none of the globals in this program needs a lock.
+ *
+ * The thread has every signal blocked (the handlers are the main thread's business) and is told
+ * to stop through a flag libcurl asks about as it waits. There is no deadline on silence here —
+ * an answer that is not streamed is silent until it is whole — only a generous one on the whole
+ * call, so a server that died does not hold a worker for ever. */
+#define HTTP_JOB_MAX_S (45 * 60)
+struct http_job {
+    pthread_t thread;
+    CURL *h; struct curl_slist *hdrs;
+    char *url, *body; char errbuf[CURL_ERROR_SIZE];
+    char *data; size_t len, cap;      /* the answer */
+    atomic_bool cancel, done;
+    CURLcode cc;
+};
+static size_t job_body(char *p, size_t size, size_t n, void *ud) {
+    http_job *j = ud; size_t len = size * n;
+    if (j->len + len + 1 > j->cap) {
+        size_t cap = j->cap ? j->cap * 2 : 16384; while (cap < j->len + len + 1) cap *= 2;
+        char *d = realloc(j->data, cap);
+        if (!d) return 0;
+        j->data = d; j->cap = cap;
+    }
+    memcpy(j->data + j->len, p, len); j->len += len; j->data[j->len] = 0;
+    return len;
+}
+static int job_progress(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut, curl_off_t un) {
+    (void)dt; (void)dn; (void)ut; (void)un;
+    return atomic_load(&((http_job *)ud)->cancel) ? 1 : 0;   /* nonzero: libcurl gives the transfer up */
+}
+static void *job_run(void *ud) {
+    http_job *j = ud;
+    j->cc = curl_easy_perform(j->h);
+    atomic_store(&j->done, true);
+    return NULL;
+}
+
+http_job *http_job_start(const char *base_url, const char *path, const char *body) {
+    if (!curl_ready()) return NULL;
+    http_job *j = calloc(1, sizeof *j);
+    if (!j) return NULL;
+    j->h = curl_easy_init();
+    if (!j->h) { free(j); return NULL; }
+    j->url = http_url(base_url, path); j->body = xstrdup(body ? body : "");
+    j->hdrs = easy_setup(j->h, j->url, "POST", j->body, NULL, j->errbuf);
+    curl_easy_setopt(j->h, CURLOPT_WRITEFUNCTION, job_body);
+    curl_easy_setopt(j->h, CURLOPT_WRITEDATA, j);
+    curl_easy_setopt(j->h, CURLOPT_XFERINFOFUNCTION, job_progress);
+    curl_easy_setopt(j->h, CURLOPT_XFERINFODATA, j);
+    curl_easy_setopt(j->h, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(j->h, CURLOPT_TIMEOUT, (long)HTTP_JOB_MAX_S);
+    sigset_t all, was; sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &was);   /* the thread inherits the mask: no signal is ever delivered to it */
+    int rc = pthread_create(&j->thread, NULL, job_run, j);
+    pthread_sigmask(SIG_SETMASK, &was, NULL);
+    if (rc != 0) { curl_slist_free_all(j->hdrs); curl_easy_cleanup(j->h); free(j->url); free(j->body); free(j); return NULL; }
+    return j;
+}
+bool http_job_done(http_job *j) { return atomic_load(&j->done); }
+void http_job_cancel(http_job *j) { atomic_store(&j->cancel, true); }
+
+/* Wait for the job (cancel it first where that should not take long), hand over its answer and
+ * free it. Returns as http_request() does: 0 with the status and the body, <0 with res->err, and
+ * 0 with res->aborted for one that was cancelled. */
+int http_job_finish(http_job *j, sbuf *out, http_result *res) {
+    memset(res, 0, sizeof *res);
+    pthread_join(j->thread, NULL);
+    int rv = 0;
+    long code = 0; curl_easy_getinfo(j->h, CURLINFO_RESPONSE_CODE, &code);
+    res->status = (int)code;
+    if (atomic_load(&j->cancel)) res->aborted = true;
+    else if (j->cc != CURLE_OK) {
+        const char *why = j->errbuf[0] ? j->errbuf : curl_easy_strerror(j->cc);
+        if (j->cc == CURLE_GOT_NOTHING) snprintf(res->err, sizeof res->err, "empty response from server");
+        else if (j->cc == CURLE_COULDNT_CONNECT || j->cc == CURLE_COULDNT_RESOLVE_HOST) snprintf(res->err, sizeof res->err, "%s%s", strcasestr(why, "connect") ? "" : "cannot connect: ", why);
+        else snprintf(res->err, sizeof res->err, "%s", why);
+        rv = -1;
+    } else if (out && j->data) sb_append(out, j->data, j->len);
+    curl_slist_free_all(j->hdrs); curl_easy_cleanup(j->h);
+    free(j->url); free(j->body); free(j->data); free(j);
     return rv;
 }

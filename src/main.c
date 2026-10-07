@@ -44,6 +44,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/effort", "how hard this model thinks" },
     { "/advisor", "a stronger model the agent may consult: a local one, or Claude, ChatGPT, Grok by API key" },
     { "/orchestrate", "the advisor model plans the request as tasks, this model does them, the advisor reviews each" },
+    { "/workers", "how many tasks of /orchestrate may run at the same time" },
     { "/mode", "permission mode: manual, accept-edits, plan, auto" },
     { "/yolo", "auto mode on or off: every tool call approved" },
     { "/tools", "tool calling on or off" },
@@ -1357,91 +1358,6 @@ static cJSON *tools_for_mode(void) {
  * tool rounds. Its streaming output is not shown; each tool call is echoed as one line and
  * the final report is previewed and returned to the parent as the tool result. */
 #define SUBAGENT_ITERS 25
-/* The loop of an agent that is not the main one: `msgs` is its own conversation (it grows, and
- * the caller keeps it — /orchestrate hands a worker its reviewer's words and runs it again),
- * `tools` what it may call, `who` what it is called on screen and in its results. Its streaming
- * output is not shown; each tool call is echoed as one line and the final report is previewed
- * and put into `out`. Returns 0 with a report, 1 without; *how says how it ended. */
-enum { AGENT_REPORTED, AGENT_FAILED, AGENT_INTERRUPTED, AGENT_STOPPED };   /* (stopped: a message of the user's goes first) */
-static int agent_loop(cJSON *msgs, size_t sp_bytes, cJSON *tools, const char *who, bool may_write, sbuf *out, int *how) {
-    int rc = 1, tool_rounds = 0, round_first = -1;
-    bool stopped_early = false;   /* the user sent a message: report what it has and get out */
-    bool interrupted = false;
-    const char *final = NULL;
-    for (int iter = 0; iter <= SUBAGENT_ITERS; iter++) {
-        /* the sub-agent has its own conversation and up to SUBAGENT_ITERS rounds of results in
-         * it: keep it inside the window the same way, on bytes (nothing here is measured) */
-        if (round_first > 0 && g_cfg.num_ctx > 0 &&
-            (double)(sp_bytes + tools_bytes() + conv_bytes(msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0))
-            elide_tool_results(msgs, round_first);
-        chat_stats st; bool aborted = false;
-        char label[64]; snprintf(label, sizeof label, "%.40s · round %d", who, tool_rounds + 1);
-        ollama_quiet = true; ollama_call.busy = label;
-        ollama_call.followup = iter > 0;   /* think=auto: think about the task once, not after every tool result */
-        cJSON *reply = ollama_chat(msgs, g_model_tools ? tools : NULL, &st, &aborted);
-        ollama_call_reset(); ollama_quiet = false;
-        account(&st);
-        term_status_refresh();
-        if (!reply) { sb_printf(out, aborted ? "error: %s interrupted by the user" : "error: %s model call failed", who); interrupted = aborted; break; }
-        cJSON_AddItemToArray(msgs, reply);
-        cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
-        cJSON *content = cJSON_GetObjectItemCaseSensitive(reply, "content");
-        if (aborted) { sb_printf(out, "error: %s interrupted by the user", who); interrupted = true; break; }
-        if (!calls || cJSON_GetArraySize(calls) == 0) { final = cJSON_IsString(content) ? content->valuestring : ""; rc = 0; break; }
-        if (iter == SUBAGENT_ITERS) { sb_printf(out, "error: %s stopped after %d tool rounds without a report", who, SUBAGENT_ITERS); if (cJSON_IsString(content) && content->valuestring[0]) sb_printf(out, "\nIts last message:\n%s", content->valuestring); break; }
-        cJSON *call;
-        round_first = cJSON_GetArraySize(msgs);
-        bool cut = false;   /* a message arrived mid-round: start nothing more */
-        cJSON_ArrayForEach(call, calls) {
-            cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
-            cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
-            cJSON *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
-            const char *name = cJSON_IsString(nm) ? nm->valuestring : "?";
-            cJSON *parsed = NULL;
-            if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
-            char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
-            if (!cut && term_queue_new()) cut = true;
-            if (cut) {
-                printf("    " C_DIM "⎿ %s — not run" C_RESET "\n", name);
-                cJSON_AddItemToArray(msgs, tool_result_message(name, TOOL_NOT_RUN));
-                if (parsed) cJSON_Delete(parsed);
-                continue;
-            }
-            printf("    " C_DIM "⎿ %s%s%s%s" C_RESET "\n", name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
-            sbuf o; sb_init(&o);
-            g_session.tool_calls++;
-            tool_status ts;
-            if (!strcmp(name, "task") || (!may_write && (!strcmp(name, "write_file") || !strcmp(name, "edit_file")))) { sb_printf(&o, may_write ? "error: %s is not available to a %s" : "error: %s is not available to a %s (read-only)", name, who); ts = TOOL_ERROR; }
-            else if (!strcmp(name, "advisor")) { sb_printf(&o, "error: the advisor is not available to a %s (it would be shown the wrong conversation); report what you found", who); ts = TOOL_ERROR; }
-            else ts = tools_execute(name, args, &o);
-            (void)ts;
-            cJSON_AddItemToArray(msgs, tool_result_message(name, o.data ? o.data : ""));
-            sb_free(&o);
-            if (parsed) cJSON_Delete(parsed);
-        }
-        tool_rounds++;
-        if (term_poll_interrupt()) { sb_printf(out, "error: %s interrupted by the user", who); interrupted = true; break; }
-        /* The user is talking to the main agent: half a report now beats a whole one after
-         * another twenty rounds of research it may no longer want. */
-        if (term_queue_new()) {
-            sb_printf(out, "The %s was stopped after %d tool round%s because the user sent a message that comes first. What it had gathered so far:\n%s",
-                      who, tool_rounds, tool_rounds == 1 ? "" : "s",
-                      cJSON_IsString(content) && content->valuestring[0] ? content->valuestring : "(nothing reported yet)");
-            stopped_early = true; rc = 0; break;
-        }
-    }
-    if (stopped_early) {
-        printf("    " C_YELLOW "⎿ stopped after %d tool round%s — your message goes first" C_RESET "\n",
-               tool_rounds, tool_rounds == 1 ? "" : "s");
-    } else if (rc == 0) {
-        sb_printf(out, "%s", final && *final ? final : "(it returned an empty report)");
-        printf("    " C_DIM "⎿ report after %d tool round%s:" C_RESET "\n", tool_rounds, tool_rounds == 1 ? "" : "s");
-        print_result_preview(final && *final ? final : "(empty)", 8);
-    } else printf("    " C_RED "⎿ %s" C_RESET "\n", out->data ? out->data : "it failed");
-    if (how) *how = stopped_early ? AGENT_STOPPED : interrupted ? AGENT_INTERRUPTED : rc == 0 ? AGENT_REPORTED : AGENT_FAILED;
-    return rc;
-}
-
 static int run_subagent(const char *description, const char *prompt, sbuf *out) {
     printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", description);
     cJSON *msgs = cJSON_CreateArray();
@@ -1468,7 +1384,79 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         if (!strcmp(name, "read_file") || !strcmp(name, "list_dir") || !strcmp(name, "grep") || !strcmp(name, "bash") ||
             !strcmp(name, "web_fetch") || !strcmp(name, "web_search")) cJSON_AddItemReferenceToArray(tools, t);
     }
-    int rc = agent_loop(msgs, sp_bytes, tools, "sub-agent", false, out, NULL);
+    int rc = 1, tool_rounds = 0, round_first = -1;
+    bool stopped_early = false;   /* the user sent a message: report what it has and get out */
+    const char *final = NULL;
+    for (int iter = 0; iter <= SUBAGENT_ITERS; iter++) {
+        /* the sub-agent has its own conversation and up to SUBAGENT_ITERS rounds of results in
+         * it: keep it inside the window the same way, on bytes (nothing here is measured) */
+        if (round_first > 0 && g_cfg.num_ctx > 0 &&
+            (double)(sp_bytes + tools_bytes() + conv_bytes(msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0))
+            elide_tool_results(msgs, round_first);
+        chat_stats st; bool aborted = false;
+        char label[48]; snprintf(label, sizeof label, "sub-agent · round %d", tool_rounds + 1);
+        ollama_quiet = true; ollama_call.busy = label;
+        ollama_call.followup = iter > 0;   /* think=auto: think about the task once, not after every tool result */
+        cJSON *reply = ollama_chat(msgs, g_model_tools ? tools : NULL, &st, &aborted);
+        ollama_call_reset(); ollama_quiet = false;
+        account(&st);
+        term_status_refresh();
+        if (!reply) { sb_puts(out, aborted ? "error: sub-agent interrupted by the user" : "error: sub-agent model call failed"); break; }
+        cJSON_AddItemToArray(msgs, reply);
+        cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
+        cJSON *content = cJSON_GetObjectItemCaseSensitive(reply, "content");
+        if (aborted) { sb_puts(out, "error: sub-agent interrupted by the user"); break; }
+        if (!calls || cJSON_GetArraySize(calls) == 0) { final = cJSON_IsString(content) ? content->valuestring : ""; rc = 0; break; }
+        if (iter == SUBAGENT_ITERS) { sb_printf(out, "error: sub-agent stopped after %d tool rounds without a report", SUBAGENT_ITERS); if (cJSON_IsString(content) && content->valuestring[0]) sb_printf(out, "\nIts last message:\n%s", content->valuestring); break; }
+        cJSON *call;
+        round_first = cJSON_GetArraySize(msgs);
+        bool cut = false;   /* a message arrived mid-round: start nothing more */
+        cJSON_ArrayForEach(call, calls) {
+            cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
+            cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+            cJSON *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+            const char *name = cJSON_IsString(nm) ? nm->valuestring : "?";
+            cJSON *parsed = NULL;
+            if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
+            char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
+            if (!cut && term_queue_new()) cut = true;
+            if (cut) {
+                printf("    " C_DIM "⎿ %s — not run" C_RESET "\n", name);
+                cJSON_AddItemToArray(msgs, tool_result_message(name, TOOL_NOT_RUN));
+                if (parsed) cJSON_Delete(parsed);
+                continue;
+            }
+            printf("    " C_DIM "⎿ %s%s%s%s" C_RESET "\n", name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
+            sbuf o; sb_init(&o);
+            g_session.tool_calls++;
+            tool_status ts;
+            if (!strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "task")) { sb_printf(&o, "error: %s is not available to a sub-agent (read-only)", name); ts = TOOL_ERROR; }
+            else if (!strcmp(name, "advisor")) { sb_puts(&o, "error: the advisor is not available to a sub-agent (it would be shown the wrong conversation); report what you found"); ts = TOOL_ERROR; }
+            else ts = tools_execute(name, args, &o);
+            (void)ts;
+            cJSON_AddItemToArray(msgs, tool_result_message(name, o.data ? o.data : ""));
+            sb_free(&o);
+            if (parsed) cJSON_Delete(parsed);
+        }
+        tool_rounds++;
+        if (term_poll_interrupt()) { sb_puts(out, "error: sub-agent interrupted by the user"); break; }
+        /* The user is talking to the main agent: half a report now beats a whole one after
+         * another twenty rounds of research it may no longer want. */
+        if (term_queue_new()) {
+            sb_printf(out, "The sub-agent was stopped after %d tool round%s because the user sent a message that comes first. What it had gathered so far:\n%s",
+                      tool_rounds, tool_rounds == 1 ? "" : "s",
+                      cJSON_IsString(content) && content->valuestring[0] ? content->valuestring : "(nothing reported yet)");
+            stopped_early = true; rc = 0; break;
+        }
+    }
+    if (stopped_early) {
+        printf("    " C_YELLOW "⎿ stopped after %d tool round%s — your message goes first" C_RESET "\n",
+               tool_rounds, tool_rounds == 1 ? "" : "s");
+    } else if (rc == 0) {
+        sb_printf(out, "%s", final && *final ? final : "(the sub-agent returned an empty report)");
+        printf("    " C_DIM "⎿ report after %d tool round%s:" C_RESET "\n", tool_rounds, tool_rounds == 1 ? "" : "s");
+        print_result_preview(final && *final ? final : "(empty)", 8);
+    } else printf("    " C_RED "⎿ %s" C_RESET "\n", out->data ? out->data : "sub-agent failed");
     cJSON_Delete(tools);
     cJSON_Delete(msgs);
     return rc;
@@ -2166,42 +2154,54 @@ static char *expand_mentions(const char *input) {
  * charge and the model doing the work is its hands. Three kinds of call, one after another:
  *   plan    the request, the project's instructions, a listing of the directory and the
  *           conversation so far go to the orchestrator, which answers with tasks (orch_parse_plan());
- *   work    each task runs as an agent of its own on the main model (agent_loop(), as a
- *           sub-agent does, but with write_file/edit_file — through confirm(), so the permission
- *           mode holds) with a fresh context: the task, and the reports of the ones before it;
+ *   work    each task runs as an agent of its own on the main model (as a sub-agent does, but
+ *           with write_file/edit_file — through confirm(), so the permission mode holds) with a
+ *           fresh context: the task, and the reports of the ones that were done before it;
  *   review  the orchestrator is shown the task, the worker's report and the diff of what it
  *           wrote (tools_checkpoint_diff()) and accepts it or sends it back with what to do —
- *           ORCH_ATTEMPTS times at most, then the run stops: the next task builds on this one.
+ *           ORCH_ATTEMPTS times at most; a task that is still not accepted takes the tasks that
+ *           wait for it with it.
  * The expensive model never sees a worker's transcript, only plans, reports and diffs — that
  * is the point: its tokens are few, the local model's are free. It has no tools (provider.c
  * asks one question and reads one answer), so it plans from what it is shown; a plan may begin
  * with a task that explores, whose report the later workers get.
  *
- * One task at a time: there is one HTTP client and its state is global, and a local Ollama
- * would only queue parallel calls anyway. In the conversation the whole run is two messages —
+ * Tasks that do not wait for each other run at the same time, up to /workers of them — and what
+ * runs at the same time is only what takes the time: the model calls, each a job on a thread of
+ * its own (http_job_*), asked for in one piece (ollama_chat_request/_reply). Everything else is
+ * done here, on the main thread, one thing at a time: a worker's tools, the confirmations, what
+ * is printed, the accounting, the reviews. So the workers are state machines that orch_schedule()
+ * steps whenever one's call has come back, and no global of this program needs a lock. Which
+ * tasks may overlap is the planner's to say ("AFTER: none", "AFTER: 1, 2"); a plan that says
+ * nothing runs in order. Whether the overlap buys time is the server's: an Ollama with one slot
+ * (OLLAMA_NUM_PARALLEL) queues the calls. In the conversation the whole run is two messages —
  * the request as the user's, and what came of each task as the agent's reply — so what the
  * user says next follows it like any other turn, and /rewind undoes it as one request. */
 #define ORCH_ATTEMPTS 3        /* a task is tried, and sent back at most twice */
 #define ORCH_REPLY_MIN 2048    /* tokens a plan may take, whatever the guidance allows a piece of advice */
 static bool g_orch_no_ask = false;   /* "run these tasks?" was answered with "don't ask again" in this session */
 
-static void orch_system(sbuf *b) {
+static void orch_system(sbuf *b, int workers) {
     sb_printf(b,
         "You are the orchestrator of Corbie Nest (corbienest), a coding agent in the user's terminal. You do not do the work yourself. "
         "You split the user's request into tasks for worker agents, and afterwards you review what each one did.\n\n"
-        "The workers are a small local model. They run one after another in the user's project, each with a fresh context that holds only "
-        "your task text and the short reports of the tasks before it. They have tools — read_file, list_dir, grep, bash, write_file, edit_file — "
+        "The workers are a small local model. They run in the user's project, each with a fresh context that holds only "
+        "your task text and the short reports of the tasks that were finished before it started. They have tools — read_file, list_dir, grep, bash, write_file, edit_file — "
         "and you have none: you see what you are shown here and nothing else, so never claim to have read a file or run anything.\n\n"
         "When you are asked to PLAN, answer with the plan and nothing else, in exactly this shape:\n\n"
         "TASK 1: <short title>\n<what to do>\nDONE WHEN: <how to tell it is done>\n\nTASK 2: <short title>\n...\n\n"
         "- As few tasks as the request needs, at most %d. A small request is one task.\n"
         "- Every task stands by itself: name the files, the functions, the commands to run and what must not change. A worker knows nothing you do not tell it, and cannot ask.\n"
         "- Order them so that each builds on finished work; no two tasks change the same lines.\n"
+        "%s"
         "- Where you would need to read the code first, make the first task an exploration that reports what it found: the later workers get that report.\n"
         "- Where the project has a build or tests, a task says to run them.\n\n"
         "When you are asked to REVIEW a task, you are shown the task, the worker's report and the diff of the files it wrote. "
         "If the task is done and correct, answer with " ADVISOR_REVIEW_OK " alone. Otherwise say exactly what is wrong or missing and what to do about it, "
-        "briefly: your answer goes to the worker as its next instruction. Do not ask for more than the task asked for.", ORCH_MAX_TASKS);
+        "briefly: your answer goes to the worker as its next instruction. Do not ask for more than the task asked for.", ORCH_MAX_TASKS,
+        workers > 1 ? "- The tasks run one after another unless you say otherwise. Tasks that do not need each other's result AND write different files may run at the same time: "
+                      "give such a task a line \"AFTER: none\" (it can start at once) or \"AFTER: 1, 2\" (the tasks that must be finished first), right under its title. "
+                      "A task without that line waits for the task before it. When in doubt, leave the line out.\n" : "");
 }
 
 /* One call of the orchestrating model, with its line in the transcript. The answer, malloc'd,
@@ -2209,7 +2209,7 @@ static void orch_system(sbuf *b) {
 static char *orch_ask(const char *what, const char *user, chat_stats *st, int *how) {
     bool known = advisor_info();
     advisor_plan plan; advisor_plan_now(&plan);
-    sbuf sys; sb_init(&sys); orch_system(&sys);
+    sbuf sys; sb_init(&sys); orch_system(&sys, g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT);
     printf("  " C_CYAN "⤷ orchestrator" C_RESET " " C_BOLD "%s" C_RESET C_DIM " · %s · %zu KB · esc stops the run" C_RESET "\n", g_cfg.advisor, what, (strlen(user) + 1023) / 1024);
     char label[96]; snprintf(label, sizeof label, "orchestrator · %.70s", g_cfg.advisor);
     advisor_reply ar;
@@ -2238,9 +2238,213 @@ static void orch_spent(const chat_stats *st, char *out, size_t n) {
     snprintf(out, n, "%s tokens · %.0fs%s", tk, st->total_seconds, cost);
 }
 
+/* A task of the run and the worker doing it. */
+enum { T_WAITING, T_RUNNING, T_ACCEPTED, T_UNREVIEWED, T_REJECTED, T_FAILED, T_STOPPED, T_SKIPPED };
+typedef struct {
+    int state;
+    const char *status;          /* what the report says came of it */
+    cJSON *msgs; size_t sp_bytes;/* its conversation, and the size of the system prompt in it */
+    http_job *job;               /* the model call it is waiting for (T_RUNNING) */
+    int attempt, rounds, round_first;
+    sbuf out, objection;         /* its last report, and what the orchestrator last held against it */
+} orch_worker;
+typedef struct {
+    const char *request;         /* as the user typed it */
+    orch_task *tasks; orch_worker *w; int nt;
+    cJSON *tools;                /* what a worker may call */
+    int first; size_t budget;    /* the request's checkpoint turn; bytes a review may take */
+    bool aborted;                /* the user stopped the run */
+} orch_run;
+static bool task_ok(const orch_worker *w) { return w->state == T_ACCEPTED || w->state == T_UNREVIEWED; }
+static void task_end(orch_worker *w, int state, const char *status) { w->state = state; w->status = status; }
+
+/* send the worker's conversation to the model: the call is a job, and the worker waits for it */
+static void worker_call(orch_run *r, int i) {
+    orch_worker *w = &r->w[i];
+    /* its conversation is its own and nothing in it is measured: kept inside the window on bytes, as a sub-agent's is */
+    if (w->round_first > 0 && g_cfg.num_ctx > 0 &&
+        (double)(w->sp_bytes + tools_bytes() + conv_bytes(w->msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0))
+        elide_tool_results(w->msgs, w->round_first);
+    ollama_call.followup = w->rounds > 0 || w->attempt > 1;   /* think=auto: think about the task once, not after every tool result */
+    char *body = ollama_chat_request(w->msgs, r->tools);
+    ollama_call_reset();
+    w->job = http_job_start(g_cfg.host, "/api/chat", body);
+    free(body);
+    if (w->job) w->state = T_RUNNING;
+    else { printf("    " C_RED "[%d] ⎿ the model call could not be started" C_RESET "\n", i + 1); task_end(w, T_FAILED, "failed: the model call could not be started"); }
+}
+
+static void worker_begin(orch_run *r, int i) {
+    orch_worker *w = &r->w[i];
+    w->msgs = cJSON_CreateArray(); w->attempt = 1;
+    sbuf sp; sb_init(&sp);
+    sb_printf(&sp, "You are a worker agent of Corbie Nest (corbienest), a coding agent in the user's terminal. An orchestrator split the user's request into tasks; "
+                   "you do ONE of them, in the user's project, with your tools.\nWorking directory: %s\n"
+                   "Do this task and only this task — not the others; some of them may be under way at this very moment, in files that are not yours to touch. "
+                   "Read the code before you change it, change no more than the task needs, "
+                   "and check your work where you can (build it, run the test). Do not ask questions: make a reasonable assumption and say which.\n"
+                   "End with ONE final message, your report: what you changed and in which files, what you checked and how, and anything left undone or that you are unsure of. "
+                   "The orchestrator sees only that report and the diff of the files you wrote.", g_cwd);
+    if (g_project_instructions) sb_puts(&sp, g_project_instructions);
+    w->sp_bytes = sp.len;
+    cJSON *m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "system"); cJSON_AddStringToObject(m, "content", sp.data); cJSON_AddItemToArray(w->msgs, m);
+    sb_free(&sp);
+    sbuf u; sb_init(&u);
+    sb_puts(&u, "# The user's request (for context — you do one part of it)\n"); sb_put_cut(&u, r->request, 4096);
+    bool any = false;
+    for (int j = 0; j < r->nt; j++) {   /* what is finished as this one starts, in the plan's order */
+        if (!task_ok(&r->w[j])) continue;
+        if (!any) { sb_puts(&u, "\n\n# Done before you\n"); any = true; }
+        sb_printf(&u, "## Task %d: %s — %s\n", j + 1, r->tasks[j].title, r->w[j].status); sb_put_cut(&u, r->w[j].out.data ? r->w[j].out.data : "", 2048); sb_puts(&u, "\n\n");
+    }
+    sb_printf(&u, "%s# Your task (%d of %d): %s\n%s", any ? "" : "\n\n", i + 1, r->nt, r->tasks[i].title, r->tasks[i].body);
+    m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", u.data); cJSON_AddItemToArray(w->msgs, m);
+    sb_free(&u);
+    printf("  " C_CYAN "⤷ worker %d/%d" C_RESET " " C_BOLD "%s" C_RESET "\n", i + 1, r->nt, r->tasks[i].title);
+    worker_call(r, i);
+}
+
+/* the worker has reported: the orchestrator looks at it, and it is accepted, sent back or given up */
+static void worker_review(orch_run *r, int i) {
+    orch_worker *w = &r->w[i];
+    sbuf rb, diff; sb_init(&rb); sb_init(&diff);
+    int nfiles = tools_checkpoint_diff(r->first, i + 1, &diff);
+    sb_puts(&rb, "# The user's request\n"); sb_put_cut(&rb, r->request, r->budget / 8);
+    sb_printf(&rb, "\n\n# The task (%d of %d): %s\n", i + 1, r->nt, r->tasks[i].title); sb_put_cut(&rb, r->tasks[i].body, r->budget / 8);
+    sb_puts(&rb, "\n\n# The worker's report\n"); sb_put_cut(&rb, w->out.data ? w->out.data : "", r->budget / 6);
+    sb_printf(&rb, "\n\n# The files it wrote, as a diff (%d file%s; what a shell command changed is not in it)\n", nfiles, nfiles == 1 ? "" : "s");
+    sb_put_cut(&rb, nfiles ? diff.data : "(it wrote no file)", r->budget / 2);
+    sb_printf(&rb, "\n\n# REVIEW this task (attempt %d of %d)\nIs it done and correct? " ADVISOR_REVIEW_OK " alone if so; otherwise what the worker must do.", w->attempt, ORCH_ATTEMPTS);
+    char what[64], spent[96]; snprintf(what, sizeof what, "reviews task %d/%d", i + 1, r->nt);
+    chat_stats st; int how;
+    char *verdict = orch_ask(what, rb.data, &st, &how);
+    sb_free(&rb); sb_free(&diff);
+    if (how == ADVICE_STOPPED || how == ADVICE_SKIPPED) { task_end(w, T_STOPPED, "done, but the run was stopped before its review"); r->aborted = true; }
+    else if (how != ADVICE_GIVEN) task_end(w, T_UNREVIEWED, "done, not reviewed (the orchestrator could not be asked)");
+    else if (advisor_approves(verdict)) {
+        orch_spent(&st, spent, sizeof spent);
+        printf("    " C_GREEN "⎿ accepted" C_RESET C_DIM " · %s" C_RESET "\n", spent);
+        task_end(w, T_ACCEPTED, w->attempt == 1 ? "accepted" : "accepted after corrections");
+    } else {
+        orch_spent(&st, spent, sizeof spent);
+        printf("    " C_YELLOW "⎿ sent back" C_RESET C_DIM " · %s:" C_RESET "\n", spent); print_result_preview(verdict, 8);
+        sb_clear(&w->objection); sb_puts(&w->objection, verdict);
+        if (w->attempt == ORCH_ATTEMPTS) task_end(w, T_REJECTED, "not accepted");
+        else {
+            sbuf fb; sb_init(&fb);
+            sb_printf(&fb, "The orchestrator reviewed your work on this task and does not accept it yet. It says:\n\n%s\n\nDo that — or, where the files or a command's output show it is wrong, say so — then report again.", verdict);
+            cJSON *m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", fb.data); cJSON_AddItemToArray(w->msgs, m);
+            sb_free(&fb);
+            w->attempt++;
+            printf("  " C_CYAN "⤷ worker %d/%d" C_RESET " " C_BOLD "%s" C_RESET C_DIM " · %s" C_RESET "\n", i + 1, r->nt, r->tasks[i].title, w->attempt == 2 ? "second attempt" : "last attempt");
+            worker_call(r, i);
+        }
+    }
+    free(verdict);
+}
+
+/* the worker's model call has come back: run the tools it asked for and call again, or take its report to the review */
+static void worker_step(orch_run *r, int i) {
+    orch_worker *w = &r->w[i];
+    sbuf body; sb_init(&body); http_result res;
+    int rc = http_job_finish(w->job, &body, &res);
+    w->job = NULL;
+    chat_stats st; char err[512] = "";
+    cJSON *reply = rc == 0 ? ollama_chat_reply(body.data, res.status, true, &st, err, sizeof err) : NULL;
+    if (rc != 0) snprintf(err, sizeof err, "%s", res.err);
+    sb_free(&body);
+    if (!reply) { printf("    " C_RED "[%d] ⎿ the model call failed: %s" C_RESET "\n", i + 1, err); task_end(w, T_FAILED, "failed: the model call did"); return; }
+    account(&st);
+    term_status_refresh();
+    cJSON_AddItemToArray(w->msgs, reply);
+    cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls"), *content = cJSON_GetObjectItemCaseSensitive(reply, "content"), *call;
+    if (!calls || cJSON_GetArraySize(calls) == 0) {
+        sb_clear(&w->out); sb_puts(&w->out, cJSON_IsString(content) && content->valuestring[0] ? content->valuestring : "(it returned an empty report)");
+        printf("    " C_DIM "[%d] ⎿ report after %d tool round%s:" C_RESET "\n", i + 1, w->rounds, w->rounds == 1 ? "" : "s");
+        print_result_preview(w->out.data, 6);
+        worker_review(r, i);
+        return;
+    }
+    if (w->rounds >= SUBAGENT_ITERS) {
+        printf("    " C_RED "[%d] ⎿ stopped after %d tool rounds without a report" C_RESET "\n", i + 1, SUBAGENT_ITERS);
+        sb_clear(&w->out); if (cJSON_IsString(content)) sb_puts(&w->out, content->valuestring);
+        task_end(w, T_FAILED, "failed: no report after all its tool rounds");
+        return;
+    }
+    w->round_first = cJSON_GetArraySize(w->msgs);
+    tools_checkpoint_step(i + 1);   /* what it writes is this task's, whatever the others write meanwhile */
+    bool cut = false;               /* the user spoke mid-round: start nothing more */
+    cJSON_ArrayForEach(call, calls) {
+        cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
+        cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+        cJSON *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+        const char *name = cJSON_IsString(nm) ? nm->valuestring : "?";
+        cJSON *parsed = NULL;
+        if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
+        char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
+        if (!cut && term_queue_new()) cut = true;
+        if (cut) cJSON_AddItemToArray(w->msgs, tool_result_message(name, TOOL_NOT_RUN));
+        else {
+            printf("    " C_DIM "[%d] ⎿ %s%s%s%s" C_RESET "\n", i + 1, name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
+            sbuf o; sb_init(&o);
+            g_session.tool_calls++;
+            if (!strcmp(name, "task") || !strcmp(name, "advisor")) sb_printf(&o, "error: %s is not available to a worker; do the task with the other tools and report", name);
+            else tools_execute(name, args, &o);
+            cJSON_AddItemToArray(w->msgs, tool_result_message(name, o.data ? o.data : ""));
+            sb_free(&o);
+        }
+        if (parsed) cJSON_Delete(parsed);
+    }
+    tools_checkpoint_step(0);
+    w->rounds++;
+    if (cut || term_poll_interrupt()) { task_end(w, T_STOPPED, "stopped by the user before it was finished"); r->aborted = true; return; }
+    worker_call(r, i);
+}
+
+/* Run the tasks: start every one whose tasks-to-wait-for are accepted, up to `maxpar` at a time,
+ * and step each worker whenever its model call is back. One that is not accepted takes the tasks
+ * that wait for it with it; the others go on. Esc, or a message of the user's, stops them all. */
+static void orch_schedule(orch_run *r, int maxpar) {
+    term_raw(true);
+    char label[64] = "";
+    for (;;) {
+        int running = 0;
+        for (int i = 0; i < r->nt; i++) if (r->w[i].state == T_RUNNING) running++;
+        for (int i = 0; i < r->nt && !r->aborted; i++) {
+            if (r->w[i].state != T_WAITING) continue;
+            bool ready = true, lost = false;
+            for (int j = 0; j < i; j++) {
+                if (!(r->tasks[i].after & (1u << j)) || task_ok(&r->w[j])) continue;
+                if (r->w[j].state == T_WAITING || r->w[j].state == T_RUNNING) ready = false; else lost = true;
+            }
+            if (lost) task_end(&r->w[i], T_SKIPPED, "not started: a task it waits for was not accepted");
+            else if (ready && running < maxpar) { worker_begin(r, i); if (r->w[i].state == T_RUNNING) running++; }
+        }
+        if (!running || r->aborted) break;
+        char now[64]; snprintf(now, sizeof now, running == 1 ? "worker · 1 task running" : "workers · %d tasks running", running);
+        if (strcmp(now, label)) { snprintf(label, sizeof label, "%s", now); term_busy(label); }
+        bool stepped = false;
+        for (int i = 0; i < r->nt && !r->aborted; i++)
+            if (r->w[i].state == T_RUNNING && http_job_done(r->w[i].job)) { worker_step(r, i); stepped = true; label[0] = 0; }   /* (a tool or a review took the bar: say it again) */
+        if (stepped) continue;
+        if (term_poll_interrupt() || term_queue_new()) { r->aborted = true; break; }
+        term_busy_tick();
+        nanosleep(&(struct timespec){ 0, 50 * 1000 * 1000 }, NULL);
+    }
+    term_busy(NULL);
+    if (!r->aborted) return;
+    printf(C_YELLOW "⏹ the run was stopped%s" C_RESET "\n", term_queue_new() ? " — your message goes first" : "");
+    for (int i = 0; i < r->nt; i++) if (r->w[i].state == T_RUNNING) http_job_cancel(r->w[i].job);
+    for (int i = 0; i < r->nt; i++) {
+        orch_worker *w = &r->w[i];
+        if (w->state == T_RUNNING) { http_result res; http_job_finish(w->job, NULL, &res); w->job = NULL; task_end(w, T_STOPPED, "stopped by the user before it was finished"); }
+        else if (w->state == T_WAITING) task_end(w, T_SKIPPED, "not started: the run was stopped");
+    }
+}
+
 static int cmd_orchestrate(const char *arg) {
     if (!arg || !*arg) {
-        printf("usage: /orchestrate REQUEST\n" C_DIM "  the advisor model (%s) plans the request as tasks, %s does them one by one, and the advisor reviews each before the next starts" C_RESET "\n",
+        printf("usage: /orchestrate REQUEST\n" C_DIM "  the advisor model (%s) plans the request as tasks, %s does them as workers — those that do not wait for each other at the same time (/workers) — and the advisor reviews each" C_RESET "\n",
                g_cfg.advisor ? g_cfg.advisor : "none set: /advisor MODEL", g_cfg.model ? g_cfg.model : "the model");
         return 0;
     }
@@ -2273,7 +2477,7 @@ static int cmd_orchestrate(const char *arg) {
     char *plan_text = orch_ask("plans the request", brief.data, &st, &how);
     sb_free(&brief);
     orch_task *tasks = NULL;
-    int nt = plan_text ? orch_parse_plan(plan_text, &tasks) : 0, accepted = 0, started = 0;
+    int nt = plan_text ? orch_parse_plan(plan_text, &tasks) : 0, accepted = 0;
     char spent[96];
     if (how != ADVICE_GIVEN) {
         aborted = how != ADVICE_NONE;
@@ -2286,10 +2490,15 @@ static int cmd_orchestrate(const char *arg) {
         printf("    " C_DIM "⎿ plan · %d task%s · %s:" C_RESET "\n", nt, nt == 1 ? "" : "s", spent);
         for (int i = 0; i < nt; i++) {
             const char *title = tasks[i].title[0] ? tasks[i].title : "(untitled)";
-            int w = term_width() - 12; if (w < 20) w = 20;   /* "      12. " prefix + ellipsis */
+            int w = term_width() - 12 - 30; if (w < 20) w = 20;   /* "      12. " prefix + ellipsis + what it waits for */
             size_t n = strlen(title), cut = n > (size_t)w ? (size_t)w : n;
             while (cut > 0 && cut < n && ((unsigned char)title[cut] & 0xC0) == 0x80) cut--;   /* don't split UTF-8 */
-            printf("      %d. %.*s%s\n", i + 1, (int)cut, title, cut < n ? "…" : "");
+            char wait[64] = "";   /* said only where the plan departs from "one after another" */
+            if (i > 0 && tasks[i].after != (1u << (i - 1))) {
+                size_t wl = (size_t)snprintf(wait, sizeof wait, tasks[i].after ? "  after" : "  with the tasks before it");
+                for (int j = 0; j < i && wl < sizeof wait - 8; j++) if (tasks[i].after & (1u << j)) wl += (size_t)snprintf(wait + wl, sizeof wait - wl, " %d", j + 1);
+            }
+            printf("      %d. %.*s%s" C_DIM "%s" C_RESET "\n", i + 1, (int)cut, title, cut < n ? "…" : "", wait);
         }
         bool go = true; char *reason = NULL;
         if (g_cfg.mode == MODE_PLAN) {
@@ -2308,91 +2517,35 @@ static int cmd_orchestrate(const char *arg) {
             }
         }
         free(reason);
-        if (go) sb_printf(&report, "[/orchestrate: %s planned %d task%s, %s did them one by one, and %s reviewed each.]\n", g_cfg.advisor, nt, nt == 1 ? "" : "s", g_cfg.model, g_cfg.advisor);
+        if (go) sb_printf(&report, "[/orchestrate: %s planned %d task%s, %s did them as workers, and %s reviewed each.]\n", g_cfg.advisor, nt, nt == 1 ? "" : "s", g_cfg.model, g_cfg.advisor);
 
-        /* what a worker may call: everything but another agent and the advisor (its reviewer is the orchestrator) */
-        cJSON *tools = cJSON_CreateArray(), *t;
-        cJSON_ArrayForEach(t, g_tools) {
-            cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function"), *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
-            if (cJSON_IsString(nm) && strcmp(nm->valuestring, "task") && strcmp(nm->valuestring, "advisor")) cJSON_AddItemReferenceToArray(tools, t);
-        }
-        sbuf done; sb_init(&done);   /* the reports so far, for the workers that follow */
-        bool halt = !go;
-        for (int i = 0; i < nt && !halt; i++) {
-            started++;
-            tools_checkpoint_step(i + 1);
-            cJSON *msgs = cJSON_CreateArray();
-            sbuf sp; sb_init(&sp);
-            sb_printf(&sp, "You are a worker agent of Corbie Nest (corbienest), a coding agent in the user's terminal. An orchestrator split the user's request into tasks; "
-                           "you do ONE of them, in the user's project, with your tools.\nWorking directory: %s\n"
-                           "Do this task and only this task — not the ones before or after it. Read the code before you change it, change no more than the task needs, "
-                           "and check your work where you can (build it, run the test). Do not ask questions: make a reasonable assumption and say which.\n"
-                           "End with ONE final message, your report: what you changed and in which files, what you checked and how, and anything left undone or that you are unsure of. "
-                           "The orchestrator sees only that report and the diff of the files you wrote.", g_cwd);
-            if (g_project_instructions) sb_puts(&sp, g_project_instructions);
-            size_t sp_bytes = sp.len;
-            cJSON *m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "system"); cJSON_AddStringToObject(m, "content", sp.data); cJSON_AddItemToArray(msgs, m);
-            sb_free(&sp);
-            sbuf u; sb_init(&u);
-            sb_puts(&u, "# The user's request (for context — you do one part of it)\n"); sb_put_cut(&u, arg, 4096);
-            if (done.len) { sb_puts(&u, "\n\n# Done before you\n"); sb_put_cut(&u, done.data, 8192); }
-            sb_printf(&u, "\n\n# Your task (%d of %d): %s\n%s", i + 1, nt, tasks[i].title, tasks[i].body);
-            m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", u.data); cJSON_AddItemToArray(msgs, m);
-            sb_free(&u);
-            char who[32]; snprintf(who, sizeof who, "worker %d/%d", i + 1, nt);
-            sbuf out, verdict_last; sb_init(&out); sb_init(&verdict_last);
-            const char *status = NULL; bool ok = false;
-            for (int attempt = 1; !status; attempt++) {
-                printf("  " C_CYAN "⤷ %s" C_RESET " " C_BOLD "%s" C_RESET C_DIM "%s" C_RESET "\n", who, tasks[i].title, attempt == 2 ? " · second attempt" : attempt > 2 ? " · last attempt" : "");
-                out.len = 0; if (out.data) out.data[0] = 0;
-                int ended;
-                agent_loop(msgs, sp_bytes, tools, who, true, &out, &ended);
-                if (ended == AGENT_INTERRUPTED || ended == AGENT_STOPPED) { status = "stopped by the user before it was finished"; aborted = halt = true; break; }
-                if (ended == AGENT_FAILED) { status = "failed"; halt = true; break; }
-                sbuf rb, diff; sb_init(&rb); sb_init(&diff);
-                int nfiles = tools_checkpoint_diff(first, i + 1, &diff);
-                sb_puts(&rb, "# The user's request\n"); sb_put_cut(&rb, arg, budget / 8);
-                sb_printf(&rb, "\n\n# The task (%d of %d): %s\n", i + 1, nt, tasks[i].title); sb_put_cut(&rb, tasks[i].body, budget / 8);
-                sb_puts(&rb, "\n\n# The worker's report\n"); sb_put_cut(&rb, out.data ? out.data : "", budget / 6);
-                sb_printf(&rb, "\n\n# The files it wrote, as a diff (%d file%s; what a shell command changed is not in it)\n", nfiles, nfiles == 1 ? "" : "s");
-                sb_put_cut(&rb, nfiles ? diff.data : "(it wrote no file)", budget / 2);
-                sb_printf(&rb, "\n\n# REVIEW this task (attempt %d of %d)\nIs it done and correct? " ADVISOR_REVIEW_OK " alone if so; otherwise what the worker must do.", attempt, ORCH_ATTEMPTS);
-                char what[64]; snprintf(what, sizeof what, "reviews task %d/%d", i + 1, nt);
-                char *verdict = orch_ask(what, rb.data, &st, &how);
-                sb_free(&rb); sb_free(&diff);
-                if (how == ADVICE_STOPPED || how == ADVICE_SKIPPED) { status = "done, but the run was stopped before its review"; aborted = halt = true; }
-                else if (how != ADVICE_GIVEN) { status = "done, not reviewed (the orchestrator could not be asked)"; ok = true; }
-                else if (advisor_approves(verdict)) { orch_spent(&st, spent, sizeof spent); printf("    " C_GREEN "⎿ accepted" C_RESET C_DIM " · %s" C_RESET "\n", spent); status = attempt == 1 ? "accepted" : "accepted after corrections"; ok = true; }
-                else {
-                    orch_spent(&st, spent, sizeof spent);
-                    printf("    " C_YELLOW "⎿ sent back" C_RESET C_DIM " · %s:" C_RESET "\n", spent); print_result_preview(verdict, 8);
-                    verdict_last.len = 0; sb_puts(&verdict_last, verdict);
-                    if (attempt == ORCH_ATTEMPTS) { status = "not accepted"; halt = true; }
-                    else {
-                        sbuf fb; sb_init(&fb);
-                        sb_printf(&fb, "The orchestrator reviewed your work on this task and does not accept it yet. It says:\n\n%s\n\nDo that — or, where the files or a command's output show it is wrong, say so — then report again.", verdict);
-                        m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", fb.data); cJSON_AddItemToArray(msgs, m);
-                        sb_free(&fb);
-                    }
-                }
-                free(verdict);
-            }
-            if (ok) accepted++;
-            sb_printf(&report, "\n## Task %d of %d: %s — %s\n", i + 1, nt, tasks[i].title, status);
-            sb_put_cut(&report, out.data && out.data[0] ? out.data : "(no report)", 6144);
-            if (!ok && verdict_last.len) { sb_puts(&report, "\n\nThe orchestrator's objection:\n"); sb_put_cut(&report, verdict_last.data, 2048); }
-            sb_putc(&report, '\n');
-            sb_printf(&done, "## Task %d: %s — %s\n", i + 1, tasks[i].title, status); sb_put_cut(&done, out.data ? out.data : "", 2048); sb_puts(&done, "\n\n");
-            sb_free(&out); sb_free(&verdict_last);
-            cJSON_Delete(msgs);
-        }
-        tools_checkpoint_step(0);
-        sb_free(&done); cJSON_Delete(tools);
         if (go) {
+            int maxpar = g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT;
+            orch_run run = { arg, tasks, xmalloc(sizeof(orch_worker) * (size_t)nt), nt, cJSON_CreateArray(), first, budget, false };
+            memset(run.w, 0, sizeof(orch_worker) * (size_t)nt);
+            for (int i = 0; i < nt; i++) { sb_init(&run.w[i].out); sb_init(&run.w[i].objection); }
+            /* what a worker may call: everything but another agent and the advisor (its reviewer is the orchestrator) */
+            cJSON *t;
+            cJSON_ArrayForEach(t, g_tools) {
+                cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function"), *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+                if (cJSON_IsString(nm) && strcmp(nm->valuestring, "task") && strcmp(nm->valuestring, "advisor")) cJSON_AddItemReferenceToArray(run.tools, t);
+            }
+            orch_schedule(&run, maxpar);
+            tools_checkpoint_step(0);
+            aborted = run.aborted;
+            for (int i = 0; i < nt; i++) {
+                orch_worker *w = &run.w[i];
+                if (task_ok(w)) accepted++;
+                sb_printf(&report, "\n## Task %d of %d: %s — %s\n", i + 1, nt, tasks[i].title, w->status ? w->status : "not started");
+                if (w->state != T_SKIPPED) sb_put_cut(&report, w->out.data && w->out.data[0] ? w->out.data : "(no report)", 6144);
+                if (!task_ok(w) && w->objection.len) { sb_puts(&report, "\n\nThe orchestrator's objection:\n"); sb_put_cut(&report, w->objection.data, 2048); }
+                sb_putc(&report, '\n');
+                if (w->msgs) cJSON_Delete(w->msgs);
+                sb_free(&w->out); sb_free(&w->objection);
+            }
+            free(run.w); cJSON_Delete(run.tools);
             sbuf names; sb_init(&names);
             int nf = tools_checkpoint_files(first, &names);
-            if (nt - started == 1) sb_printf(&report, "\nTask %d was not started.\n", nt);
-            else if (started < nt) sb_printf(&report, "\nTasks %d–%d were not started.\n", started + 1, nt);
             if (nf) sb_printf(&report, "\nFiles written: %s\n", names.data);
             printf("%s%s orchestrated: %d of %d task%s accepted" C_RESET C_DIM "%s%s%s" C_RESET "\n", accepted == nt ? C_GREEN : C_YELLOW, accepted == nt ? "✓" : "!", accepted, nt, nt == 1 ? "" : "s",
                    nf ? " · files written: " : "", nf ? names.data : "", accepted == nt ? "" : " — the tasks that are left were not run; /rewind undoes what was written");
@@ -2484,8 +2637,9 @@ static void cmd_help(void) {
            "  /think show|hide      show or hide thinking tokens\n"
            "  /effort [LEVEL]       how hard this model thinks, in the levels it has (gpt-oss: low medium high · qwen3.8: off low medium high · most others: off on);\n"
            "                        no argument opens a picker, default leaves it to the model. Kept per model; a level is sent with every call\n"
-           "  /orchestrate REQUEST  the advisor model in charge: it plans the request as tasks, this model does them one by one as workers with a fresh\n"
-           "                        context each, and the advisor reviews every task's report and diff — sending it back at most twice — before the next starts\n"
+           "  /orchestrate REQUEST  the advisor model in charge: it plans the request as tasks, this model does them as workers with a fresh context\n"
+           "                        each — those that do not wait for each other at the same time — and the advisor reviews every task's report and diff\n"
+           "  /workers [N]          how many tasks of /orchestrate may run at the same time (the model calls, each on a thread; default 3, 1 = in turn)\n"
            "  /advisor [MODEL|off]  a stronger model the agent may consult when the work is hard (the advisor tool): a bigger local model, a cloud one\n"
            "                        (NAME-cloud, after `ollama signin`) or a hosted API: xai:MODEL, openai:MODEL, anthropic:MODEL (key from XAI_API_KEY,\n"
            "                        OPENAI_API_KEY, ANTHROPIC_API_KEY). It is shown the conversation and answers with advice; it has no tools.\n"
@@ -2908,6 +3062,15 @@ static int handle_slash(char *line) {
             printf(C_GREEN "✓ web_search/web_fetch %s" C_RESET "\n", g_cfg.web ? "on" : "off");
         }
     }
+    else if (!strcmp(cmd, "/workers")) {
+        int now = g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT, n = arg ? atoi(arg) : 0;
+        if (!arg) printf("workers: %d" C_DIM " — tasks of /orchestrate that may run at the same time, where the plan lets them (1 = one after another)" C_RESET "\n", now);
+        else if (n < 1 || n > ORCH_WORKERS_MAX) printf("usage: /workers N   (1 to %d: tasks of /orchestrate that may run at the same time)\n", ORCH_WORKERS_MAX);
+        else {
+            g_cfg.workers = n; config_save();
+            printf(C_GREEN "✓ workers = %d" C_RESET C_DIM "%s" C_RESET "\n", n, n > 1 ? " — whether they overlap is the server's to say too: an Ollama with one slot (OLLAMA_NUM_PARALLEL) answers them in turn" : " — one task after another");
+        }
+    }
     else if (!strcmp(cmd, "/max_iters") || !strcmp(cmd, "/max-iters")) {
         if (!arg) printf("max_iters: %d tool rounds per request\n", g_cfg.max_iters);
         else {
@@ -2969,7 +3132,7 @@ static int handle_slash(char *line) {
 static bool slash_runs_while_busy(const char *cmd, const char *arg) {
     static const char *ok[] = {
         "/help", "/?", "/status", "/cost", "/usage", "/diff", "/history", "/pwd", "/skills",
-        "/mode", "/yolo", "/permissions", "/tools", "/max_iters", "/max-iters", "/think", "/effort", "/temp",
+        "/mode", "/yolo", "/permissions", "/tools", "/workers", "/max_iters", "/max-iters", "/think", "/effort", "/temp",
         "/keepalive", "/keep-alive", "/memory", "/web", NULL };
     /* /web with an argument is not just a report: on|off rebuilds the tool list the running
      * turn is holding, and engine writes the config. Bare /web only prints. */

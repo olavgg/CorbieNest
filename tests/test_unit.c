@@ -989,6 +989,12 @@ static void test_orchestrate(void) {
     CHECK_STR(t[0].title, "add the flag"); CHECK_STR(t[0].body, "Edit src/a.c: add --dry.\nDONE WHEN: make passes");
     CHECK_STR(t[1].title, "document it"); CHECK(strstr(t[1].body, "Task 2 depends on the flag") && strstr(t[1].body, "- README.md"));   /* a sentence is not a header, markdown is no obstacle */
     CHECK_STR(t[2].title, "run the tests"); CHECK_STR(t[2].body, "make test");                                                       /* numbered as they come */
+    CHECK(t[0].after == 0 && t[1].after == 1u && t[2].after == 2u);   /* a plan that says nothing runs in order */
+    orch_tasks_free(t, n);
+    n = orch_parse_plan("TASK 1: a\nAFTER: none\ndo a\n\nTASK 2: b\n**AFTER:** none\ndo b\n\nTASK 3: c\nAfter: tasks 1 and 2\ndo c\n\nTASK 4: d\ndo d after lunch\n\nTASK 5: e\nAFTER: 5, 9, 1\ndo e\n", &t);
+    CHECK(n == 5 && t[0].after == 0 && t[1].after == 0 && t[2].after == 3u && t[3].after == 4u);   /* none, none, both, and — unsaid — the one before */
+    CHECK(t[4].after == 1u);                                             /* itself and a task that is not there do not count */
+    CHECK_STR(t[2].body, "do c"); CHECK_STR(t[3].body, "do d after lunch");   /* the line is no part of the instructions; a sentence stays */
     orch_tasks_free(t, n);
     n = orch_parse_plan("TASK 1\nJust the instructions.\n\nTASK 2: —\n", &t);
     CHECK(n == 2); CHECK_STR(t[0].title, ""); CHECK_STR(t[0].body, "Just the instructions.");
