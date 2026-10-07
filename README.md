@@ -210,6 +210,26 @@ larger ones skipped.)
   `/rewind`, `/resume`, `/save`, `/system`, `/init`, skills), needs the server (`/model`,
   `/models`, `/ctx`, `/host`, `/memory update`) or asks a question stays queued until the turn ends.
 
+### When something is drawn wrong
+
+Terminals differ, and a drawing problem that shows in one and not in another cannot be fixed
+from a description. corbienest can record what it draws and what the terminal sends it:
+
+```sh
+CORBIENEST_TRACE=/tmp/corbie.trace corbienest      # reproduce the problem, then quit
+tools/trace_replay.py /tmp/corbie.trace --info     # sizes, layout changes, keys and mouse reports
+tools/trace_replay.py /tmp/corbie.trace            # play it back, in a terminal of the same size
+tools/trace_replay.py /tmp/corbie.trace --from 40 --step   # from 40 s on, one write per Enter
+```
+
+The trace is plain text, one record per line with its time: every write to the terminal, the
+output held back while scrolled back, every byte read from it, and each change of layout. A
+replay in another terminal shows whether the problem is in what corbienest wrote or in what
+that terminal made of it; `--until SEC` stops at the moment in question and holds the picture.
+**The file holds the whole conversation and everything you typed** — the session says so at the
+top while it is being recorded, the file is created readable by you alone, and it is yours to
+pass on or not. Say which terminal program you use: that is the one thing the trace cannot tell.
+
 ### In tmux
 
 corbienest runs in a tmux pane like in any terminal, and nothing has to be configured:
@@ -570,7 +590,7 @@ conversation again.
 ### Config
 
 Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N` are saved to
-`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, and for a hosted advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
+`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, `CORBIENEST_TRACE` (a file to record the session's drawing into, see below), and for a hosted advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
 
 ### Running more than one session
 

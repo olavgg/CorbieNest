@@ -43,7 +43,10 @@ straight to a PR. Say which model(s) you tried it with — behaviour varies a lo
 ## Reporting bugs
 
 Include your OS, `corbienest --version`, the model, and what the status bar / stats line showed.
-If the terminal is left in a bad state, the exact terminal emulator matters too.
+If the terminal is left in a bad state, the exact terminal emulator matters too. For anything
+that is drawn wrong, a recording says more than a description: run
+`CORBIENEST_TRACE=/tmp/corbie.trace corbienest`, reproduce it and attach the file (it holds the
+conversation of that session — see "When something is drawn wrong" in the README).
 
 ## License
 

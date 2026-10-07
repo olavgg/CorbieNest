@@ -3051,6 +3051,8 @@ int main(int argc, char **argv) {
     }
 
     banner();
+    if (term_trace_path())   /* it holds the conversation: nobody should be recording one without seeing so */
+        printf(C_YELLOW "trace:" C_RESET C_DIM " everything drawn and typed in this session is written to %s" C_RESET "\n\n", term_trace_path());
     hist_load();
     term_suggest = suggest;
     term_idle_hook = memory_idle_hook;

@@ -30,7 +30,75 @@ static int vis_width_n(const char *s, size_t len);
 
 static void on_winch(int s) { (void)s; g_winch = 1; }
 
+/* ---------- trace (CORBIENEST_TRACE=FILE) ----------
+ * A drawing problem that shows in one terminal and not in another cannot be found by reading
+ * the code, and "it looks wrong when I scroll" is nothing to go by. With CORBIENEST_TRACE set,
+ * everything written to the terminal and everything read from it goes to that file as it
+ * happens, with the time and the layout it was drawn for: tools/trace_replay.py plays the file
+ * back into any terminal of the same size, and what the keyboard and the mouse really sent can
+ * be read off it. One record per line, "<ms since the start> <kind> <payload>":
+ *   O  bytes written to the terminal
+ *   H  conversation output held back while scrolled back (recorded, not painted)
+ *   I  bytes read from the terminal: keys, mouse reports
+ *   L  the layout changed: the size, the scroll region, the rows of the chrome
+ *   V  the scrollback viewer moved or was left          B  the status bar's activity label
+ * Bytes stand for themselves, except control characters and the backslash: \e \n \r \t \\ \xHH.
+ * The file holds the conversation and all that was typed, so it is created readable by its owner
+ * alone, and it is theirs to pass on or not. */
+static FILE *g_trace = NULL;
+static const char *g_trace_path = NULL;
+static struct timeval g_trace_t0;
+
+static void trace_stamp(char kind) {
+    struct timeval t; gettimeofday(&t, NULL);
+    fprintf(g_trace, "%.3f %c ", (double)(t.tv_sec - g_trace_t0.tv_sec) * 1e3 + (double)(t.tv_usec - g_trace_t0.tv_usec) / 1e3, kind);
+}
+static void trace_bytes(char kind, const void *data, size_t n) {
+    if (!g_trace) return;
+    trace_stamp(kind);
+    for (const unsigned char *p = data, *e = p + n; p < e; p++) {
+        if (*p == 27) fputs("\\e", g_trace);
+        else if (*p == '\n') fputs("\\n", g_trace);
+        else if (*p == '\r') fputs("\\r", g_trace);
+        else if (*p == '\t') fputs("\\t", g_trace);
+        else if (*p == '\\') fputs("\\\\", g_trace);
+        else if (*p < 32 || *p == 127) fprintf(g_trace, "\\x%02x", *p);
+        else fputc(*p, g_trace);
+    }
+    fputc('\n', g_trace); fflush(g_trace);   /* (as it happens: the trace of a hang or a crash ends where that did) */
+}
+static void trace_note(char kind, const char *fmt, ...) {
+    if (!g_trace) return;
+    trace_stamp(kind);
+    va_list ap; va_start(ap, fmt); vfprintf(g_trace, fmt, ap); va_end(ap);
+    fputc('\n', g_trace); fflush(g_trace);
+}
+static void trace_open(void) {
+    const char *path = getenv("CORBIENEST_TRACE");
+    if (!path || !*path) return;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);   /* (not handed down to the commands the tools run) */
+    if (fd < 0 || !(g_trace = fdopen(fd, "w"))) {
+        fprintf(stderr, "corbienest: cannot write the trace to %s: %s\n", path, strerror(errno));
+        if (fd >= 0) close(fd);
+        return;
+    }
+    g_trace_path = path;
+    gettimeofday(&g_trace_t0, NULL);
+    int rows, cols; term_size(&rows, &cols);
+    const char *term = getenv("TERM");
+    trace_note('#', "corbienest %s trace 1 · TERM=%s · %d rows x %d columns", CORBIE_VERSION, term ? term : "", rows, cols);
+}
+const char *term_trace_path(void) { return g_trace_path; }
+
+/* read() from the terminal: every place that takes input goes through here, so the trace has it */
+static ssize_t in_read(void *buf, size_t n) {
+    ssize_t k = read(STDIN_FILENO, buf, n);
+    if (k > 0) trace_bytes('I', buf, (size_t)k);
+    return k;
+}
+
 void term_init(void) {
+    trace_open();
     if (tcgetattr(STDIN_FILENO, &g_orig) == 0) g_have_orig = true;
     signal(SIGWINCH, on_winch);
     atexit(term_restore);
@@ -439,6 +507,7 @@ static bool layout_sync(void) {
     int reserved = fs_reserved_for(rows);
     if (rows == g_fs_rows && cols == g_fs_cols && reserved == g_fs_reserved) return false;
     g_fs_rows = rows; g_fs_cols = cols; g_fs_reserved = reserved;
+    trace_note('L', "rows=%d cols=%d region=1-%d chrome=%d field=%d suggestions=%d view=%d", rows, cols, fs_region(), reserved, g_field_rows, g_sug_rows, g_view_top);
     sbuf o; sb_init(&o);
     sb_printf(&o, "\x1b[1;%dr", fs_region());
     if (g_view_top >= 0) g_view_stale = true;   /* scrolled back: the window shown is the viewer's to paint */
@@ -501,6 +570,7 @@ void term_status_live(long out_tokens) {
 }
 
 void term_busy(const char *label) {
+    if (label != g_busy) trace_note('B', "%s", label ? label : "-");
     g_busy = label;
     if (label) g_busy_frame = 0;
     gettimeofday(&g_busy_t, NULL);
@@ -704,7 +774,8 @@ static ssize_t sb_write_fn(void *cookie, const char *buf, size_t n) {
     (void)cookie;
     /* Scrolled back: the screen shows an earlier window, so conversation output is only
      * recorded. Leaving the viewer paints what came meanwhile from the record (conv_repaint). */
-    if (g_view_top >= 0 && !g_sb_pause) { sb_feed(buf, n); return (ssize_t)n; }
+    if (g_view_top >= 0 && !g_sb_pause) { trace_bytes('H', buf, n); sb_feed(buf, n); return (ssize_t)n; }
+    trace_bytes('O', buf, n);
     size_t off = 0;
     while (off < n) { ssize_t w = write(STDOUT_FILENO, buf + off, n - off); if (w < 0) { if (errno == EINTR) continue; return off ? (ssize_t)off : -1; } off += (size_t)w; }
     if (!g_sb_pause) sb_feed(buf, n);
@@ -815,6 +886,7 @@ static void view_paint(void) {
     int rows = fs_region(), nrows; sb_row *r = sb_rows(g_fs_cols, &nrows);
     int maxtop = nrows > rows ? nrows - rows : 0;
     if (g_view_top > maxtop) g_view_top = maxtop;
+    trace_note('V', "top=%d window=%d of=%d", g_view_top, rows, nrows);
     sbuf o; sb_init(&o);
     sb_puts(&o, "\x1b[?7l");
     for (int i = 0; i < rows; i++) {
@@ -834,6 +906,7 @@ static void view_paint(void) {
 /* Back to the live screen: the tail of the transcript, the cursor where output continues. */
 static void view_leave(void) {
     if (g_view_top < 0) return;
+    trace_note('V', "left (was top=%d)", g_view_top);
     g_view_top = -1; g_view_stale = false;
     bool was = g_sb_pause; sb_pause(true);
     if (!layout_sync()) {   /* (a layout change paints it by itself) */
@@ -1123,7 +1196,7 @@ int term_poll_interrupt(void) {
         fd_set rf; FD_ZERO(&rf); FD_SET(STDIN_FILENO, &rf);
         struct timeval tv = { 0, 0 };
         if (select(STDIN_FILENO + 1, &rf, NULL, NULL, &tv) <= 0) return 0;
-        ssize_t k = read(STDIN_FILENO, kb, sizeof kb);
+        ssize_t k = in_read(kb, sizeof kb);
         if (k <= 0) return 0;
         for (ssize_t i = 0; i < k; i++) {
             if (kb[i] == 3) { view_leave(); return 1; }     /* Ctrl-C */
@@ -1156,7 +1229,7 @@ static int read_byte_timeout(int ms) {
     int r = select(STDIN_FILENO + 1, &rf, NULL, NULL, &tv);
     if (r <= 0) return -1;
     unsigned char c;
-    if (read(STDIN_FILENO, &c, 1) != 1) return -1;
+    if (in_read(&c, 1) != 1) return -1;
     return c;
 }
 
@@ -1227,7 +1300,7 @@ static int read_key(void) {
     else {
         int w = stdin_wait();
         if (w < 0) return w;
-        if (read(STDIN_FILENO, &c, 1) != 1) return -1;
+        if (in_read(&c, 1) != 1) return -1;
     }
     if (c != 27) return c;
     int a = read_byte_timeout(40);

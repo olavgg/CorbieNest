@@ -242,6 +242,9 @@ void term_restore(void);
 void term_raw(bool on);
 int  term_width(void);
 void term_size(int *rows, int *cols);
+/* The file CORBIENEST_TRACE names, while everything drawn and typed is being written to it for
+ * tools/trace_replay.py (see "trace" in term.c); NULL when it is not. */
+const char *term_trace_path(void);
 void term_clear_screen(void);
 
 /* Full-screen mode: alternate screen with the bottom row reserved for a status
