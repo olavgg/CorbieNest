@@ -505,7 +505,9 @@ typedef struct {
     const char *name, *alias, *label;      /* "xai", "grok", "xAI" */
     const char *key_env, *url_env, *url;   /* XAI_API_KEY, XAI_BASE_URL, the base URL otherwise */
     provider_style style;                  /* Chat Completions (xAI, OpenAI) or Anthropic's Messages API */
+    const char *example;                   /* a model of theirs, for /advisor's explanation */
 } provider_def;
+const provider_def *provider_at(int i);   /* the providers in turn, NULL past the last */
 const provider_def *provider_find(const char *advisor, const char **model);   /* NULL = a model on the Ollama server */
 const char *provider_base_url(const provider_def *p);
 typedef struct {

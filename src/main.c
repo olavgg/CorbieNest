@@ -60,7 +60,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/memory", "the project memory: on, off, clear, update, every N, idle N" },
     { "/resume", "continue an earlier session" },
     { "/permissions", "the project's saved \"always allow\" rules: add, remove, clear" },
-    { "/init", "have the model write CORBIENEST.md for this project" },
+    { "/init", "have the model write AGENTS.md for this project" },
     { "/cost", "tokens, model calls and time of this session" },
     { "/diff", "the working-tree diff, without sending it to the model" },
     { "/rewind", "go back to an earlier request: files, conversation or both" },
@@ -800,7 +800,7 @@ static void cmd_permissions(const char *arg) {
 
 /* ---------- system prompt ---------- */
 static void load_project_instructions(void) {
-    const char *names[] = { "CORBIENEST.md", "CLAUDE.md", "AGENTS.md", NULL };
+    const char *names[] = { "AGENTS.md", "CORBIENEST.md", "CLAUDE.md", NULL };
     free(g_project_instructions); g_project_instructions = NULL;
     for (int i = 0; names[i]; i++) {
         if (is_file(names[i])) {
@@ -1596,9 +1596,31 @@ static int advisor_check(const char *tool, cJSON *args, sbuf *out) {
     return r;
 }
 
+/* what an advisor can be and how each kind is set up — a hosted one needs a key in the
+ * environment, which nothing else on screen would tell — and what guidance and effort do to it.
+ * Says whether a key is there, never the key. */
+static void advisor_howto(void) {
+    printf(C_DIM "  a stronger model the agent may consult when the work is hard — /advisor MODEL, where MODEL is\n"
+                 "    a bigger local model    as /models lists it\n"
+                 "    an Ollama cloud model   like gpt-oss:120b-cloud — run `ollama signin` once\n"
+                 "    a hosted API            PROVIDER:MODEL — export its key before starting corbienest (it is never saved)\n" C_RESET);
+    const provider_def *p;
+    for (int i = 0; (p = provider_at(i)); i++) {
+        char name[96]; snprintf(name, sizeof name, "%s:%s", p->name, p->example);
+        const char *key = getenv(p->key_env); bool set = key && *key;
+        printf(C_DIM "      %-24s %-18s" C_RESET "%s%s" C_RESET "\n", name, p->key_env, set ? C_GREEN : C_DIM, set ? "set" : "not set");
+    }
+    printf(C_DIM "    another endpoint for a provider: its …_BASE_URL (https, unless it is this machine)\n"
+                 "  /advisor guidance LEVEL — how much the agent leans on it" C_RESET "\n");
+    for (int i = 0; i < GUIDANCE_COUNT; i++)
+        printf(C_DIM "    %-7s %s%s" C_RESET "\n", ADVISOR_GUIDANCE[i].name, ADVISOR_GUIDANCE[i].desc, &ADVISOR_GUIDANCE[i] == advisor_guidance() ? " · current" : "");
+    printf(C_DIM "  /advisor effort LEVEL — how hard the advisor itself thinks, once one is set: the levels are the model's own\n"
+                 "    (off, on, or low … max), bare it lists them, and default leaves it to the model" C_RESET "\n");
+}
+
 static void advisor_report(void) {
     const advisor_guidance_def *g = advisor_guidance();
-    if (!g_cfg.advisor) { printf("advisor: " C_DIM "none — /advisor MODEL lets the agent consult a stronger model when the work is hard (a bigger local one, a NAME-cloud model, or xai:MODEL, openai:MODEL, anthropic:MODEL)" C_RESET "\n"); return; }
+    if (!g_cfg.advisor) { printf("advisor: " C_DIM "none" C_RESET "\n"); advisor_howto(); return; }
     printf("advisor: " C_BOLD "%s" C_RESET, g_cfg.advisor);
     if (g_advisor_info_for && !strcmp(g_advisor_info_for, g_cfg.advisor)) printf(C_DIM " · effort %s" C_RESET, effort_label(g_cfg.advisor, &g_advisor_info));
     else if (effort_get(g_cfg.advisor)) printf(C_DIM " · effort %s" C_RESET, effort_get(g_cfg.advisor));
@@ -1725,7 +1747,7 @@ static void cmd_advisor(const char *arg) {
         own[i + 1] = sb_detach(&d); descs[i + 1] = own[i + 1];
         if (cur) current = i + 1;
     }
-    printf(C_DIM "a stronger model the agent may consult — not listed: a cloud model (/advisor NAME-cloud) or a hosted one (/advisor xai:MODEL, openai:MODEL, anthropic:MODEL)" C_RESET "\n");
+    advisor_howto();
     int r = term_select("Select advisor", names, descs, n + 1, current);
     if (r < 0) printf(C_DIM "advisor unchanged: %s" C_RESET "\n", g_cfg.advisor ? g_cfg.advisor : "none");
     else if (r == 0) advisor_set(NULL);
@@ -1966,11 +1988,11 @@ static char *expand_mentions(const char *input) {
     return sb_detach(&r);
 }
 
-/* ---------- /init: have the model write CORBIENEST.md ---------- */
+/* ---------- /init: have the model write AGENTS.md ---------- */
 static int cmd_init(void) {
-    const char *existing = is_file("CORBIENEST.md") ? "CORBIENEST.md" : is_file("CLAUDE.md") ? "CLAUDE.md" : is_file("AGENTS.md") ? "AGENTS.md" : NULL;
+    const char *existing = is_file("AGENTS.md") ? "AGENTS.md" : is_file("CORBIENEST.md") ? "CORBIENEST.md" : is_file("CLAUDE.md") ? "CLAUDE.md" : NULL;
     sbuf b; sb_init(&b);
-    sb_puts(&b, "Please analyze this codebase and create a CORBIENEST.md file, which will be given to you (and future instances of you) as project instructions at the start of every session in this directory.\n\n"
+    sb_puts(&b, "Please analyze this codebase and create an AGENTS.md file, which will be given to you (and future instances of you) as project instructions at the start of every session in this directory.\n\n"
                 "What to add:\n"
                 "1. Commands that will be commonly used, such as how to build, lint, and run tests — including how to run a single test.\n"
                 "2. High-level code architecture and structure that requires reading multiple files to understand: the main components, how they fit together, where things live. Do not list every file.\n"
@@ -1980,8 +2002,8 @@ static int cmd_init(void) {
                 "- Keep it concise (aim for well under 100 lines); prefer facts that are not obvious from a glance at the tree.\n"
                 "- Do not repeat instructions that are already covered by an existing rules file, and do not make things up: only include commands you have verified exist.\n"
                 "- Write the file with write_file, then summarise what you put in it in one short paragraph.\n");
-    if (existing) sb_printf(&b, "\nNote: a %s already exists in this directory. Read it first and improve it in place (keep what is right, fix what is wrong, fill the gaps) — write CORBIENEST.md only if you would otherwise clobber a hand-written %s.\n", existing, existing);
-    printf(C_DIM "  /init: analysing the project and writing CORBIENEST.md…" C_RESET "\n");
+    if (existing) sb_printf(&b, "\nNote: a %s already exists in this directory. Read it first and improve it in place (keep what is right, fix what is wrong, fill the gaps) — write AGENTS.md only if you would otherwise clobber a hand-written %s.\n", existing, existing);
+    printf(C_DIM "  /init: analysing the project and writing AGENTS.md…" C_RESET "\n");
     int first = begin_request();
     add_message("user", b.data); sb_free(&b);
     bool aborted = run_turn();
@@ -2048,7 +2070,7 @@ static void cmd_help(void) {
            "                        detailed; strong+ also reviews the work before a request ends, max checks the first change before it is made)\n"
            "                        /advisor effort [LEVEL] (how hard it thinks) · /advisor ctx N|auto (its context window; auto = the main one, at most 16k)\n"
            "  /skills [reload|new NAME]  list skills (SKILL.md files); run one with /NAME [args]\n"
-           "  /init                 have the model explore the project and write a CORBIENEST.md (project instructions)\n"
+           "  /init                 have the model explore the project and write an AGENTS.md (project instructions)\n"
            "  /mode [name]          permission mode: manual · accept-edits · plan · auto (or press shift+tab to cycle)\n"
            "  /permissions [...]    list the project's saved \"always allow\" rules (.corbienest/permissions); add/remove/clear\n"
            "  /web [on|off|engine URL]  let the model look documentation up with web_search/web_fetch (on by default); set the search engine\n"

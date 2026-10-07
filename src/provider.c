@@ -18,11 +18,15 @@
 #include <unistd.h>
 
 static const provider_def PROVIDERS[] = {
-    { "xai",       "grok",   "xAI",       "XAI_API_KEY",       "XAI_BASE_URL",       "https://api.x.ai/v1",       PROVIDER_CHAT_COMPLETIONS },
-    { "openai",    NULL,     "OpenAI",    "OPENAI_API_KEY",    "OPENAI_BASE_URL",    "https://api.openai.com/v1", PROVIDER_CHAT_COMPLETIONS },
+    { "xai",       "grok",   "xAI",       "XAI_API_KEY",       "XAI_BASE_URL",       "https://api.x.ai/v1",       PROVIDER_CHAT_COMPLETIONS, "grok-4.7" },
+    { "openai",    NULL,     "OpenAI",    "OPENAI_API_KEY",    "OPENAI_BASE_URL",    "https://api.openai.com/v1", PROVIDER_CHAT_COMPLETIONS, "gpt-5.2" },
     /* no /v1 in the base: ANTHROPIC_BASE_URL is written that way for the SDKs (and Claude Code) */
-    { "anthropic", "claude", "Anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "https://api.anthropic.com", PROVIDER_MESSAGES },
+    { "anthropic", "claude", "Anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "https://api.anthropic.com", PROVIDER_MESSAGES,         "claude-opus-5" },
 };
+
+const provider_def *provider_at(int i) {
+    return i >= 0 && (size_t)i < sizeof PROVIDERS / sizeof *PROVIDERS ? &PROVIDERS[i] : NULL;
+}
 
 const provider_def *provider_find(const char *advisor, const char **model) {
     const char *c = advisor ? strchr(advisor, ':') : NULL;

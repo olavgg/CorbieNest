@@ -129,7 +129,7 @@ larger ones skipped.)
 | `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (`.corbienest/permissions`) |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
-| `/init` | have the model explore the project and write a `CORBIENEST.md` (build/test commands, architecture, conventions); improves an existing one |
+| `/init` | have the model explore the project and write an `AGENTS.md` (build/test commands, architecture, conventions); improves an existing one |
 | `/skills [reload\|new NAME]` | list skills; run one with `/NAME [args]` |
 | `/tools on\|off` | enable/disable tools |
 | `/web [on\|off\|engine URL]` | whether the model may look documentation up with `web_search`/`web_fetch` (on by default; saved), and which search engine it uses (`%s` = the query; `/web engine default` restores DuckDuckGo) |
@@ -314,7 +314,7 @@ request: never guess at another project's API, options or errors — search for 
 them, match the version this project actually uses (lockfile, manifest, image tag), say which
 page you used, and skip the web when the repository answers the question. It is deliberately
 one line: the two tools' own descriptions carry the rest, and a system prompt is re-sent with
-every single call. Naming the doc sites you care about in `CORBIENEST.md` makes it concrete —
+every single call. Naming the doc sites you care about in `AGENTS.md` makes it concrete —
 see [Project instructions](#project-instructions).
 
 Pages come in through the `curl` (or `wget`) program, which already brings redirects, size caps
@@ -425,7 +425,7 @@ do quit with an update still pending, the flush on the way out says so and Ctrl-
 
 ### Project instructions
 
-If a `CORBIENEST.md`, `CLAUDE.md` or `AGENTS.md` exists in the working directory it is
+If an `AGENTS.md`, `CORBIENEST.md` or `CLAUDE.md` exists in the working directory it is
 appended to the system prompt, so you can give the model project-specific guidance (up to
 32 KB). `/init` writes a first one for you.
 
@@ -487,7 +487,9 @@ since then (deepseek-r1, for one) shows up there as chat-only.
 `/advisor MODEL` names a stronger model that the agent may **consult** while it works — a bigger
 local model, one of Ollama's cloud models (`/advisor gpt-oss:120b-cloud`; run `ollama signin`
 once, the local server relays the call), or a hosted API: xAI's Grok, OpenAI, or Anthropic's
-Claude (see [Hosted advisors](#hosted-advisors)). The agent gets an `advisor` tool and is told
+Claude (see [Hosted advisors](#hosted-advisors)). Bare `/advisor` lists the three kinds, with
+the key each hosted provider wants and whether it is set, and what `guidance` and `effort` do,
+above its picker. The agent gets an `advisor` tool and is told
 when to use it: before it commits to an approach for a non-trivial change, when an error has
 survived two fixes or a result makes no sense, and before it calls a difficult task done. You
 can also just say so: *"ask the advisor before you continue"*.

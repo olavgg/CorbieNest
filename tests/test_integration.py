@@ -688,14 +688,14 @@ end = time.time() + 3   # the session is saved when the request is over — a mo
 while "fresh start" not in titles() and time.time() < end: time.sleep(0.05)
 check("fresh start" in titles(), "/clear starts a new session file")
 
-print("test interactive: /init writes CORBIENEST.md and loads it")
+print("test interactive: /init writes AGENTS.md and loads it")
 s.send("/mode auto\r"); s.expect("mode: auto")
 s.send("/init\r"); check(s.expect("analysing the project"), "/init starts")
 check(s.expect("project instructions loaded", 15), f"instructions loaded: {s.text()[-300:]!r}")
-check(open(os.path.join(WORK, "CORBIENEST.md")).read().startswith("# Project"), "file written by the model")
+check(open(os.path.join(WORK, "AGENTS.md")).read().startswith("# Project"), "file written by the model")
 s.send("after init\r"); check(s.expect("Echo: after init"), "reply")
 check("Build with make." in requests()[-1]["messages"][0]["content"], "new instructions in the system prompt")
-os.remove(os.path.join(WORK, "CORBIENEST.md")); s.send("/mode manual\r"); s.expect("mode: manual")
+os.remove(os.path.join(WORK, "AGENTS.md")); s.send("/mode manual\r"); s.expect("mode: manual")
 
 print("test interactive: /cost")
 s.send("/cost\r"); check(s.expect("session cost"), "/cost header")
@@ -1402,7 +1402,9 @@ check(adv["model"] == "fake-coder:latest" and adv["options"]["num_ctx"] == 8192 
 
 print("test interactive: /advisor")
 s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2); s.expect("Ctrl-D to quit")
-s.send("/advisor\r"); check(s.expect("Select advisor"), "/advisor opens a picker"); check(s.expect("No advisor"), "with 'No advisor' first")
+s.send("/advisor\r"); check(s.expect("ollama signin") and s.expect("anthropic:claude-opus-5") and s.expect("ANTHROPIC_API_KEY"), "/advisor says how a cloud and a hosted model are set up")
+check(s.expect("/advisor guidance LEVEL") and s.expect("when the work is hard · 3 per request · current") and s.expect("/advisor effort LEVEL"), "and what guidance and effort do")
+check(s.expect("Select advisor"), "/advisor opens a picker"); check(s.expect("No advisor"), "with 'No advisor' first")
 s.send("\x1b"); check(s.expect("advisor unchanged: none"), "Esc leaves it")
 s.send("/advisor nope:latest\r"); check(s.expect("does not know a model 'nope:latest'"), "an unknown model is refused")
 s.send("/advisor fake-big:latest\r"); check(s.expect("advisor: fake-big:latest"), "/advisor MODEL"); check(s.expect("at most 3 times per request"), "with what it costs")
