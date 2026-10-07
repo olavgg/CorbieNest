@@ -31,30 +31,92 @@ static bool   g_advisor_said = false;            /* run_advisor() printed what c
 static bool   g_advisor_reviewed = false;        /* this request's review before it ends has been had (guidance strong and up) */
 static bool   g_advisor_checked = false;         /* and the check of its first change (max) */
 
-static const char *SLASH_CMDS[] = {
-    "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think", "/effort", "/advisor",
-    "/mode", "/yolo", "/tools", "/web", "/max_iters", "/ctx", "/temp", "/host", "/keepalive", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/diff", "/rewind", "/quit", "/exit"
+/* The commands, each with the line the suggestions under the input field show for it. */
+static const struct { const char *name, *desc; } SLASH_CMDS[] = {
+    { "/help", "commands, keys and input tricks" },
+    { "/model", "pick a model from a menu, or /model NAME" },
+    { "/models", "list the models ollama has" },
+    { "/clear", "start a new conversation" },
+    { "/compact", "summarise the conversation to free context" },
+    { "/status", "model, context usage, settings" },
+    { "/system", "extra system instructions: TEXT, or clear" },
+    { "/think", "when the model thinks: on, off, auto · show or hide it" },
+    { "/effort", "how hard this model thinks" },
+    { "/advisor", "a stronger model the agent may consult: a local one, or Claude, ChatGPT, Grok by API key" },
+    { "/mode", "permission mode: manual, accept-edits, plan, auto" },
+    { "/yolo", "auto mode on or off: every tool call approved" },
+    { "/tools", "tool calling on or off" },
+    { "/web", "web_search and web_fetch: on, off, engine URL" },
+    { "/max_iters", "tool rounds one request may run" },
+    { "/ctx", "context window: a size, max, default — or a picker" },
+    { "/temp", "temperature (-1 = the server's default)" },
+    { "/host", "the ollama host" },
+    { "/keepalive", "how long ollama keeps the model loaded" },
+    { "/save", "save the transcript as markdown" },
+    { "/history", "the last queries" },
+    { "/cd", "change the working directory" },
+    { "/pwd", "show the working directory" },
+    { "/skills", "list the skills · reload · new NAME" },
+    { "/memory", "the project memory: on, off, clear, update, every N, idle N" },
+    { "/resume", "continue an earlier session" },
+    { "/permissions", "the project's saved \"always allow\" rules: add, remove, clear" },
+    { "/init", "have the model write AGENTS.md for this project" },
+    { "/cost", "tokens, model calls and time of this session" },
+    { "/usage", "tokens per model, the advisor's too, and the estimated cost of the hosted ones" },
+    { "/diff", "the working-tree diff, without sending it to the model" },
+    { "/rewind", "go back to an earlier request: files, conversation or both" },
+    { "/quit", "leave" },
+    { "/exit", "leave" },
 };
 
-/* slash completion list = built-in commands + /skill names (rebuilt when skills reload) */
-static const char **g_slash_all = NULL;
-static void refresh_slash_completion(void) {
-    int nb = (int)(sizeof SLASH_CMDS / sizeof *SLASH_CMDS), ns = skills_count();
-    static char **owned = NULL; static int nowned = 0;
-    for (int i = 0; i < nowned; i++) free(owned[i]);
-    free(owned); free(g_slash_all);
-    owned = xmalloc(sizeof(char*) * (size_t)(ns ? ns : 1)); nowned = ns;
-    g_slash_all = xmalloc(sizeof(char*) * (size_t)(nb + ns));
-    for (int i = 0; i < nb; i++) g_slash_all[i] = SLASH_CMDS[i];
-    for (int i = 0; i < ns; i++) {
-        sbuf b; sb_init(&b); sb_printf(&b, "/%s", skill_get(i)->name);
-        owned[i] = sb_detach(&b); g_slash_all[nb + i] = owned[i];
+/* What a command takes as its next word, for the same list: "word:what it does", '|' between
+ * them. The key is the command line up to the word being typed. (/effort and /cd are worked
+ * out in suggest(): the levels are the model's, the directories the disk's.) */
+static const struct { const char *after, *opts; } SLASH_ARGS[] = {
+    { "/mode", "manual:ask before every edit and command|accept-edits:file edits go ahead, commands still ask|plan:read-only: the model proposes a plan|auto:nothing asks (dangerous)" },
+    { "/think", "on:think on every call|off:do not think|auto:think once per request, not after every tool result|show:show the thinking|hide:hide the thinking" },
+    { "/yolo", "on:approve every tool call (dangerous)|off:back to manual confirmations" },
+    { "/tools", "on:the model may call tools|off:chat only" },
+    { "/web", "on:the model may search and read the web|off:no web access|engine:the search engine: a URL with %s for the query, or default" },
+    { "/web engine", "default:back to the built-in engine" },
+    { "/memory", "on:keep the project memory up to date|off:stop updating it|update:run the pending update now|clear:remove the memory file|every:update every N requests|idle:update after N seconds idle at the prompt" },
+    { "/memory idle", "off:wait for the next update or the exit instead" },
+    { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST|remove:remove rule N|clear:remove them all" },
+    { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host" },
+    { "/advisor", "off:no advisor|guidance:how much the agent leans on it|effort:how hard it thinks|ctx:its context window" },
+    { "/advisor guidance", "light:consulted rarely|normal:the default|strong:also reviews the work before a request ends|max:also checks the first change before it is made" },
+    { "/advisor ctx", "auto:the main window, within the advisor's bounds" },
+    { "/usage", "price:what a model costs per million tokens — MODEL IN OUT, or MODEL default" },
+    { "/skills", "reload:read the SKILL.md files again|new:scaffold a skill: /skills new NAME" },
+    { "/system", "clear:remove the extra instructions" },
+    { "/keepalive", "default:the server's own|30m:half an hour|-1:forever|0:unload right away" },
+    { "/ctx", "max:the largest the model takes|default:back to the default size" },
+    { "/resume", "all:sessions of every directory, not only this one" },
+};
+
+/* what each model was sent and gave in this session: /usage, and what it estimates the cost from */
+typedef struct { char *model; long in, out; int calls; } usage_row;
+static usage_row *g_usage = NULL;
+static int g_n_usage = 0;
+static void usage_add(const char *model, long in, long out, int calls) {
+    if (!model || !*model) model = "(no model)";
+    int i = 0;
+    while (i < g_n_usage && strcmp(g_usage[i].model, model)) i++;
+    if (i == g_n_usage) {
+        g_usage = xrealloc(g_usage, sizeof *g_usage * (size_t)(g_n_usage + 1));
+        g_usage[g_n_usage++] = (usage_row){ xstrdup(model), 0, 0, 0 };
     }
-    term_set_slash_commands(g_slash_all, nb + ns);
+    g_usage[i].in += in; g_usage[i].out += out; g_usage[i].calls += calls;
+}
+static void usage_clear(void) {
+    for (int i = 0; i < g_n_usage; i++) free(g_usage[i].model);
+    free(g_usage); g_usage = NULL; g_n_usage = 0;
 }
 
-/* one model call finished: fold its stats into the session totals */
-static void account(const chat_stats *st) {
+/* one model call finished: fold its stats into the session totals — account() for the model
+ * doing the work, account_as() for a call to another one (the advisor) */
+static void account_as(const char *model, const chat_stats *st) {
+    usage_add(model, st->prompt_tokens, st->eval_tokens, 1);
     g_session.prompt_tokens += st->prompt_tokens;
     g_session.eval_tokens += st->eval_tokens;
     g_session.model_seconds += st->total_seconds;
@@ -62,6 +124,7 @@ static void account(const chat_stats *st) {
     g_session.think_seconds += st->think_seconds; g_session.think_chunks += st->think_chunks;
     g_session.calls++;
 }
+static void account(const chat_stats *st) { account_as(g_cfg.model, st); }
 
 /* ---------- how full the context is ----------
  * Ollama reports prompt_eval_count, but only for calls that have already happened: everything
@@ -495,6 +558,14 @@ static void session_save(void) {
     char *title = session_title_of(g_messages); cJSON_AddStringToObject(o, "title", title); free(title);
     cJSON_AddNumberToObject(o, "prompt_tokens", (double)g_session.prompt_tokens);
     cJSON_AddNumberToObject(o, "eval_tokens", (double)g_session.eval_tokens);
+    cJSON *us = cJSON_AddArrayToObject(o, "usage");   /* per model, for /usage after a --resume */
+    for (int i = 0; i < g_n_usage; i++) {
+        cJSON *u = cJSON_CreateObject();
+        cJSON_AddStringToObject(u, "model", g_usage[i].model);
+        cJSON_AddNumberToObject(u, "in", (double)g_usage[i].in); cJSON_AddNumberToObject(u, "out", (double)g_usage[i].out);
+        cJSON_AddNumberToObject(u, "calls", g_usage[i].calls);
+        cJSON_AddItemToArray(us, u);
+    }
     cJSON_AddItemReferenceToObject(o, "messages", g_messages);
     char *txt = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
@@ -560,6 +631,11 @@ static bool session_load(const char *id) {
     cJSON *pt = cJSON_GetObjectItemCaseSensitive(o, "prompt_tokens"), *et = cJSON_GetObjectItemCaseSensitive(o, "eval_tokens");
     g_session.prompt_tokens = cJSON_IsNumber(pt) ? (long)pt->valuedouble : 0;
     g_session.eval_tokens = cJSON_IsNumber(et) ? (long)et->valuedouble : 0;
+    usage_clear();   /* the totals are the resumed session's from here on, and so is what /usage lists */
+    cJSON *u; cJSON_ArrayForEach(u, cJSON_GetObjectItemCaseSensitive(o, "usage")) {
+        cJSON *um = cJSON_GetObjectItemCaseSensitive(u, "model"), *ui = cJSON_GetObjectItemCaseSensitive(u, "in"), *uo = cJSON_GetObjectItemCaseSensitive(u, "out"), *uc = cJSON_GetObjectItemCaseSensitive(u, "calls");
+        if (cJSON_IsString(um) && cJSON_IsNumber(ui) && cJSON_IsNumber(uo)) usage_add(um->valuestring, (long)ui->valuedouble, (long)uo->valuedouble, cJSON_IsNumber(uc) ? (int)uc->valuedouble : 0);
+    }
     g_session.last_prompt_tokens = 0;
     cJSON *cwd = cJSON_GetObjectItemCaseSensitive(o, "cwd");
     /* recap: title, size, and how the last exchange ended */
@@ -607,6 +683,70 @@ static void cmd_resume(const char *arg) {
     free(bufs); free(items); free(descs); sessions_free(v, n);
 }
 
+/* ---------- /usage: tokens per model, and what the hosted ones cost ----------
+ * The tokens are the ones each API reported for the calls of this session; the money is those
+ * tokens at a price per million (model_price()). It is an estimate: the providers only tell
+ * what was really billed to an admin key, and then for the whole organisation, not this session. */
+static void fmt_usd(double v, char *out, size_t n) { snprintf(out, n, v > 0 && v < 0.01 ? "$%.4f" : "$%.2f", v); }
+
+/* what the session's hosted calls come to at their prices; *priced says whether any had one */
+static double usage_cost_total(bool *priced) {
+    double total = 0, pi, po;
+    *priced = false;
+    for (int i = 0; i < g_n_usage; i++)
+        if (model_price(g_usage[i].model, &pi, &po)) { total += ((double)g_usage[i].in * pi + (double)g_usage[i].out * po) / 1e6; *priced = true; }
+    return total;
+}
+
+static void usage_price(const char *v) {
+    char model[200], word[32]; double pi, po;
+    while (*v == ' ') v++;
+    if (sscanf(v, "%199s %lf %lf", model, &pi, &po) == 3 && pi >= 0 && po >= 0) {
+        price_set(model, pi, po); config_save();
+        printf(C_GREEN "✓ %s: $%g in · $%g out per million tokens" C_RESET "\n", model, pi, po);
+    } else if (sscanf(v, "%199s %31s", model, word) == 2 && !strcmp(word, "default")) {
+        price_set(model, -1, -1); config_save();
+        if (model_price(model, &pi, &po)) printf(C_GREEN "✓ %s: back to the list price, $%g in · $%g out per million tokens" C_RESET "\n", model, pi, po);
+        else printf(C_GREEN "✓ %s: no price" C_RESET "\n", model);
+    } else {
+        printf("usage: /usage price MODEL IN OUT   (USD per million input and output tokens, e.g. /usage price openai:gpt-5.2 1.75 14)\n"
+               "       /usage price MODEL default  (back to the built-in list price)\n");
+        for (int i = 0; i < g_cfg.n_prices; i++) printf(C_DIM "  %s  $%g in · $%g out" C_RESET "\n", g_cfg.prices[i].model, g_cfg.prices[i].in, g_cfg.prices[i].out);
+    }
+}
+
+static void cmd_usage(const char *arg) {
+    if (arg && !strncmp(arg, "price", 5) && (arg[5] == ' ' || !arg[5])) { usage_price(arg + 5); return; }
+    if (arg) { printf("usage: /usage   ·   /usage price MODEL IN OUT   ·   /usage price MODEL default\n"); return; }
+    if (!g_n_usage) { printf(C_DIM "no model has been called in this session yet" C_RESET "\n"); return; }
+    printf(C_BOLD "usage" C_RESET C_DIM " (this session: the tokens each API counted, input ↑ and output ↓)" C_RESET "\n");
+    int w = 0;
+    for (int i = 0; i < g_n_usage; i++) { int l = (int)strlen(g_usage[i].model); if (l > w) w = l; }
+    if (w > 40) w = 40;
+    double total = 0; bool priced = false, unknown = false;
+    for (int i = 0; i < g_n_usage; i++) {
+        const usage_row *u = &g_usage[i];
+        char tin[32], tout[32], usd[32]; fmt_tokens(u->in, tin, sizeof tin); fmt_tokens(u->out, tout, sizeof tout);
+        double pi = 0, po = 0; int known = model_price(u->model, &pi, &po);
+        printf("  %-*s  %4d call%s  ↑%-6s ↓%-6s  ", w, u->model, u->calls, u->calls == 1 ? " " : "s", tin, tout);
+        if (known) {
+            double cost = ((double)u->in * pi + (double)u->out * po) / 1e6;
+            total += cost; priced = true;
+            fmt_usd(cost, usd, sizeof usd);
+            printf("≈ %s" C_DIM "  ($%g in · $%g out per million, %s)" C_RESET "\n", usd, pi, po, known == 2 ? "set with /usage price" : "list price");
+        } else if (provider_find(u->model, NULL)) {
+            unknown = true;
+            printf(C_YELLOW "no price known" C_RESET C_DIM " — /usage price %s IN OUT" C_RESET "\n", u->model);
+        } else if (model_is_cloud(u->model)) printf(C_DIM "an Ollama cloud model: on your ollama.com plan" C_RESET "\n");
+        else printf(C_DIM "local: no charge" C_RESET "\n");
+    }
+    if (priced) {
+        char usd[32]; fmt_usd(total, usd, sizeof usd);
+        printf("  estimated cost  " C_BOLD "≈ %s" C_RESET "%s\n", usd, unknown ? C_DIM "  (without the models that have no price)" C_RESET : "");
+        printf(C_DIM "  an estimate from token counts and prices per million tokens — what the provider bills is on its own usage page" C_RESET "\n");
+    }
+}
+
 /* ---------- /cost ---------- */
 static void fmt_dur(double sec, char *out, size_t n) {
     if (sec < 60) snprintf(out, n, "%.1fs", sec);
@@ -621,7 +761,8 @@ static void cmd_cost(void) {
     fmt_dur(difftime(time(NULL), g_session.started), wall, sizeof wall);
     fmt_dur(g_session.model_seconds, model, sizeof model);
     fmt_dur(g_session.eval_seconds, gen, sizeof gen);
-    printf(C_BOLD "session cost" C_RESET C_DIM " (local model: no money, just tokens and time)" C_RESET "\n");
+    bool priced; double money = usage_cost_total(&priced);
+    printf(C_BOLD "session cost" C_RESET C_DIM " (%s)" C_RESET "\n", priced ? "the local model: tokens and time; the hosted one: money too" : "local model: no money, just tokens and time");
     printf("  tokens        %s  " C_DIM "(↑%s in · ↓%s out)" C_RESET "\n", ttot, tin, tout);
     printf("  model calls   %d  " C_DIM "(%d request%s · %d tool call%s)" C_RESET "\n", g_session.calls, g_session.turns, g_session.turns == 1 ? "" : "s", g_session.tool_calls, g_session.tool_calls == 1 ? "" : "s");
     printf("  model time    %s  " C_DIM "(%s generating", model, gen);
@@ -633,6 +774,7 @@ static void cmd_cost(void) {
         char at[32], ad[32]; fmt_tokens(g_session.advisor_tokens, at, sizeof at); fmt_dur(g_session.advisor_seconds, ad, sizeof ad);
         printf("  advisor       %d consultation%s  " C_DIM "(%s tokens · %s · %s — included in the figures above)" C_RESET "\n", g_session.advisor_calls, g_session.advisor_calls == 1 ? "" : "s", at, ad, g_cfg.advisor ? g_cfg.advisor : "off now");
     }
+    if (priced) { char usd[32]; fmt_usd(money, usd, sizeof usd); printf("  est. cost     ≈ %s  " C_DIM "(the hosted models' tokens at their price per million — /usage has it per model)" C_RESET "\n", usd); }
     printf("  wall time     %s\n", wall);
     if (g_cfg.num_ctx > 0 && g_session.last_prompt_tokens > 0)
         printf("  context       %d of %d tokens (%d%%)\n", g_session.last_prompt_tokens, g_cfg.num_ctx, (int)(100.0 * g_session.last_prompt_tokens / g_cfg.num_ctx));
@@ -761,7 +903,7 @@ static void cmd_permissions(const char *arg) {
 
 /* ---------- system prompt ---------- */
 static void load_project_instructions(void) {
-    const char *names[] = { "CORBIENEST.md", "CLAUDE.md", "AGENTS.md", NULL };
+    const char *names[] = { "AGENTS.md", "CORBIENEST.md", "CLAUDE.md", NULL };
     free(g_project_instructions); g_project_instructions = NULL;
     for (int i = 0; names[i]; i++) {
         if (is_file(names[i])) {
@@ -1410,7 +1552,7 @@ static int consult(const char *question, const char *what, sbuf *advice, sbuf *w
         if (r) cJSON_Delete(r);
     }
     free(brief); sb_free(&sys);
-    account(&st);
+    account_as(g_cfg.advisor, &st);
     g_session.advisor_tokens += st.prompt_tokens + st.eval_tokens; g_session.advisor_seconds += st.total_seconds;
     g_session.advisor_eval_tokens += st.eval_tokens; g_session.advisor_eval_seconds += st.eval_seconds;
     term_status_refresh();
@@ -1441,7 +1583,9 @@ static int consult(const char *question, const char *what, sbuf *advice, sbuf *w
         sb_puts(advice, text);
         if (cut) sb_puts(advice, "\n[… the answer was cut off here: the advisor ran out of tokens]");
         char tk[32]; fmt_tokens(st.prompt_tokens + st.eval_tokens, tk, sizeof tk);
-        printf("    " C_DIM "⎿ advice · %s tokens · %.0fs%s:" C_RESET "\n", tk, st.total_seconds, st.load_seconds >= 1 ? " (of which loading the model)" : "");
+        char cost[48] = ""; double pi, po;   /* a model with a price: what this one consultation came to, estimated as /usage does */
+        if (model_price(g_cfg.advisor, &pi, &po)) { char usd[32]; fmt_usd(((double)st.prompt_tokens * pi + (double)st.eval_tokens * po) / 1e6, usd, sizeof usd); snprintf(cost, sizeof cost, " · ≈ %s", usd); }
+        printf("    " C_DIM "⎿ advice · %s tokens · %.0fs%s%s:" C_RESET "\n", tk, st.total_seconds, cost, st.load_seconds >= 1 ? " (of which loading the model)" : "");
         print_result_preview(text, 12);
         res = ADVICE_GIVEN;
     }
@@ -1557,9 +1701,31 @@ static int advisor_check(const char *tool, cJSON *args, sbuf *out) {
     return r;
 }
 
+/* what an advisor can be and how each kind is set up — a hosted one needs a key in the
+ * environment, which nothing else on screen would tell — and what guidance and effort do to it.
+ * Says whether a key is there, never the key. */
+static void advisor_howto(void) {
+    printf(C_DIM "  a stronger model the agent may consult when the work is hard — /advisor MODEL, where MODEL is\n"
+                 "    a bigger local model    as /models lists it\n"
+                 "    an Ollama cloud model   like gpt-oss:120b-cloud — run `ollama signin` once\n"
+                 "    a hosted API            PROVIDER:MODEL — export its key before starting corbienest (it is never saved)\n" C_RESET);
+    const provider_def *p;
+    for (int i = 0; (p = provider_at(i)); i++) {
+        char name[96]; snprintf(name, sizeof name, "%s:%s", p->name, p->example);
+        const char *key = getenv(p->key_env); bool set = key && *key;
+        printf(C_DIM "      %-24s %-18s" C_RESET "%s%s" C_RESET "\n", name, p->key_env, set ? C_GREEN : C_DIM, set ? "set" : "not set");
+    }
+    printf(C_DIM "    another endpoint for a provider: its …_BASE_URL (https, unless it is this machine)\n"
+                 "  /advisor guidance LEVEL — how much the agent leans on it" C_RESET "\n");
+    for (int i = 0; i < GUIDANCE_COUNT; i++)
+        printf(C_DIM "    %-7s %s%s" C_RESET "\n", ADVISOR_GUIDANCE[i].name, ADVISOR_GUIDANCE[i].desc, &ADVISOR_GUIDANCE[i] == advisor_guidance() ? " · current" : "");
+    printf(C_DIM "  /advisor effort LEVEL — how hard the advisor itself thinks, once one is set: the levels are the model's own\n"
+                 "    (off, on, or low … max), bare it lists them, and default leaves it to the model" C_RESET "\n");
+}
+
 static void advisor_report(void) {
     const advisor_guidance_def *g = advisor_guidance();
-    if (!g_cfg.advisor) { printf("advisor: " C_DIM "none — /advisor MODEL lets the agent consult a stronger model when the work is hard (a bigger local one, a NAME-cloud model, or xai:MODEL, openai:MODEL, anthropic:MODEL)" C_RESET "\n"); return; }
+    if (!g_cfg.advisor) { printf("advisor: " C_DIM "none" C_RESET "\n"); advisor_howto(); return; }
     printf("advisor: " C_BOLD "%s" C_RESET, g_cfg.advisor);
     if (g_advisor_info_for && !strcmp(g_advisor_info_for, g_cfg.advisor)) printf(C_DIM " · effort %s" C_RESET, effort_label(g_cfg.advisor, &g_advisor_info));
     else if (effort_get(g_cfg.advisor)) printf(C_DIM " · effort %s" C_RESET, effort_get(g_cfg.advisor));
@@ -1686,7 +1852,7 @@ static void cmd_advisor(const char *arg) {
         own[i + 1] = sb_detach(&d); descs[i + 1] = own[i + 1];
         if (cur) current = i + 1;
     }
-    printf(C_DIM "a stronger model the agent may consult — not listed: a cloud model (/advisor NAME-cloud) or a hosted one (/advisor xai:MODEL, openai:MODEL, anthropic:MODEL)" C_RESET "\n");
+    advisor_howto();
     int r = term_select("Select advisor", names, descs, n + 1, current);
     if (r < 0) printf(C_DIM "advisor unchanged: %s" C_RESET "\n", g_cfg.advisor ? g_cfg.advisor : "none");
     else if (r == 0) advisor_set(NULL);
@@ -1894,6 +2060,13 @@ static char *expand_mentions(const char *input) {
             while (e > s && strchr(",.;:)!?", e[-1])) e--;
             char *path = xstrndup(s, (size_t)(e - s));
             char *fp = expand_home(path);
+            if (!is_file(fp) && !is_dir(fp)) {   /* not a path from here: the one file by that name, when there is just one */
+                int hits = 0; sbuf names; sb_init(&names);
+                char *found = file_find_named(path, &hits, &names);
+                if (found) { free(fp); free(path); path = found; fp = xstrdup(found); }
+                else if (hits > 1) printf(C_DIM "  (@%s could be %s%s — give more of the path)" C_RESET "\n", path, names.data, hits > 5 ? ", …" : "");
+                sb_free(&names);
+            }
             if (is_file(fp)) {
                 size_t n; char *d = read_whole_file(fp, &n, 128 * 1024);
                 if (d) {
@@ -1920,11 +2093,11 @@ static char *expand_mentions(const char *input) {
     return sb_detach(&r);
 }
 
-/* ---------- /init: have the model write CORBIENEST.md ---------- */
+/* ---------- /init: have the model write AGENTS.md ---------- */
 static int cmd_init(void) {
-    const char *existing = is_file("CORBIENEST.md") ? "CORBIENEST.md" : is_file("CLAUDE.md") ? "CLAUDE.md" : is_file("AGENTS.md") ? "AGENTS.md" : NULL;
+    const char *existing = is_file("AGENTS.md") ? "AGENTS.md" : is_file("CORBIENEST.md") ? "CORBIENEST.md" : is_file("CLAUDE.md") ? "CLAUDE.md" : NULL;
     sbuf b; sb_init(&b);
-    sb_puts(&b, "Please analyze this codebase and create a CORBIENEST.md file, which will be given to you (and future instances of you) as project instructions at the start of every session in this directory.\n\n"
+    sb_puts(&b, "Please analyze this codebase and create an AGENTS.md file, which will be given to you (and future instances of you) as project instructions at the start of every session in this directory.\n\n"
                 "What to add:\n"
                 "1. Commands that will be commonly used, such as how to build, lint, and run tests — including how to run a single test.\n"
                 "2. High-level code architecture and structure that requires reading multiple files to understand: the main components, how they fit together, where things live. Do not list every file.\n"
@@ -1934,8 +2107,8 @@ static int cmd_init(void) {
                 "- Keep it concise (aim for well under 100 lines); prefer facts that are not obvious from a glance at the tree.\n"
                 "- Do not repeat instructions that are already covered by an existing rules file, and do not make things up: only include commands you have verified exist.\n"
                 "- Write the file with write_file, then summarise what you put in it in one short paragraph.\n");
-    if (existing) sb_printf(&b, "\nNote: a %s already exists in this directory. Read it first and improve it in place (keep what is right, fix what is wrong, fill the gaps) — write CORBIENEST.md only if you would otherwise clobber a hand-written %s.\n", existing, existing);
-    printf(C_DIM "  /init: analysing the project and writing CORBIENEST.md…" C_RESET "\n");
+    if (existing) sb_printf(&b, "\nNote: a %s already exists in this directory. Read it first and improve it in place (keep what is right, fix what is wrong, fill the gaps) — write AGENTS.md only if you would otherwise clobber a hand-written %s.\n", existing, existing);
+    printf(C_DIM "  /init: analysing the project and writing AGENTS.md…" C_RESET "\n");
     int first = begin_request();
     add_message("user", b.data); sb_free(&b);
     bool aborted = run_turn();
@@ -1956,10 +2129,10 @@ static void cmd_skills(const char *arg) {
         if (rc == 1) printf(C_YELLOW "%s already exists" C_RESET "\n", path);
         else if (rc < 0) printf(C_RED "✗ cannot create skill '%s': %s" C_RESET "\n", name, strerror(errno));
         else printf(C_GREEN "✓ created %s" C_RESET " — edit it, then run it with /%s [args]\n", path, name);
-        skills_load(); refresh_slash_completion();
+        skills_load();
         return;
     }
-    if (arg && !strcmp(arg, "reload")) { skills_load(); refresh_slash_completion(); }
+    if (arg && !strcmp(arg, "reload")) skills_load();
     int n = skills_count();
     if (!n) {
         printf(C_DIM "no skills found." C_RESET "\n"
@@ -1988,6 +2161,8 @@ static void cmd_help(void) {
            "  /memory [on|off|clear|update|every N|idle N]  show the project memory (" MEMORY_PATH ", curated by the model every N requests, after N seconds idle at the prompt, and at exit; default every 5 / 15s idle), toggle it, run the update now, set the cadence, or delete it\n"
            "  /status               show model, context usage, settings\n"
            "  /cost                 tokens, model calls, model time and wall time of this session\n"
+           "  /usage                tokens per model in this session — the advisor's too — and the estimated cost of the hosted ones;\n"
+           "                        /usage price MODEL IN OUT sets a price (USD per million tokens), /usage price MODEL default takes the built-in one\n"
            "  /diff [git args]      show the working-tree diff (stat + patch + untracked), without sending it to the model; e.g. /diff --staged\n"
            "  /rewind               (or Esc Esc at an empty prompt) go back to an earlier request: undo the file changes since, the conversation, or both\n"
            "  /system [text|clear]  show/set extra system instructions\n"
@@ -2002,7 +2177,7 @@ static void cmd_help(void) {
            "                        detailed; strong+ also reviews the work before a request ends, max checks the first change before it is made)\n"
            "                        /advisor effort [LEVEL] (how hard it thinks) · /advisor ctx N|auto (its context window; auto = the main one, at most 16k)\n"
            "  /skills [reload|new NAME]  list skills (SKILL.md files); run one with /NAME [args]\n"
-           "  /init                 have the model explore the project and write a CORBIENEST.md (project instructions)\n"
+           "  /init                 have the model explore the project and write an AGENTS.md (project instructions)\n"
            "  /mode [name]          permission mode: manual · accept-edits · plan · auto (or press shift+tab to cycle)\n"
            "  /permissions [...]    list the project's saved \"always allow\" rules (.corbienest/permissions); add/remove/clear\n"
            "  /web [on|off|engine URL]  let the model look documentation up with web_search/web_fetch (on by default); set the search engine\n"
@@ -2019,17 +2194,25 @@ static void cmd_help(void) {
            "  /cd DIR, /pwd         change / show working directory\n"
            "  /quit, /exit          leave (also Ctrl-D)\n\n"
            C_BOLD "Input\n" C_RESET
-           "  !cmd                  run a shell command yourself; output is added to the conversation\n"
-           "  @path                 attach a file (or directory listing) to your message\n"
+           "  !cmd                  run a shell command yourself; output is added to the conversation. Its words are completed as\n"
+           "                        in a shell: programs from $PATH where a command goes, files and directories elsewhere\n"
+           "  @path                 attach a file (or directory listing) to your message — while you type, the files matching the name\n"
+           "                        so far are listed under the input field (@term finds src/term.c; @../lib/pa looks below ../lib)\n"
            "  # fact                remember something: appended to " MEMORY_PATH " (pick the section from a menu), no model call\n"
            "  Enter                 send  ·  Alt+Enter / Ctrl+J / trailing \\ : newline\n"
            "  Enter while busy      queue a message for the model (added between tool rounds or after the turn; Ctrl-C hands it back)\n"
-           "                        commands that only report or set something run at once instead: /help /status /cost /diff /history /pwd\n"
+           "                        commands that only report or set something run at once instead: /help /status /cost /usage /diff /history /pwd\n"
            "                        /skills /memory /mode /yolo /permissions /tools /web /max_iters /think /effort /advisor /temp /keepalive\n"
            "  Ctrl-C                cancel generation / clear line (twice: quit)  ·  Ctrl-L clear screen\n"
-           "  PgUp / PgDn           scroll back through the conversation (↑/↓, Home/End inside; Esc/Enter return)\n"
+           "  mouse wheel, PgUp/PgDn  scroll back through the conversation, also while the model works (at the prompt ↑/↓ and Home/End\n"
+           "                        scroll too; Esc/Enter return); a line under it says where you are, the status bar stays as it is.\n"
+           "                        The wheel does nothing over the input field: there ↑/↓ are the keys.\n"
+           "                        Selecting text with the mouse needs Shift held down (in tmux too)\n"
            "  status bar            bottom row shows the permission mode, model, session tokens and context usage\n"
-           "  Tab                   complete slash commands  ·  ↑/↓ history  ·  Ctrl-R search history\n\n"
+           "  / @ and !             the commands (and their options), files, or programs and paths matching what you typed are listed\n"
+           "                        under the input field, also while the model works: Tab completes, ↓ steps into the list, Enter\n"
+           "                        takes the highlighted one, Esc closes it\n"
+           "  ↑/↓                   history  ·  Ctrl-R search history\n\n"
            C_BOLD "Tools the model can call\n" C_RESET "  %s\n"
            "  write/edit/bash ask for confirmation: pick with ↑/↓ + enter, or press y (once), a (always this session), p (always in this project), n (deny, with optional reason)\n"
            "  modes: manual asks for everything · accept-edits auto-approves file edits · plan is read-only (model proposes a plan) · auto approves all\n",
@@ -2335,6 +2518,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
     else if (!strcmp(cmd, "/cost")) cmd_cost();
+    else if (!strcmp(cmd, "/usage")) cmd_usage(arg);
     else if (!strcmp(cmd, "/diff")) cmd_diff(arg);
     else if (!strcmp(cmd, "/rewind")) return cmd_rewind();
     else if (!strcmp(cmd, "/init")) return cmd_init();
@@ -2431,7 +2615,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/cd")) {
         char *d = expand_home(arg ? arg : "~");
         memory_flush();   /* the memory file belongs to the directory we are leaving */
-        if (chdir(d) == 0) { if (getcwd(g_cwd, sizeof g_cwd)) {} load_project_instructions(); load_memory(); tools_permissions_load(); skills_load(); refresh_slash_completion(); printf(C_GREEN "✓ %s" C_RESET "\n", g_cwd); }
+        if (chdir(d) == 0) { if (getcwd(g_cwd, sizeof g_cwd)) {} load_project_instructions(); load_memory(); tools_permissions_load(); skills_load(); printf(C_GREEN "✓ %s" C_RESET "\n", g_cwd); }
         else printf(C_RED "✗ cd %s: %s" C_RESET "\n", d, strerror(errno));
         free(d);
     }
@@ -2465,7 +2649,7 @@ static int handle_slash(char *line) {
  * anything (the pickers), or change the ground under the running turn (/cd). */
 static bool slash_runs_while_busy(const char *cmd, const char *arg) {
     static const char *ok[] = {
-        "/help", "/?", "/status", "/cost", "/diff", "/history", "/pwd", "/skills",
+        "/help", "/?", "/status", "/cost", "/usage", "/diff", "/history", "/pwd", "/skills",
         "/mode", "/yolo", "/permissions", "/tools", "/max_iters", "/max-iters", "/think", "/effort", "/temp",
         "/keepalive", "/keep-alive", "/memory", "/web", NULL };
     /* /web with an argument is not just a report: on|off rebuilds the tool list the running
@@ -2546,6 +2730,207 @@ static void banner(void) {
     printf(C_ORANGE "╰"); for (int i = 0; i < w - 2; i++) printf("─"); printf("╯" C_RESET "\n");
     if (ok != 0) printf(C_RED "cannot reach ollama at %s: %s" C_RESET "\n" C_DIM "start it with `ollama serve`, or set the host with /host or OLLAMA_HOST" C_RESET "\n", g_cfg.host, ver);
     printf(C_DIM "/help for commands · @file to attach · !cmd for shell · shift+tab to switch mode · Ctrl-D to quit" C_RESET "\n\n");
+}
+
+/* ---------- suggestions under the input field (term_suggest) ----------
+ * What the word at the cursor could become: a command for "/mo", one of its options for
+ * "/mode pl", a file for "@te" (see file_complete: the name is searched for below the working
+ * directory, or below the directory typed in front of it), a program or a path in a "!line". */
+static void sug_add(term_sug **v, int *n, const char *text, const char *desc, bool open) {
+    for (int i = 0; i < *n; i++) if (!strcmp((*v)[i].text, text)) return;   /* once is enough */
+    *v = xrealloc(*v, sizeof **v * (size_t)(*n + 1));
+    (*v)[(*n)++] = (term_sug){ xstrdup(text), desc && *desc ? xstrdup(desc) : NULL, open };
+}
+
+/* The model lists behind /advisor's suggestions: slot 0 is the Ollama server's, 1 + i that of
+ * hosted provider i. Asked for when a name is first typed and kept for a minute — an answer that
+ * did not come too, so a server that is down costs one wait and not one per letter. The hook
+ * runs inside the poll of a live request as well, where a second request must not start: there
+ * it gets what is already known. */
+#define MODEL_LIST_SECS 60
+#define MODEL_LIST_WAIT_MS 3000
+#define MODEL_LISTS 8
+#define MODEL_SUG_MAX 60
+static struct { cJSON *list; char *from; time_t at; char why[240]; } g_model_lists[MODEL_LISTS];   /* why: what kept a provider's list away */
+
+static cJSON *model_list_get(int slot, const provider_def *p, const char **why) {
+    if (why) *why = NULL;
+    if (slot >= MODEL_LISTS) return NULL;
+    const char *from = p ? provider_base_url(p) : g_cfg.host;
+    bool same = g_model_lists[slot].from && !strcmp(g_model_lists[slot].from, from);
+    const char *key = p ? getenv(p->key_env) : NULL;   /* a key that is missing is not an answer to keep: it costs nothing to look again */
+    if (http_busy() || (same && time(NULL) - g_model_lists[slot].at <= MODEL_LIST_SECS && (!p || g_model_lists[slot].list || (key && *key)))) {
+        if (why && same && g_model_lists[slot].why[0]) *why = g_model_lists[slot].why;
+        return same ? g_model_lists[slot].list : NULL;
+    }
+    cJSON_Delete(g_model_lists[slot].list); free(g_model_lists[slot].from);
+    g_model_lists[slot].why[0] = 0;
+    g_model_lists[slot].list = p ? provider_list_models(p, MODEL_LIST_WAIT_MS, g_model_lists[slot].why, sizeof g_model_lists[slot].why) : ollama_list_models_quiet(MODEL_LIST_WAIT_MS);
+    g_model_lists[slot].from = xstrdup(from); g_model_lists[slot].at = time(NULL);
+    if (why && g_model_lists[slot].why[0]) *why = g_model_lists[slot].why;
+    return g_model_lists[slot].list;
+}
+
+static void sug_add(term_sug **v, int *n, const char *text, const char *desc, bool open);
+
+/* What /advisor could be given besides its options: an installed model, or a hosted provider's
+ * prefix — and behind the prefix, the models its key can use. The providers come before the
+ * installed models (those can be many, and a hosted one is what nobody would guess is there);
+ * of the models, names that start with what was typed come first, then those that contain it. */
+static void suggest_advisor(const char *word, term_sug **items, int *n) {
+    size_t wl = strlen(word);
+    const char *colon = strchr(word, ':');
+    const provider_def *pv = NULL, *p;
+    if (colon) {   /* "xai:" is a provider as much as "xai:grok" is */
+        sbuf probe; sb_init(&probe); sb_append(&probe, word, (size_t)(colon - word) + 1); sb_putc(&probe, 'x');
+        pv = provider_find(probe.data, NULL);
+        sb_free(&probe);
+    }
+    cJSON *m;
+    if (pv) {
+        int slot = 1; while (provider_at(slot - 1) != pv) slot++;
+        const char *why;
+        cJSON *list = model_list_get(slot, pv, &why);
+        const char *rest = colon + 1; size_t rl = strlen(rest);
+        if (!list && why) {   /* an empty list would look like a prefix nothing is known about: say what is in the way, on a row that changes nothing when taken */
+            char *pre = xstrndup(word, (size_t)(colon - word) + 1);
+            sug_add(items, n, pre, why, true);
+            free(pre);
+            return;
+        }
+        for (int pass = 0; pass < 2; pass++) cJSON_ArrayForEach(m, list) {
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(m, "id"), *name = cJSON_GetObjectItemCaseSensitive(m, "name");
+            bool starts = !strncasecmp(id->valuestring, rest, rl);
+            if (*n >= MODEL_SUG_MAX || (pass == 0 ? !starts : starts || rl < 2 || !strcasestr(id->valuestring, rest))) continue;
+            sbuf t; sb_init(&t); sb_append(&t, word, (size_t)(colon - word) + 1); sb_puts(&t, id->valuestring);
+            sug_add(items, n, t.data, cJSON_IsString(name) ? name->valuestring : NULL, false);
+            sb_free(&t);
+        }
+        return;
+    }
+    for (int i = 0; (p = provider_at(i)); i++) {   /* by either name: "grok", "chatgpt" and "claude" are what people type */
+        char pre[48], desc[128]; snprintf(pre, sizeof pre, "%s:", p->name);
+        if (strncasecmp(pre, word, wl) && (!p->alias || strncasecmp(p->alias, word, wl))) continue;
+        const char *key = getenv(p->key_env);
+        snprintf(desc, sizeof desc, "%s (%s), a hosted API · %s %s", p->label, p->known_as, p->key_env, key && *key ? "set" : "not set");
+        sug_add(items, n, pre, desc, true);
+    }
+    cJSON *list = model_list_get(0, NULL, NULL);
+    for (int pass = 0; pass < 2; pass++) cJSON_ArrayForEach(m, list) {
+        const char *name = cJSON_GetObjectItemCaseSensitive(m, "name")->valuestring, *size = cJSON_GetObjectItemCaseSensitive(m, "size")->valuestring;
+        bool starts = !strncasecmp(name, word, wl);
+        if (*n >= MODEL_SUG_MAX || (pass == 0 ? !starts : starts || wl < 2 || !strcasestr(name, word))) continue;
+        char desc[96]; snprintf(desc, sizeof desc, "%s%s%s", size, *size && model_same(name, g_cfg.model) ? " · " : "", model_same(name, g_cfg.model) ? "the model doing the work" : "");
+        sug_add(items, n, name, desc, false);
+    }
+}
+
+static int suggest_files(const char *typed, bool dirs_only, term_sug **items) {
+    file_match *m;
+    int n = file_complete(typed, dirs_only, 50, &m), k = 0;
+    for (int i = 0; i < n; i++) sug_add(items, &k, m[i].path, NULL, m[i].dir);
+    file_matches_free(m, n);
+    return k;
+}
+
+/* A "!line" is the shell's, so its words are completed the way a shell would: where a command
+ * goes, the programs in $PATH that start with what was typed; anywhere else the files and
+ * directories that do — found like an "@file", wherever below the working directory they are,
+ * but by the start of their name only: most words of a command are not files, and a list that
+ * came up for every one of them would be in the way. First of all come the "!lines" sent
+ * before that go on from what is typed (the newest first), so a bare "!" shows what was run. */
+static int suggest_shell(const char *buf, size_t cur, size_t *from, term_sug **items) {
+    bool command;
+    long ws = shell_word(buf, cur, &command);
+    if (ws < 0) return 0;
+    int n = 0;
+    *from = (size_t)ws;
+    char *word = xstrndup(buf + ws, cur - (size_t)ws);
+    size_t wl = 0;
+    for (const char *p = word; *p; p++) { if (*p == '\\' && p[1]) p++; word[wl++] = *p; }   /* as the shell reads it */
+    word[wl] = 0;
+    for (int i = hist_count() - 1, most = wl ? 3 : 8; i >= 0 && n < most; i--) {
+        const char *h = hist_get(i);
+        if (h[0] == '!' && strlen(h) > cur && !strncmp(h, buf, cur) && !strchr(h, '\n')) sug_add(items, &n, h + ws, NULL, true);
+    }
+    bool prog = command && !strchr(word, '/');   /* a program by its name; with a '/' in it, it is a path like any other */
+    const char *name = strrchr(word, '/'); name = name ? name + 1 : word;
+    file_match *m = NULL;
+    int k = !wl || word[0] == '-' ? 0 : prog ? command_complete(word, 50, &m) : file_complete(word, false, 50, &m);
+    for (int i = 0; i < k; i++) {
+        if (!prog) {   /* the last part of the path has to start with what was typed */
+            const char *base = m[i].path + strlen(m[i].path) - (m[i].dir ? 1 : 0);
+            while (base > m[i].path && base[-1] != '/') base--;
+            if (strncasecmp(base, name, strlen(name))) continue;
+        }
+        char *text = shell_escape(m[i].path);
+        sug_add(items, &n, text, NULL, m[i].dir);
+        free(text);
+    }
+    file_matches_free(m, k);
+    free(word);
+    return n;
+}
+
+static int suggest(const char *buf, size_t cur, size_t *from, term_sug **items) {
+    int n = 0;
+    if (buf[0] == '!') return suggest_shell(buf, cur, from, items);
+    long at = mention_start(buf, cur);
+    if (at >= 0) {
+        char *typed = xstrndup(buf + at, cur - (size_t)at);
+        *from = (size_t)at;
+        n = suggest_files(typed, false, items);
+        free(typed);
+        return n;
+    }
+    if (buf[0] != '/' || memchr(buf, '\n', cur)) return 0;
+    size_t ws = cur;   /* where the word at the cursor starts */
+    while (ws > 0 && buf[ws - 1] != ' ') ws--;
+    char *word = xstrndup(buf + ws, cur - ws);
+    size_t wl = strlen(word);
+    *from = ws;
+    if (ws == 0) {   /* the command: the names that start with what was typed, then those that contain it */
+        int nb = (int)(sizeof SLASH_CMDS / sizeof *SLASH_CMDS), ns = skills_count();
+        for (int pass = 0; pass < 2; pass++)
+            for (int i = 0; i < nb + ns; i++) {
+                sbuf sk; sb_init(&sk);
+                if (i >= nb) sb_printf(&sk, "/%s", skill_get(i - nb)->name);
+                const char *name = i < nb ? SLASH_CMDS[i].name : sk.data;
+                bool starts = !strncmp(name, word, wl);
+                if (pass == 0 ? starts : !starts && wl > 2 && strcasestr(name + 1, word + 1))
+                    sug_add(items, &n, name, i < nb ? SLASH_CMDS[i].desc : skill_get(i - nb)->desc, false);
+                sb_free(&sk);
+            }
+        free(word);
+        return n;
+    }
+    size_t bl = ws;   /* an argument: the options of the command line so far */
+    while (bl > 0 && buf[bl - 1] == ' ') bl--;
+    char *before = xstrndup(buf, bl);
+    if (!strcmp(before, "/cd")) n = suggest_files(word, true, items);
+    else if (!strcmp(before, "/effort")) {
+        const model_info *mi = &g_model_info;
+        const char *opt[EFFORT_LEVELS_MAX + 3], *why[EFFORT_LEVELS_MAX + 3]; int no = 0;
+        opt[no] = "default"; why[no++] = "leave it to the model";
+        if (mi->think_off) { opt[no] = "off"; why[no++] = "no thinking: fastest"; }
+        if (mi->think_on) { opt[no] = "on"; why[no++] = "think"; }
+        for (int i = 0; i < mi->n_think_levels; i++) { opt[no] = mi->think_levels[i]; why[no++] = i == 0 ? "the least thinking" : i == mi->n_think_levels - 1 ? "the most thinking: slowest" : ""; }
+        for (int i = 0; i < no; i++) if (!strncmp(opt[i], word, wl)) sug_add(items, &n, opt[i], why[i], false);
+    }
+    else for (size_t i = 0; i < sizeof SLASH_ARGS / sizeof *SLASH_ARGS; i++) {
+        if (strcmp(SLASH_ARGS[i].after, before)) continue;
+        for (const char *o = SLASH_ARGS[i].opts; *o; ) {
+            size_t ol = strcspn(o, "|"), nl = strcspn(o, ":|");
+            char *name = xstrndup(o, nl), *desc = xstrndup(o + (nl < ol ? nl + 1 : nl), nl < ol ? ol - nl - 1 : 0);
+            if (!strncmp(name, word, wl)) sug_add(items, &n, name, desc, false);
+            free(name); free(desc);
+            o += ol; if (*o == '|') o++;
+        }
+        break;
+    }
+    if (!strcmp(before, "/advisor")) suggest_advisor(word, items, &n);
+    free(before); free(word);
+    return n;
 }
 
 /* Handle one line of user input (from the editor or the message queue).
@@ -2880,8 +3265,10 @@ int main(int argc, char **argv) {
     }
 
     banner();
+    if (term_trace_path())   /* it holds the conversation: nobody should be recording one without seeing so */
+        printf(C_YELLOW "trace:" C_RESET C_DIM " everything drawn and typed in this session is written to %s" C_RESET "\n\n", term_trace_path());
     hist_load();
-    refresh_slash_completion();
+    term_suggest = suggest;
     term_idle_hook = memory_idle_hook;
     for (;;) {
         memory_arm_idle();   /* a finished request folds itself into memory while the prompt sits idle */

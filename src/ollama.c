@@ -365,6 +365,8 @@ static int plain_request(const char *method, const char *path, const char *body,
     return rc;
 }
 
+static cJSON *models_from_tags(const char *json);
+
 cJSON *ollama_list_models(void) {
     sbuf out; sb_init(&out);
     http_result res;
@@ -372,8 +374,27 @@ cJSON *ollama_list_models(void) {
         printf(C_RED "✗ cannot list models: %s" C_RESET "\n", res.err[0] ? res.err : "bad status");
         sb_free(&out); return NULL;
     }
-    cJSON *j = cJSON_Parse(out.data ? out.data : "");
+    cJSON *arr = models_from_tags(out.data);
     sb_free(&out);
+    return arr;
+}
+
+/* The same list for the suggestions under the input field: nothing is printed and nothing shown
+ * in the bar, and a server that does not answer within wait_ms is given up on. */
+cJSON *ollama_list_models_quiet(int wait_ms) {
+    sbuf out; sb_init(&out);
+    http_result res;
+    int idle_was = http_idle_timeout_ms, fd_was = http_interrupt_fd;
+    http_idle_timeout_ms = wait_ms; http_interrupt_fd = -1;
+    int rc = http_request(g_cfg.host, "GET", "/api/tags", NULL, &out, NULL, NULL, &res);
+    http_idle_timeout_ms = idle_was; http_interrupt_fd = fd_was;
+    cJSON *arr = rc == 0 && res.status == 200 ? models_from_tags(out.data) : NULL;
+    sb_free(&out);
+    return arr;
+}
+
+static cJSON *models_from_tags(const char *json) {
+    cJSON *j = cJSON_Parse(json ? json : "");
     if (!j) return NULL;
     cJSON *arr = cJSON_CreateArray();
     cJSON *models = cJSON_GetObjectItemCaseSensitive(j, "models"), *m;

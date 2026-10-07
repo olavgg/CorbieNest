@@ -18,11 +18,15 @@
 #include <unistd.h>
 
 static const provider_def PROVIDERS[] = {
-    { "xai",       "grok",   "xAI",       "XAI_API_KEY",       "XAI_BASE_URL",       "https://api.x.ai/v1",       PROVIDER_CHAT_COMPLETIONS },
-    { "openai",    NULL,     "OpenAI",    "OPENAI_API_KEY",    "OPENAI_BASE_URL",    "https://api.openai.com/v1", PROVIDER_CHAT_COMPLETIONS },
+    { "xai",       "grok",   "xAI",       "XAI_API_KEY",       "XAI_BASE_URL",       "https://api.x.ai/v1",       PROVIDER_CHAT_COMPLETIONS, "grok-4.7", "Grok" },
+    { "openai",    "chatgpt","OpenAI",    "OPENAI_API_KEY",    "OPENAI_BASE_URL",    "https://api.openai.com/v1", PROVIDER_CHAT_COMPLETIONS, "gpt-5.2", "ChatGPT" },
     /* no /v1 in the base: ANTHROPIC_BASE_URL is written that way for the SDKs (and Claude Code) */
-    { "anthropic", "claude", "Anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "https://api.anthropic.com", PROVIDER_MESSAGES },
+    { "anthropic", "claude", "Anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "https://api.anthropic.com", PROVIDER_MESSAGES,         "claude-opus-5", "Claude" },
 };
+
+const provider_def *provider_at(int i) {
+    return i >= 0 && (size_t)i < sizeof PROVIDERS / sizeof *PROVIDERS ? &PROVIDERS[i] : NULL;
+}
 
 const provider_def *provider_find(const char *advisor, const char **model) {
     const char *c = advisor ? strchr(advisor, ':') : NULL;
@@ -264,7 +268,7 @@ int provider_model_info(const char *advisor, model_info *mi, char *err, size_t n
     provider_parse_model(advisor, NULL, mi);   /* what it generally takes, until the API says more */
     if (!p) { snprintf(err, n, "'%s' is not a hosted model", advisor ? advisor : ""); return -1; }
     const char *key = getenv(p->key_env);
-    if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest", p->key_env); return -1; }
+    if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest (a NAME=value line without `export` is not passed on)", p->key_env); return -1; }
     if (base_insecure(p, err, n)) return -1;
     const char *hdrs[4]; sbuf keep; auth_headers(p, advisor, key, hdrs, &keep);
     char *id = url_encode(model);
@@ -289,13 +293,53 @@ int provider_model_info(const char *advisor, model_info *mi, char *err, size_t n
     return ret;
 }
 
+/* A provider's model list — {"data":[{"id":…}]} at all three, Anthropic's with a display_name —
+ * as an array of {"id","name"}, in the order given. NULL when the answer is not a list. */
+cJSON *provider_parse_models(const char *json) {
+    cJSON *j = cJSON_Parse(json ? json : ""), *data = cJSON_GetObjectItemCaseSensitive(j, "data"), *m;
+    if (!cJSON_IsArray(data)) { cJSON_Delete(j); return NULL; }
+    cJSON *arr = cJSON_CreateArray();
+    cJSON_ArrayForEach(m, data) {
+        cJSON *id = cJSON_GetObjectItemCaseSensitive(m, "id"), *dn = cJSON_GetObjectItemCaseSensitive(m, "display_name");
+        if (!cJSON_IsString(id) || !id->valuestring[0]) continue;
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "id", id->valuestring);
+        if (cJSON_IsString(dn)) cJSON_AddStringToObject(o, "name", dn->valuestring);
+        cJSON_AddItemToArray(arr, o);
+    }
+    cJSON_Delete(j);
+    return arr;
+}
+
+/* The models the key in the environment can use, for the suggestions under the input field:
+ * asked silently, given up on after wait_ms, NULL without a key or an answer — err then says
+ * which, in the few words a row of that list has room for. */
+cJSON *provider_list_models(const provider_def *p, int wait_ms, char *err, size_t n) {
+    err[0] = 0;
+    const char *key = getenv(p->key_env);
+    if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest", p->key_env); return NULL; }
+    if (base_insecure(p, err, n)) return NULL;
+    const char *hdrs[4]; sbuf keep; auth_headers(p, "", key, hdrs, &keep);
+    sbuf out; sb_init(&out); http_result res;
+    int idle_was = http_idle_timeout_ms, fd_was = http_interrupt_fd;
+    http_headers = hdrs; http_idle_timeout_ms = wait_ms; http_interrupt_fd = -1;
+    int rc = http_request(provider_base_url(p), "GET", p->style == PROVIDER_MESSAGES ? "/v1/models?limit=1000" : "/models", NULL, &out, NULL, NULL, &res);
+    http_headers = NULL; http_idle_timeout_ms = idle_was; http_interrupt_fd = fd_was;
+    cJSON *arr = rc == 0 && res.status == 200 ? provider_parse_models(out.data) : NULL;
+    if (rc != 0) snprintf(err, n, "no model list: %s", res.err);
+    else if (res.status == 404 || (res.status == 200 && !arr)) snprintf(err, n, "%s has no model list at %s", p->label, provider_base_url(p));
+    else if (res.status != 200) status_error(p, "", res.status, out.data, err, n);
+    sb_free(&out); sb_free(&keep);
+    return arr;
+}
+
 char *provider_chat(const char *advisor, const model_info *mi, const provider_request *rq, chat_stats *st, bool *aborted, char *err, size_t n) {
     *aborted = false; err[0] = 0;
     memset(st, 0, sizeof *st);
     const char *model; const provider_def *p = provider_find(advisor, &model);
     if (!p) { snprintf(err, n, "'%s' is not a hosted model", advisor ? advisor : ""); return NULL; }
     const char *key = getenv(p->key_env);
-    if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest", p->key_env); return NULL; }
+    if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest (a NAME=value line without `export` is not passed on)", p->key_env); return NULL; }
     if (base_insecure(p, err, n)) return NULL;
     char *body = provider_request_body(advisor, mi, rq);
     const char *hdrs[4]; sbuf keep; auth_headers(p, advisor, key, hdrs, &keep);

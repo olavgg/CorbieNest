@@ -122,6 +122,7 @@ larger ones skipped.)
 | `/diff [git args]` | show `git diff` of the working tree (stat, patch, untracked files) for you only — nothing is added to the conversation; `/diff --staged`, `/diff HEAD~1` … pass through |
 | `/rewind` | (or **Esc Esc** at an empty prompt) pick an earlier request and go back: undo the file changes the model made since (files are checkpointed before every `write_file`/`edit_file`), truncate the conversation to just before it (the request text returns to the editor), or both |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
+| `/usage`, `/usage price MODEL IN OUT\|default` | tokens per model in this session — the main model, the advisor — and the **estimated cost** of the hosted ones, at the provider's list price per million tokens (built in, as of October 2026) or the one you set with `price`. The same estimate is on each consultation's result line (`⎿ advice · 4.2k tokens · 12s · ≈ $0.03`) and in `/cost`. An estimate: what was billed is on the provider's usage page |
 | `/system [text\|clear]` | extra system instructions |
 | `/think on\|off\|auto`, `/think show\|hide` | *when* a thinking-capable model thinks: `auto` (default) lets it think about each request once and turns thinking off for the tool rounds that follow, `on` thinks on every call, `off` never. *How hard* is `/effort` (`/think low\|medium\|high\|max` still works, as an alias for it) |
 | `/effort [LEVEL\|default]` | how hard **this model** thinks, in the levels it has — see [Effort](#effort). No argument opens a picker of them; `default` leaves it to the model. Kept per model, shown next to the model's name in the status bar |
@@ -129,7 +130,7 @@ larger ones skipped.)
 | `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (`.corbienest/permissions`) |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
-| `/init` | have the model explore the project and write a `CORBIENEST.md` (build/test commands, architecture, conventions); improves an existing one |
+| `/init` | have the model explore the project and write an `AGENTS.md` (build/test commands, architecture, conventions); improves an existing one |
 | `/skills [reload\|new NAME]` | list skills; run one with `/NAME [args]` |
 | `/tools on\|off` | enable/disable tools |
 | `/web [on\|off\|engine URL]` | whether the model may look documentation up with `web_search`/`web_fetch` (on by default; saved), and which search engine it uses (`%s` = the query; `/web engine default` restores DuckDuckGo) |
@@ -145,15 +146,44 @@ larger ones skipped.)
 
 ### Input tricks
 
-- `!cmd` — run a shell command yourself; its output is added to the conversation.
-- `@path` — attach a file (or a directory listing) to your message.
+- `!cmd` — run a shell command yourself; its output is added to the conversation. The line is
+  completed the way a shell would do it: where a command goes (the first word, or after `|`,
+  `;`, `&&`) the programs in `$PATH` that start with what you typed are listed, the shortest
+  first; any other word is offered the files and directories whose name starts with it —
+  found wherever they are below the working directory, as for `@` (`!cat term` → `src/term.c`),
+  and `!ls src/` lists `src`. Lines you ran before that go on from what you have typed come
+  first, so a bare `!` shows your last shell commands. Nothing is offered inside quotes.
+- `@path` — attach a file (or a directory listing) to your message. You do not have to know
+  the path: while you type, the files that match the name so far are listed under the input
+  field — `@term` finds `src/term.c`, wherever it is (a name that starts with what you typed
+  first, then one that contains it, then one with its letters in that order). A directory in
+  front says where to look, also outside the working directory: `@../lib/pa` searches below
+  `../lib`, `@src/` lists `src`. Tab completes, ↓ steps into the list, Enter takes the
+  highlighted file, Esc closes it. A bare name sent as it is (`@term.c`) is attached when
+  exactly one file has it; when several do, they are named and none is guessed.
+- `/` — the commands that match what you have typed are listed the same way, each with what
+  it does, and after the command its options (`/mode ` → `manual`, `accept-edits`, `plan`,
+  `auto`; `/effort ` → the levels this model has; `/cd ` → directories). The list is a preview
+  until you step into it: Enter still sends what you typed.
+- All three lists come up **while the model works** as well, for what you are typing ahead:
+  `/` shows the commands, Tab completes, ↓ steps in and Enter takes the highlighted row. There
+  Esc closes the list first; it is the Esc after that one which stops the model.
 - `# fact` — remember something: a menu asks which section of `.corbienest/memory.md` it belongs
   to (Project / User / Feedback / Reference) and the line is appended, no model call involved.
 - Enter sends; Alt+Enter, Ctrl+J or a trailing `\` inserts a newline. Bracketed paste works.
 - Ctrl-C (or Esc) cancels a running generation / clears the line (twice on an empty line quits).
-- PgUp at the prompt scrolls back through the conversation (the alternate screen has no scrollback of
-  its own, so corbienest keeps one): PgUp/PgDn/↑/↓ move, Home/End jump, Esc/Enter/PgDn at the bottom
-  return to the prompt exactly as it was.
+- The **mouse wheel** and PgUp/PgDn scroll back through the conversation (the alternate screen has
+  no scrollback of its own, so corbienest keeps one) — at the prompt and while the model works:
+  what arrives meanwhile is kept and shown when you scroll back down, and Esc returns to the
+  output at once (it takes a second Esc to stop the model). While you are scrolled back a line
+  under the conversation says which rows you are looking at and how to get back; the status
+  bar stays what it is, so the mode, the tokens and what the model is doing remain in view. At the prompt ↑/↓ scroll too,
+  Home/End jump, and Esc/Enter return to the prompt exactly as it was; anything you type
+  returns as well and goes into your message. The wheel only scrolls the conversation: over
+  the input field it does nothing, and ↑/↓ there are always the keyboard's (history, or the
+  lines of what you are writing). corbienest asks the terminal for the mouse to get the wheel
+  as a wheel — so **selecting text with the mouse needs Shift held down** (Option in iTerm2),
+  as in any full-screen program.
   Esc twice at an empty prompt opens `/rewind`.
 - **You can keep typing while the model works.** What you type shows up in the input field as
   you go (`❯ …▏`); press Enter to queue it as a message — add details,
@@ -167,7 +197,7 @@ larger ones skipped.)
   you like; they are sent in order, and a `/command` waiting for the end of the turn does not
   hold back the messages behind it. Ctrl-C hands queued text back to the editor instead of
   sending it. Text without Enter simply reappears in the prompt afterwards.
-- Tab completes slash commands and skill names; ↑/↓ browse history — the latest 100 queries are
+- Tab completes slash commands, their options, skill names, `@files` and the words of a `!line`; ↑/↓ browse history — the latest 100 queries are
   kept in `~/.config/corbienest/history` (`/history` lists them). Ctrl-R searches it
   incrementally (`(reverse-i-search)`, like bash): type to refine, Ctrl-R again for an older
   match, Enter keeps the match in the editor, Esc restores what you had.
@@ -180,6 +210,44 @@ larger ones skipped.)
   tool confirmations still to come, like Shift+Tab, and `/max_iters` to the rounds still to come. Everything that touches the conversation (`/clear`, `/compact`,
   `/rewind`, `/resume`, `/save`, `/system`, `/init`, skills), needs the server (`/model`,
   `/models`, `/ctx`, `/host`, `/memory update`) or asks a question stays queued until the turn ends.
+
+### When something is drawn wrong
+
+Terminals differ, and a drawing problem that shows in one and not in another cannot be fixed
+from a description. corbienest can record what it draws and what the terminal sends it:
+
+```sh
+CORBIENEST_TRACE=/tmp/corbie.trace corbienest      # reproduce the problem, then quit
+tools/trace_replay.py /tmp/corbie.trace --info     # sizes, layout changes, keys and mouse reports
+tools/trace_replay.py /tmp/corbie.trace            # play it back, in a terminal of the same size
+tools/trace_replay.py /tmp/corbie.trace --from 40 --step   # from 40 s on, one write per Enter
+```
+
+The trace is plain text, one record per line with its time: every write to the terminal, the
+output held back while scrolled back, every byte read from it, and each change of layout. A
+replay in another terminal shows whether the problem is in what corbienest wrote or in what
+that terminal made of it; `--until SEC` stops at the moment in question and holds the picture.
+**The file holds the whole conversation and everything you typed** — the session says so at the
+top while it is being recorded, the file is created readable by you alone, and it is yours to
+pass on or not. Say which terminal program you use: that is the one thing the trace cannot tell.
+
+### In tmux
+
+corbienest runs in a tmux pane like in any terminal, and nothing has to be configured:
+
+- **The wheel scrolls the conversation** whether tmux's own `mouse` option is off or on. (An
+  application that does not ask for the mouse gets the wheel as ↑/↓ keys from the terminal, or
+  loses it to tmux's copy mode — of an alternate screen, which has no history to show.
+  corbienest asks, so tmux hands the wheel over.)
+- **Splitting, zooming or resizing the pane redraws at once**: the input field and the bar move
+  to the new last rows and the conversation is laid out again for the new width, from
+  corbienest's own scrollback, without waiting for a key.
+- To select text with the mouse hold Shift (that is the terminal's selection, across panes), or
+  use tmux's copy mode from the keyboard (`prefix [`): it shows what is on screen, so scroll
+  corbienest back first to copy something older.
+- Esc reaches a program in tmux only after tmux's `escape-time` (500 ms by default in tmux 3.4):
+  `set -sg escape-time 10` in `~/.tmux.conf` makes Esc — cancel, back from the scrollback —
+  as quick as outside tmux.
 
 ### Permission modes
 
@@ -247,7 +315,7 @@ request: never guess at another project's API, options or errors — search for 
 them, match the version this project actually uses (lockfile, manifest, image tag), say which
 page you used, and skip the web when the repository answers the question. It is deliberately
 one line: the two tools' own descriptions carry the rest, and a system prompt is re-sent with
-every single call. Naming the doc sites you care about in `CORBIENEST.md` makes it concrete —
+every single call. Naming the doc sites you care about in `AGENTS.md` makes it concrete —
 see [Project instructions](#project-instructions).
 
 Pages come in through the `curl` (or `wget`) program, which already brings redirects, size caps
@@ -358,7 +426,7 @@ do quit with an update still pending, the flush on the way out says so and Ctrl-
 
 ### Project instructions
 
-If a `CORBIENEST.md`, `CLAUDE.md` or `AGENTS.md` exists in the working directory it is
+If an `AGENTS.md`, `CORBIENEST.md` or `CLAUDE.md` exists in the working directory it is
 appended to the system prompt, so you can give the model project-specific guidance (up to
 32 KB). `/init` writes a first one for you.
 
@@ -420,7 +488,12 @@ since then (deepseek-r1, for one) shows up there as chat-only.
 `/advisor MODEL` names a stronger model that the agent may **consult** while it works — a bigger
 local model, one of Ollama's cloud models (`/advisor gpt-oss:120b-cloud`; run `ollama signin`
 once, the local server relays the call), or a hosted API: xAI's Grok, OpenAI, or Anthropic's
-Claude (see [Hosted advisors](#hosted-advisors)). The agent gets an `advisor` tool and is told
+Claude (see [Hosted advisors](#hosted-advisors)). As you type `/advisor ` the list under the input field offers the hosted providers (`xai:`,
+`openai:`, `anthropic:` — typing `grok`, `chatgpt` or `claude` finds them too) and the installed
+models, and behind a provider's prefix the models its key can use, asked from the provider's
+own model list. Bare `/advisor` lists the three kinds, with
+the key each hosted provider wants and whether it is set, and what `guidance` and `effort` do,
+above its picker. The agent gets an `advisor` tool and is told
 when to use it: before it commits to an approach for a non-trivial change, when an error has
 survived two fixes or a result makes no sense, and before it calls a difficult task done. You
 can also just say so: *"ask the advisor before you continue"*.
@@ -496,7 +569,7 @@ conversation again.
 | provider | name it | key | base URL (override) | API |
 |---|---|---|---|---|
 | xAI (Grok) | `xai:grok-4.7` (or `grok:…`) | `XAI_API_KEY` | `https://api.x.ai/v1` (`XAI_BASE_URL`) | Chat Completions |
-| OpenAI | `openai:gpt-5.2` | `OPENAI_API_KEY` | `https://api.openai.com/v1` (`OPENAI_BASE_URL`) | Chat Completions |
+| OpenAI | `openai:gpt-5.2` (or `chatgpt:…`) | `OPENAI_API_KEY` | `https://api.openai.com/v1` (`OPENAI_BASE_URL`) | Chat Completions |
 | Anthropic (Claude) | `anthropic:claude-opus-5` (or `claude:…`) | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` (`ANTHROPIC_BASE_URL`) | Messages |
 
 - **Keys come from the environment only** — export one before starting corbienest. They are
@@ -523,7 +596,7 @@ conversation again.
 ### Config
 
 Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N` are saved to
-`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, and for a hosted advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
+`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, `CORBIENEST_TRACE` (a file to record the session's drawing into, see below), and for a hosted advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
 
 ### Running more than one session
 
@@ -565,7 +638,8 @@ make test
   markdown printer, text tool-call recovery, every tool (read/write/edit/list/grep/bash
   including timeouts and non-interactive denial), URL checks and the HTML-to-text and
   search-result extraction behind `web_fetch`/`web_search`, permission modes, skills
-  (frontmatter parsing, `$ARGUMENTS`, scaffolding), what each kind of model can be set to and
+  (frontmatter parsing, `$ARGUMENTS`, scaffolding), which files a half-typed `@name` finds and
+  in what order, what each kind of model can be set to and
   what is sent as `think` for every combination of `/think`, `/effort` and kind of call,
   where an advisor consultation runs and what it is shown at each guidance level, and what goes
   to and comes back from the hosted APIs (request bodies, answers, refusals, errors).
@@ -576,7 +650,11 @@ make test
   the confirmation menu (arrow keys, deny with reason, always, stray keys ignored),
   messages queued with Enter while the model streams or a tool runs (they stop the command,
   the round and the sub-agent in flight, step past a queued `/command`, and are handed back on
-  Ctrl-C), the `/ctx` picker and `/history`,
+  Ctrl-C), the mouse wheel and the scrollback (at the prompt, while a reply streams, over the
+  input field), the suggestions for `/commands`, their options, `@files` and `!lines` (at the
+  prompt and while the model works), a resize at an idle
+  prompt, the same wheel and resize through a real tmux when one is installed (its `mouse`
+  option off and on), the `/ctx` picker and `/history`,
   Shift+Tab mode cycling (plan / accept-edits behaviour), `/skills`, Ctrl-C interruption,
   slash commands, the `/model` picker, `!cmd`, `/save`, config/history persistence, `/effort`
   (per-model levels, the picker, the status bar), `/advisor` (the consultation, its limit,
@@ -590,10 +668,11 @@ make test
 
 ```
 src/common.h   shared declarations
-src/util.c     string buffer, file helpers, config, URL checks + HTML-to-text + search results
+src/util.c     string buffer, file helpers, config, the file finder behind @mentions,
+               URL checks + HTML-to-text + search results
 src/http.c     the HTTP(S) client over libcurl (streaming, Esc interrupt, idle timeout)
-src/term.c     raw mode, key decoding, full-screen mode + status bar, line editor, confirmation menu,
-               list picker, markdown printer
+src/term.c     raw mode, key and mouse decoding, full-screen mode + status bar, scrollback, line editor
+               with its suggestion list, confirmation menu, list picker, markdown printer
 src/tools.c    the tools + permission-mode checks + shell runner
 src/ollama.c   /api/chat streaming, tool-call accumulation, /api/tags, /api/show (capabilities, effort levels)
 src/provider.c the hosted APIs the advisor can consult: xAI, OpenAI (Chat Completions), Anthropic (Messages)

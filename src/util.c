@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "common.h"
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -8,6 +9,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #include <pwd.h>
 
@@ -138,6 +140,233 @@ char *expand_home(const char *path) {
 int is_dir(const char *path) { struct stat st; return stat(path, &st) == 0 && S_ISDIR(st.st_mode); }
 int is_file(const char *path) { struct stat st; return stat(path, &st) == 0 && S_ISREG(st.st_mode); }
 
+/* ---------- finding the file a half-typed name means (@file, /cd) ----------
+ * A name is rarely typed from the directory it lives in, so what is typed is taken as a hint
+ * rather than as a path: "@term" finds src/term.c. The tree below the directory typed so far
+ * (the working directory when there is none: "@../lib/pa" looks below ../lib) is read once,
+ * breadth first — what is near comes first, and the bound on how much is read cuts off what is
+ * deep — and kept for a moment, since the next letter asks about the same tree. */
+/* The same words expand_mentions() (main.c) attaches, short of its search for a bare name: this
+ * runs with every redraw of the input field, so it costs a stat per mention and nothing more. */
+int mention_spans(const char *buf, size_t len, size_t (*spans)[2], int max) {
+    int n = 0;
+    for (size_t i = 0; i < len && n < max; i++) {
+        if (buf[i] != '@' || (i > 0 && !isspace((unsigned char)buf[i - 1]))) continue;
+        size_t s = i + 1, e = s;
+        while (e < len && !isspace((unsigned char)buf[e])) e++;
+        while (e > s && strchr(",.;:)!?", buf[e - 1])) e--;
+        if (e == s) continue;
+        char *path = xstrndup(buf + s, e - s), *fp = expand_home(path);
+        if (is_file(fp) || is_dir(fp)) { spans[n][0] = i; spans[n][1] = e; n++; }
+        free(path); free(fp);
+        i = e - 1;
+    }
+    return n;
+}
+
+long mention_start(const char *buf, size_t cur) {
+    size_t i = cur;
+    while (i > 0 && !isspace((unsigned char)buf[i - 1])) i--;   /* start of the word the cursor is in */
+    return i < cur && buf[i] == '@' ? (long)i + 1 : -1;
+}
+
+#define WALK_MAX   20000   /* entries read: what one keystroke may cost */
+#define WALK_DEPTH 12
+#define WALK_KEEP  2       /* seconds the listing is good for */
+typedef struct { char *rel; bool dir, link; int depth; } walk_ent;
+static walk_ent *g_walk = NULL;
+static int g_walk_n = 0, g_walk_cap = 0;
+static char *g_walk_root = NULL;
+static time_t g_walk_at = 0;
+
+static bool walk_skip(const char *name) {   /* (the directories the grep tool leaves out too) */
+    static const char *SKIP[] = { ".", "..", ".git", "node_modules", ".venv", "__pycache__", ".hg", ".svn" };
+    for (size_t i = 0; i < sizeof SKIP / sizeof *SKIP; i++) if (!strcmp(name, SKIP[i])) return true;
+    return name[strcspn(name, " \t\r\n")] != 0;   /* a mention ends at whitespace: it could not be written */
+}
+static int walk_cmp(const void *a, const void *b) { return strcmp(((const walk_ent *)a)->rel, ((const walk_ent *)b)->rel); }
+
+static void walk_tree(const char *root) {
+    time_t now = time(NULL);
+    char *abs = realpath(root, NULL);   /* by its real name: "." is another place after a /cd */
+    if (abs && g_walk_root && !strcmp(g_walk_root, abs) && now - g_walk_at < WALK_KEEP && now >= g_walk_at) { free(abs); return; }
+    for (int i = 0; i < g_walk_n; i++) free(g_walk[i].rel);
+    g_walk_n = 0;
+    free(g_walk_root); g_walk_root = abs; g_walk_at = now;
+    if (!abs) return;   /* no such directory */
+    /* the list is its own queue: entry i is read after everything that was found before it */
+    for (int i = -1; i < g_walk_n && g_walk_n < WALK_MAX; i++) {
+        if (i >= 0 && (!g_walk[i].dir || g_walk[i].link || g_walk[i].depth >= WALK_DEPTH)) continue;
+        const char *rel = i < 0 ? "" : g_walk[i].rel;   /* (its own allocation: growing the list does not move it) */
+        int depth = i < 0 ? 0 : g_walk[i].depth + 1, from = g_walk_n;
+        sbuf dp; sb_init(&dp); sb_printf(&dp, "%s%s%s", abs, *rel ? "/" : "", rel);
+        DIR *d = opendir(dp.data);
+        struct dirent *de;
+        while (d && (de = readdir(d)) && g_walk_n < WALK_MAX) {
+            if (walk_skip(de->d_name)) continue;
+            bool dir = de->d_type == DT_DIR, link = false;
+            if (de->d_type != DT_DIR && de->d_type != DT_REG) {   /* a link, or a filesystem that does not say */
+                sbuf fp; sb_init(&fp); sb_printf(&fp, "%s/%s", dp.data, de->d_name);
+                struct stat st;
+                bool ok = lstat(fp.data, &st) == 0;
+                if (ok && S_ISLNK(st.st_mode)) { link = true; ok = stat(fp.data, &st) == 0; }   /* listed, never followed: it may point back up */
+                sb_free(&fp);
+                if (!ok || (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode))) continue;
+                dir = S_ISDIR(st.st_mode);
+            }
+            if (g_walk_n == g_walk_cap) { g_walk_cap = g_walk_cap ? g_walk_cap * 2 : 512; g_walk = xrealloc(g_walk, sizeof *g_walk * (size_t)g_walk_cap); }
+            sbuf r; sb_init(&r); sb_printf(&r, "%s%s%s", rel, *rel ? "/" : "", de->d_name);
+            g_walk[g_walk_n++] = (walk_ent){ sb_detach(&r), dir, link, depth };
+        }
+        if (d) closedir(d);
+        sb_free(&dp);
+        qsort(g_walk + from, (size_t)(g_walk_n - from), sizeof *g_walk, walk_cmp);   /* readdir's order is nobody's */
+    }
+}
+
+static bool subseq(const char *hay, const char *needle) {   /* the letters of needle, in order, somewhere in hay */
+    for (; *needle; needle++, hay++) {
+        while (*hay && tolower((unsigned char)*hay) != tolower((unsigned char)*needle)) hay++;
+        if (!*hay) return false;
+    }
+    return true;
+}
+
+void file_matches_free(file_match *m, int n) {
+    for (int i = 0; i < n; i++) free(m[i].path);
+    free(m);
+}
+
+int file_complete(const char *typed, bool dirs_only, int max, file_match **out) {
+    const char *slash = strrchr(typed, '/'), *needle = slash ? slash + 1 : typed;
+    char *prefix = xstrndup(typed, (size_t)(needle - typed));   /* as typed ("../lib/", "~/"): it goes back in front of what is found */
+    char *root = *prefix ? expand_home(prefix) : xstrdup(".");
+    size_t nl = strlen(needle);
+    file_match *m = xmalloc(sizeof *m * (size_t)(max > 0 ? max : 1));
+    int n = 0;
+    /* What was typed is a directory as it stands ("..", "src", "~"): going into it comes first. */
+    if (nl && max > 0) {
+        char *self = expand_home(typed);
+        if (is_dir(self)) { sbuf b; sb_init(&b); sb_printf(&b, "%s/", typed); m[n++] = (file_match){ sb_detach(&b), true }; }
+        free(self);
+    }
+    walk_tree(root);
+    /* Best first: a name in the directory itself that starts with what was typed (plain path
+     * completion), a file name anywhere below that starts with it, one that contains it, and
+     * last one that merely has its letters in that order. Nothing typed yet lists the directory. */
+    for (int tier = 0; tier < 4 && n < max; tier++)
+        for (int i = 0; i < g_walk_n && n < max; i++) {
+            const walk_ent *e = &g_walk[i];
+            if (dirs_only && !e->dir) continue;
+            const char *base = strrchr(e->rel, '/'); base = base ? base + 1 : e->rel;
+            int t = -1;
+            if (!nl) { if (e->depth == 0 && base[0] != '.') t = 0; }
+            else if (!strncasecmp(base, needle, nl)) t = e->depth == 0 ? 0 : 1;
+            else if (strcasestr(base, needle)) t = 2;
+            else if (!e->dir && nl >= 2 && subseq(base, needle)) t = 3;
+            if (t != tier) continue;
+            sbuf b; sb_init(&b); sb_printf(&b, "%s%s%s", prefix, e->rel, e->dir ? "/" : "");
+            if (n && !strcmp(m[0].path, b.data)) { sb_free(&b); continue; }   /* the directory offered above */
+            m[n++] = (file_match){ sb_detach(&b), e->dir };
+        }
+    free(prefix); free(root);
+    *out = m;
+    return n;
+}
+
+char *file_find_named(const char *name, int *count, sbuf *names) {
+    *count = 0;
+    while (!strncmp(name, "./", 2)) name += 2;
+    if (!*name || name[0] == '/' || name[0] == '~' || !strncmp(name, "../", 3)) return NULL;   /* a place was named, and it is not there */
+    size_t nl = strlen(name);
+    const char *found = NULL;
+    walk_tree(".");
+    for (int i = 0; i < g_walk_n; i++) {
+        const char *rel = g_walk[i].rel; size_t rl = strlen(rel);
+        if (g_walk[i].dir || rl < nl || strcmp(rel + rl - nl, name) || (rl > nl && rel[rl - nl - 1] != '/')) continue;
+        if (!found) found = rel;
+        if (names && *count < 5) sb_printf(names, "%s%s", *count ? ", " : "", rel);
+        ++*count;
+    }
+    return *count == 1 ? xstrdup(found) : NULL;
+}
+
+/* ---------- what a word of a "!line" could become ----------
+ * A shell line has two kinds of word: where a command goes — the start of the line, or after
+ * | ; & ( — it is one of the programs in $PATH, anywhere else it may be a path. Inside quotes it
+ * is text, and nothing is offered for that. */
+#define SHELL_BREAKS "|;&(<>="   /* besides whitespace: what a word ends at */
+long shell_word(const char *buf, size_t cur, bool *command) {
+    if (cur < 1) return -1;
+    char q = 0;
+    for (size_t i = 1; i < cur; i++) {
+        char c = buf[i];
+        if (c == '\\' && q != '\'') i++;   /* the character after it is just that character */
+        else if (q) { if (c == q) q = 0; }
+        else if (c == '\'' || c == '"') q = c;
+    }
+    if (q) return -1;
+    size_t ws = cur;
+    while (ws > 1) {
+        char c = buf[ws - 1];
+        if (!(ws > 2 && buf[ws - 2] == '\\') && (isspace((unsigned char)c) || strchr(SHELL_BREAKS, c))) break;
+        ws--;
+    }
+    size_t p = ws;
+    while (p > 1 && (buf[p - 1] == ' ' || buf[p - 1] == '\t')) p--;
+    *command = p == 1 || strchr("|;&(\n", buf[p - 1]) != NULL;
+    return (long)ws;
+}
+
+char *shell_escape(const char *s) {
+    sbuf b; sb_init(&b); sb_append(&b, "", 0);
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (!isalnum(c) && c < 0x80 && !strchr("_-./~+:@%,", c)) sb_putc(&b, '\\');
+        sb_putc(&b, (char)c);
+    }
+    return sb_detach(&b);
+}
+
+static int cmd_cmp(const void *a, const void *b) {   /* the short names first: "git" is meant more often than "gi-compile-repository" */
+    const char *x = ((const file_match *)a)->path, *y = ((const file_match *)b)->path;
+    size_t xl = strlen(x), yl = strlen(y);
+    return xl != yl ? (xl < yl ? -1 : 1) : strcmp(x, y);
+}
+
+int command_complete(const char *typed, int max, file_match **out) {
+    size_t tl = strlen(typed);
+    file_match *m = NULL;
+    int n = 0, cap = 0, k = 0;
+    const char *path = getenv("PATH");
+    for (const char *p = path ? path : ""; *p; p += strspn(p, ":")) {
+        size_t dl = strcspn(p, ":");
+        char *dir = xstrndup(p, dl);
+        p += dl;
+        DIR *d = opendir(dir);
+        struct dirent *de;
+        while (d && (de = readdir(d))) {
+            if (de->d_name[0] == '.' || strncmp(de->d_name, typed, tl)) continue;
+            sbuf fp; sb_init(&fp); sb_printf(&fp, "%s/%s", dir, de->d_name);
+            struct stat st;
+            bool ok = stat(fp.data, &st) == 0 && S_ISREG(st.st_mode) && access(fp.data, X_OK) == 0;
+            sb_free(&fp);
+            if (!ok) continue;
+            if (n == cap) { cap = cap ? cap * 2 : 64; m = xrealloc(m, sizeof *m * (size_t)cap); }
+            m[n++] = (file_match){ xstrdup(de->d_name), false };
+        }
+        if (d) closedir(d);
+        free(dir);
+    }
+    if (n) qsort(m, (size_t)n, sizeof *m, cmd_cmp);
+    for (int i = 0; i < n; i++) {   /* each name once (it is in /bin and in /usr/bin), and no more than asked for */
+        if (k < max && (!k || strcmp(m[k - 1].path, m[i].path))) m[k++] = m[i];
+        else free(m[i].path);
+    }
+    *out = m;
+    return k;
+}
+
 /* ---------- config ---------- */
 const char *config_dir(void) {
     static char dir[1024];
@@ -170,7 +399,7 @@ void config_load(void) {
         trim(line);
         if (!line[0] || line[0] == '#') continue;
         /* key=value, split at the first '=' — except effort.<model>=<level>, at the last: a model name may hold one, a level never does */
-        char *eq = !strncmp(line, "effort.", 7) ? strrchr(line, '=') : strchr(line, '=');
+        char *eq = !strncmp(line, "effort.", 7) || !strncmp(line, "price.", 6) ? strrchr(line, '=') : strchr(line, '=');
         if (!eq) continue;
         *eq = 0;
         const char *k = line, *v = eq + 1;
@@ -181,6 +410,7 @@ void config_load(void) {
         else if (!strcmp(k, "think")) g_cfg.think = atoi(v);
         else if (!strcmp(k, "think_level")) { free(legacy_level); legacy_level = *v ? xstrdup(v) : NULL; }
         else if (!strncmp(k, "effort.", 7)) { if (k[7] && effort_name_ok(v)) effort_set(k + 7, v); }
+        else if (!strncmp(k, "price.", 6)) { double pi, po; if (k[6] && sscanf(v, "%lf/%lf", &pi, &po) == 2 && pi >= 0 && po >= 0) price_set(k + 6, pi, po); }
         else if (!strcmp(k, "advisor")) { free(g_cfg.advisor); g_cfg.advisor = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "advisor_ctx")) { int n = atoi(v); if (n == 0 || n >= ADVISOR_CTX_MIN) g_cfg.advisor_ctx = n; }
         else if (!strcmp(k, "advisor_guidance")) { int n = advisor_guidance_parse(v); if (n >= 0) g_cfg.advisor_guidance = n; }
@@ -216,6 +446,7 @@ void config_save(void) {
     if (g_cfg.temperature >= 0) sb_printf(&b, "temperature=%g\n", g_cfg.temperature);
     sb_printf(&b, "think=%d\n", g_cfg.think);
     for (int i = 0; i < g_cfg.n_efforts; i++) sb_printf(&b, "effort.%s=%s\n", g_cfg.efforts[i].model, g_cfg.efforts[i].level);
+    for (int i = 0; i < g_cfg.n_prices; i++) sb_printf(&b, "price.%s=%g/%g\n", g_cfg.prices[i].model, g_cfg.prices[i].in, g_cfg.prices[i].out);
     if (g_cfg.advisor) sb_printf(&b, "advisor=%s\n", g_cfg.advisor);
     if (g_cfg.advisor_ctx > 0) sb_printf(&b, "advisor_ctx=%d\n", g_cfg.advisor_ctx);
     if (g_cfg.advisor_guidance != GUIDANCE_NORMAL) sb_printf(&b, "advisor_guidance=%s\n", advisor_guidance()->name);
@@ -252,6 +483,72 @@ bool model_same(const char *a, const char *b) {
 bool model_is_cloud(const char *name) {
     size_t l = name ? strlen(name) : 0;
     return l > 6 && (!strcmp(name + l - 6, ":cloud") || !strcmp(name + l - 6, "-cloud"));
+}
+
+/* ---------- prices ----------
+ * The providers' list prices, USD per million input / output tokens, as their pricing pages had
+ * them in October 2026. Prices move and models come and go: /usage says which price it used, and
+ * /usage price sets another. The higher rates some charge for a very long prompt (xAI from 200k
+ * tokens, OpenAI from 272k, Haiku 5.5 from 100k) are left out: the one hosted call corbienest
+ * makes is a consultation, whose brief is capped far below that. */
+static const struct { const char *name; double in, out; } LIST_PRICES[] = {
+    { "anthropic:claude-fable-5", 10, 50 },   { "anthropic:claude-mythos-5", 10, 50 },
+    { "anthropic:claude-opus-5-5", 4, 20 },   { "anthropic:claude-opus-5", 5, 25 },
+    { "anthropic:claude-opus-4", 5, 25 },     { "anthropic:claude-opus-4-1", 15, 75 },
+    { "anthropic:claude-sonnet-5", 2, 10 },   { "anthropic:claude-sonnet-4", 3, 15 },
+    { "anthropic:claude-haiku-5", 0.10, 0.50 }, { "anthropic:claude-haiku-4-5", 1, 5 },
+    { "openai:gpt-6-astra", 10, 50 },   { "openai:gpt-6.1-sol", 2, 10 },    { "openai:gpt-6-sol", 2, 10 },      { "openai:gpt-6-luna", 0.10, 0.50 },
+    { "openai:gpt-5.6-sol", 4, 20 },    { "openai:gpt-5.6-terra", 2, 12 },  { "openai:gpt-5.6-luna", 0.20, 1.20 },
+    { "openai:gpt-5.5", 5, 30 },        { "openai:gpt-5.5-pro", 30, 180 },
+    { "openai:gpt-5.4", 2.50, 15 },     { "openai:gpt-5.4-mini", 0.75, 4.50 }, { "openai:gpt-5.4-nano", 0.20, 1.25 }, { "openai:gpt-5.4-pro", 30, 180 },
+    { "openai:gpt-5.2", 1.75, 14 },     { "openai:gpt-5.2-pro", 21, 168 },  { "openai:gpt-5.1", 1.25, 10 },
+    { "openai:gpt-5", 1.25, 10 },       { "openai:gpt-5-mini", 0.25, 2 },   { "openai:gpt-5-nano", 0.05, 0.40 }, { "openai:gpt-5-pro", 15, 120 },
+    { "openai:gpt-4.1", 2, 8 },         { "openai:gpt-4.1-mini", 0.40, 1.60 }, { "openai:gpt-4.1-nano", 0.10, 0.40 },
+    { "openai:gpt-4o", 2.50, 10 },      { "openai:gpt-4o-mini", 0.15, 0.60 },
+    { "openai:o3", 2, 8 },              { "openai:o3-pro", 20, 80 },        { "openai:o3-mini", 1.10, 4.40 },   { "openai:o4-mini", 1.10, 4.40 },
+    { "xai:grok-4.7", 2, 6 },           { "xai:grok-4.6", 2, 6 },           { "xai:grok-4.5", 2, 6 },
+    { "xai:grok-4.3", 1.25, 2.50 },     { "xai:grok-4.20", 1.25, 2.50 },    { "xai:grok-4.20-multi-agent", 1.25, 2.50 }, { "xai:grok-build-0.1", 1, 2 },
+};
+
+/* a hosted model under its provider's own name ("claude:x" is "anthropic:x"); any other as it is. malloc'd */
+static char *price_key(const char *model) {
+    const char *m; const provider_def *p = provider_find(model, &m);
+    if (!p) return xstrdup(model);
+    sbuf b; sb_init(&b); sb_printf(&b, "%s:%s", p->name, m);
+    return sb_detach(&b);
+}
+
+int model_price(const char *model, double *in, double *out) {
+    if (!model || !*model) return 0;
+    char *key = price_key(model);
+    int found = 0; size_t best = 0;
+    for (int i = 0; !found && i < g_cfg.n_prices; i++)
+        if (!strcmp(g_cfg.prices[i].model, key)) { *in = g_cfg.prices[i].in; *out = g_cfg.prices[i].out; found = 2; }
+    /* the name itself, or a dated snapshot of it ("-2026…") — "gpt-5" says nothing about "gpt-5.9" or "gpt-5-mini" */
+    for (size_t i = 0; !found && i < sizeof LIST_PRICES / sizeof *LIST_PRICES; i++) {
+        size_t l = strlen(LIST_PRICES[i].name);
+        if (l <= best || strncmp(key, LIST_PRICES[i].name, l)) continue;
+        if (key[l] && !(key[l] == '-' && isdigit((unsigned char)key[l + 1]))) continue;
+        *in = LIST_PRICES[i].in; *out = LIST_PRICES[i].out; best = l;
+    }
+    free(key);
+    return found ? found : best ? 1 : 0;
+}
+
+void price_set(const char *model, double in, double out) {
+    if (!model || !*model || strchr(model, '\n')) return;
+    char *key = price_key(model);
+    int i = 0;
+    while (i < g_cfg.n_prices && strcmp(g_cfg.prices[i].model, key)) i++;
+    if (in < 0) {   /* forget it */
+        if (i < g_cfg.n_prices) { free(g_cfg.prices[i].model); g_cfg.prices[i] = g_cfg.prices[--g_cfg.n_prices]; }
+        free(key);
+        return;
+    }
+    if (i == g_cfg.n_prices) {
+        g_cfg.prices = xrealloc(g_cfg.prices, sizeof *g_cfg.prices * (size_t)(g_cfg.n_prices + 1));
+        g_cfg.prices[g_cfg.n_prices++] = (price_entry){ key, in, out };
+    } else { g_cfg.prices[i].in = in; g_cfg.prices[i].out = out; free(key); }
 }
 
 const char *effort_get(const char *model) {

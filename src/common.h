@@ -58,6 +58,34 @@ char *expand_home(const char *path);   /* "~/x" -> "/home/u/x", malloc'd */
 int   is_dir(const char *path);
 int   is_file(const char *path);
 
+/* Finding the file a half-typed name means (the suggestions for "@file", and "@name" as sent).
+ * mention_start(): the offset just after the '@' of the mention the cursor (byte `cur`) is in —
+ * an '@' that starts a word — or -1. file_complete(): up to `max` paths for what was typed after
+ * it, best first: `typed` may carry a directory ("../lib/pa", "~/", "src/") — the search is below
+ * that one, the working directory otherwise — and its last part is matched against file names:
+ * those starting with it, those containing it, those with its letters in order. Paths come back
+ * the way they would be typed, a directory with a trailing '/'. file_find_named(): the one file
+ * below the working directory with that name (or path ending), malloc'd; NULL when there is none
+ * or more than one — *count says how many, and `names` (if given) lists the first few. */
+typedef struct { char *path; bool dir; } file_match;
+long  mention_start(const char *buf, size_t cur);
+/* The "@path" mentions in buf[0..len) that name a file or a directory that is there, as
+ * [start, end) byte ranges from the '@' on: what the input field colours. At most max. */
+int   mention_spans(const char *buf, size_t len, size_t (*spans)[2], int max);
+int   file_complete(const char *typed, bool dirs_only, int max, file_match **out);
+void  file_matches_free(file_match *m, int n);
+char *file_find_named(const char *name, int *count, sbuf *names);
+
+/* The same for a "!line", which is the shell's. shell_word(): where the word the cursor (byte
+ * `cur`) is in starts, and whether a command goes there (*command) rather than an argument; -1
+ * inside quotes — that is text. command_complete(): the programs in $PATH whose name starts
+ * with `typed`, the shortest first, each once, at most `max` (the name is in .path).
+ * shell_escape(): a path as it has to be written there, malloc'd — a backslash before what the
+ * shell would take apart. */
+long  shell_word(const char *buf, size_t cur, bool *command);
+int   command_complete(const char *typed, int max, file_match **out);
+char *shell_escape(const char *s);
+
 /* URLs and HTML, for the web_fetch tool (in util.c so the unit tests can reach them) */
 bool  url_ok(const char *url);                                  /* http(s), sane, not cloud metadata */
 bool  url_host(const char *url, char *out, size_t n);           /* "host[:port]", lowercased */
@@ -122,6 +150,7 @@ bool  model_same(const char *a, const char *b);   /* equal, a trailing ":latest"
 bool  model_is_cloud(const char *name);           /* NAME:cloud / NAME-cloud */
 
 /* ---------- global config ---------- */
+typedef struct { char *model; double in, out; } price_entry;   /* USD per million tokens, set with /usage price */
 typedef struct { char *model, *level; } effort_entry;   /* level: "off", "on", or one of the model's named levels */
 
 typedef struct {
@@ -134,6 +163,8 @@ typedef struct {
     int   think;         /* -1 auto (server default on the first call of a request, off for tool rounds), 0 off, 1 on for every call */
     effort_entry *efforts; /* how hard each model thinks (/effort), see effort_get(); saved as effort.<model>=<level> */
     int   n_efforts;
+    price_entry *prices;   /* what a model costs where the built-in list does not know or is out of date; saved as price.<model>=<in>/<out> */
+    int   n_prices;
     char *advisor;       /* the stronger model the agent may consult through the advisor tool (/advisor); NULL = none */
     int   advisor_ctx;   /* num_ctx of an advisor call; 0 = auto (see advisor_plan_for()) */
     int   advisor_guidance; /* how much the agent leans on it, GUIDANCE_* (/advisor guidance) */
@@ -209,6 +240,7 @@ extern const char *const *http_headers;   /* extra request headers ("Name: value
 int http_request(const char *base_url, const char *method, const char *path,
                  const char *body, sbuf *out, http_line_cb line_cb, void *ud,
                  http_result *res);
+bool http_busy(void);   /* a request is in flight: do not start another (their settings are globals) */
 char *http_url(const char *base, const char *path);   /* base + path; "host" and "http://host" get Ollama's port 11434 (malloc'd) */
 
 /* ---------- term.h ---------- */
@@ -217,6 +249,9 @@ void term_restore(void);
 void term_raw(bool on);
 int  term_width(void);
 void term_size(int *rows, int *cols);
+/* The file CORBIENEST_TRACE names, while everything drawn and typed is being written to it for
+ * tools/trace_replay.py (see "trace" in term.c); NULL when it is not. */
+const char *term_trace_path(void);
 void term_clear_screen(void);
 
 /* Full-screen mode: alternate screen with the bottom row reserved for a status
@@ -287,7 +322,15 @@ char *term_ask_line(const char *prompt);
  * question appeared are never taken as the answer. */
 int term_confirm(const char *question, const char *always_label, const char *project_label, char **reason);
 
-void term_set_slash_commands(const char **cmds, int n);   /* tab completion */
+/* Suggestions under the input field while a "/command", an "@file" or a "!line" is being typed,
+ * and what Tab completes. main.c supplies them: for the text `buf` with the cursor at byte `cur`
+ * the hook returns how many there are (0 = none) in *items — malloc'd, like the strings in it;
+ * term.c frees them — and sets *from to where the word they would replace starts. `open` marks
+ * one that more is going to follow (a directory): no space is put after it and the list stays
+ * up. The hook is also asked about what is typed while the model works, i.e. from inside the
+ * poll of a live request: it may read whatever it likes and must change nothing. */
+typedef struct { char *text; char *desc; bool open; } term_sug;
+extern int (*term_suggest)(const char *buf, size_t cur, size_t *from, term_sug **items);
 /* Interactive list picker: returns chosen index or -1 if cancelled. */
 int term_select(const char *title, const char **items, const char **descs, int n, int current);
 
@@ -396,6 +439,13 @@ void   model_think_profile(model_info *mi);   /* fill think_* from family/render
 int    ollama_model_show(const char *model, model_info *mi);    /* 0 ok, -1 unknown model / request failed (*mi is still zeroed) */
 extern model_info g_model_info;   /* the model in use (set by main.c) */
 
+/* ---------- prices: what /usage estimates the cost with ----------
+ * USD per million input and output tokens. model_price() says what a model costs: 2 = a price
+ * set with /usage price, 1 = the provider's list price as built in (hosted models only, by the
+ * name or a dated snapshot of it), 0 = not known. */
+int  model_price(const char *model, double *in, double *out);
+void price_set(const char *model, double in, double out);   /* in < 0 = forget it (does not save the config) */
+
 /* ---------- effort: how hard a model thinks (/effort) ----------
  * Kept per model, because the levels are the model's: gpt-oss has low/medium/high and cannot
  * stop thinking, qwen3.8 has off/low/medium/high, most others are on or off. "off" and "on" are
@@ -448,6 +498,7 @@ int ollama_poll_or_message(void);         /* http_interrupt_check for such a cal
 extern char ollama_error[512];
 /* Fetch model names. Returns cJSON array of strings (caller owns) or NULL. */
 cJSON *ollama_list_models(void);
+cJSON *ollama_list_models_quiet(int wait_ms);   /* the same, silently: for the suggestions */
 int    ollama_ping(char *ver, size_t verlen);
 /* Context length the model was trained for (from /api/show), 0 if unknown. */
 int    ollama_model_context_length(const char *model);
@@ -462,14 +513,16 @@ cJSON *parse_text_tool_calls(const char *content);
 
 /* ---------- provider.c: hosted model APIs, for the advisor ----------
  * Besides a model on the Ollama server the advisor can be a hosted one, named PROVIDER:MODEL:
- * "xai:grok-4.7", "openai:gpt-5.2", "anthropic:claude-opus-5" (grok: and claude: work too). The
+ * "xai:grok-4.7", "openai:gpt-5.2", "anthropic:claude-opus-5" (grok:, chatgpt: and claude: work too). The
  * key comes from the environment and is never saved. */
 typedef enum { PROVIDER_CHAT_COMPLETIONS, PROVIDER_MESSAGES } provider_style;
 typedef struct {
     const char *name, *alias, *label;      /* "xai", "grok", "xAI" */
     const char *key_env, *url_env, *url;   /* XAI_API_KEY, XAI_BASE_URL, the base URL otherwise */
     provider_style style;                  /* Chat Completions (xAI, OpenAI) or Anthropic's Messages API */
+    const char *example, *known_as;        /* a model of theirs and what people call them ("Grok"), for /advisor's explanation and suggestions */
 } provider_def;
+const provider_def *provider_at(int i);   /* the providers in turn, NULL past the last */
 const provider_def *provider_find(const char *advisor, const char **model);   /* NULL = a model on the Ollama server */
 const char *provider_base_url(const provider_def *p);
 typedef struct {
@@ -490,6 +543,8 @@ char *provider_chat(const char *advisor, const model_info *mi, const provider_re
 char *provider_request_body(const char *advisor, const model_info *mi, const provider_request *rq);
 char *provider_parse_reply(const char *advisor, const char *json, int status, chat_stats *st, char *err, size_t n);
 void  provider_parse_model(const char *advisor, const char *json, model_info *mi);
+cJSON *provider_parse_models(const char *json);                    /* a model list as [{"id","name"}], NULL if it is not one */
+cJSON *provider_list_models(const provider_def *p, int wait_ms, char *err, size_t n);   /* what the key can use, asked silently; NULL without a key or an answer, and err says which */
 bool  provider_fallbacks(const char *advisor);   /* an Anthropic model with server-side refusal fallbacks (Opus 5, Fable 5.x) */
 
 #endif
