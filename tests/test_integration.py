@@ -6,7 +6,7 @@ config/env handling, and — via a pseudo-terminal — the interactive editor,
 confirmations, Ctrl-C interruption, type-ahead, slash commands and the /model
 picker. Requires only python3 (stdlib). No real Ollama needed.
 """
-import json, os, pty, re, select, shutil, socket, struct, subprocess, sys, tempfile, termios, fcntl, time, threading, urllib.request
+import inspect, json, os, pty, re, select, shutil, socket, struct, subprocess, sys, tempfile, termios, fcntl, time, threading, urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +63,12 @@ threading.Thread(target=HTTPServer(("127.0.0.1", DOC_PORT), _Docs).serve_forever
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[78]")   # CSI sequences, DECSC/DECRC
 def clean(s): return ANSI.sub("", s).replace("\r", "")
+# During a turn the input field and the status bar are redrawn between DECSC and DECRC — at the
+# bottom of the screen on a real terminal, but in the middle of whatever was streaming in the
+# byte stream a test reads: "Echo: " <the bar> "hello" never contains "Echo: hello". Every
+# DECSC/DECRC pair in term.c wraps chrome and nothing else, so without them this is the transcript.
+CHROME = re.compile(r"\x1b7.*?\x1b8", re.S)
+def transcript(s): return clean(CHROME.sub("", s))
 
 WORK = tempfile.mkdtemp(prefix="crowtest_")
 CFG = tempfile.mkdtemp(prefix="crowcfg_")
@@ -78,10 +84,11 @@ passed = failed = 0
 def check(cond, msg):
     global passed, failed
     if cond: passed += 1
-    else: failed += 1; print(f"  FAIL: {msg}")
+    else: failed += 1; print(f"  FAIL: {msg} (line {inspect.currentframe().f_back.f_lineno})")
 
-def run(args, stdin=b""):
-    p = subprocess.run([BIN] + args, cwd=WORK, env=ENV, input=stdin, capture_output=True, timeout=60)
+def run(args, stdin=b"", env=None):
+    p = subprocess.run([BIN] + args, cwd=WORK, env=env or ENV, input=stdin, capture_output=True, timeout=60)
+    run.err = clean(p.stderr.decode())
     return clean(p.stdout.decode()), p.returncode
 
 def requests(): return json.loads(urllib.request.urlopen(f"{HOST}/_requests").read())
@@ -100,7 +107,7 @@ check(any(t["function"]["name"] == "bash" for t in req.get("tools", [])), "tools
 check(req["options"]["num_ctx"] == 32768, "default num_ctx")
 check(req["keep_alive"] == "30m" and "num_predict" not in req["options"] and "think" not in req, "default keep_alive 30m; no num_predict/think on a normal call")
 out, rc = run(["-m", "fake-coder:latest", "--keep-alive", "-1", "-p", "hello"])
-check(requests()[-1]["keep_alive"] == "-1", "--keep-alive -1 sent")
+check(requests()[-1]["keep_alive"] == -1, "--keep-alive -1 sent as a number: the server refuses the string (missing unit in duration)")
 out, rc = run(["-m", "fake-coder:latest", "--keep-alive", "default", "-p", "hello"])
 check("keep_alive" not in requests()[-1], "--keep-alive default omits the key")
 out, rc = run(["-m", "fake-coder:latest", "-c", "16k", "-p", "hello"])
@@ -217,6 +224,8 @@ out, rc = run(["-m", "nope:latest", "-p", "hi"])
 check("not found" in out, f"unknown model error: {out!r}")
 out = clean(subprocess.run([BIN, "-H", "http://127.0.0.1:1", "-p", "hi"], cwd=WORK, env=ENV, capture_output=True, timeout=30).stdout.decode())
 check("connect" in out or "no models" in out, "unreachable host reported")
+out, rc = run(["-H", f"localhost:{PORT}", "-m", "fake-coder:latest", "-p", "no scheme"])
+check(rc == 0 and "Echo: no scheme" in out, f"a host written the way OLLAMA_HOST is (no scheme) is plain http: {out[-200:]!r}")
 
 print("test chat-only model gets no tools; thinking flag")
 out, rc = run(["-m", "fake-chat:latest", "-p", "hi"])
@@ -299,11 +308,11 @@ out, rc = run(["-m", "fake-coder:latest", "--draft", "x", "-p", "hi"]); check(rc
 
 # ---------- interactive via pty ----------
 class Session:
-    def __init__(self, args=(), cols=100, rows=40):
+    def __init__(self, args=(), cols=100, rows=40, env=None):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(WORK)
-            for k, v in ENV.items(): os.environ[k] = v
+            for k, v in (env or ENV).items(): os.environ[k] = v
             os.execv(BIN, ["corbienest"] + list(args))
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self.out = b""; self.mark = 0
@@ -317,19 +326,34 @@ class Session:
                 except OSError: return False
                 if not d: return False
                 self.out += d
-            if pat in clean(self.out[self.mark:].decode("utf-8", "replace")): return True
+            t = self.out[self.mark:].decode("utf-8", "replace")
+            if pat in clean(t) or pat in transcript(t): return True   # the chrome is read on purpose too ("1 queued", the bar's effort)
         return False
     def send(self, s, wait=0.15):
         self.mark = len(self.out)
         os.write(self.fd, s.encode() if isinstance(s, str) else s); time.sleep(wait)
     def text(self): return clean(self.out.decode("utf-8", "replace"))
     def close(self):
+        """Kill it and wait: a session that is still exiting writes the config one last time,
+        and a test that writes its own config next would lose it to that write."""
         try: os.kill(self.pid, 9)
         except Exception: pass
+        try: os.waitpid(self.pid, 0)
+        except Exception: pass
+        try: os.close(self.fd)
+        except Exception: pass
+
+def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
+
+print("test interactive: an Ollama on another machine over plain http is said to be one")
+s = Session(["-H", "http://ollama.invalid:9", "-m", "fake-coder:latest"])
+check(s.expect("⚠ plain http to ollama.invalid: the conversation crosses the network unencrypted", 20), f"another machine over plain http: the banner says so: {s.text()[-300:]!r}")
+s.close()
 
 print("test interactive: banner, echo, editor keys, history")
 s = Session(["-m", "fake-coder:latest"])
 check(s.expect("Ctrl-D to quit"), "banner"); check("● connected" in s.text(), "connected marker")
+check("plain http to" not in s.text(), "no unencrypted-host warning for an Ollama on this machine")
 raw = s.out.decode("utf-8", "replace")
 check("\x1b[?1049h" in raw, "alternate screen entered (full screen)")
 check(re.search(r"\x1b\[1;36r", raw) is not None, "scroll region reserves the input field and the status bar")
@@ -911,10 +935,12 @@ s.send("\x04"); s.close()
 
 print("test interactive: /keepalive, /status placement, GPU placement warning")
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
-s.send("/think high\r"); check(s.expect("level high"), "/think high")
+s.send("/think high\r"); check(s.expect("fake-coder:latest cannot think"), "/think high is /effort high: refused for a model that cannot think")
 s.send("/model fake-thinker:latest\r"); s.expect("model set to fake-thinker")
+s.send("/think high\r"); check(s.expect("effort: high"), "/think high sets the model's effort")
 s.send("level test\r"); check(s.expect("Echo: level test"), "reply"); check(requests()[-1]["think"] == "high", "thinking level sent as a string")
-s.send("/think auto\r"); s.expect("think: auto"); s.send("level test 2\r"); s.expect("Echo: level test 2"); check("think" not in requests()[-1], "/think auto clears the level")
+s.send("/think auto\r"); s.expect("think: auto"); s.send("level test 2\r"); s.expect("Echo: level test 2"); check(requests()[-1]["think"] == "high", "/think auto says when, not how hard: the level stays")
+s.send("/effort default\r"); s.expect("effort: default"); s.send("level test 3\r"); s.expect("Echo: level test 3"); check("think" not in requests()[-1], "/effort default leaves it to the model again")
 s.send("/model fake-coder:latest\r"); s.expect("model set to fake-coder")
 s.send("/keepalive\r"); check(s.expect("keep_alive: 30m"), "/keepalive shows the default")
 s.send("/keepalive 1h\r"); check(s.expect("keep_alive = 1h"), "/keepalive sets it")
@@ -929,6 +955,422 @@ s.send("again\r"); check(s.expect("Echo: again"), "reply")
 check(s.text().count("only 50% in GPU memory") == 1, "warning shown once per model")
 s.send("/model fake-coder:latest\r"); s.expect("model set to fake-coder")
 s.send("\x04"); s.close()
+
+# ---------- /effort and /advisor ----------
+# a config directory of their own: what they save (an advisor, per-model efforts) would
+# otherwise follow every test that comes after
+CFG2 = tempfile.mkdtemp(prefix="crowcfg2_")
+ENV2 = dict(ENV, XDG_CONFIG_HOME=CFG2)
+CFG2_FILE = os.path.join(CFG2, "corbienest", "config")
+os.makedirs(os.path.join(CFG2, "corbienest")); open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+def thinks(rs): return [r.get("think", "absent") for r in rs]
+def run_rounds(model, args):
+    """run() in ENV2; returns (out, rc, the requests this run made to `model`) — not the log's last n, which may be an earlier run's"""
+    n0 = len(requests())
+    out, rc = run(args, env=ENV2)
+    return out, rc, [r for r in requests()[n0:] if r["model"] == model]
+
+print("test effort: a level is part of the prompt, so it goes with every call; a model that cannot stop is never told to")
+out, rc, rs = run_rounds("fake-levels:latest", ["-m", "fake-levels:latest", "--yolo", "--effort", "high", "-p", "TOOL_BASH please"])
+check(rc == 0 and thinks(rs) == ["high", "high"], f"--effort high: the first call and the tool round both carry it: {thinks(rs)!r}")
+out, rc, rs = run_rounds("fake-levels:latest", ["-m", "fake-levels:latest", "--yolo", "-p", "TOOL_BASH please"])
+check(rc == 0 and thinks(rs) == ["absent", "absent"], f"no effort set, /think auto: a gpt-oss-like model is not sent think:false for the tool round (it would be ignored, and cost the prompt cache): {thinks(rs)!r}")
+out, rc = run(["-m", "fake-levels:latest", "--no-think", "-p", "hi"], env=ENV2)
+check(requests()[-1].get("think") == "low", f"--no-think on a model that cannot stop: its weakest level: {requests()[-1].get('think')!r}")
+out, rc = run(["-m", "fake-levels:latest", "--effort", "off", "-p", "hi"], env=ENV2)
+check(rc == 2 and "low · medium · high" in run.err, f"--effort off refused for it, with what it does offer: {run.err!r}")
+out, rc = run(["-m", "fake-levels:latest", "--effort", "max", "-p", "hi"], env=ENV2)
+check(rc == 0 and requests()[-1].get("think") == "high", f"--effort max means as hard as it goes: sent as the model's strongest level: {requests()[-1].get('think')!r}")
+out, rc = run(["-m", "fake-levels:latest", "--effort", "ultra", "-p", "hi"], env=ENV2)
+check(rc == 2 and "offers" in run.err, "a name that means nothing is refused")
+out, rc = run(["-m", "fake-levels:latest", "--think", "-p", "hi"], env=ENV2)
+check(requests()[-1].get("think") == "medium", f"--think on a model with levels and no 'true': its default level by name: {requests()[-1].get('think')!r}")
+out, rc = run(["-m", "fake-coder:latest", "--effort", "high", "-p", "hi"], env=ENV2)
+check(rc == 2 and "cannot think" in run.err, f"--effort on a model that cannot think: {run.err!r}")
+out, rc, rs = run_rounds("fake-thinker:latest", ["-m", "fake-thinker:latest", "--yolo", "--effort", "on", "-p", "TOOL_BASH please"])
+check(rc == 0 and thinks(rs) == [True, False], f"an on/off model: on for the request, off for its tool round (/think auto): {thinks(rs)!r}")
+out, rc, rs = run_rounds("fake-thinker:latest", ["-m", "fake-thinker:latest", "--yolo", "--effort", "off", "--think", "-p", "TOOL_BASH please"])
+check(rc == 0 and thinks(rs) == [False, False], f"--effort off wins over --think for that model: {thinks(rs)!r}")
+out, rc, rs = run_rounds("fake-thinker:latest", ["-m", "fake-thinker:latest", "--yolo", "--effort", "high", "-p", "TOOL_BASH please"])
+check(rc == 0 and thinks(rs) == ["high", False], f"a level for an on/off model is passed on (the server takes it as on), and like on it rests for the tool round: {thinks(rs)!r}")
+out, rc = run(["-m", "fake-coder:latest", "--think", "-p", "hi"], env=ENV2)
+check(rc == 0 and "think" not in requests()[-1] and "Echo: hi" in out, f"--think with a model that cannot think: nothing is sent, the request goes through: {out!r}")
+out, rc = run(["-m", "fake-declared:latest", "--effort", "xhigh", "-p", "hi"], env=ENV2)
+check(rc == 0 and requests()[-1].get("think") == "xhigh", "levels the server lists in /api/show are used by the names it gives")
+out, rc = run(["-m", "fake-declared:latest", "--effort", "high", "-p", "hi"], env=ENV2)
+check(rc == 0 and requests()[-1].get("think") == "xhigh", f"'high' saved under an older server is sent as the top level this one has, not left to fall back to medium in silence: {requests()[-1].get('think')!r}")
+out, rc = run(["-m", "fake-declared:latest", "--effort", "medium", "-p", "hi"], env=ENV2)
+check(rc == 2 and "off · low · xhigh" in run.err, f"a level it does not list is refused: {run.err!r}")
+
+out, rc = run(["-m", "fake-coder:latest", "--keep-alive", "inf", "-p", "hi"], env=ENV2)
+check(requests()[-1].get("keep_alive") == "inf", f"only a plain decimal goes out as a number: 'inf' would become null, which the server takes for 'not set' in silence: {requests()[-1].get('keep_alive')!r}")
+out, rc = run(["-m", "deep-thinker", "-p", "hi"], env=ENV2)
+check("not found" in out and "refused" not in out, f"an error that merely quotes a model called …thinker is not taken for a refused think value: {out[-200:]!r}")
+
+print("test capabilities come from /api/show: /api/tags may be out of date")
+out, rc, rs = run_rounds("fake-stale:latest", ["-m", "fake-stale:latest", "--yolo", "--think", "-p", "TOOL_BASH please"])
+check(rc == 0 and len(rs) == 2 and "Tool said: hello-from-tool" in out, f"a model /api/tags calls chat-only gets its tools: {out!r}")
+check(any(t["function"]["name"] == "bash" for t in rs[0].get("tools", [])) and rs[0].get("think") is True, "tools and think:true sent")
+
+print("test effort: the level saved under the old global key goes to the model it was set for")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nmodel=fake-thinker:latest\nthink=1\nthink_level=high\n")
+out, rc = run(["-p", "hi"], env=ENV2)
+check(requests()[-1]["model"] == "fake-thinker:latest" and requests()[-1].get("think") == "high", "think_level=high still read")
+out, rc = run(["-m", "fake-levels:latest", "-p", "hi"], env=ENV2)
+check(requests()[-1].get("think") == "medium", f"but not applied to another model (think=1 alone: that model's default level): {requests()[-1].get('think')!r}")
+s = Session([], env=ENV2); s.expect("Ctrl-D to quit")
+s.send("/temp 0.2\r"); s.expect("temperature = 0.2"); s.send("\x04"); s.close()
+cfg2 = open(CFG2_FILE).read()
+check("effort.fake-thinker:latest=high" in cfg2 and "think_level" not in cfg2, f"the next save writes it per model and drops the old key: {cfg2!r}")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+
+print("test effort and advisor: a fresh process reads them back from the config")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nmodel=fake-levels:latest\neffort.fake-levels:latest=high\neffort.fake-big:latest=off\nadvisor=fake-big:latest\nadvisor_ctx=8192\n")
+out, rc, rs = run_rounds("fake-levels:latest", ["--yolo", "-p", "TOOL_ADVISOR please"])
+adv = [r for r in requests() if r["model"] == "fake-big:latest"][-1]
+check(rc == 0 and thinks(rs) == ["high", "high"], f"the model's saved effort: {thinks(rs)!r}")
+check(adv["options"]["num_ctx"] == 8192 and adv.get("think") is False, f"the saved advisor, its window and its own effort (off): {adv['options']!r} {adv.get('think', 'absent')!r}")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nadvisor=fake-big:latest\nadvisor_ctx=100\neffort.fake-levels:latest=ultra\n")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENV2)
+check([r for r in requests() if r["model"] == "fake-big:latest"][-1]["options"]["num_ctx"] == 16384, "an advisor_ctx too small to be one is ignored")
+s = Session(["-m", "fake-levels:latest"], env=ENV2)
+check(s.expect("effort 'ultra' is saved for fake-levels:latest, which does not offer it"), "a saved effort the model does not offer is said at start-up, and left to the model")
+check(s.expect("advisor: fake-big:latest"), "the banner names the advisor"); s.expect("Ctrl-D to quit")
+s.send("hello\r"); s.expect("Echo: hello"); check("think" not in requests()[-1] and "· ultra" not in s.text(), "and neither sent nor shown in the bar")
+s.send("\x04"); s.close()
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+
+print("test interactive: /effort offers what the model has, keeps it per model, shows it in the bar")
+s = Session(["-m", "fake-coder:latest"], env=ENV2); s.expect("Ctrl-D to quit")
+s.send("/effort\r"); check(s.expect("cannot think"), "/effort on a model that cannot think says so")
+s.send("/effort high\r"); check(s.expect("cannot think"), "and sets nothing")
+s.send("/model fake-levels:latest\r"); s.expect("model set to fake-levels")
+s.send("/effort off\r"); check(s.expect("cannot stop thinking"), "/effort off: gpt-oss-like models cannot stop")
+check("low · medium · high" in since_send(s), "with the levels it has")
+s.send("/effort ultra\r"); check(s.expect("has no effort 'ultra'"), "a level it does not have is refused")
+s.send("/effort max\r"); check(s.expect("sent as high, its strongest level"), "max is as hard as it goes, whatever the model calls that")
+s.send("/effort default\r"); s.expect("effort: default")   # so that the picker opens on "default" and the filter has to find "high"
+s.send("/effort\r"); check(s.expect("Effort for fake-levels:latest"), "/effort opens a picker")
+check(s.expect("leave it to the model (medium)"), "default first, with what the model does by itself")
+picker = since_send(s)
+check("low" in picker and "medium" in picker and "high" in picker and "no thinking" not in picker, f"its levels, and no off: {picker[-400:]!r}")
+s.send("hig"); time.sleep(0.2); s.send("\r"); check(s.expect("effort: high"), "picked by filter + Enter")
+check(s.expect("sent with every model call"), "and told why /think auto does not switch it off for the tool rounds")
+check(s.expect("fake-levels:latest · high"), f"the status bar shows the effort with the model: {s.text()[-300:]!r}")
+s.send("hello levels\r"); check(s.expect("Echo: hello levels"), "reply"); check(requests()[-1].get("think") == "high", "level sent")
+check("effort.fake-levels:latest=high" in open(CFG2_FILE).read(), "saved per model")
+s.send("/model fake-thinker:latest\r"); s.expect("model set to fake-thinker")
+s.send("/effort\r"); check(s.expect("Effort for fake-thinker:latest"), "picker for an on/off model")
+check(s.expect("this model has no levels"), "says it has no levels"); s.send("\x1b"); s.expect("effort unchanged")
+s.send("hello thinker\r"); s.expect("Echo: hello thinker"); check("think" not in requests()[-1], "the other model's level does not follow")
+s.send("/status\r"); check(s.expect("effort     default (on)"), f"/status shows the effort: {since_send(s)[-300:]!r}")
+s.send("/model fake-levels:latest\r"); s.expect("model set to fake-levels")
+s.send("back again\r"); s.expect("Echo: back again"); check(requests()[-1].get("think") == "high", "back on the first model its level is still there")
+s.send("/think off\r"); check(s.expect("cannot stop thinking: it is sent its weakest level (low)"), "/think off says what it means for this model"); s.expect("think: off"); s.send("quiet now\r"); s.expect("Echo: quiet now")
+check(requests()[-1].get("think") == "low", "/think off: never think — for this model, as little as it can")
+s.send("/effort medium\r"); check(s.expect("/think was off: now auto"), "setting a level switches thinking back on")
+s.send("SLOW while busy\r"); s.expect("one ")
+s.send("/effort low\r"); check(s.expect("effort: low", 3), "/effort LEVEL runs while the model is working")
+check("queued" not in since_send(s) and "eight" not in since_send(s), "there and then: not queued for after the turn")
+s.send("/effort\r"); check(s.expect("fake-levels:latest offers: low · medium · high", 3), "bare /effort prints the levels while busy")
+check("Effort for" not in since_send(s) and "eight" not in since_send(s), "instead of opening a picker inside a live request")
+check(s.expect("eight", 10), "generation carried on"); s.expect("tok/s")
+s.send("/model fake-thinker:latest\r"); s.expect("model set to fake-thinker")
+s.send("/effort off\r"); s.expect("effort: off"); s.send("/think on\r"); check(s.expect("/effort off for fake-thinker:latest is forgotten"), "/think on takes back an /effort off, or nothing would change")
+s.send("/think auto\r"); s.expect("think: auto"); s.send("/model fake-levels:latest\r"); s.expect("model set to fake-levels")
+s.send("/effort default\r"); check(s.expect("effort: default"), "/effort default")
+check("effort.fake-levels" not in open(CFG2_FILE).read(), "forgotten in the config too")
+s.send("\x04"); s.close()
+
+print("test advisor: the agent consults a stronger model, which is shown the conversation")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENV2)
+check("advisor" not in [t["function"]["name"] for t in requests()[-1].get("tools", [])] and "advisor is a stronger" not in requests()[-1]["messages"][0]["content"], "no advisor set: no tool, no mention")
+check("no advisor is set" in requests()[-1]["messages"][-1]["content"], "a model that calls it anyway is told there is none")
+check("⎿  error: no advisor is set" in out, f"and so is the user: {out!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-big:latest", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENV2)
+check(rc == 0 and "⤷ advisor fake-big:latest" in out and "consultation 1 of 3" in out, f"consultation shown: {out!r}")
+check("ADVICE: read hay.txt" in out and "Tool said: ADVICE: read hay.txt" in out, "the advice is previewed, and the agent carries on with it")
+reqs = requests()
+adv = [r for r in reqs if r["model"] == "fake-big:latest"][-1]
+main_first, main_last = [r for r in reqs if r["model"] == "fake-coder:latest"][-2:]
+check("advisor" in [t["function"]["name"] for t in main_first["tools"]] and "advisor is a stronger" in main_first["messages"][0]["content"], "the agent is offered the tool and told when to use it")
+check("tools" not in adv and [m["role"] for m in adv["messages"]] == ["system", "user"], "the advisor gets no tools and one quoted brief, not the conversation's turns")
+brief = adv["messages"][1]["content"]
+check("[user]\nTOOL_ADVISOR please" in brief and "# What the agent asks you\nWhy does the needle test fail" in brief, f"the brief holds the transcript and the question: {brief[-300:]!r}")
+check("→ advisor(" not in brief, "the call that asked is not part of the transcript")
+check(adv["keep_alive"] == 0 and adv["options"]["num_ctx"] == 16384 and adv["options"]["num_predict"] == 5461, f"a window of its own, a cap on the answer, and its memory back at once: {adv.get('keep_alive')!r} {adv['options']!r}")
+check("think" not in adv, "its effort is left to it unless set")
+check(main_last["messages"][-1]["role"] == "tool" and main_last["messages"][-1]["tool_name"] == "advisor" and "consultation 1 of 3" in main_last["messages"][-1]["content"], "the advice is the tool result")
+check(main_last["options"]["num_ctx"] == 32768 and main_last["keep_alive"] == "30m", "the main model's own settings are untouched by it")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-big:latest", "--yolo", "-p", "TOOL_ADVISOR_NOQ please"], env=ENV2)
+check("It did not say" in [r for r in requests() if r["model"] == "fake-big:latest"][-1]["messages"][1]["content"], "no question: the advisor is asked to review where the agent stands")
+n0 = len([r for r in requests() if r["model"] == "fake-big:latest"])
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-big:latest", "--yolo", "-p", "TOOL_ADVISOR ADVISOR_LOOP"], env=ENV2)
+check(len([r for r in requests() if r["model"] == "fake-big:latest"]) - n0 == 3 and "is the limit" in out, f"a model that keeps asking is stopped after 3 consultations: {out[-300:]!r}")
+check("Tool said: error: the advisor has been consulted 3 times" in out, "and told so, in a tool result")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "no-such:latest", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENV2)
+check(rc == 0 and "Tool said: error: the advisor model no-such:latest is not installed" in out and "/advisor picks another" in out, f"an advisor that is not there costs the consultation, not the turn: {out[-300:]!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-remote:cloud", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENV2)
+adv = [r for r in requests() if r["model"] == "fake-remote:cloud"][-1]
+check("keep_alive" not in adv and "num_ctx" not in adv["options"], f"a cloud model is sent neither a window nor a keep_alive: they are not ours to set: {adv['options']!r}")
+check("ollama signin" in out and rc == 0, f"and a daemon that is not signed in is what the user is told: {out[-300:]!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-big:latest", "--yolo", "--no-think", "--draft", "2", "--mode", "plan", "-p", "TOOL_ADVISOR THINKTAG"], env=ENV2)
+adv = [r for r in requests() if r["model"] == "fake-big:latest"][-1]
+check("think" not in adv and "draft_num_predict" not in adv["options"], f"/think and --draft are the main model's: the advisor follows its own effort: {adv.get('think', 'absent')!r} {adv['options']!r}")
+check("plan mode" in adv["messages"][1]["content"], "the advisor is told the agent is in plan mode")
+check(adv["messages"][1]["content"].rstrip().endswith("do not call tools."), "what matters most stands last in the brief: a server that cuts a prompt keeps the end")
+check("SECRET-REASONING" not in requests()[-1]["messages"][-1]["content"] and "ADVICE: strip me" in requests()[-1]["messages"][-1]["content"], "thinking that arrives inside the answer is not passed on as advice")
+main_req = [r for r in requests() if r["model"] == "fake-coder:latest"][-1]
+names = [t["function"]["name"] for t in main_req["tools"]]
+check("advisor" in names and "write_file" not in names, f"plan mode keeps the advisor: it changes nothing: {names!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-big:latest", "--yolo", "--output-format", "json", "-p", "TOOL_ADVISOR please"], env=ENV2)
+check(json.loads(out)["advisor_calls"] == 1, "-p --output-format json counts the consultations")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-big:latest", "--yolo", "-p", "TOOL_ADVISOR CUTADVICE"], env=ENV2)
+check("Tool said: error: the advisor gave no answer" in out and "ran out of tokens" in out, f"out of tokens while thinking: said, not returned as empty advice: {out[-300:]!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-coder:latest", "--yolo", "-c", "8k", "-p", "TOOL_ADVISOR please"], env=ENV2)
+adv = [r for r in requests() if r["messages"][0]["content"].startswith("You are the advisor")][-1]
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-coder:latest", "--yolo", "-c", "8k", "--draft", "2", "-p", "TOOL_ADVISOR please"], env=ENV2)
+adv = [r for r in requests() if r["messages"][0]["content"].startswith("You are the advisor")][-1]
+check(adv["options"].get("draft_num_predict") == 2, "and its draft length: a changed one reloads it too")
+check(adv["model"] == "fake-coder:latest" and adv["options"]["num_ctx"] == 8192 and adv["keep_alive"] == "30m", f"the main model as its own advisor keeps the main window and keep_alive: anything else would reload it: {adv['options']!r} {adv.get('keep_alive')!r}")
+
+print("test interactive: /advisor")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2); s.expect("Ctrl-D to quit")
+s.send("/advisor\r"); check(s.expect("Select advisor"), "/advisor opens a picker"); check(s.expect("No advisor"), "with 'No advisor' first")
+s.send("\x1b"); check(s.expect("advisor unchanged: none"), "Esc leaves it")
+s.send("/advisor nope:latest\r"); check(s.expect("does not know a model 'nope:latest'"), "an unknown model is refused")
+s.send("/advisor fake-big:latest\r"); check(s.expect("advisor: fake-big:latest"), "/advisor MODEL"); check(s.expect("at most 3 times per request"), "with what it costs")
+check("advisor=fake-big:latest" in open(CFG2_FILE).read(), "saved")
+s.send("/advisor effort high\r"); check(s.expect("advisor effort: high"), "/advisor effort LEVEL")
+check("effort.fake-big:latest=high" in open(CFG2_FILE).read(), "kept with the advisor's model, like any model's")
+s.send("/advisor ctx 8k\r"); check(s.expect("advisor context window: 8k"), "/advisor ctx")
+s.send("TOOL_ADVISOR now\r"); check(s.expect("⤷ advisor fake-big:latest"), "consulted"); check(s.expect("Tool said: ADVICE"), "advice used")
+adv = [r for r in requests() if r["model"] == "fake-big:latest"][-1]
+check(adv.get("think") == "high" and adv["options"]["num_ctx"] == 8192, f"its effort and its window: {adv.get('think')!r} {adv['options']!r}")
+s.send("/status\r"); check(s.expect("advisor    fake-big:latest"), "/status shows it")
+s.send("/cost\r"); check(s.expect("advisor       1 consultation"), f"/cost counts it: {since_send(s)[-300:]!r}")
+s.send("TOOL_ADVISOR SLOWADVICE\r"); check(s.expect("⤷ advisor"), "a slow consultation")
+time.sleep(0.6); s.send("never mind, do this\r")
+check(s.expect("stopped — your message goes first", 10), f"a queued message stops the consultation: {s.text()[-400:]!r}")
+check(s.expect("Echo: never mind, do this", 10), "and reaches the model on its next call")
+msgs = requests()[-1]["messages"]
+check(msgs[-2]["role"] == "tool" and "not heard out" in msgs[-2]["content"] and msgs[-1]["content"] == "never mind, do this", f"the conversation stays well-formed: {[m['role'] for m in msgs[-3:]]}")
+check("What it had written so far:\nADVICE:" in msgs[-2]["content"], "with what the advisor had written by then")
+s.send("TOOL_ADVISOR SLOWADVICE again\r"); s.expect("⤷ advisor"); time.sleep(0.6); s.send("\x1b")
+check(s.expect("⎿ interrupted", 10), "Esc skips the consultation"); check(s.expect("Tool said: error: the consultation was interrupted", 10), "and the turn carries on without it")
+s.send("/status\r"); check(s.expect("last prompt 123 tokens"), "the advisor's prompt (30k tokens, says the fake) is no part of the conversation's context figure")
+check("auto-compacting" not in s.text() and "ctx 91%" not in s.text(), "so nothing is compacted on its account")
+s.send("TOOL_ADVISOR EVICTMAIN\r"); check(s.expect("fake-coder:latest was unloaded to make room", 15), f"a main model pushed out of memory is said: {s.text()[-400:]!r}"); s.expect("tok/s")
+s.send("SLOW report while busy\r"); s.expect("one ")
+s.send("/advisor\r"); check(s.expect("advisor: fake-big:latest"), "bare /advisor reports while the model works"); s.expect("tok/s")
+s.send("/advisor\r"); s.expect("Select advisor"); s.send("No adv"); time.sleep(0.2); s.send("\r"); check(s.expect("advisor off"), "'No advisor' in the picker")
+s.send("plain again\r"); s.expect("Echo: plain again")
+check("advisor" not in [t["function"]["name"] for t in requests()[-1]["tools"]] and "advisor=" not in open(CFG2_FILE).read(), "off: the tool is gone, and so is the config key")
+s.send("/advisor ctx 8k\r"); check(s.expect("advisor context window: 8k", 5), "/advisor ctx with the advisor switched off again sets it for the next one (it used to crash)")
+s.send("/advisor ctx 1k\r"); check(s.expect("usage: /advisor ctx"), "a window too small to be one is refused")
+s.send("/advisor ctx auto\r"); s.expect("advisor context window: auto")
+s.send("/model fake-thinker:latest\r"); s.expect("model set to fake-thinker"); s.send("/think off\r"); s.expect("think: off")
+s.send("/advisor fake-big:latest\r"); s.expect("advisor: fake-big:latest")
+s.send("/advisor effort low\r"); check(s.expect("advisor effort: low"), "/advisor effort with /think off")
+check("now auto" not in since_send(s) and "think=0" in open(CFG2_FILE).read(), "leaves /think alone: that is the main model's, and the advisor never reads it")
+s.send("/advisor fake-thinker:latest\r"); check(s.expect("a second opinion, not a stronger one"), "the model doing the work as its own advisor")
+s.send("/advisor effort on\r"); check(s.expect("this is its effort there too"), "its effort is one and the same entry"); check(s.expect("now auto") or "now auto" in since_send(s), "and there /think off is in the way")
+s.send("SLOW and then\r"); s.expect("one ")
+s.send("/advisor off\r"); time.sleep(0.5); check("advisor off" not in since_send(s), "/advisor with an argument waits for the turn: it asks the server and rebuilds the tool list")
+check(s.expect("advisor off", 15), "and runs after it")
+s.send("\x04"); s.close()
+
+# ---------- the advisor on a hosted API: xAI, OpenAI, Anthropic ----------
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+KEYS = dict(XAI_API_KEY="test-key", OPENAI_API_KEY="test-key", ANTHROPIC_API_KEY="test-key",
+            XAI_BASE_URL=f"{HOST}/xai/v1", OPENAI_BASE_URL=f"{HOST}/openai/v1", ANTHROPIC_BASE_URL=f"{HOST}/anthropic")
+ENVK = dict(ENV2, **KEYS)
+def preqs(): return json.loads(urllib.request.urlopen(f"{HOST}/_provider_requests").read())
+def last_preq(prov): return [r for r in preqs() if r["provider"] == prov][-1]
+def key_nowhere():
+    """the key is never written anywhere: not the config, not a session, not the history"""
+    for root, _, files in os.walk(CFG2):
+        for f in files:
+            if "test-key" in open(os.path.join(root, f), errors="replace").read(): return os.path.join(root, f)
+    return None
+
+print("test advisor on a hosted API: xAI and OpenAI through Chat Completions")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+check(rc == 0 and "⤷ advisor xai:grok-fake" in out and "Tool said: ADVICE: read hay.txt" in out, f"consulted, and the agent carries on with the advice: {out[-400:]!r}")
+r = last_preq("xai")
+check(r["path"] == "/xai/v1/chat/completions" and [m["role"] for m in r["body"]["messages"]] == ["system", "user"], f"one request, a system and a user message: {r['path']!r}")
+check(r["body"]["messages"][0]["content"].startswith("You are the advisor") and "# What the agent asks you\nWhy does the needle test fail" in r["body"]["messages"][1]["content"], "the same brief an Ollama advisor gets")
+check(r["body"]["max_completion_tokens"] == 16000 and "max_tokens" not in r["body"] and "reasoning_effort" not in r["body"], f"the cap by the name reasoning models take; no effort unless set: {r['body'].keys()!r}")
+check("stream" not in r["body"] and "tools" not in r["body"] and "keep_alive" not in r["body"] and "options" not in r["body"], "not streamed, no tools, nothing of Ollama's")
+main_last = requests()[-1]
+check("advice from xai:grok-fake" in main_last["messages"][-1]["content"], "the advice is the tool result")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "--output-format", "json", "-p", "TOOL_ADVISOR please"], env=ENVK)
+j = json.loads(out); check(j["advisor_calls"] == 1 and j["prompt_tokens"] >= 2000, f"its tokens are counted: {j}")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\neffort.openai:gpt-fake=high\n")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+check(rc == 0 and last_preq("openai")["body"].get("reasoning_effort") == "high" and "Tool said: ADVICE" in out, "OpenAI, with the effort saved for that model")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\neffort.openai:gpt-fake=max\n")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+check(rc == 0 and "OpenAI answered 400: Unsupported value: 'max'" in out and "/advisor effort default" in out, f"an effort the model does not take: the server's words, and the way back: {out[-400:]!r}")
+check("Tool said: error: the advisor (openai:gpt-fake) could not be reached" in out, "and the turn carries on")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "-p", "TOOL_ADVISOR CUTADVICE"], env=ENVK)
+check("ran out of tokens while still thinking" in out and "Tool said: error: the advisor gave no answer" in out, f"spent on thinking: said as such: {out[-300:]!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo", "-p", "TOOL_ADVISOR REFUSEADVICE"], env=ENVK)
+check(rc == 0 and "gpt-fake declined to answer" in out, f"a refusal is an answer of its own kind: {out[-300:]!r}")
+
+print("test advisor on a hosted API: Anthropic's Messages API")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\neffort.anthropic:claude-fake-opus=xhigh\n")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-fake-opus", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+r = last_preq("anthropic")
+check(rc == 0 and "Tool said: ADVICE: read hay.txt" in out, f"consulted: {out[-300:]!r}")
+check(r["path"] == "/anthropic/v1/messages" and r["headers"].get("anthropic-version") == "2023-06-01", f"the Messages API, versioned: {r['path']!r} {r['headers']!r}")
+b = r["body"]
+check(b["system"].startswith("You are the advisor") and [m["role"] for m in b["messages"]] == ["user"] and b["max_tokens"] == 16000, "the system prompt on its own, one user message")
+check(b.get("thinking") == {"type": "adaptive"} and b.get("output_config") == {"effort": "xhigh"} and "fallbacks" not in b, f"adaptive thinking, the effort it has; no fallbacks where the model has none: {b.get('thinking')!r} {b.get('output_config')!r}")
+check("anthropic-beta" not in r["headers"], "and no beta header for them")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-opus-5", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+r = last_preq("anthropic")
+check(rc == 0 and r["body"].get("fallbacks") == "default" and r["headers"].get("anthropic-beta") == "server-side-fallback-2026-07-01", f"Opus 5: a declined request is answered by the fallback model: {r['body'].get('fallbacks')!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-fake-opus", "--yolo", "-p", "TOOL_ADVISOR REFUSEADVICE"], env=ENVK)
+check(rc == 0 and "declined to answer (refusal: cyber)" in out, f"a refusal says its category, and the turn goes on: {out[-300:]!r}")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\neffort.anthropic:claude-fake-haiku=on\n")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-fake-haiku", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+b = last_preq("anthropic")["body"]
+check(rc == 0 and b.get("thinking") == {"type": "enabled", "budget_tokens": 8000} and "output_config" not in b, f"a model with a thinking budget and no effort levels: {b.get('thinking')!r}")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+
+print("test advisor on a hosted API: no key, a wrong key, no such model")
+noenv = {k: v for k, v in ENVK.items() if k != "XAI_API_KEY"}
+n0 = len(preqs())
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=noenv)
+check(rc == 0 and "⎿ no advice: XAI_API_KEY is not set — export it before starting corbienest" in out and "Tool said: error: the advisor (xai:grok-fake) cannot be used" in out,
+      f"no key: said, to the user and to the agent: {out[-300:]!r}")
+check(len(preqs()) == n0, "and nothing is sent")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=dict(ENVK, XAI_API_KEY="wrong-key"))
+check(rc == 0 and "xAI refused the key in XAI_API_KEY (400" in out and "wrong-key" not in out, f"a wrong key (xAI says so with a 400): said, without printing it: {out[-300:]!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=dict(ENVK, OPENAI_API_KEY="sk-secret-wxyz"))
+check(rc == 0 and "OpenAI refused the key in OPENAI_API_KEY (401" in out and "wxyz" not in out and "wxyz" not in json.dumps(requests()[-1]), f"not even the masked piece of it OpenAI quotes back: {out[-300:]!r}")
+t0 = time.time()
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=dict(ENVK, OPENAI_BASE_URL="http://192.0.2.1/v1"))
+check(rc == 0 and "OPENAI_BASE_URL is plain http to another machine (192.0.2.1)" in out and time.time() - t0 < 4,
+      f"a key is not sent in the clear to another machine — refused before any connection: {out[-300:]!r}")
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-nope", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+check(rc == 0 and "Anthropic does not know a model 'claude-nope'" in out, f"no such model: {out[-300:]!r}")
+check(key_nowhere() is None, f"the key was written nowhere: {key_nowhere()!r}")
+
+print("test interactive: /advisor with a hosted API")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
+s.send("/advisor xai:grok-nope\r"); check(s.expect("xAI does not know a model 'grok-nope'"), "the model endpoint is asked: an unknown model is refused")
+s.send("/advisor xai:grok-fake\r"); check(s.expect("advisor: xai:grok-fake"), "/advisor PROVIDER:MODEL")
+check(s.expect(f"sent to {HOST}/xai/v1 with each consultation, billed to the key in XAI_API_KEY"), f"with where the conversation goes: {since_send(s)[-300:]!r}")
+cfg = open(CFG2_FILE).read(); check("advisor=xai:grok-fake" in cfg and "test-key" not in cfg, "saved, without the key")
+s.send("/advisor effort\r"); check(s.expect("advisor effort for xai:grok-fake"), "/advisor effort offers its levels"); check(s.expect("xhigh"), "the ones xAI's models take")
+s.send("\x1b"); s.expect("unchanged")
+s.send("/advisor effort max\r"); check(s.expect("sent as xhigh, its strongest level"), "max is as hard as it goes, in xAI's name")
+s.send("TOOL_ADVISOR now\r"); check(s.expect("Tool said: ADVICE"), "consulted"); check(last_preq("xai")["body"].get("reasoning_effort") == "xhigh", "with that effort")
+s.send("TOOL_ADVISOR SLOWADVICE\r"); check(s.expect("⤷ advisor xai:grok-fake"), "a slow consultation")
+time.sleep(0.8); s.send("never mind, do this\r")
+check(s.expect("stopped — your message goes first", 10), f"a queued message stops a hosted consultation too: {s.text()[-400:]!r}")
+check(s.expect("Echo: never mind, do this", 15), "and reaches the model")
+s.send("TOOL_ADVISOR SLOWADVICE again\r"); s.expect("⤷ advisor"); time.sleep(0.8); s.send("\x1b")
+check(s.expect("⎿ interrupted", 10), "Esc skips it"); check(s.expect("Tool said: error: the consultation was interrupted", 15), "and the turn carries on")
+s.send("/cost\r"); check(s.expect("advisor       1 consultation "), f"/cost counts the one that gave advice (the stopped and the skipped one did not): {since_send(s)[-300:]!r}")
+s.send("/advisor anthropic:claude-fake-haiku\r"); check(s.expect("advisor: anthropic:claude-fake-haiku"), "switched to Anthropic")
+s.send("/advisor effort on\r"); check(s.expect("advisor effort: on"), "a thinking budget, on")
+s.send("\x04"); s.close()
+check(key_nowhere() is None, f"still nowhere: {key_nowhere()!r}")
+
+# ---------- /advisor guidance: how much the agent leans on it ----------
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+def guided(level, prompt, advisor="fake-big:latest"):
+    n0, p0 = len(requests()), len(preqs())
+    out, rc = run(["-m", "fake-coder:latest", "--advisor", advisor, "--advisor-guidance", level, "--yolo", "-p", prompt], env=ENVK)
+    return out, rc, requests()[n0:]
+
+print("test advisor guidance: light and normal leave it to the agent")
+out, rc, rs = guided("light", "TOOL_ADVISOR ADVISOR_LOOP")
+sysmsg = rs[0]["messages"][0]["content"]
+check("Consult it only when you are stuck" in sysmsg and "at most once per request" in sysmsg, f"light: only when stuck, once: {sysmsg[-600:]!r}")
+check(len([r for r in rs if r["model"] == "fake-big:latest"]) == 1 and "consulted 1 time in this request" in out, f"and stopped after one: {out[-300:]!r}")
+adv = [r for r in rs if r["model"] == "fake-big:latest"][0]
+check("under about 250 words" in adv["messages"][0]["content"] and "under about 250 words" in adv["messages"][1]["content"], "and asked for a short answer")
+if os.path.exists(os.path.join(WORK, "made.txt")): os.remove(os.path.join(WORK, "made.txt"))
+out, rc, rs = guided("normal", "TOOL_WRITE please")
+check("reviews the work" not in out and os.path.exists(os.path.join(WORK, "made.txt")), "normal: no review of its own")
+check(not any(r["model"] == "fake-big:latest" for r in rs), "and no consultation the agent did not ask for")
+
+print("test advisor guidance strong: the work is reviewed before the request ends")
+os.remove(os.path.join(WORK, "made.txt"))
+out, rc, rs = guided("strong", "TOOL_WRITE please")
+check(rc == 0 and "⤷ advisor fake-big:latest · reviews the work before the request ends" in out, f"a request that changed files is reviewed: {out[-600:]!r}")
+check("Tool said: ADVICE: REVIEW-FINDING" in out, f"and what it finds goes to the agent, which gets another round: {out[-300:]!r}")
+main = [r for r in rs if r["model"] == "fake-coder:latest"]
+m = main[-1]["messages"]
+check(m[-1]["role"] == "tool" and m[-1]["tool_name"] == "advisor" and "REVIEW-FINDING" in m[-1]["content"] and "corbienest asked it, not you" in m[-1]["content"],
+      f"as the result of an advisor call: {m[-1]!r}")
+check(m[-2]["role"] == "assistant" and m[-2]["tool_calls"][-1]["function"]["name"] == "advisor", "that the agent's last reply now carries")
+check(len(main) == 3, f"one more round, not a loop: {len(main)}")
+sysmsg = main[0]["messages"][0]["content"]
+check("Lean on it" in sysmsg and "at most 6 times per request" in sysmsg and "It reviews your work by itself" in sysmsg, f"the agent is told how to lean on it: {sysmsg[-700:]!r}")
+adv = [r for r in rs if r["model"] == "fake-big:latest"][0]
+check("under about 700 words" in adv["messages"][0]["content"] and "exact steps" in adv["messages"][0]["content"], "the advisor is asked for concrete steps")
+os.remove(os.path.join(WORK, "made.txt"))
+out, rc, rs = guided("strong", "TOOL_WRITE APPROVE")
+check("reviews the work" in out and "nothing to change" in out and len([r for r in rs if r["model"] == "fake-coder:latest"]) == 2, f"LGTM: the request ends there, no extra round: {out[-300:]!r}")
+out, rc, rs = guided("strong", "hello there")
+check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), "a request that changed nothing is not reviewed")
+os.remove(os.path.join(WORK, "made.txt"))
+out, rc, rs = guided("strong", "TOOL_WRITE please", advisor="anthropic:claude-fake-opus")
+check("reviews the work before the request ends" in out and "Tool said: ADVICE: REVIEW-FINDING" in out, "a hosted advisor reviews the same way")
+check("The agent has ended its turn" in last_preq("anthropic")["body"]["messages"][0]["content"], "and is asked the same")
+
+print("test advisor guidance max: the first change is checked before it is made")
+os.remove(os.path.join(WORK, "made.txt"))
+out, rc, rs = guided("max", "TOOL_WRITE please")
+check("checks the first change before it is made" in out and "held back — the advisor sees a problem with it" in out, f"checked, and held back: {out[-600:]!r}")
+check(not os.path.exists(os.path.join(WORK, "made.txt")), "the change was not made")
+m = [r for r in rs if r["model"] == "fake-coder:latest"][-1]["messages"]
+check(m[-1]["role"] == "tool" and m[-1]["tool_name"] == "write_file" and m[-1]["content"].startswith("not applied: the advisor") and "CHECK-FINDING" in m[-1]["content"], f"the agent is told why: {m[-1]!r}")
+check("reviews the work" not in out, "nothing was changed, so there is nothing to review")
+out, rc, rs = guided("max", "TOOL_WRITE APPROVE")
+check("checks the first change" in out and "go ahead" in out and os.path.exists(os.path.join(WORK, "made.txt")), f"LGTM: the change is made: {out[-600:]!r}")
+check("reviews the work before the request ends" in out, "and reviewed before the request ends")
+check("and checks the first change of a request before it is made" in rs[0]["messages"][0]["content"], "the agent is told so")
+
+print("test interactive: /advisor guidance")
+s = Session(["-m", "fake-coder:latest", "--advisor", "fake-big:latest"], env=ENVK); s.expect("Ctrl-D to quit")
+s.send("/advisor guidance\r"); check(s.expect("Advisor guidance: how much the agent leans on it"), "a picker"); check(s.expect("normal") and "current" in since_send(s), "on the current level")
+s.send("stro"); time.sleep(0.2); s.send("\r"); check(s.expect("advisor guidance: strong"), "picked by filter")
+check("advisor_guidance=strong" in open(CFG2_FILE).read(), "saved")
+s.send("/advisor guidance bogus\r"); check(s.expect("usage: /advisor guidance"), "a level that is not one")
+s.send("/status\r"); check(s.expect("guidance strong"), "/status shows it")
+s.send("/advisor guidance normal\r"); s.expect("advisor guidance: normal")
+check("advisor_guidance" not in open(CFG2_FILE).read(), "the default is not written")
+s.send("\x04"); s.close()
+shutil.rmtree(CFG2, ignore_errors=True)
+
+# ---------- https: Ollama behind TLS, and a hosted API over it ----------
+print("test https: the same client over TLS, with the certificate checked")
+if shutil.which("openssl"):
+    TLS = tempfile.mkdtemp(prefix="crowtls_")
+    cert, key = os.path.join(TLS, "cert.pem"), os.path.join(TLS, "key.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-days", "1",
+                    "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"], capture_output=True, check=True)
+    TLS_PORT = free_port()
+    threading.Thread(target=fake_ollama.serve, args=(TLS_PORT, cert, key), daemon=True).start()
+    time.sleep(0.5)
+    TENV = {k: v for k, v in ENV.items() if k not in ("CURL_CA_BUNDLE", "SSL_CERT_FILE")}
+    out, rc = run(["-H", f"https://localhost:{TLS_PORT}", "-m", "fake-coder:latest", "-p", "hello over tls"], env=dict(TENV, CURL_CA_BUNDLE=cert))
+    check(rc == 0 and "Echo: hello over tls" in out, f"an Ollama behind TLS: streamed as over http: {out[-300:]!r}")
+    out, rc = run(["-H", f"https://localhost:{TLS_PORT}", "-m", "fake-coder:latest", "-p", "hello over tls"], env=TENV)
+    check("TLS:" in out and "certificate" in out and "Echo:" not in out, f"a certificate nobody vouches for is refused: {out[-300:]!r}")
+    out, rc = run(["-m", "fake-coder:latest", "--advisor", "anthropic:claude-fake-opus", "--yolo", "-p", "TOOL_ADVISOR please"],
+                  env=dict(TENV, ANTHROPIC_API_KEY="test-key", ANTHROPIC_BASE_URL=f"https://localhost:{TLS_PORT}/anthropic", SSL_CERT_FILE=cert))
+    check(rc == 0 and "Tool said: ADVICE: read hay.txt" in out, f"a hosted advisor over https (SSL_CERT_FILE names the CA): {out[-300:]!r}")
+    shutil.rmtree(TLS, ignore_errors=True)
+else:
+    print("  (skipped: no openssl to make a certificate with)")
 
 print("test config persistence")
 cfg = open(os.path.join(CFG, "corbienest", "config")).read()

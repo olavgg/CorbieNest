@@ -243,7 +243,7 @@ static void test_http(void) {
     free(req); sb_free(&lines);
 
     /* content-length body into sbuf */
-    p = start_server("HTTP/1.1 404 Not Found\r\nContent-Length: 17\r\n\r\n{\"error\":\"nope\"}", &port, &reqpath);
+    p = start_server("HTTP/1.1 404 Not Found\r\nContent-Length: 16\r\n\r\n{\"error\":\"nope\"}", &port, &reqpath);
     snprintf(url, sizeof url, "http://127.0.0.1:%d", port);
     sbuf body; sb_init(&body);
     rc = http_request(url, "GET", "/api/tags", NULL, &body, NULL, NULL, &res);
@@ -261,10 +261,54 @@ static void test_http(void) {
     /* connection refused */
     rc = http_request("http://127.0.0.1:1", "GET", "/", NULL, NULL, NULL, NULL, &res);
     CHECK(rc < 0); CHECK(strstr(res.err, "connect") != NULL);
-    /* https unsupported */
-    rc = http_request("https://example.com", "GET", "/", NULL, NULL, NULL, NULL, &res);
-    CHECK(rc < 0);
+    /* a host without a scheme, the way OLLAMA_HOST is written: plain http */
+    p = start_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}", &port, &reqpath);
+    snprintf(url, sizeof url, "127.0.0.1:%d", port);
+    sbuf got; sb_init(&got);
+    rc = http_request(url, "GET", "/api/version", NULL, &got, NULL, NULL, &res);
+    CHECK(rc == 0 && res.status == 200); CHECK_STR(got.data, "{}");
+    waitpid(p, NULL, 0); sb_free(&got);
+    /* https goes through the same client: refused like plain http, not "unsupported" */
+    rc = http_request("https://127.0.0.1:1", "GET", "/", NULL, NULL, NULL, NULL, &res);
+    CHECK(rc < 0); CHECK(strstr(res.err, "connect") != NULL);
+
+    /* extra headers go out with the request (the hosted APIs' keys) */
+    p = start_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}", &port, &reqpath);
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/v1", port);
+    const char *extra[] = { "x-api-key: sk-test", "anthropic-version: 2023-06-01", NULL };
+    http_headers = extra;
+    rc = http_request(url, "POST", "/messages", "{}", NULL, NULL, NULL, &res);
+    http_headers = NULL;
+    CHECK(rc == 0 && res.status == 200);
+    waitpid(p, NULL, 0);
+    req = read_whole_file(reqpath, &n, 0);
+    CHECK(strstr(req, "POST /v1/messages HTTP/1.1\r\n") != NULL);
+    CHECK(strcasestr(req, "\r\nx-api-key: sk-test\r\n") != NULL && strcasestr(req, "\r\nanthropic-version: 2023-06-01\r\n") != NULL);
+    free(req);
     unlink(reqpath);
+
+    /* where a host setting points, and whether the way there is encrypted */
+    char hn[64];
+    CHECK(url_hostname("gpu-box:11434", hn, sizeof hn) && !strcmp(hn, "gpu-box"));
+    CHECK(url_hostname("https://user@API.example.org:8443/v1", hn, sizeof hn) && !strcmp(hn, "api.example.org"));
+    CHECK(url_hostname("http://[fd00::1]:8080/v1", hn, sizeof hn) && !strcmp(hn, "[fd00::1]"));
+    CHECK(!url_hostname(":11434", hn, sizeof hn));
+    CHECK(url_is_local("localhost") && url_is_local("http://127.0.0.1:11434") && url_is_local("[::1]:9") && url_is_local("0.0.0.0") && url_is_local(":11434") && url_is_local("http://LOCALHOST"));
+    CHECK(!url_is_local("gpu-box:11434") && !url_is_local("http://10.0.0.5") && !url_is_local("http://127.evil.example/") && !url_is_local("https://api.x.ai/v1"));
+    CHECK(url_cleartext("gpu-box:11434") && url_cleartext("http://x") && url_cleartext("HTTP://x") && !url_cleartext("https://x") && !url_cleartext("HTTPS://x"));
+    /* what the host setting becomes: Ollama's port when http has none, the scheme's own for https */
+    char *u;
+    u = http_url("http://127.0.0.1:11434", "/api/chat"); CHECK_STR(u, "http://127.0.0.1:11434/api/chat"); free(u);
+    u = http_url("localhost", "/api/tags"); CHECK_STR(u, "localhost:11434/api/tags"); free(u);   /* no scheme written in: libcurl's default is http */
+    u = http_url("http://gpu-box", "/api/tags"); CHECK_STR(u, "http://gpu-box:11434/api/tags"); free(u);
+    u = http_url("0.0.0.0:8080", "/x"); CHECK_STR(u, "0.0.0.0:8080/x"); free(u);
+    u = http_url(":11500", "/x"); CHECK_STR(u, "127.0.0.1:11500/x"); free(u);
+    u = http_url("gpu-box", "/api/chat"); CHECK_STR(u, "gpu-box:11434/api/chat"); free(u);
+    u = http_url("http://[::1]", "/x"); CHECK_STR(u, "http://[::1]:11434/x"); free(u);
+    u = http_url("http://[::1]:9000/", "/x"); CHECK_STR(u, "http://[::1]:9000/x"); free(u);
+    u = http_url("https://ollama.example.org", "/api/chat"); CHECK_STR(u, "https://ollama.example.org/api/chat"); free(u);
+    u = http_url("https://api.x.ai/v1/", "/chat/completions"); CHECK_STR(u, "https://api.x.ai/v1/chat/completions"); free(u);
+    u = http_url("https://api.openai.com/v1", "models/gpt-5"); CHECK_STR(u, "https://api.openai.com/v1/models/gpt-5"); free(u);
 }
 
 /* ---------- misc util ---------- */
@@ -505,6 +549,433 @@ static void test_skills(void) {
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
 }
 
+/* ---------- /api/show ---------- */
+static void test_model_info(void) {
+    model_info mi;
+    model_info_parse("{\"model_info\":{\"general.architecture\":\"gptoss\",\"gptoss.context_length\":131072},"
+                     "\"parameters\":\"top_k 20\\ndraft_num_predict              4\\ntemperature 1\","
+                     "\"details\":{\"family\":\"gptoss\",\"parameter_size\":\"20.9B\"},"
+                     "\"capabilities\":[\"completion\",\"tools\",\"thinking\"]}", &mi);
+    CHECK(mi.context_length == 131072 && mi.draft == 4);
+    CHECK_STR(mi.family, "gptoss");
+    CHECK(mi.caps_known && mi.tools && mi.thinking);
+    /* a chat-only model, no draft head */
+    model_info_parse("{\"model_info\":{\"llama.context_length\":8192},\"details\":{\"family\":\"llama\"},\"capabilities\":[\"completion\"]}", &mi);
+    CHECK(mi.context_length == 8192 && mi.draft == -1 && mi.caps_known && !mi.tools && !mi.thinking);
+    /* an older server: no capabilities[] at all — the caller falls back on /api/tags */
+    model_info_parse("{\"model_info\":{\"llama.context_length\":4096}}", &mi);
+    CHECK(mi.context_length == 4096 && !mi.caps_known && !mi.family[0]);
+    /* not JSON, or nothing at all */
+    model_info_parse("<html>502</html>", &mi); CHECK(mi.context_length == 0 && mi.draft == -1 && !mi.caps_known);
+    model_info_parse(NULL, &mi); CHECK(mi.context_length == 0 && mi.draft == -1);
+}
+
+/* ---------- effort: what a model can be set to, and what is sent as "think" ---------- */
+static model_info mi_of(const char *show_json) { model_info mi; model_info_parse(show_json, &mi); return mi; }
+static bool same_level(const char *a, const char *b) { return a && b ? !strcmp(a, b) : a == b; }
+#define THINKS(mi, when, quiet, followup, effort, kind, lvl) do { const char *_l = NULL; \
+    think_kind _k = think_decide((when), (quiet), (followup), (effort), &(mi), &_l); \
+    if (_k == (kind) && same_level(_l, (lvl))) g_pass++; \
+    else { g_fail++; fprintf(stderr, "  FAIL %s:%d: think_decide -> %d \"%s\", wanted %d \"%s\"\n", __FILE__, __LINE__, (int)_k, _l ? _l : "", (int)(kind), (lvl) ? (lvl) : ""); } } while (0)
+static void test_effort(void) {
+    model_info none  = mi_of("{\"capabilities\":[\"completion\",\"tools\"]}");
+    model_info onoff = mi_of("{\"details\":{\"family\":\"qwen3\"},\"capabilities\":[\"completion\",\"thinking\"]}");
+    model_info oss   = mi_of("{\"details\":{\"family\":\"gptoss\"},\"capabilities\":[\"thinking\"]}");
+    model_info q38   = mi_of("{\"details\":{\"family\":\"qwen35\"},\"capabilities\":[\"thinking\"],\"modelfile\":\"# made by ollama\\nFROM /blob\\nRENDERER qwen3.8\\nPARSER qwen3.5\\n\"}");
+    model_info q35   = mi_of("{\"details\":{\"family\":\"qwen35\"},\"capabilities\":[\"thinking\"],\"modelfile\":\"FROM /blob\\nRENDERER qwen3.5\\n\"}");
+    model_info decl  = mi_of("{\"details\":{\"family\":\"qwen35\"},\"capabilities\":[\"thinking\"],\"modelfile\":\"RENDERER qwen3.8\\n\","
+                             "\"thinking\":{\"values\":[false,\"low\",\"medium\",\"xhigh\"],\"default\":\"medium\"}}");
+    model_info cloud = mi_of("{\"capabilities\":[\"completion\"],\"thinking\":{\"values\":[\"low\",\"high\",\"max\"],\"default\":\"max\"}}");
+
+    /* what each offers: the server's list when it sends one, else the table, else on/off */
+    CHECK(!none.thinking && !none.think_off && !none.think_on && none.n_think_levels == 0);
+    CHECK(onoff.think_off && onoff.think_on && onoff.n_think_levels == 0 && !onoff.think_declared); CHECK_STR(onoff.think_default, "on");
+    CHECK(!oss.think_off && !oss.think_on && oss.n_think_levels == 3); CHECK_STR(oss.think_levels[0], "low"); CHECK_STR(oss.think_levels[2], "high"); CHECK_STR(oss.think_default, "medium");
+    CHECK_STR(q38.renderer, "qwen3.8"); CHECK(q38.think_off && !q38.think_on && q38.n_think_levels == 3);
+    CHECK(q35.think_on && q35.n_think_levels == 0);                       /* the same family without that renderer is on/off */
+    CHECK(decl.think_declared && decl.think_off && !decl.think_on && decl.n_think_levels == 3); CHECK_STR(decl.think_levels[2], "xhigh");   /* declared beats the table */
+    CHECK(cloud.thinking && !cloud.think_off && cloud.n_think_levels == 3); CHECK_STR(cloud.think_default, "max");   /* it says how it thinks: it thinks */
+
+    CHECK(effort_name_ok("xhigh") && effort_name_ok("off") && !effort_name_ok("") && !effort_name_ok("High") && !effort_name_ok("a b") && !effort_name_ok("0123456789abcdefg"));
+    CHECK(effort_supported(&oss, "high") == 1 && effort_supported(&oss, "off") == 0 && effort_supported(&oss, "on") == 0 && effort_supported(&oss, "max") == 0);
+    CHECK(effort_supported(&onoff, "off") == 1 && effort_supported(&onoff, "on") == 1 && effort_supported(&onoff, "high") == -1 && effort_supported(&onoff, "xhigh") == 0);
+    CHECK(effort_supported(&none, "off") == 0 && effort_supported(&none, "high") == 0);
+    CHECK(effort_supported(&decl, "xhigh") == 1 && effort_supported(&decl, "high") == 0);
+
+    bool mapped;
+    CHECK_STR(effort_resolve(&decl, "high", &mapped), "xhigh"); CHECK(mapped);    /* saved under 0.33, run under 0.34.3 */
+    CHECK_STR(effort_resolve(&oss, "max", &mapped), "high"); CHECK(mapped);
+    CHECK_STR(effort_resolve(&oss, "low", &mapped), "low"); CHECK(!mapped);
+    CHECK_STR(effort_resolve(&onoff, "high", &mapped), "high"); CHECK(!mapped);   /* passed on as it is */
+    CHECK(effort_resolve(&decl, "ultra", NULL) == NULL && effort_resolve(&oss, "off", NULL) == NULL && effort_resolve(&onoff, "xhigh", NULL) == NULL);
+    CHECK(effort_resolve(&none, "high", NULL) == NULL && effort_resolve(&oss, NULL, NULL) == NULL);
+
+    /* the table of effort entries */
+    CHECK(effort_get("m:7b") == NULL);
+    effort_set("m:7b", "high"); effort_set("reg:5000/ns/other", "off"); effort_set("m:7b", "low");
+    CHECK_STR(effort_get("m:7b"), "low"); CHECK_STR(effort_get("reg:5000/ns/other"), "off"); CHECK(g_cfg.n_efforts == 2);
+    effort_set("plain", "on"); CHECK_STR(effort_get("plain:latest"), "on");   /* one model to the server */
+    effort_set("plain:latest", "off"); CHECK_STR(effort_get("plain"), "off"); CHECK(g_cfg.n_efforts == 3);
+    effort_set("m:7b", NULL); CHECK(effort_get("m:7b") == NULL && g_cfg.n_efforts == 2);
+    effort_set("reg:5000/ns/other", NULL); effort_set("plain", NULL); effort_set("never-set", NULL); CHECK(g_cfg.n_efforts == 0);
+    CHECK(model_same("a:latest", "a") && model_same("a", "a") && !model_same("a:7b", "a") && !model_same("a", NULL) && !model_same("reg:5000/ns/m", "reg:5000/ns/n"));
+    CHECK(model_is_cloud("gpt-oss:120b-cloud") && model_is_cloud("kimi-k3:cloud") && !model_is_cloud("cloud") && !model_is_cloud("cloudy:7b") && !model_is_cloud(NULL));
+
+    /* think_decide(when, quiet, followup, effort): when -1 auto / 0 off / 1 every call */
+    /* a model that cannot think is never sent anything but false */
+    THINKS(none, -1, false, false, NULL, THINK_OMIT, NULL);  THINKS(none, 1, false, false, NULL, THINK_OMIT, NULL);
+    THINKS(none, 0, false, false, NULL, THINK_FALSE, NULL);  THINKS(none, 1, true, false, NULL, THINK_FALSE, NULL);
+    THINKS(none, -1, true, false, NULL, THINK_OMIT, NULL);   THINKS(none, 1, false, false, "high", THINK_OMIT, NULL);
+    /* on/off, nothing set: the old behaviour */
+    THINKS(onoff, -1, false, false, NULL, THINK_OMIT, NULL); THINKS(onoff, -1, false, true, NULL, THINK_FALSE, NULL);
+    THINKS(onoff, 1, false, false, NULL, THINK_TRUE, NULL);  THINKS(onoff, 1, false, true, NULL, THINK_TRUE, NULL);
+    THINKS(onoff, 0, false, false, NULL, THINK_FALSE, NULL); THINKS(onoff, 1, true, false, NULL, THINK_FALSE, NULL);
+    THINKS(onoff, -1, false, false, "on", THINK_TRUE, NULL); THINKS(onoff, -1, false, true, "on", THINK_FALSE, NULL);
+    THINKS(onoff, 1, false, true, "off", THINK_FALSE, NULL);                                /* off for this model beats /think on */
+    /* a name passed on in hope is "on" to such a model: it rests for the tool rounds like on does */
+    THINKS(onoff, -1, false, false, "high", THINK_LEVEL, "high"); THINKS(onoff, -1, false, true, "high", THINK_FALSE, NULL);
+    THINKS(onoff, 1, false, true, "high", THINK_LEVEL, "high");
+    /* a level of the model's own is part of the prompt: every call that shares it carries it */
+    THINKS(q38, -1, false, false, "low", THINK_LEVEL, "low"); THINKS(q38, -1, false, true, "low", THINK_LEVEL, "low");
+    THINKS(q38, -1, true, true, "low", THINK_LEVEL, "low");                                  /* compaction: the conversation's own prompt */
+    THINKS(q38, -1, true, false, "low", THINK_FALSE, NULL);                                  /* the memory update: a prompt of its own */
+    THINKS(q38, 0, false, false, "low", THINK_FALSE, NULL);                                  /* /think off */
+    THINKS(q38, -1, false, false, NULL, THINK_OMIT, NULL); THINKS(q38, -1, false, true, NULL, THINK_FALSE, NULL);
+    THINKS(q38, 1, false, false, NULL, THINK_LEVEL, "medium");                               /* no "true" for it: its default, by name */
+    THINKS(q38, -1, false, false, "max", THINK_LEVEL, "high");                               /* as hard as it goes */
+    THINKS(decl, -1, false, true, "high", THINK_LEVEL, "xhigh");
+    THINKS(decl, -1, false, false, "ultra", THINK_OMIT, NULL);                               /* a saved level it no longer has: left to the model */
+    /* gpt-oss cannot stop: never false, and nothing that changes the prompt between two calls that share it */
+    THINKS(oss, -1, false, false, NULL, THINK_OMIT, NULL); THINKS(oss, -1, false, true, NULL, THINK_OMIT, NULL);
+    THINKS(oss, -1, true, true, NULL, THINK_OMIT, NULL);                                     /* compaction */
+    THINKS(oss, -1, true, false, NULL, THINK_LEVEL, "low");                                  /* memory update: as little as it can */
+    THINKS(oss, 0, false, false, NULL, THINK_LEVEL, "low"); THINKS(oss, 0, false, true, "high", THINK_LEVEL, "low");
+    THINKS(oss, 1, false, false, NULL, THINK_LEVEL, "medium"); THINKS(oss, 1, true, true, NULL, THINK_LEVEL, "medium");
+    THINKS(oss, -1, false, true, "high", THINK_LEVEL, "high"); THINKS(oss, -1, true, true, "high", THINK_LEVEL, "high");
+    THINKS(oss, -1, true, false, "high", THINK_LEVEL, "low");
+    THINKS(oss, -1, false, false, "off", THINK_OMIT, NULL);                                  /* from a hand-edited config: not something it can do, so left to the model */
+    THINKS(cloud, 1, false, false, NULL, THINK_LEVEL, "max");
+    /* glimmer writes its "off" into the top of the prompt like any level ("Reasoning strength: none."): no flip mid-prompt */
+    model_info glim = mi_of("{\"details\":{\"family\":\"muse-glimmer\"},\"capabilities\":[\"thinking\"]}");
+    model_info glimd = mi_of("{\"details\":{\"family\":\"muse-glimmer\"},\"capabilities\":[\"thinking\"],\"thinking\":{\"values\":[false,\"low\",\"medium\",\"high\",\"max\"],\"default\":\"high\"}}");
+    CHECK(glim.think_off && glim.think_off_top && glim.n_think_levels == 4 && glimd.think_off_top && glimd.think_declared && !q38.think_off_top && !onoff.think_off_top);
+    THINKS(glim, -1, false, false, NULL, THINK_OMIT, NULL); THINKS(glim, -1, false, true, NULL, THINK_OMIT, NULL);
+    THINKS(glimd, 1, false, true, NULL, THINK_LEVEL, "high"); THINKS(glimd, 1, true, true, NULL, THINK_LEVEL, "high");   /* compaction under /think on */
+    THINKS(glim, -1, true, false, NULL, THINK_FALSE, NULL);  /* the memory update has a prompt of its own */
+    THINKS(glim, 0, false, true, NULL, THINK_FALSE, NULL);   /* and off for good is the same on every call */
+}
+
+/* ---------- the advisor: where it runs, what it is shown ---------- */
+static void test_advisor(void) {
+    advisor_plan p;
+    char *old_model = g_cfg.model; int old_ctx = g_cfg.num_ctx, old_actx = g_cfg.advisor_ctx, old_guid = g_cfg.advisor_guidance;
+    g_cfg.model = "small:7b"; g_cfg.num_ctx = 32768; g_cfg.advisor_ctx = 0; g_cfg.advisor_guidance = GUIDANCE_NORMAL;
+    const size_t BRIEF_NORMAL = ADVISOR_GUIDANCE[GUIDANCE_NORMAL].brief_max;
+    advisor_plan_for("big:70b", 131072, &p);           /* another local model: a window of its own, memory back at once */
+    CHECK(!p.same && !p.cloud && p.window == 16384 && p.send_ctx == 16384 && p.reply == 5461); CHECK_STR(p.keep_alive, "0");
+    CHECK(p.budget == (size_t)(16384 - 5461 - 256) * 3);
+    g_cfg.advisor_ctx = 65536; advisor_plan_for("big:70b", 8192, &p);   /* never more than it was trained for */
+    CHECK(p.window == 8192 && p.send_ctx == 8192 && p.reply == 2730);
+    advisor_plan_for("big:70b", 0, &p); CHECK(p.window == 65536 && p.reply == ADVISOR_REPLY_MAX && p.budget == BRIEF_NORMAL);   /* however large: reading it is the wait */
+    g_cfg.advisor_guidance = GUIDANCE_STRONG; advisor_plan_for("big:70b", 0, &p); CHECK(p.budget == ADVISOR_GUIDANCE[GUIDANCE_STRONG].brief_max && p.budget > BRIEF_NORMAL);   /* strong: shown more of it */
+    g_cfg.advisor_guidance = GUIDANCE_NORMAL;
+    g_cfg.advisor_ctx = 0; g_cfg.num_ctx = 0; advisor_plan_for("big:70b", 131072, &p);
+    CHECK(p.window == ADVISOR_CTX_UNSET && p.send_ctx == 0);                                 /* left to the server: plan for little */
+    g_cfg.num_ctx = 512; advisor_plan_for("small:7b", 131072, &p); CHECK(p.window == 512 && p.budget == ADVISOR_BRIEF_MIN);   /* too small to plan for: a floor, not an underflow */
+    g_cfg.advisor_ctx = 100; advisor_plan_for("big:70b", 0, &p); CHECK(p.budget == ADVISOR_BRIEF_MIN); g_cfg.advisor_ctx = 0;
+    g_cfg.num_ctx = 65536; advisor_plan_for("small:7b", 131072, &p);   /* the main model itself: called exactly as it always is */
+    CHECK(p.same && !p.cloud && p.window == 65536 && p.send_ctx == 0 && p.keep_alive == NULL);
+    g_cfg.model = "small"; advisor_plan_for("small:latest", 0, &p); CHECK(p.same); g_cfg.model = "small:7b";
+    g_cfg.advisor_ctx = 8192; advisor_plan_for("gpt-oss:120b-cloud", 131072, &p);           /* a cloud model: nothing of ours to set */
+    CHECK(p.cloud && !p.same && p.window == ADVISOR_CTX_CLOUD && p.send_ctx < 0); CHECK_STR(p.keep_alive, "");
+    advisor_plan_for("tiny:cloud", 8192, &p); CHECK(p.window == 8192);
+    /* a hosted API: runs elsewhere like a cloud model, with a larger answer (paid by the token used) */
+    advisor_plan_for("xai:grok-4.7", 0, &p);
+    CHECK(p.api && p.cloud && !p.same && p.send_ctx < 0 && p.window == ADVISOR_CTX_API && p.reply == ADVISOR_REPLY_API && p.budget == BRIEF_NORMAL); CHECK_STR(p.keep_alive, "");
+    advisor_plan_for("anthropic:claude-opus-5", 1000000, &p); CHECK(p.api && p.window == 1000000 && p.reply == ADVISOR_REPLY_API);
+    advisor_plan_for("openai:gpt-5.2", 0, &p); CHECK(p.api);
+    advisor_plan_for("qwen3:32b", 0, &p); CHECK(!p.api && !p.cloud);   /* a tag is not a provider */
+    g_cfg.model = old_model; g_cfg.num_ctx = old_ctx; g_cfg.advisor_ctx = old_actx;
+
+    cJSON *msgs = cJSON_CreateArray();
+    cJSON *m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", "fix the parser"); cJSON_AddItemToArray(msgs, m);
+    sbuf rules; sb_init(&rules); sb_puts(&rules, "RULES-HEAD\n"); for (int i = 0; i < 3000; i++) sb_puts(&rules, "rule "); sb_puts(&rules, "\nDONTS-AT-THE-END");
+    char *b = advisor_brief(msgs, 0, 20000, "Working directory: /w · Linux x86_64", true, rules.data, "  Is my plan right?", 400);
+    CHECK(strstr(b, "# Environment\nWorking directory: /w") == b);
+    CHECK(strstr(b, "plan mode") != NULL);
+    CHECK(strstr(b, "RULES-HEAD") && strstr(b, "DONTS-AT-THE-END") && strstr(b, "bytes cut"));   /* the rules lose their middle, not their end */
+    CHECK(strstr(b, "# The agent's conversation so far\n") && strstr(b, "[user]\nfix the parser\n\n# What the agent asks you\nIs my plan right?\n"));
+    const char *tail = "do not call tools.\n"; CHECK(strlen(b) > strlen(tail) && !strcmp(b + strlen(b) - strlen(tail), tail));   /* what a cut prompt keeps */
+    CHECK(strlen(b) < 20000 && strstr(b, "under about 400 words"));
+    free(b);
+    b = advisor_brief(msgs, 0, 20000, "env", false, NULL, NULL, 700);
+    CHECK(strstr(b, "under about 700 words") != NULL);
+    CHECK(strstr(b, "(It did not say.") && !strstr(b, "plan mode") && !strstr(b, "project's rules"));
+    free(b); sb_free(&rules); cJSON_Delete(msgs);
+
+    CHECK_STR(strip_think_block("plain advice"), "plain advice");
+    CHECK_STR(strip_think_block("  \n<think>hmm\nhmm</think>\n\nADVICE"), "ADVICE");
+    CHECK_STR(strip_think_block("<think>never finished"), "");
+    CHECK_STR(strip_think_block("say <think> later"), "say <think> later");
+
+    /* a review or a check that finds nothing to change */
+    CHECK(advisor_approves("LGTM") && advisor_approves("  LGTM.") && advisor_approves("**LGTM** — nothing to add") && advisor_approves("lgtm\n"));
+    CHECK(advisor_approves("LGTM — the change is correct and complete, and the tests cover it."));   /* a sentence of its own is still a yes */
+    CHECK(advisor_approves("LGTM: the fix is right and the tests still pass."));
+    CHECK(!advisor_approves("LGTM, but the test for the empty field is missing: add it to tests/test_parse.c") && !advisor_approves("Not yet: run the tests") && !advisor_approves(""));
+    CHECK(!advisor_approves("LGTM. You should still run the tests.") && !advisor_approves("LGTM once the import is fixed"));
+    CHECK(!advisor_approves("LGTM overall. The parser now handles empty fields, the tests pass, and the change is small, which is good; one more thing to consider is the docs"));   /* too long to be only a yes */
+    /* the levels, by name */
+    CHECK(advisor_guidance_parse("strong") == GUIDANCE_STRONG && advisor_guidance_parse("MAX") == GUIDANCE_MAX && advisor_guidance_parse("ultra") == -1);
+    CHECK(ADVISOR_GUIDANCE[GUIDANCE_NORMAL].uses == 3 && !ADVISOR_GUIDANCE[GUIDANCE_NORMAL].review && ADVISOR_GUIDANCE[GUIDANCE_STRONG].review && ADVISOR_GUIDANCE[GUIDANCE_MAX].check_first_edit);
+    for (int i = 1; i < GUIDANCE_COUNT; i++) CHECK(ADVISOR_GUIDANCE[i].uses > ADVISOR_GUIDANCE[i - 1].uses && ADVISOR_GUIDANCE[i].words > ADVISOR_GUIDANCE[i - 1].words);
+    g_cfg.advisor_guidance = old_guid;
+
+    /* the tool is on offer only while an advisor is set, and says so when called without one */
+    char *old_adv = g_cfg.advisor;
+    g_cfg.advisor = NULL;
+    cJSON *defs = tools_definitions(); char *t = cJSON_PrintUnformatted(defs);
+    CHECK(!strstr(t, "\"advisor\"") && !strstr(tools_summary_line(), "advisor")); free(t); cJSON_Delete(defs);
+    sbuf out; sb_init(&out);
+    CHECK(tools_execute("advisor", NULL, &out) == TOOL_ERROR && strstr(out.data, "no advisor is set")); sb_free(&out);
+    g_cfg.advisor = "big:70b";
+    defs = tools_definitions(); t = cJSON_PrintUnformatted(defs);
+    CHECK(strstr(t, "\"name\":\"advisor\"") && strstr(tools_summary_line(), "task, advisor")); free(t);
+    cJSON *last = cJSON_GetArrayItem(defs, cJSON_GetArraySize(defs) - 1);
+    CHECK_STR(cJSON_GetObjectItem(cJSON_GetObjectItem(last, "function"), "name")->valuestring, "advisor");   /* last: the tools before it keep their place in the prompt */
+    t = cJSON_PrintUnformatted(last); CHECK(strstr(t, "\"required\":[]") != NULL); free(t);             /* the question is optional */
+    cJSON_Delete(defs);
+    sb_init(&out); CHECK(tools_execute("advisor", NULL, &out) == TOOL_ERROR && strstr(out.data, "no advisor is set")); sb_free(&out);   /* set, but nothing to run it (main.c's hook) */
+    g_cfg.advisor = old_adv;
+}
+
+/* strict enough to see a sequence cut at either end: every lead byte has its continuation bytes, and none stand alone */
+static bool utf8_valid(const char *s) {
+    for (const unsigned char *p = (const unsigned char *)s; *p; ) {
+        int n = *p < 0x80 ? 0 : (*p & 0xE0) == 0xC0 ? 1 : (*p & 0xF0) == 0xE0 ? 2 : (*p & 0xF8) == 0xF0 ? 3 : -1;
+        if (n < 0) return false;
+        p++;
+        for (; n > 0; n--, p++) if ((*p & 0xC0) != 0x80) return false;
+    }
+    return true;
+}
+
+/* ---------- the conversation as quoted text (what the advisor is shown) ---------- */
+static cJSON *tmsg(const char *role, const char *content) {
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddStringToObject(m, "role", role); cJSON_AddStringToObject(m, "content", content);
+    return m;
+}
+static void test_transcript(void) {
+    cJSON *msgs = cJSON_CreateArray();
+    cJSON_AddItemToArray(msgs, tmsg("user", "old request"));
+    cJSON_AddItemToArray(msgs, tmsg("assistant", "old answer"));
+    cJSON_AddItemToArray(msgs, tmsg("user", "fix the parser"));                 /* [2] the request being worked on */
+    cJSON *a = tmsg("assistant", "Let me look.");
+    cJSON *calls = cJSON_AddArrayToObject(a, "tool_calls");
+    cJSON *call = cJSON_CreateObject(); cJSON *fn = cJSON_AddObjectToObject(call, "function");
+    cJSON_AddStringToObject(fn, "name", "read_file");
+    cJSON_AddStringToObject(cJSON_AddObjectToObject(fn, "arguments"), "path", "src/parser.py");
+    cJSON_AddItemToArray(calls, call);
+    cJSON_AddItemToArray(msgs, a);
+    cJSON *t = tmsg("tool", "def parse(): pass\n"); cJSON_AddStringToObject(t, "tool_name", "read_file");
+    cJSON_AddItemToArray(msgs, t);
+    cJSON *ask = tmsg("assistant", "");                                          /* the turn that calls the advisor */
+    calls = cJSON_AddArrayToObject(ask, "tool_calls");
+    call = cJSON_CreateObject(); fn = cJSON_AddObjectToObject(call, "function");
+    cJSON_AddStringToObject(fn, "name", "advisor");
+    cJSON_AddStringToObject(cJSON_AddObjectToObject(fn, "arguments"), "question", "SECRET_QUESTION");
+    cJSON_AddItemToArray(calls, call);
+    cJSON_AddItemToArray(msgs, ask);
+
+    char *x = transcript_text(msgs, 2, 100000);
+    CHECK(strstr(x, "[user]\nold request\n\n[agent]\nold answer\n\n[user]\nfix the parser\n\n") == x);
+    CHECK(strstr(x, "[agent]\nLet me look.\n→ read_file({\"path\":\"src/parser.py\"})\n\n") != NULL);
+    CHECK(strstr(x, "[result of read_file]\ndef parse(): pass\n\n") != NULL);
+    CHECK(!strstr(x, "SECRET_QUESTION") && !strstr(x, "advisor"));   /* the question travels separately; an empty turn is no block */
+    free(x);
+
+    /* too small for everything: the newest blocks win, the request stays, and the gap is named */
+    x = transcript_text(msgs, 2, 140);
+    CHECK(strstr(x, "fix the parser") != NULL && strstr(x, "def parse()") != NULL);
+    CHECK(!strstr(x, "old request") && !strstr(x, "old answer"));
+    CHECK(strstr(x, "[… 2 earlier messages left out to fit …]\n\n[user]\nfix the parser") == x);
+    free(x);
+    x = transcript_text(msgs, -1, 110);   /* nothing pinned: just the tail */
+    CHECK(!strstr(x, "fix the parser") && strstr(x, "def parse()") != NULL);
+    free(x);
+
+    /* a long result loses its middle, on UTF-8 boundaries, and says how much */
+    sbuf big; sb_init(&big);
+    sb_puts(&big, "HEAD-OF-FILE\n"); for (int i = 0; i < 2000; i++) sb_puts(&big, "æøå "); sb_puts(&big, "\nTAIL-OF-FILE");
+    cJSON *bt = tmsg("tool", big.data); cJSON_AddStringToObject(bt, "tool_name", "bash");
+    cJSON_AddItemToArray(msgs, bt);
+    x = transcript_text(msgs, 2, 100000);
+    CHECK(strstr(x, "HEAD-OF-FILE") && strstr(x, "TAIL-OF-FILE") && strstr(x, " bytes cut …]"));
+    CHECK(strlen(x) < 5000);
+    CHECK(utf8_valid(x));
+    free(x); sb_free(&big);
+    /* the cut points have to land inside a character some of the time: shift the text a byte at a time */
+    for (int shift = 0; shift < 7; shift++) {
+        sbuf t; sb_init(&t);
+        for (int i = 0; i < shift; i++) sb_putc(&t, 'x');
+        for (int i = 0; i < 800; i++) sb_puts(&t, "æøå€");   /* 2+2+2+3 bytes */
+        sbuf o; sb_init(&o); sb_put_cut(&o, t.data, 1000);
+        CHECK(utf8_valid(o.data) && o.len < 1100 && strstr(o.data, "bytes cut"));
+        sb_free(&o); sb_free(&t);
+    }
+
+    cJSON *none = cJSON_CreateArray();
+    x = transcript_text(none, -1, 1000); CHECK_STR(x, ""); free(x);
+    cJSON_Delete(none); cJSON_Delete(msgs);
+}
+
+/* ---------- hosted APIs for the advisor: what goes out, what comes back ---------- */
+static cJSON *jget(cJSON *o, const char *path) {   /* "a.b.0.c" */
+    char buf[256]; snprintf(buf, sizeof buf, "%s", path);
+    for (char *k = strtok(buf, "."); k && o; k = strtok(NULL, ".")) o = (*k >= '0' && *k <= '9') ? cJSON_GetArrayItem(o, atoi(k)) : cJSON_GetObjectItemCaseSensitive(o, k);
+    return o;
+}
+static const char *jstr_at(cJSON *o, const char *path) { cJSON *v = jget(o, path); return cJSON_IsString(v) ? v->valuestring : NULL; }
+
+static void test_provider(void) {
+    const char *model = NULL;
+    const provider_def *p = provider_find("xai:grok-4.7", &model);
+    CHECK(p && !strcmp(p->name, "xai") && p->style == PROVIDER_CHAT_COMPLETIONS); CHECK_STR(model, "grok-4.7");
+    p = provider_find("grok:grok-4.7", &model); CHECK(p && !strcmp(p->name, "xai"));
+    p = provider_find("claude:claude-opus-5", &model); CHECK(p && p->style == PROVIDER_MESSAGES); CHECK_STR(model, "claude-opus-5");
+    CHECK(provider_find("OpenAI:gpt-5.2", NULL) != NULL);
+    CHECK(!provider_find("qwen3:32b", NULL) && !provider_find("gpt-oss:120b-cloud", NULL) && !provider_find("xai:", NULL) && !provider_find(NULL, NULL));
+    p = provider_find("openai:x", NULL);
+    unsetenv("OPENAI_BASE_URL"); CHECK_STR(provider_base_url(p), "https://api.openai.com/v1");
+    setenv("OPENAI_BASE_URL", "http://127.0.0.1:9/v1", 1); CHECK_STR(provider_base_url(p), "http://127.0.0.1:9/v1"); unsetenv("OPENAI_BASE_URL");
+    CHECK_STR(provider_base_url(provider_find("anthropic:x", NULL)), "https://api.anthropic.com");
+
+    /* what each can be set to */
+    model_info mi;
+    provider_parse_model("openai:gpt-5.2", "{\"id\":\"gpt-5.2\",\"object\":\"model\"}", &mi);
+    CHECK(mi.thinking && mi.think_off && !mi.think_on && mi.n_think_levels == 6 && !strcmp(mi.think_levels[0], "minimal") && !strcmp(mi.think_levels[5], "max"));
+    provider_parse_model("xai:grok-4.7", NULL, &mi);
+    CHECK(mi.thinking && mi.n_think_levels == 4 && !strcmp(mi.think_levels[3], "xhigh"));
+    CHECK_STR(effort_resolve(&mi, "max", NULL), "xhigh");   /* as hard as it goes, in its own name */
+    const char *OPUS = "{\"id\":\"claude-opus-5\",\"max_input_tokens\":1000000,\"max_tokens\":128000,\"capabilities\":{"
+        "\"thinking\":{\"supported\":true,\"types\":{\"enabled\":{\"supported\":false},\"adaptive\":{\"supported\":true}}},"
+        "\"effort\":{\"supported\":true,\"low\":{\"supported\":true},\"medium\":{\"supported\":true},\"high\":{\"supported\":true},\"xhigh\":{\"supported\":true},\"max\":{\"supported\":true}}}}";
+    provider_parse_model("anthropic:claude-opus-5", OPUS, &mi);
+    CHECK(mi.context_length == 1000000 && mi.think_adaptive && !mi.think_budget && mi.n_think_levels == 5 && !mi.think_off && !strcmp(mi.think_default, "high"));
+    model_info opus = mi;
+    const char *HAIKU = "{\"id\":\"claude-haiku-4-5\",\"max_input_tokens\":200000,\"capabilities\":{"
+        "\"thinking\":{\"supported\":true,\"types\":{\"enabled\":{\"supported\":true},\"adaptive\":{\"supported\":false}}},\"effort\":{\"supported\":false}}}";
+    provider_parse_model("anthropic:claude-haiku-4-5", HAIKU, &mi);
+    CHECK(mi.think_budget && !mi.think_adaptive && mi.n_think_levels == 0 && mi.think_off && mi.think_on && !strcmp(mi.think_default, "off"));
+    model_info haiku = mi;
+    provider_parse_model("anthropic:claude-x", "{\"id\":\"claude-x\"}", &mi);   /* a proxy that says nothing: nothing is sent that it might refuse */
+    CHECK(!mi.thinking && !mi.think_adaptive);
+
+    /* Chat Completions */
+    model_info oai; provider_parse_model("openai:gpt-5.2", NULL, &oai);
+    provider_request rq = { "SYS", "BRIEF", 16000, "high", NULL, 0 };
+    char *body = provider_request_body("openai:gpt-5.2", &oai, &rq);
+    cJSON *j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "model"), "gpt-5.2");
+    CHECK_STR(jstr_at(j, "messages.0.role"), "system"); CHECK_STR(jstr_at(j, "messages.0.content"), "SYS");
+    CHECK_STR(jstr_at(j, "messages.1.role"), "user"); CHECK_STR(jstr_at(j, "messages.1.content"), "BRIEF");
+    CHECK(cJSON_GetNumberValue(jget(j, "max_completion_tokens")) == 16000 && !jget(j, "max_tokens"));   /* the name reasoning models take */
+    CHECK_STR(jstr_at(j, "reasoning_effort"), "high");
+    CHECK(!jget(j, "stream") && !jget(j, "tools") && !jget(j, "temperature"));
+    cJSON_Delete(j); free(body);
+    rq.effort = "off"; body = provider_request_body("openai:gpt-5.2", &oai, &rq); j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "reasoning_effort"), "none"); cJSON_Delete(j); free(body);
+    rq.effort = NULL; body = provider_request_body("openai:gpt-5.2", &oai, &rq); j = cJSON_Parse(body);
+    CHECK(!jget(j, "reasoning_effort")); cJSON_Delete(j); free(body);   /* left to the model */
+
+    /* the Messages API */
+    rq.effort = "xhigh";
+    body = provider_request_body("anthropic:claude-opus-5", &opus, &rq); j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "model"), "claude-opus-5"); CHECK_STR(jstr_at(j, "system"), "SYS");
+    CHECK(cJSON_GetArraySize(jget(j, "messages")) == 1); CHECK_STR(jstr_at(j, "messages.0.role"), "user");
+    CHECK(cJSON_GetNumberValue(jget(j, "max_tokens")) == 16000);
+    CHECK_STR(jstr_at(j, "thinking.type"), "adaptive"); CHECK_STR(jstr_at(j, "output_config.effort"), "xhigh");
+    CHECK_STR(jstr_at(j, "fallbacks"), "default"); CHECK(provider_fallbacks("anthropic:claude-opus-5"));
+    CHECK(!jget(j, "temperature") && !jget(j, "thinking.budget_tokens"));
+    cJSON_Delete(j); free(body);
+    rq.effort = NULL;
+    body = provider_request_body("anthropic:claude-sonnet-5", &opus, &rq); j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "thinking.type"), "adaptive"); CHECK(!jget(j, "output_config") && !jget(j, "fallbacks"));   /* no effort: the API's own; no fallbacks where there are none */
+    cJSON_Delete(j); free(body);
+    rq.effort = "on";
+    body = provider_request_body("anthropic:claude-haiku-4-5", &haiku, &rq); j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "thinking.type"), "enabled"); CHECK(cJSON_GetNumberValue(jget(j, "thinking.budget_tokens")) == 8000 && !jget(j, "output_config"));
+    cJSON_Delete(j); free(body);
+    rq.effort = NULL;
+    body = provider_request_body("anthropic:claude-haiku-4-5", &haiku, &rq); j = cJSON_Parse(body);
+    CHECK(!jget(j, "thinking")); cJSON_Delete(j); free(body);
+
+    /* answers */
+    chat_stats st; char err[512];
+    memset(&st, 0, sizeof st);
+    char *t = provider_parse_reply("openai:gpt-5.2", "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ADVICE: read it\"},\"finish_reason\":\"stop\"}],"
+                                   "\"usage\":{\"prompt_tokens\":1200,\"completion_tokens\":300}}", 200, &st, err, sizeof err);
+    CHECK_STR(t, "ADVICE: read it"); CHECK(st.prompt_tokens == 1200 && st.eval_tokens == 300); CHECK_STR(st.done_reason, "stop"); free(t);
+    memset(&st, 0, sizeof st);
+    t = provider_parse_reply("xai:grok-4.7", "{\"choices\":[{\"message\":{\"content\":\"\"},\"finish_reason\":\"length\"}]}", 200, &st, err, sizeof err);
+    CHECK_STR(t, ""); CHECK_STR(st.done_reason, "length"); free(t);   /* spent it all thinking: an empty answer, cut */
+    t = provider_parse_reply("openai:gpt-5.2", "{\"choices\":[{\"message\":{\"content\":null,\"refusal\":\"I can't help with that.\"},\"finish_reason\":\"stop\"}]}", 200, &st, err, sizeof err);
+    CHECK(!t && strstr(err, "declined") && strstr(err, "can't help"));
+    memset(&st, 0, sizeof st);
+    t = provider_parse_reply("anthropic:claude-opus-5", "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"x\"},{\"type\":\"text\",\"text\":\"Verdict: \"},{\"type\":\"text\",\"text\":\"fine.\"}],"
+                             "\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":900,\"cache_read_input_tokens\":100,\"output_tokens\":42}}", 200, &st, err, sizeof err);
+    CHECK_STR(t, "Verdict: fine."); CHECK(st.prompt_tokens == 1000 && st.eval_tokens == 42); free(t);
+    memset(&st, 0, sizeof st);
+    t = provider_parse_reply("anthropic:claude-opus-5", "{\"content\":[{\"type\":\"text\",\"text\":\"Half an ans\"}],\"stop_reason\":\"max_tokens\"}", 200, &st, err, sizeof err);
+    CHECK_STR(t, "Half an ans"); CHECK_STR(st.done_reason, "length"); free(t);
+    t = provider_parse_reply("anthropic:claude-fable-5-1", "{\"content\":[],\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\"}}", 200, &st, err, sizeof err);
+    CHECK(!t && strstr(err, "declined") && strstr(err, "cyber"));
+    /* errors say what to do about them, and never how the key reads */
+    t = provider_parse_reply("anthropic:claude-opus-5", "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}}", 401, &st, err, sizeof err);
+    CHECK(!t && strstr(err, "ANTHROPIC_API_KEY") && strstr(err, "invalid x-api-key"));
+    t = provider_parse_reply("xai:grok-9", "{\"code\":\"Some resource has not been found\",\"error\":\"The model grok-9 does not exist.\"}", 404, &st, err, sizeof err);
+    CHECK(!t && strstr(err, "does not know a model 'grok-9'") && strstr(err, "does not exist"));
+    /* the answers the real APIs give a wrong key: xAI says 400; OpenAI echoes a masked piece of the key, which goes no further */
+    t = provider_parse_reply("xai:grok-4.7", "{\"code\":\"Client specified an invalid argument\",\"error\":\"Incorrect API key provided. You can obtain an API key from https://console.x.ai.\"}", 400, &st, err, sizeof err);
+    CHECK(!t && strstr(err, "xAI refused the key in XAI_API_KEY (400"));
+    t = provider_parse_reply("openai:gpt-5.2", "{\"error\":{\"message\":\"Incorrect API key provided: sk-proj-********wxyz. You can find your API key at https://platform.openai.com/account/api-keys.\",\"type\":\"invalid_request_error\",\"code\":\"invalid_api_key\"}}", 401, &st, err, sizeof err);
+    CHECK(!t && strstr(err, "refused the key in OPENAI_API_KEY") && !strstr(err, "wxyz") && !strstr(err, "sk-proj") && strstr(err, "Incorrect API key provided. You can find your API key"));
+    t = provider_parse_reply("openai:gpt-5.2", "{\"error\":{\"message\":\"Rate limit\\nreached\",\"type\":\"requests\"}}", 429, &st, err, sizeof err);
+    CHECK(!t && strstr(err, "rate-limiting") && !strchr(err, '\n'));
+    t = provider_parse_reply("openai:gpt-5.2", "<html>bad gateway</html>", 502, &st, err, sizeof err);
+    CHECK(!t && strstr(err, "answered 502") && strstr(err, "bad gateway"));
+
+    /* a key goes over TLS or stays on this machine */
+    setenv("OPENAI_API_KEY", "sk-test", 1);
+    setenv("OPENAI_BASE_URL", "http://proxy.lan:4000/v1", 1);
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == -1 && strstr(err, "OPENAI_BASE_URL is plain http to another machine (proxy.lan)") && strstr(err, "unencrypted"));
+    setenv("OPENAI_BASE_URL", "proxy.lan:4000/v1", 1);   /* no scheme: libcurl would send it as http */
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == -1 && strstr(err, "(proxy.lan)"));
+    setenv("OPENAI_BASE_URL", "http://127.evil.example/v1", 1);   /* a name that merely starts like a loopback address */
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == -1 && strstr(err, "(127.evil.example)"));
+    setenv("OPENAI_BASE_URL", "http://proxy.lan:4000/v1", 1);
+    bool ab0; t = provider_chat("openai:gpt-5.2", &oai, &rq, &st, &ab0, err, sizeof err);
+    CHECK(!t && !ab0 && strstr(err, "unencrypted"));
+    setenv("OPENAI_BASE_URL", "http://10.0.0.5/v1", 1);
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == -1 && strstr(err, "(10.0.0.5)"));
+    setenv("OPENAI_BASE_URL", "http://[fd00::1]:8080/v1", 1);
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == -1 && strstr(err, "([fd00::1])"));
+    setenv("OPENAI_BASE_URL", "http://localhost:1/v1", 1);   /* this machine: allowed, and so it is tried (and nothing listens there) */
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == 1 && !strstr(err, "unencrypted"));
+    setenv("OPENAI_BASE_URL", "http://[::1]:1/v1", 1);
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == 1 && !strstr(err, "unencrypted"));
+    setenv("OPENAI_BASE_URL", "https://127.0.0.1:1/v1", 1);
+    CHECK(provider_model_info("openai:gpt-5.2", &mi, err, sizeof err) == 1 && !strstr(err, "unencrypted"));
+    unsetenv("OPENAI_BASE_URL"); unsetenv("OPENAI_API_KEY");
+
+    /* without a key there is no request at all */
+    unsetenv("XAI_API_KEY");
+    CHECK(provider_model_info("xai:grok-4.7", &mi, err, sizeof err) == -1 && strstr(err, "XAI_API_KEY is not set"));
+    bool ab; t = provider_chat("xai:grok-4.7", &mi, &rq, &st, &ab, err, sizeof err);
+    CHECK(!t && !ab && strstr(err, "XAI_API_KEY is not set"));
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -513,7 +984,8 @@ int main(void) {
         { "sbuf", test_sbuf }, { "util", test_util }, { "markdown", test_md },
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "http", test_http },
-        { "web", test_web },
+        { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
+        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

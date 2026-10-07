@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "common.h"
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -164,10 +165,12 @@ void config_load(void) {
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[4096];
+    char *legacy_level = NULL;   /* think_level=: one level for every model, from before levels were kept per model */
     while (fgets(line, sizeof line, f)) {
         trim(line);
         if (!line[0] || line[0] == '#') continue;
-        char *eq = strchr(line, '=');
+        /* key=value, split at the first '=' — except effort.<model>=<level>, at the last: a model name may hold one, a level never does */
+        char *eq = !strncmp(line, "effort.", 7) ? strrchr(line, '=') : strchr(line, '=');
         if (!eq) continue;
         *eq = 0;
         const char *k = line, *v = eq + 1;
@@ -176,7 +179,11 @@ void config_load(void) {
         else if (!strcmp(k, "num_ctx")) g_cfg.num_ctx = atoi(v);
         else if (!strcmp(k, "temperature")) g_cfg.temperature = atof(v);
         else if (!strcmp(k, "think")) g_cfg.think = atoi(v);
-        else if (!strcmp(k, "think_level")) { free(g_cfg.think_level); g_cfg.think_level = *v ? xstrdup(v) : NULL; }
+        else if (!strcmp(k, "think_level")) { free(legacy_level); legacy_level = *v ? xstrdup(v) : NULL; }
+        else if (!strncmp(k, "effort.", 7)) { if (k[7] && effort_name_ok(v)) effort_set(k + 7, v); }
+        else if (!strcmp(k, "advisor")) { free(g_cfg.advisor); g_cfg.advisor = *v ? xstrdup(v) : NULL; }
+        else if (!strcmp(k, "advisor_ctx")) { int n = atoi(v); if (n == 0 || n >= ADVISOR_CTX_MIN) g_cfg.advisor_ctx = n; }
+        else if (!strcmp(k, "advisor_guidance")) { int n = advisor_guidance_parse(v); if (n >= 0) g_cfg.advisor_guidance = n; }
         else if (!strcmp(k, "show_thinking")) g_cfg.show_thinking = atoi(v) != 0;
         else if (!strcmp(k, "yolo")) { if (atoi(v)) g_cfg.mode = MODE_AUTO; }
         else if (!strcmp(k, "mode")) { int m = mode_parse(v); if (m >= 0) g_cfg.mode = m; }
@@ -189,6 +196,9 @@ void config_load(void) {
         else if (!strcmp(k, "keep_alive")) { free(g_cfg.keep_alive); g_cfg.keep_alive = *v ? xstrdup(v) : NULL; }
     }
     fclose(f);
+    /* the old global level belonged to whatever model was in use when it was set */
+    if (legacy_level && effort_name_ok(legacy_level) && g_cfg.model && !effort_get(g_cfg.model)) effort_set(g_cfg.model, legacy_level);
+    free(legacy_level);
 }
 
 /* The whole file is rewritten on every setting change, and another session may be reading it
@@ -205,7 +215,10 @@ void config_save(void) {
     sb_printf(&b, "num_ctx=%d\n", g_cfg.num_ctx);
     if (g_cfg.temperature >= 0) sb_printf(&b, "temperature=%g\n", g_cfg.temperature);
     sb_printf(&b, "think=%d\n", g_cfg.think);
-    sb_printf(&b, "think_level=%s\n", g_cfg.think_level ? g_cfg.think_level : "");
+    for (int i = 0; i < g_cfg.n_efforts; i++) sb_printf(&b, "effort.%s=%s\n", g_cfg.efforts[i].model, g_cfg.efforts[i].level);
+    if (g_cfg.advisor) sb_printf(&b, "advisor=%s\n", g_cfg.advisor);
+    if (g_cfg.advisor_ctx > 0) sb_printf(&b, "advisor_ctx=%d\n", g_cfg.advisor_ctx);
+    if (g_cfg.advisor_guidance != GUIDANCE_NORMAL) sb_printf(&b, "advisor_guidance=%s\n", advisor_guidance()->name);
     sb_printf(&b, "show_thinking=%d\n", g_cfg.show_thinking ? 1 : 0);
     sb_printf(&b, "mode=%s\n", mode_name(g_cfg.mode));
     sb_printf(&b, "max_iters=%d\n", g_cfg.max_iters);
@@ -217,6 +230,78 @@ void config_save(void) {
     sb_printf(&b, "keep_alive=%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "");
     write_whole_file_atomic(path, b.data, b.len);
     sb_free(&b);
+}
+
+/* ---------- effort: how hard each model thinks ---------- */
+bool effort_name_ok(const char *s) {
+    if (!s || !*s || strlen(s) >= EFFORT_NAME_MAX) return false;
+    for (; *s; s++) if (!((*s >= 'a' && *s <= 'z') || (*s >= '0' && *s <= '9') || *s == '-' || *s == '_')) return false;
+    return true;
+}
+
+/* "qwen3.8" and "qwen3.8:latest" are one model to the server */
+bool model_same(const char *a, const char *b) {
+    if (!a || !b) return false;
+    size_t la = strlen(a), lb = strlen(b);
+    if (la > 7 && !strcmp(a + la - 7, ":latest")) la -= 7;
+    if (lb > 7 && !strcmp(b + lb - 7, ":latest")) lb -= 7;
+    return la == lb && !strncmp(a, b, la);
+}
+
+/* One of Ollama's cloud models: the local server relays the call to ollama.com */
+bool model_is_cloud(const char *name) {
+    size_t l = name ? strlen(name) : 0;
+    return l > 6 && (!strcmp(name + l - 6, ":cloud") || !strcmp(name + l - 6, "-cloud"));
+}
+
+const char *effort_get(const char *model) {
+    for (int i = 0; model && i < g_cfg.n_efforts; i++) if (model_same(g_cfg.efforts[i].model, model)) return g_cfg.efforts[i].level;
+    return NULL;
+}
+
+void effort_set(const char *model, const char *level) {
+    if (!model || !*model || strchr(model, '\n')) return;
+    int i = 0;
+    while (i < g_cfg.n_efforts && !model_same(g_cfg.efforts[i].model, model)) i++;
+    if (!level) {   /* forget it */
+        if (i == g_cfg.n_efforts) return;
+        free(g_cfg.efforts[i].model); free(g_cfg.efforts[i].level);
+        g_cfg.efforts[i] = g_cfg.efforts[--g_cfg.n_efforts];
+        return;
+    }
+    if (i == g_cfg.n_efforts) {
+        g_cfg.efforts = xrealloc(g_cfg.efforts, sizeof *g_cfg.efforts * (size_t)(g_cfg.n_efforts + 1));
+        g_cfg.efforts[g_cfg.n_efforts++] = (effort_entry){ xstrdup(model), NULL };
+    }
+    free(g_cfg.efforts[i].level); g_cfg.efforts[i].level = xstrdup(level);
+}
+
+int effort_supported(const model_info *mi, const char *level) {
+    if (!mi->thinking || !effort_name_ok(level)) return 0;
+    if (!strcmp(level, "off")) return mi->think_off;
+    if (!strcmp(level, "on")) return mi->think_on;
+    for (int i = 0; i < mi->n_think_levels; i++) if (!strcmp(mi->think_levels[i], level)) return 1;
+    if (mi->think_declared || mi->n_think_levels) return 0;   /* its levels are known, and this is not one of them */
+    /* an on/off model as far as anyone knows: the server still takes the four names it has always known */
+    return (!strcmp(level, "low") || !strcmp(level, "medium") || !strcmp(level, "high") || !strcmp(level, "max")) ? -1 : 0;
+}
+
+/* What is sent for a saved level: the level itself when the model has it (or may), and for
+ * "as hard as it goes" — high, xhigh, max — the strongest one the model does have. The names of
+ * the top level differ between models and between server versions (qwen3.8: "high" up to
+ * Ollama 0.34.2, "xhigh" from 0.34.3, where "high" quietly means medium), and what the user
+ * meant is the same. NULL = nothing the model can be set to. */
+const char *effort_resolve(const model_info *mi, const char *want, bool *mapped) {
+    if (mapped) *mapped = false;
+    if (!want) return NULL;
+    if (effort_supported(mi, want) != 0) return want;
+    static const char *TOP[] = { "high", "xhigh", "max" };
+    const char *strongest = mi->thinking && mi->n_think_levels ? mi->think_levels[mi->n_think_levels - 1] : NULL;
+    bool want_top = false, has_top = false;
+    for (int i = 0; i < 3; i++) { if (!strcmp(want, TOP[i])) want_top = true; if (strongest && !strcmp(strongest, TOP[i])) has_top = true; }
+    if (!want_top || !has_top) return NULL;
+    if (mapped) *mapped = true;
+    return strongest;
 }
 
 /* ---------- permission modes ---------- */
@@ -256,6 +341,38 @@ bool url_host(const char *url, char *out, size_t n) {
     char *at = strrchr(out, '@');
     if (at) memmove(out, at + 1, strlen(at + 1) + 1);
     return out[0] != 0;
+}
+
+/* The host of a URL, or of a host setting as the user writes one — scheme, user@ and port all
+ * optional ("gpu-box:11434", "http://[::1]:8080/v1") — lowercased, without the port. */
+bool url_hostname(const char *url, char *out, size_t n) {
+    if (!url || !n) return false;
+    out[0] = 0;
+    const char *p = strstr(url, "://"); p = p ? p + 3 : url;
+    while (*p == ' ') p++;
+    size_t len = strcspn(p, "/?#");
+    for (size_t i = len; i > 0; i--) if (p[i - 1] == '@') { p += i; len -= i; break; }
+    size_t h = p[0] == '[' ? (memchr(p, ']', len) ? (size_t)((const char *)memchr(p, ']', len) - p) + 1 : len) : strcspn(p, ":/?#");
+    if (h > len) h = len;
+    if (h >= n) h = n - 1;
+    for (size_t i = 0; i < h; i++) out[i] = (p[i] >= 'A' && p[i] <= 'Z') ? (char)(p[i] - 'A' + 'a') : p[i];
+    out[h] = 0;
+    return out[0] != 0;
+}
+
+/* This machine: localhost, an IPv4 loopback address (a literal one — "127.evil.example" is a
+ * name like any other), ::1, 0.0.0.0, or no host at all (":11434"). */
+bool url_is_local(const char *url) {
+    char h[256];
+    if (!url_hostname(url, h, sizeof h)) return true;
+    if (!strcmp(h, "localhost") || !strcmp(h, "[::1]") || !strcmp(h, "::1") || !strcmp(h, "0.0.0.0")) return true;
+    return !strncmp(h, "127.", 4) && strspn(h, "0123456789.") == strlen(h);
+}
+
+/* Not encrypted on the way: anything but https — a host without a scheme is plain http */
+bool url_cleartext(const char *url) {
+    while (url && *url == ' ') url++;
+    return !url || strncasecmp(url, "https://", 8) != 0;
 }
 
 /* Is this a URL we are willing to hand to curl? http(s) only, sane length, no control
@@ -631,4 +748,217 @@ char *search_results_text(const char *html, size_t len, const char *engine_url, 
     }
     if (count) *count = n;
     return sb_detach(&out);
+}
+
+/* ---------- a conversation as quoted text (for the advisor) ----------
+ * The advisor is shown the conversation, it is not part of it: handing it the messages as they
+ * are would make it carry on in the agent's voice — and answer tool results it has no tools
+ * for. So the conversation becomes one text, a block per message. Long messages lose their
+ * middle (both ends of a file or a log are what locates it); when the whole does not fit the
+ * budget the newest blocks win, since that is where the agent is stuck, and `keep` — the
+ * request being worked on — stays whatever happens. */
+#define TRANSCRIPT_USER_CAP   6000
+#define TRANSCRIPT_AGENT_CAP  4000
+#define TRANSCRIPT_RESULT_CAP 3000
+#define TRANSCRIPT_ARGS_CAP   600
+
+void sb_put_cut(sbuf *b, const char *s, size_t cap) {
+    size_t len = strlen(s);
+    if (len <= cap) { sb_append(b, s, len); return; }
+    size_t head = cap * 2 / 3, tail = cap - head;
+    while (head && ((unsigned char)s[head] & 0xC0) == 0x80) head--;            /* UTF-8 boundaries */
+    const char *t = s + len - tail;
+    while (tail && ((unsigned char)*t & 0xC0) == 0x80) { t++; tail--; }
+    sb_append(b, s, head);
+    sb_printf(b, "\n[… %zu bytes cut …]\n", len - head - tail);
+    sb_append(b, t, tail);
+}
+
+/* one message as a block, or NULL when it says nothing (an assistant turn that only called the advisor) */
+static char *transcript_block(cJSON *m, size_t budget) {
+    cJSON *role = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+    const char *r = cJSON_IsString(role) ? role->valuestring : "user";
+    const char *text = cJSON_IsString(c) ? c->valuestring : "";
+    size_t share = budget / 4;   /* no single message may crowd the others out */
+    #define CAP(n) ((size_t)(n) < share ? (size_t)(n) : share)
+    sbuf b; sb_init(&b);
+    if (!strcmp(r, "tool")) {
+        cJSON *tn = cJSON_GetObjectItemCaseSensitive(m, "tool_name");
+        sb_printf(&b, "[result of %s]\n", cJSON_IsString(tn) ? tn->valuestring : "tool");
+        sb_put_cut(&b, *text ? text : "(empty)", CAP(TRANSCRIPT_RESULT_CAP));
+    } else if (!strcmp(r, "assistant")) {
+        sbuf calls; sb_init(&calls);
+        cJSON *tc = cJSON_GetObjectItemCaseSensitive(m, "tool_calls"), *call;
+        cJSON_ArrayForEach(call, tc) {
+            cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
+            cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+            cJSON *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+            if (!cJSON_IsString(nm) || !strcmp(nm->valuestring, "advisor")) continue;   /* the question is handed over separately */
+            char *a = cJSON_IsString(args) ? xstrdup(args->valuestring) : args ? cJSON_PrintUnformatted(args) : xstrdup("{}");
+            size_t al = strlen(a), cut = al > TRANSCRIPT_ARGS_CAP ? TRANSCRIPT_ARGS_CAP : al;
+            while (cut && cut < al && ((unsigned char)a[cut] & 0xC0) == 0x80) cut--;
+            sb_printf(&calls, "\n→ %s(%.*s%s)", nm->valuestring, (int)cut, a, cut < al ? "…" : "");
+            free(a);
+        }
+        if (!*text && !calls.len) { sb_free(&calls); return NULL; }
+        sb_puts(&b, "[agent]\n");
+        sb_put_cut(&b, text, CAP(TRANSCRIPT_AGENT_CAP));
+        if (calls.len) sb_puts(&b, *text ? calls.data : calls.data + 1);
+        sb_free(&calls);
+    } else {
+        sb_puts(&b, "[user]\n");
+        sb_put_cut(&b, *text ? text : "(empty)", CAP(TRANSCRIPT_USER_CAP));
+    }
+    #undef CAP
+    sb_puts(&b, "\n\n");
+    return sb_detach(&b);
+}
+
+char *transcript_text(cJSON *msgs, int keep, size_t budget) {
+    int n = cJSON_GetArraySize(msgs), i = 0;
+    char **blk = xmalloc(sizeof(char*) * (size_t)n);
+    bool *in = xmalloc(sizeof(bool) * (size_t)n);
+    cJSON *m;
+    cJSON_ArrayForEach(m, msgs) { blk[i] = transcript_block(m, budget); in[i] = false; i++; }
+    size_t used = 0;
+    if (keep >= 0 && keep < n && blk[keep]) { in[keep] = true; used = strlen(blk[keep]); }
+    for (i = n - 1; i >= 0; i--) {   /* newest first, and no holes: stop at the first that does not fit */
+        if (in[i] || !blk[i]) continue;
+        size_t l = strlen(blk[i]);
+        if (used + l > budget) break;
+        in[i] = true; used += l;
+    }
+    sbuf o; sb_init(&o); sb_append(&o, "", 0);
+    int gap = 0;
+    for (i = 0; i < n; i++) {
+        if (!blk[i]) continue;
+        if (!in[i]) { gap++; continue; }
+        if (gap) { sb_printf(&o, "[… %d earlier message%s left out to fit …]\n\n", gap, gap == 1 ? "" : "s"); gap = 0; }
+        sb_puts(&o, blk[i]);
+    }
+    for (i = 0; i < n; i++) free(blk[i]);
+    free(blk); free(in);
+    return sb_detach(&o);
+}
+
+/* ---------- the advisor: how much it is leaned on ----------
+ * normal is what the advisor always was: the agent asks when it judges the work hard. A small
+ * model is a poor judge of that — it is sure of the wrong approach, and calls a task done that is
+ * not — so strong has corbienest ask as well, before a request that changed files ends, and max
+ * also before the request's first change is made. The advice gets longer and more concrete the
+ * higher it goes: the reader is a model that follows steps better than it follows advice. */
+const advisor_guidance_def ADVISOR_GUIDANCE[GUIDANCE_COUNT] = {
+    { "light",  1, 250, 32 * 1024, false, false, "only when the agent is stuck · 1 consultation per request · short answers" },
+    { "normal", 3, 400, 48 * 1024, false, false, "when the work is hard · 3 per request" },
+    { "strong", 6, 700, 96 * 1024, true,  false, "early and often · 6 per request · concrete steps · reviews the work before a request that changed files ends" },
+    { "max",   10, 900, 96 * 1024, true,  true,  "as strong, 10 per request · and checks the first change of a request before it is made" },
+};
+const advisor_guidance_def *advisor_guidance(void) {
+    int g = g_cfg.advisor_guidance;
+    return &ADVISOR_GUIDANCE[g >= 0 && g < GUIDANCE_COUNT ? g : GUIDANCE_NORMAL];
+}
+int advisor_guidance_parse(const char *s) {
+    for (int i = 0; s && i < GUIDANCE_COUNT; i++) if (!strcasecmp(s, ADVISOR_GUIDANCE[i].name)) return i;
+    return -1;
+}
+
+/* "LGTM", "LGTM.", "LGTM — the change is correct and complete": nothing to act on. "LGTM, but
+ * the test for X is missing" is advice all the same, and goes to the agent. Taking an approval
+ * for advice costs a round of the main model, which on a small machine is minutes; taking advice
+ * for an approval loses what the advisor found — so a short sentence after it is still an
+ * approval, one that objects to anything is not. */
+bool advisor_approves(const char *advice) {
+    while (advice && (*advice == ' ' || *advice == '\n' || *advice == '*')) advice++;
+    if (!advice || strncasecmp(advice, ADVISOR_REVIEW_OK, strlen(ADVISOR_REVIEW_OK))) return false;
+    /* words that object, or make it conditional — not ones an approval uses as readily
+     * ("the fix is right", "the tests still pass", "nothing to add") */
+    static const char *OBJECTIONS[] = { "but", "however", "except", "though", "although", "once", "unless", "until", "missing", "should",
+                                        "must", "need", "needs", "wrong", "not", "bug", "fails", "failing", "instead", NULL };
+    int words = 0;
+    for (const char *c = advice + strlen(ADVISOR_REVIEW_OK); *c; ) {
+        while (*c && !isalnum((unsigned char)*c)) c++;
+        const char *w = c;
+        while (*c && (isalnum((unsigned char)*c) || *c == '\'')) c++;
+        if (c == w) break;
+        if (++words > 15) return false;
+        for (int i = 0; OBJECTIONS[i]; i++)
+            if ((size_t)(c - w) == strlen(OBJECTIONS[i]) && !strncasecmp(w, OBJECTIONS[i], (size_t)(c - w))) return false;
+    }
+    return true;
+}
+
+/* ---------- the advisor: where it runs, and what it is shown ----------
+ * Three placements, and they want opposite things. The main model as its own advisor must be
+ * called exactly as the main model is: another num_ctx makes the server reload it, and
+ * keep_alive 0 would unload it — either way the conversation's cache is gone. A model that is
+ * not on this machine (one of Ollama's cloud models, or a hosted API) has its own window and no
+ * memory of ours to give back, so neither key means anything. Another local model gets a window
+ * of its own (a 70B model pays several times the memory per token of context that a small one
+ * does) and keep_alive 0, so that its memory is free again when the main model wants it back. */
+void advisor_plan_for(const char *advisor, int trained_ctx, advisor_plan *p) {
+    memset(p, 0, sizeof *p);
+    p->same = model_same(advisor, g_cfg.model);
+    p->api = !p->same && provider_find(advisor, NULL) != NULL;
+    p->cloud = !p->same && (p->api || model_is_cloud(advisor));
+    if (p->same) { p->window = g_cfg.num_ctx > 0 ? g_cfg.num_ctx : ADVISOR_CTX_UNSET; }
+    else if (p->api) { p->window = trained_ctx > 0 ? trained_ctx : ADVISOR_CTX_API; p->send_ctx = -1; p->keep_alive = ""; }
+    else if (p->cloud) {
+        p->window = trained_ctx > 0 && trained_ctx < ADVISOR_CTX_CLOUD ? trained_ctx : ADVISOR_CTX_CLOUD;
+        p->send_ctx = -1; p->keep_alive = "";
+    } else {
+        int n = g_cfg.advisor_ctx > 0 ? g_cfg.advisor_ctx : g_cfg.num_ctx > ADVISOR_CTX_AUTO ? ADVISOR_CTX_AUTO : g_cfg.num_ctx;
+        if (n > 0 && trained_ctx > 0 && n > trained_ctx) n = trained_ctx;
+        p->window = n > 0 ? n : ADVISOR_CTX_UNSET;   /* left to the server: plan for the little it gives */
+        p->send_ctx = n; p->keep_alive = "0";
+    }
+    int cap = p->api ? ADVISOR_REPLY_API : ADVISOR_REPLY_MAX;
+    p->reply = p->window / 3 < cap ? p->window / 3 : cap;
+    /* bytes for the whole prompt at a careful 3 bytes a token (it is another tokenizer than the
+     * one the context estimate is calibrated on), and no more than the guidance's brief_max
+     * however large the window: what the advisor has to read first is the wait */
+    int tokens = p->window - p->reply - 256;
+    size_t room = tokens > 0 ? (size_t)tokens * 3 : 0, most = advisor_guidance()->brief_max;
+    if (room < ADVISOR_BRIEF_MIN) room = ADVISOR_BRIEF_MIN;   /* a window too small to plan for (-c 512): a floor, and the server cuts what it must */
+    p->budget = room < most ? room : most;
+}
+
+/* The one user message of an advisor call. What matters most stands last — the question, and
+ * who the reader is: a server that has to cut an over-long prompt keeps the end of it. */
+char *advisor_brief(cJSON *msgs, int keep, size_t budget, const char *env, bool plan_mode, const char *rules, const char *question, int words) {
+    sbuf b; sb_init(&b);
+    sb_printf(&b, "# Environment\n%s\n", env ? env : "");
+    if (plan_mode) sb_puts(&b, "The agent is in plan mode: it may only read, and has to present a plan instead of changing files.\n");
+    if (rules && *rules) {
+        size_t cap = budget / 4 < ADVISOR_RULES_MAX ? budget / 4 : ADVISOR_RULES_MAX;
+        sb_puts(&b, "\n# The project's rules (the agent works under them; so must your advice)\n");
+        sb_put_cut(&b, rules, cap);
+        sb_putc(&b, '\n');
+    }
+    if (!question) question = "";
+    while (*question == ' ' || *question == '\n') question++;
+    size_t qlen = strlen(question), qcap = qlen > ADVISOR_QUESTION_MAX ? ADVISOR_QUESTION_MAX : qlen;
+    while (qcap && qcap < qlen && ((unsigned char)question[qcap] & 0xC0) == 0x80) qcap--;
+    size_t fixed = b.len + qcap + 600;   /* the headings and the closing lines */
+    char *tr = transcript_text(msgs, keep, budget > fixed + 1024 ? budget - fixed : 1024);
+    sb_printf(&b, "\n# The agent's conversation so far\n"
+                  "[user] is the human, [agent] the agent (→ marks a tool call), [result of …] what a tool returned; long texts lose their middle.\n\n%s", tr);
+    free(tr);
+    sb_puts(&b, "# What the agent asks you\n");
+    if (qcap) sb_printf(&b, "%.*s%s\n", (int)qcap, question, qcap < qlen ? "…" : "");
+    else sb_puts(&b, "(It did not say. Review where it stands and tell it what to do next.)\n");
+    sb_printf(&b, "\nAnswer the agent now — verdict first, then the steps, under about %d words. "
+                  "You are the advisor, not the agent: do not continue the conversation above and do not call tools.\n", words > 0 ? words : 400);
+    return sb_detach(&b);
+}
+
+/* A model whose thinking the server does not split off writes it into the answer as
+ * <think>…</think>; the agent is to get the advice, not the way there. */
+const char *strip_think_block(const char *s) {
+    while (*s == ' ' || *s == '\n' || *s == '\r' || *s == '\t') s++;
+    if (strncmp(s, "<think>", 7)) return s;
+    const char *e = strstr(s, "</think>");
+    if (!e) return s + strlen(s);   /* it never finished thinking: there is no answer */
+    e += 8;
+    while (*e == ' ' || *e == '\n' || *e == '\r' || *e == '\t') e++;
+    return e;
 }

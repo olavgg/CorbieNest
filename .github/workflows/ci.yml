@@ -12,8 +12,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install cJSON
-        run: sudo apt-get update && sudo apt-get install -y libcjson-dev
+      - name: Install cJSON and libcurl
+        run: sudo apt-get update && sudo apt-get install -y libcjson-dev libcurl4-openssl-dev
 
       - name: Build (warnings are errors)
         run: make CFLAGS="-O2 -g -Wall -Wextra -Werror -std=gnu11"
