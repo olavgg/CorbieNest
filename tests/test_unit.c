@@ -549,6 +549,137 @@ static void test_skills(void) {
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
 }
 
+/* ---------- finding files for @mentions ---------- */
+static const char *match_at(file_match *m, int n, int i) { return i < n ? m[i].path : "(none)"; }
+static bool match_has(file_match *m, int n, const char *path) {
+    for (int i = 0; i < n; i++) if (!strcmp(m[i].path, path)) return true;
+    return false;
+}
+static void test_files(void) {
+    /* which word is a mention: an '@' that starts a word, up to the cursor */
+    CHECK(mention_start("look at @src/te", 15) == 9);
+    CHECK(mention_start("@", 1) == 1);
+    CHECK(mention_start("@a b", 4) == -1);                   /* the cursor is in the next word */
+    CHECK(mention_start("@a b", 2) == 1);                    /* ... or still in the mention */
+    CHECK(mention_start("mail me at a@b.org", 18) == -1);    /* not at the start of a word */
+    CHECK(mention_start("no mention", 10) == -1);
+    CHECK(mention_start("one\n@two", 8) == 5);               /* a new line starts a word too */
+
+    char dir[] = "/tmp/crowtest_f_XXXXXX"; CHECK(mkdtemp(dir) != NULL);
+    char old[4096]; CHECK(getcwd(old, sizeof old) != NULL);
+    char proj[64]; snprintf(proj, sizeof proj, "%s/proj", dir);
+    CHECK(mkdir_p(proj) == 0); CHECK(chdir(proj) == 0);
+    const char *files[] = { "Makefile", "README.md", "src/term.c", "src/tools.c", "src/deep/er/terminal_notes.md", "tests/test_unit.c",
+                            "docs/term.md", "docs/guide/intro.md", ".git/config", "node_modules/pkg/term.js", "a b/spaced.txt", "../lib/parser.c", "../lib/parse_util.h" };
+    for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
+        char *d = xstrdup(files[i]), *sl = strrchr(d, '/');
+        if (sl) { *sl = 0; CHECK(mkdir_p(d) == 0); }
+        free(d);
+        CHECK(write_whole_file(files[i], "x\n", 2) == 0);
+    }
+    file_match *m; int n;
+
+    n = file_complete("", false, 50, &m);                     /* nothing typed yet: the directory itself, in order */
+    CHECK(n == 5); CHECK_STR(match_at(m, n, 0), "Makefile"); CHECK_STR(match_at(m, n, 1), "README.md");
+    CHECK_STR(match_at(m, n, 2), "docs/"); CHECK(n > 2 && m[2].dir); CHECK_STR(match_at(m, n, 4), "tests/");
+    CHECK(!match_has(m, n, ".git/") && !match_has(m, n, "node_modules/") && !match_has(m, n, "a b/"));
+    file_matches_free(m, n);
+
+    n = file_complete("term", false, 50, &m);                 /* a name is a hint, not a path: found wherever it is */
+    CHECK_STR(match_at(m, n, 0), "docs/term.md"); CHECK_STR(match_at(m, n, 1), "src/term.c");
+    CHECK_STR(match_at(m, n, 2), "src/deep/er/terminal_notes.md");   /* the nearer ones first */
+    CHECK(n == 3);                                            /* nothing out of .git or node_modules */
+    file_matches_free(m, n);
+
+    n = file_complete("te", false, 50, &m);                   /* in the directory itself first, then below, then "contains" */
+    CHECK_STR(match_at(m, n, 0), "tests/"); CHECK(match_has(m, n, "src/term.c")); CHECK(match_has(m, n, "tests/test_unit.c"));
+    file_matches_free(m, n);
+
+    n = file_complete("UNIT", false, 50, &m);                 /* part of the name, in any case */
+    CHECK(n == 1); CHECK_STR(match_at(m, n, 0), "tests/test_unit.c");
+    file_matches_free(m, n);
+
+    n = file_complete("tlc", false, 50, &m);                  /* last resort: the letters in that order (ToLs.C) */
+    CHECK(n == 1); CHECK_STR(match_at(m, n, 0), "src/tools.c");
+    file_matches_free(m, n);
+
+    n = file_complete("src/t", false, 50, &m);                /* a directory in front: the search is below it */
+    CHECK_STR(match_at(m, n, 0), "src/term.c"); CHECK_STR(match_at(m, n, 1), "src/tools.c");
+    CHECK_STR(match_at(m, n, 2), "src/deep/er/terminal_notes.md"); CHECK(n == 3);
+    file_matches_free(m, n);
+
+    n = file_complete("../lib/pa", false, 50, &m);            /* ... also when it is outside the working directory */
+    CHECK(n == 2); CHECK_STR(match_at(m, n, 0), "../lib/parse_util.h"); CHECK_STR(match_at(m, n, 1), "../lib/parser.c");
+    file_matches_free(m, n);
+
+    n = file_complete("..", false, 50, &m);                   /* what was typed is a directory: going into it comes first */
+    CHECK_STR(match_at(m, n, 0), "../"); CHECK(n >= 1 && m[0].dir);
+    file_matches_free(m, n);
+    n = file_complete("src", false, 50, &m);
+    CHECK_STR(match_at(m, n, 0), "src/"); CHECK(n == 1);      /* (and once only) */
+    file_matches_free(m, n);
+
+    n = file_complete("d", true, 50, &m);                     /* directories only (/cd) */
+    CHECK_STR(match_at(m, n, 0), "docs/"); CHECK(match_has(m, n, "src/deep/")); CHECK(!match_has(m, n, "docs/term.md"));
+    file_matches_free(m, n);
+
+    n = file_complete("te", false, 2, &m); CHECK(n == 2); file_matches_free(m, n);     /* never more than asked for */
+    n = file_complete("no-such-thing", false, 50, &m); CHECK(n == 0); file_matches_free(m, n);
+    n = file_complete("nowhere/x", false, 50, &m); CHECK(n == 0); file_matches_free(m, n);
+
+    /* "@name" as sent: the one file by that name */
+    int hits = 0; sbuf names; sb_init(&names);
+    char *f = file_find_named("test_unit.c", &hits, &names); CHECK_STR(f, "tests/test_unit.c"); CHECK(hits == 1); free(f);
+    f = file_find_named("deep/er/terminal_notes.md", &hits, NULL); CHECK_STR(f, "src/deep/er/terminal_notes.md"); free(f);   /* or path ending */
+    f = file_find_named("unit.c", &hits, NULL); CHECK(f == NULL && hits == 0);         /* a whole name, not a part of one */
+    f = file_find_named("deep", &hits, NULL); CHECK(f == NULL && hits == 0);           /* files, not directories */
+    f = file_find_named("../lib/nope.c", &hits, NULL); CHECK(f == NULL && hits == 0);  /* a place was named: no guessing */
+    CHECK(write_whole_file("docs/guide/term.c", "x\n", 2) == 0);
+    sleep(2);                                                                           /* (the listing is kept for a moment) */
+    sb_clear(&names);
+    f = file_find_named("term.c", &hits, &names); CHECK(f == NULL && hits == 2);        /* two of them: neither is guessed */
+    CHECK(names.data && strstr(names.data, "src/term.c") && strstr(names.data, "docs/guide/term.c"));
+    sb_free(&names);
+
+    /* a "!line" is the shell's: which word the cursor is in, and whether a command goes there */
+    bool prog = false;
+    CHECK(shell_word("!", 1, &prog) == 1 && prog);
+    CHECK(shell_word("!gi", 3, &prog) == 1 && prog);
+    CHECK(shell_word("!git st", 7, &prog) == 5 && !prog);              /* an argument */
+    CHECK(shell_word("!git ", 5, &prog) == 5 && !prog);                /* ... also one that has not been started */
+    CHECK(shell_word("!cat a.c | gre", 14, &prog) == 11 && prog);      /* after a pipe a command again */
+    CHECK(shell_word("!make && ./te", 13, &prog) == 9 && prog);
+    CHECK(shell_word("!sort <in", 9, &prog) == 7 && !prog);            /* a redirection is followed by a file */
+    CHECK(shell_word("!cc --out=bu", 12, &prog) == 10 && !prog);       /* and so may a '=' be */
+    CHECK(shell_word("!echo \"two wor", 14, &prog) == -1);            /* inside quotes it is text: nothing to complete */
+    CHECK(shell_word("!echo 'it' sr", 13, &prog) == 11 && !prog);      /* ... which ends where they do */
+    CHECK(shell_word("!echo it\\'s sr", 14, &prog) == 12 && !prog);    /* an escaped quote opens nothing */
+    CHECK(shell_word("!ls my\\ fi", 10, &prog) == 4 && !prog);         /* and an escaped blank is part of the word */
+    CHECK(shell_word("!git st", 0, &prog) == -1);
+    char *esc = shell_escape("src/deep/term-notes_v2.md"); CHECK_STR(esc, "src/deep/term-notes_v2.md"); free(esc);
+    esc = shell_escape("~/a(1)&b$c.txt"); CHECK_STR(esc, "~/a\\(1\\)\\&b\\$c.txt"); free(esc);   /* what the shell would take apart */
+    esc = shell_escape("caf\xc3\xa9.md"); CHECK_STR(esc, "caf\xc3\xa9.md"); free(esc);
+
+    /* ... and the programs $PATH has for it */
+    char *path_was = getenv("PATH") ? xstrdup(getenv("PATH")) : NULL;
+    const char *bins[] = { "bin1/zzcrow-long", "bin1/zzcrow", "bin2/zzcrow", "bin2/zzcroak", "bin1/zzcrow.txt" };
+    CHECK(mkdir_p("bin1/zzcrowdir") == 0 && mkdir_p("bin2") == 0);
+    for (size_t i = 0; i < sizeof bins / sizeof *bins; i++)
+        CHECK(write_whole_file(bins[i], "#!/bin/sh\n", 10) == 0 && chmod(bins[i], strstr(bins[i], ".txt") ? 0644 : 0755) == 0);
+    sbuf pv; sb_init(&pv); sb_printf(&pv, "%s/bin1:%s/nowhere::%s/bin2", proj, proj, proj);
+    setenv("PATH", pv.data, 1);
+    n = command_complete("zzcro", 50, &m);                    /* the short names first, each once; no text file, no directory */
+    CHECK(n == 3); CHECK_STR(match_at(m, n, 0), "zzcrow"); CHECK_STR(match_at(m, n, 1), "zzcroak"); CHECK_STR(match_at(m, n, 2), "zzcrow-long");
+    file_matches_free(m, n);
+    n = command_complete("zzcro", 2, &m); CHECK(n == 2); file_matches_free(m, n);
+    n = command_complete("zz-none", 50, &m); CHECK(n == 0); file_matches_free(m, n);
+    if (path_was) setenv("PATH", path_was, 1); else unsetenv("PATH");
+    free(path_was); sb_free(&pv);
+
+    CHECK(chdir(old) == 0);
+    char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
+}
+
 /* ---------- /api/show ---------- */
 static void test_model_info(void) {
     model_info mi;
@@ -983,7 +1114,7 @@ int main(void) {
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "sbuf", test_sbuf }, { "util", test_util }, { "markdown", test_md },
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
-        { "queue", test_queue }, { "skills", test_skills }, { "http", test_http },
+        { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
         { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider },
     };

@@ -145,15 +145,44 @@ larger ones skipped.)
 
 ### Input tricks
 
-- `!cmd` — run a shell command yourself; its output is added to the conversation.
-- `@path` — attach a file (or a directory listing) to your message.
+- `!cmd` — run a shell command yourself; its output is added to the conversation. The line is
+  completed the way a shell would do it: where a command goes (the first word, or after `|`,
+  `;`, `&&`) the programs in `$PATH` that start with what you typed are listed, the shortest
+  first; any other word is offered the files and directories whose name starts with it —
+  found wherever they are below the working directory, as for `@` (`!cat term` → `src/term.c`),
+  and `!ls src/` lists `src`. Lines you ran before that go on from what you have typed come
+  first, so a bare `!` shows your last shell commands. Nothing is offered inside quotes.
+- `@path` — attach a file (or a directory listing) to your message. You do not have to know
+  the path: while you type, the files that match the name so far are listed under the input
+  field — `@term` finds `src/term.c`, wherever it is (a name that starts with what you typed
+  first, then one that contains it, then one with its letters in that order). A directory in
+  front says where to look, also outside the working directory: `@../lib/pa` searches below
+  `../lib`, `@src/` lists `src`. Tab completes, ↓ steps into the list, Enter takes the
+  highlighted file, Esc closes it. A bare name sent as it is (`@term.c`) is attached when
+  exactly one file has it; when several do, they are named and none is guessed.
+- `/` — the commands that match what you have typed are listed the same way, each with what
+  it does, and after the command its options (`/mode ` → `manual`, `accept-edits`, `plan`,
+  `auto`; `/effort ` → the levels this model has; `/cd ` → directories). The list is a preview
+  until you step into it: Enter still sends what you typed.
+- All three lists come up **while the model works** as well, for what you are typing ahead:
+  `/` shows the commands, Tab completes, ↓ steps in and Enter takes the highlighted row. There
+  Esc closes the list first; it is the Esc after that one which stops the model.
 - `# fact` — remember something: a menu asks which section of `.corbienest/memory.md` it belongs
   to (Project / User / Feedback / Reference) and the line is appended, no model call involved.
 - Enter sends; Alt+Enter, Ctrl+J or a trailing `\` inserts a newline. Bracketed paste works.
 - Ctrl-C (or Esc) cancels a running generation / clears the line (twice on an empty line quits).
-- PgUp at the prompt scrolls back through the conversation (the alternate screen has no scrollback of
-  its own, so corbienest keeps one): PgUp/PgDn/↑/↓ move, Home/End jump, Esc/Enter/PgDn at the bottom
-  return to the prompt exactly as it was.
+- The **mouse wheel** and PgUp/PgDn scroll back through the conversation (the alternate screen has
+  no scrollback of its own, so corbienest keeps one) — at the prompt and while the model works:
+  what arrives meanwhile is kept and shown when you scroll back down, and Esc returns to the
+  output at once (it takes a second Esc to stop the model). While you are scrolled back a line
+  under the conversation says which rows you are looking at and how to get back; the status
+  bar stays what it is, so the mode, the tokens and what the model is doing remain in view. At the prompt ↑/↓ scroll too,
+  Home/End jump, and Esc/Enter return to the prompt exactly as it was; anything you type
+  returns as well and goes into your message. The wheel only scrolls the conversation: over
+  the input field it does nothing, and ↑/↓ there are always the keyboard's (history, or the
+  lines of what you are writing). corbienest asks the terminal for the mouse to get the wheel
+  as a wheel — so **selecting text with the mouse needs Shift held down** (Option in iTerm2),
+  as in any full-screen program.
   Esc twice at an empty prompt opens `/rewind`.
 - **You can keep typing while the model works.** What you type shows up in the input field as
   you go (`❯ …▏`); press Enter to queue it as a message — add details,
@@ -167,7 +196,7 @@ larger ones skipped.)
   you like; they are sent in order, and a `/command` waiting for the end of the turn does not
   hold back the messages behind it. Ctrl-C hands queued text back to the editor instead of
   sending it. Text without Enter simply reappears in the prompt afterwards.
-- Tab completes slash commands and skill names; ↑/↓ browse history — the latest 100 queries are
+- Tab completes slash commands, their options, skill names, `@files` and the words of a `!line`; ↑/↓ browse history — the latest 100 queries are
   kept in `~/.config/corbienest/history` (`/history` lists them). Ctrl-R searches it
   incrementally (`(reverse-i-search)`, like bash): type to refine, Ctrl-R again for an older
   match, Enter keeps the match in the editor, Esc restores what you had.
@@ -180,6 +209,24 @@ larger ones skipped.)
   tool confirmations still to come, like Shift+Tab, and `/max_iters` to the rounds still to come. Everything that touches the conversation (`/clear`, `/compact`,
   `/rewind`, `/resume`, `/save`, `/system`, `/init`, skills), needs the server (`/model`,
   `/models`, `/ctx`, `/host`, `/memory update`) or asks a question stays queued until the turn ends.
+
+### In tmux
+
+corbienest runs in a tmux pane like in any terminal, and nothing has to be configured:
+
+- **The wheel scrolls the conversation** whether tmux's own `mouse` option is off or on. (An
+  application that does not ask for the mouse gets the wheel as ↑/↓ keys from the terminal, or
+  loses it to tmux's copy mode — of an alternate screen, which has no history to show.
+  corbienest asks, so tmux hands the wheel over.)
+- **Splitting, zooming or resizing the pane redraws at once**: the input field and the bar move
+  to the new last rows and the conversation is laid out again for the new width, from
+  corbienest's own scrollback, without waiting for a key.
+- To select text with the mouse hold Shift (that is the terminal's selection, across panes), or
+  use tmux's copy mode from the keyboard (`prefix [`): it shows what is on screen, so scroll
+  corbienest back first to copy something older.
+- Esc reaches a program in tmux only after tmux's `escape-time` (500 ms by default in tmux 3.4):
+  `set -sg escape-time 10` in `~/.tmux.conf` makes Esc — cancel, back from the scrollback —
+  as quick as outside tmux.
 
 ### Permission modes
 
@@ -565,7 +612,8 @@ make test
   markdown printer, text tool-call recovery, every tool (read/write/edit/list/grep/bash
   including timeouts and non-interactive denial), URL checks and the HTML-to-text and
   search-result extraction behind `web_fetch`/`web_search`, permission modes, skills
-  (frontmatter parsing, `$ARGUMENTS`, scaffolding), what each kind of model can be set to and
+  (frontmatter parsing, `$ARGUMENTS`, scaffolding), which files a half-typed `@name` finds and
+  in what order, what each kind of model can be set to and
   what is sent as `think` for every combination of `/think`, `/effort` and kind of call,
   where an advisor consultation runs and what it is shown at each guidance level, and what goes
   to and comes back from the hosted APIs (request bodies, answers, refusals, errors).
@@ -576,7 +624,11 @@ make test
   the confirmation menu (arrow keys, deny with reason, always, stray keys ignored),
   messages queued with Enter while the model streams or a tool runs (they stop the command,
   the round and the sub-agent in flight, step past a queued `/command`, and are handed back on
-  Ctrl-C), the `/ctx` picker and `/history`,
+  Ctrl-C), the mouse wheel and the scrollback (at the prompt, while a reply streams, over the
+  input field), the suggestions for `/commands`, their options, `@files` and `!lines` (at the
+  prompt and while the model works), a resize at an idle
+  prompt, the same wheel and resize through a real tmux when one is installed (its `mouse`
+  option off and on), the `/ctx` picker and `/history`,
   Shift+Tab mode cycling (plan / accept-edits behaviour), `/skills`, Ctrl-C interruption,
   slash commands, the `/model` picker, `!cmd`, `/save`, config/history persistence, `/effort`
   (per-model levels, the picker, the status bar), `/advisor` (the consultation, its limit,
@@ -590,10 +642,11 @@ make test
 
 ```
 src/common.h   shared declarations
-src/util.c     string buffer, file helpers, config, URL checks + HTML-to-text + search results
+src/util.c     string buffer, file helpers, config, the file finder behind @mentions,
+               URL checks + HTML-to-text + search results
 src/http.c     the HTTP(S) client over libcurl (streaming, Esc interrupt, idle timeout)
-src/term.c     raw mode, key decoding, full-screen mode + status bar, line editor, confirmation menu,
-               list picker, markdown printer
+src/term.c     raw mode, key and mouse decoding, full-screen mode + status bar, scrollback, line editor
+               with its suggestion list, confirmation menu, list picker, markdown printer
 src/tools.c    the tools + permission-mode checks + shell runner
 src/ollama.c   /api/chat streaming, tool-call accumulation, /api/tags, /api/show (capabilities, effort levels)
 src/provider.c the hosted APIs the advisor can consult: xAI, OpenAI (Chat Completions), Anthropic (Messages)

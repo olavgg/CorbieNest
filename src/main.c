@@ -31,27 +31,66 @@ static bool   g_advisor_said = false;            /* run_advisor() printed what c
 static bool   g_advisor_reviewed = false;        /* this request's review before it ends has been had (guidance strong and up) */
 static bool   g_advisor_checked = false;         /* and the check of its first change (max) */
 
-static const char *SLASH_CMDS[] = {
-    "/help", "/model", "/models", "/clear", "/compact", "/status", "/system", "/think", "/effort", "/advisor",
-    "/mode", "/yolo", "/tools", "/web", "/max_iters", "/ctx", "/temp", "/host", "/keepalive", "/save", "/history", "/cd", "/pwd", "/skills", "/memory", "/resume", "/permissions", "/init", "/cost", "/diff", "/rewind", "/quit", "/exit"
+/* The commands, each with the line the suggestions under the input field show for it. */
+static const struct { const char *name, *desc; } SLASH_CMDS[] = {
+    { "/help", "commands, keys and input tricks" },
+    { "/model", "pick a model from a menu, or /model NAME" },
+    { "/models", "list the models ollama has" },
+    { "/clear", "start a new conversation" },
+    { "/compact", "summarise the conversation to free context" },
+    { "/status", "model, context usage, settings" },
+    { "/system", "extra system instructions: TEXT, or clear" },
+    { "/think", "when the model thinks: on, off, auto · show or hide it" },
+    { "/effort", "how hard this model thinks" },
+    { "/advisor", "a stronger model the agent may consult: MODEL, off, guidance, effort, ctx" },
+    { "/mode", "permission mode: manual, accept-edits, plan, auto" },
+    { "/yolo", "auto mode on or off: every tool call approved" },
+    { "/tools", "tool calling on or off" },
+    { "/web", "web_search and web_fetch: on, off, engine URL" },
+    { "/max_iters", "tool rounds one request may run" },
+    { "/ctx", "context window: a size, max, default — or a picker" },
+    { "/temp", "temperature (-1 = the server's default)" },
+    { "/host", "the ollama host" },
+    { "/keepalive", "how long ollama keeps the model loaded" },
+    { "/save", "save the transcript as markdown" },
+    { "/history", "the last queries" },
+    { "/cd", "change the working directory" },
+    { "/pwd", "show the working directory" },
+    { "/skills", "list the skills · reload · new NAME" },
+    { "/memory", "the project memory: on, off, clear, update, every N, idle N" },
+    { "/resume", "continue an earlier session" },
+    { "/permissions", "the project's saved \"always allow\" rules: add, remove, clear" },
+    { "/init", "have the model write CORBIENEST.md for this project" },
+    { "/cost", "tokens, model calls and time of this session" },
+    { "/diff", "the working-tree diff, without sending it to the model" },
+    { "/rewind", "go back to an earlier request: files, conversation or both" },
+    { "/quit", "leave" },
+    { "/exit", "leave" },
 };
 
-/* slash completion list = built-in commands + /skill names (rebuilt when skills reload) */
-static const char **g_slash_all = NULL;
-static void refresh_slash_completion(void) {
-    int nb = (int)(sizeof SLASH_CMDS / sizeof *SLASH_CMDS), ns = skills_count();
-    static char **owned = NULL; static int nowned = 0;
-    for (int i = 0; i < nowned; i++) free(owned[i]);
-    free(owned); free(g_slash_all);
-    owned = xmalloc(sizeof(char*) * (size_t)(ns ? ns : 1)); nowned = ns;
-    g_slash_all = xmalloc(sizeof(char*) * (size_t)(nb + ns));
-    for (int i = 0; i < nb; i++) g_slash_all[i] = SLASH_CMDS[i];
-    for (int i = 0; i < ns; i++) {
-        sbuf b; sb_init(&b); sb_printf(&b, "/%s", skill_get(i)->name);
-        owned[i] = sb_detach(&b); g_slash_all[nb + i] = owned[i];
-    }
-    term_set_slash_commands(g_slash_all, nb + ns);
-}
+/* What a command takes as its next word, for the same list: "word:what it does", '|' between
+ * them. The key is the command line up to the word being typed. (/effort and /cd are worked
+ * out in suggest(): the levels are the model's, the directories the disk's.) */
+static const struct { const char *after, *opts; } SLASH_ARGS[] = {
+    { "/mode", "manual:ask before every edit and command|accept-edits:file edits go ahead, commands still ask|plan:read-only: the model proposes a plan|auto:nothing asks (dangerous)" },
+    { "/think", "on:think on every call|off:do not think|auto:think once per request, not after every tool result|show:show the thinking|hide:hide the thinking" },
+    { "/yolo", "on:approve every tool call (dangerous)|off:back to manual confirmations" },
+    { "/tools", "on:the model may call tools|off:chat only" },
+    { "/web", "on:the model may search and read the web|off:no web access|engine:the search engine: a URL with %s for the query, or default" },
+    { "/web engine", "default:back to the built-in engine" },
+    { "/memory", "on:keep the project memory up to date|off:stop updating it|update:run the pending update now|clear:remove the memory file|every:update every N requests|idle:update after N seconds idle at the prompt" },
+    { "/memory idle", "off:wait for the next update or the exit instead" },
+    { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST|remove:remove rule N|clear:remove them all" },
+    { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host" },
+    { "/advisor", "off:no advisor|guidance:how much the agent leans on it|effort:how hard it thinks|ctx:its context window" },
+    { "/advisor guidance", "light:consulted rarely|normal:the default|strong:also reviews the work before a request ends|max:also checks the first change before it is made" },
+    { "/advisor ctx", "auto:the main window, within the advisor's bounds" },
+    { "/skills", "reload:read the SKILL.md files again|new:scaffold a skill: /skills new NAME" },
+    { "/system", "clear:remove the extra instructions" },
+    { "/keepalive", "default:the server's own|30m:half an hour|-1:forever|0:unload right away" },
+    { "/ctx", "max:the largest the model takes|default:back to the default size" },
+    { "/resume", "all:sessions of every directory, not only this one" },
+};
 
 /* one model call finished: fold its stats into the session totals */
 static void account(const chat_stats *st) {
@@ -1894,6 +1933,13 @@ static char *expand_mentions(const char *input) {
             while (e > s && strchr(",.;:)!?", e[-1])) e--;
             char *path = xstrndup(s, (size_t)(e - s));
             char *fp = expand_home(path);
+            if (!is_file(fp) && !is_dir(fp)) {   /* not a path from here: the one file by that name, when there is just one */
+                int hits = 0; sbuf names; sb_init(&names);
+                char *found = file_find_named(path, &hits, &names);
+                if (found) { free(fp); free(path); path = found; fp = xstrdup(found); }
+                else if (hits > 1) printf(C_DIM "  (@%s could be %s%s — give more of the path)" C_RESET "\n", path, names.data, hits > 5 ? ", …" : "");
+                sb_free(&names);
+            }
             if (is_file(fp)) {
                 size_t n; char *d = read_whole_file(fp, &n, 128 * 1024);
                 if (d) {
@@ -1956,10 +2002,10 @@ static void cmd_skills(const char *arg) {
         if (rc == 1) printf(C_YELLOW "%s already exists" C_RESET "\n", path);
         else if (rc < 0) printf(C_RED "✗ cannot create skill '%s': %s" C_RESET "\n", name, strerror(errno));
         else printf(C_GREEN "✓ created %s" C_RESET " — edit it, then run it with /%s [args]\n", path, name);
-        skills_load(); refresh_slash_completion();
+        skills_load();
         return;
     }
-    if (arg && !strcmp(arg, "reload")) { skills_load(); refresh_slash_completion(); }
+    if (arg && !strcmp(arg, "reload")) skills_load();
     int n = skills_count();
     if (!n) {
         printf(C_DIM "no skills found." C_RESET "\n"
@@ -2019,17 +2065,25 @@ static void cmd_help(void) {
            "  /cd DIR, /pwd         change / show working directory\n"
            "  /quit, /exit          leave (also Ctrl-D)\n\n"
            C_BOLD "Input\n" C_RESET
-           "  !cmd                  run a shell command yourself; output is added to the conversation\n"
-           "  @path                 attach a file (or directory listing) to your message\n"
+           "  !cmd                  run a shell command yourself; output is added to the conversation. Its words are completed as\n"
+           "                        in a shell: programs from $PATH where a command goes, files and directories elsewhere\n"
+           "  @path                 attach a file (or directory listing) to your message — while you type, the files matching the name\n"
+           "                        so far are listed under the input field (@term finds src/term.c; @../lib/pa looks below ../lib)\n"
            "  # fact                remember something: appended to " MEMORY_PATH " (pick the section from a menu), no model call\n"
            "  Enter                 send  ·  Alt+Enter / Ctrl+J / trailing \\ : newline\n"
            "  Enter while busy      queue a message for the model (added between tool rounds or after the turn; Ctrl-C hands it back)\n"
            "                        commands that only report or set something run at once instead: /help /status /cost /diff /history /pwd\n"
            "                        /skills /memory /mode /yolo /permissions /tools /web /max_iters /think /effort /advisor /temp /keepalive\n"
            "  Ctrl-C                cancel generation / clear line (twice: quit)  ·  Ctrl-L clear screen\n"
-           "  PgUp / PgDn           scroll back through the conversation (↑/↓, Home/End inside; Esc/Enter return)\n"
+           "  mouse wheel, PgUp/PgDn  scroll back through the conversation, also while the model works (at the prompt ↑/↓ and Home/End\n"
+           "                        scroll too; Esc/Enter return); a line under it says where you are, the status bar stays as it is.\n"
+           "                        The wheel does nothing over the input field: there ↑/↓ are the keys.\n"
+           "                        Selecting text with the mouse needs Shift held down (in tmux too)\n"
            "  status bar            bottom row shows the permission mode, model, session tokens and context usage\n"
-           "  Tab                   complete slash commands  ·  ↑/↓ history  ·  Ctrl-R search history\n\n"
+           "  / @ and !             the commands (and their options), files, or programs and paths matching what you typed are listed\n"
+           "                        under the input field, also while the model works: Tab completes, ↓ steps into the list, Enter\n"
+           "                        takes the highlighted one, Esc closes it\n"
+           "  ↑/↓                   history  ·  Ctrl-R search history\n\n"
            C_BOLD "Tools the model can call\n" C_RESET "  %s\n"
            "  write/edit/bash ask for confirmation: pick with ↑/↓ + enter, or press y (once), a (always this session), p (always in this project), n (deny, with optional reason)\n"
            "  modes: manual asks for everything · accept-edits auto-approves file edits · plan is read-only (model proposes a plan) · auto approves all\n",
@@ -2431,7 +2485,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/cd")) {
         char *d = expand_home(arg ? arg : "~");
         memory_flush();   /* the memory file belongs to the directory we are leaving */
-        if (chdir(d) == 0) { if (getcwd(g_cwd, sizeof g_cwd)) {} load_project_instructions(); load_memory(); tools_permissions_load(); skills_load(); refresh_slash_completion(); printf(C_GREEN "✓ %s" C_RESET "\n", g_cwd); }
+        if (chdir(d) == 0) { if (getcwd(g_cwd, sizeof g_cwd)) {} load_project_instructions(); load_memory(); tools_permissions_load(); skills_load(); printf(C_GREEN "✓ %s" C_RESET "\n", g_cwd); }
         else printf(C_RED "✗ cd %s: %s" C_RESET "\n", d, strerror(errno));
         free(d);
     }
@@ -2546,6 +2600,123 @@ static void banner(void) {
     printf(C_ORANGE "╰"); for (int i = 0; i < w - 2; i++) printf("─"); printf("╯" C_RESET "\n");
     if (ok != 0) printf(C_RED "cannot reach ollama at %s: %s" C_RESET "\n" C_DIM "start it with `ollama serve`, or set the host with /host or OLLAMA_HOST" C_RESET "\n", g_cfg.host, ver);
     printf(C_DIM "/help for commands · @file to attach · !cmd for shell · shift+tab to switch mode · Ctrl-D to quit" C_RESET "\n\n");
+}
+
+/* ---------- suggestions under the input field (term_suggest) ----------
+ * What the word at the cursor could become: a command for "/mo", one of its options for
+ * "/mode pl", a file for "@te" (see file_complete: the name is searched for below the working
+ * directory, or below the directory typed in front of it), a program or a path in a "!line". */
+static void sug_add(term_sug **v, int *n, const char *text, const char *desc, bool open) {
+    for (int i = 0; i < *n; i++) if (!strcmp((*v)[i].text, text)) return;   /* once is enough */
+    *v = xrealloc(*v, sizeof **v * (size_t)(*n + 1));
+    (*v)[(*n)++] = (term_sug){ xstrdup(text), desc && *desc ? xstrdup(desc) : NULL, open };
+}
+
+static int suggest_files(const char *typed, bool dirs_only, term_sug **items) {
+    file_match *m;
+    int n = file_complete(typed, dirs_only, 50, &m), k = 0;
+    for (int i = 0; i < n; i++) sug_add(items, &k, m[i].path, NULL, m[i].dir);
+    file_matches_free(m, n);
+    return k;
+}
+
+/* A "!line" is the shell's, so its words are completed the way a shell would: where a command
+ * goes, the programs in $PATH that start with what was typed; anywhere else the files and
+ * directories that do — found like an "@file", wherever below the working directory they are,
+ * but by the start of their name only: most words of a command are not files, and a list that
+ * came up for every one of them would be in the way. First of all come the "!lines" sent
+ * before that go on from what is typed (the newest first), so a bare "!" shows what was run. */
+static int suggest_shell(const char *buf, size_t cur, size_t *from, term_sug **items) {
+    bool command;
+    long ws = shell_word(buf, cur, &command);
+    if (ws < 0) return 0;
+    int n = 0;
+    *from = (size_t)ws;
+    char *word = xstrndup(buf + ws, cur - (size_t)ws);
+    size_t wl = 0;
+    for (const char *p = word; *p; p++) { if (*p == '\\' && p[1]) p++; word[wl++] = *p; }   /* as the shell reads it */
+    word[wl] = 0;
+    for (int i = hist_count() - 1, most = wl ? 3 : 8; i >= 0 && n < most; i--) {
+        const char *h = hist_get(i);
+        if (h[0] == '!' && strlen(h) > cur && !strncmp(h, buf, cur) && !strchr(h, '\n')) sug_add(items, &n, h + ws, NULL, true);
+    }
+    bool prog = command && !strchr(word, '/');   /* a program by its name; with a '/' in it, it is a path like any other */
+    const char *name = strrchr(word, '/'); name = name ? name + 1 : word;
+    file_match *m = NULL;
+    int k = !wl || word[0] == '-' ? 0 : prog ? command_complete(word, 50, &m) : file_complete(word, false, 50, &m);
+    for (int i = 0; i < k; i++) {
+        if (!prog) {   /* the last part of the path has to start with what was typed */
+            const char *base = m[i].path + strlen(m[i].path) - (m[i].dir ? 1 : 0);
+            while (base > m[i].path && base[-1] != '/') base--;
+            if (strncasecmp(base, name, strlen(name))) continue;
+        }
+        char *text = shell_escape(m[i].path);
+        sug_add(items, &n, text, NULL, m[i].dir);
+        free(text);
+    }
+    file_matches_free(m, k);
+    free(word);
+    return n;
+}
+
+static int suggest(const char *buf, size_t cur, size_t *from, term_sug **items) {
+    int n = 0;
+    if (buf[0] == '!') return suggest_shell(buf, cur, from, items);
+    long at = mention_start(buf, cur);
+    if (at >= 0) {
+        char *typed = xstrndup(buf + at, cur - (size_t)at);
+        *from = (size_t)at;
+        n = suggest_files(typed, false, items);
+        free(typed);
+        return n;
+    }
+    if (buf[0] != '/' || memchr(buf, '\n', cur)) return 0;
+    size_t ws = cur;   /* where the word at the cursor starts */
+    while (ws > 0 && buf[ws - 1] != ' ') ws--;
+    char *word = xstrndup(buf + ws, cur - ws);
+    size_t wl = strlen(word);
+    *from = ws;
+    if (ws == 0) {   /* the command: the names that start with what was typed, then those that contain it */
+        int nb = (int)(sizeof SLASH_CMDS / sizeof *SLASH_CMDS), ns = skills_count();
+        for (int pass = 0; pass < 2; pass++)
+            for (int i = 0; i < nb + ns; i++) {
+                sbuf sk; sb_init(&sk);
+                if (i >= nb) sb_printf(&sk, "/%s", skill_get(i - nb)->name);
+                const char *name = i < nb ? SLASH_CMDS[i].name : sk.data;
+                bool starts = !strncmp(name, word, wl);
+                if (pass == 0 ? starts : !starts && wl > 2 && strcasestr(name + 1, word + 1))
+                    sug_add(items, &n, name, i < nb ? SLASH_CMDS[i].desc : skill_get(i - nb)->desc, false);
+                sb_free(&sk);
+            }
+        free(word);
+        return n;
+    }
+    size_t bl = ws;   /* an argument: the options of the command line so far */
+    while (bl > 0 && buf[bl - 1] == ' ') bl--;
+    char *before = xstrndup(buf, bl);
+    if (!strcmp(before, "/cd")) n = suggest_files(word, true, items);
+    else if (!strcmp(before, "/effort")) {
+        const model_info *mi = &g_model_info;
+        const char *opt[EFFORT_LEVELS_MAX + 3], *why[EFFORT_LEVELS_MAX + 3]; int no = 0;
+        opt[no] = "default"; why[no++] = "leave it to the model";
+        if (mi->think_off) { opt[no] = "off"; why[no++] = "no thinking: fastest"; }
+        if (mi->think_on) { opt[no] = "on"; why[no++] = "think"; }
+        for (int i = 0; i < mi->n_think_levels; i++) { opt[no] = mi->think_levels[i]; why[no++] = i == 0 ? "the least thinking" : i == mi->n_think_levels - 1 ? "the most thinking: slowest" : ""; }
+        for (int i = 0; i < no; i++) if (!strncmp(opt[i], word, wl)) sug_add(items, &n, opt[i], why[i], false);
+    }
+    else for (size_t i = 0; i < sizeof SLASH_ARGS / sizeof *SLASH_ARGS; i++) {
+        if (strcmp(SLASH_ARGS[i].after, before)) continue;
+        for (const char *o = SLASH_ARGS[i].opts; *o; ) {
+            size_t ol = strcspn(o, "|"), nl = strcspn(o, ":|");
+            char *name = xstrndup(o, nl), *desc = xstrndup(o + (nl < ol ? nl + 1 : nl), nl < ol ? ol - nl - 1 : 0);
+            if (!strncmp(name, word, wl)) sug_add(items, &n, name, desc, false);
+            free(name); free(desc);
+            o += ol; if (*o == '|') o++;
+        }
+        break;
+    }
+    free(before); free(word);
+    return n;
 }
 
 /* Handle one line of user input (from the editor or the message queue).
@@ -2881,7 +3052,7 @@ int main(int argc, char **argv) {
 
     banner();
     hist_load();
-    refresh_slash_completion();
+    term_suggest = suggest;
     term_idle_hook = memory_idle_hook;
     for (;;) {
         memory_arm_idle();   /* a finished request folds itself into memory while the prompt sits idle */

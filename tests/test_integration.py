@@ -69,6 +69,13 @@ def clean(s): return ANSI.sub("", s).replace("\r", "")
 # DECSC/DECRC pair in term.c wraps chrome and nothing else, so without them this is the transcript.
 CHROME = re.compile(r"\x1b7.*?\x1b8", re.S)
 def transcript(s): return clean(CHROME.sub("", s))
+# When the layout changes (a resize, the input field or the list under it growing or shrinking,
+# the scrollback viewer being left) the conversation region is painted again from the scrollback,
+# between "autowrap off" and "autowrap on" — and so is the viewer's window. That is old text
+# in the byte stream, not output: expect() must not take a line that was merely painted again
+# for the one it is waiting for. since()/text() still show it, for the tests that are about it.
+REPAINT = re.compile(r"\x1b\[\?7l.*?\x1b\[\?7h", re.S)
+def fresh(s): return REPAINT.sub("", s)
 
 WORK = tempfile.mkdtemp(prefix="crowtest_")
 CFG = tempfile.mkdtemp(prefix="crowcfg_")
@@ -326,7 +333,7 @@ class Session:
                 except OSError: return False
                 if not d: return False
                 self.out += d
-            t = self.out[self.mark:].decode("utf-8", "replace")
+            t = fresh(self.out[self.mark:].decode("utf-8", "replace"))
             if pat in clean(t) or pat in transcript(t): return True   # the chrome is read on purpose too ("1 queued", the bar's effort)
         return False
     def send(self, s, wait=0.15):
@@ -344,6 +351,12 @@ class Session:
         except Exception: pass
 
 def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
+def scrolled(sess):
+    """Whether the chrome as last drawn says the conversation is scrolled back: the line for that
+    is drawn right above the input field's upper rule. (The status bar says nothing about it —
+    it stays what it is.)"""
+    sess.expect("(no such text)", 0.4)   # let the redraw finish
+    return "scrollback · rows" in sess.text().rsplit("❯", 1)[0].rstrip("─")[-130:]
 
 print("test interactive: an Ollama on another machine over plain http is said to be one")
 s = Session(["-H", "http://ollama.invalid:9", "-m", "fake-coder:latest"])
@@ -399,14 +412,18 @@ sf.send("\x15")   # ctrl-u back to one row
 check(sf.expect("❯ "), "cleared")
 raw = sf.out.decode("utf-8", "replace")[-4000:]
 check(re.search(r"\x1b\[1;16r", raw) is not None, "the region grew back")
-check(re.search(r"\x1b\[15;1H\x1b\[K", raw) and re.search(r"\x1b\[16;1H\x1b\[K", raw),
-      f"the rows the field gave back are wiped, not left showing its old text: {raw[-300:]!r}")
+check(re.search(r"\x1b\[15;1H\x1b\[2K", raw) and re.search(r"\x1b\[16;1H\x1b\[2K", raw),
+      f"the rows the field gave back are painted again from the transcript, not left showing its old text: {raw[-300:]!r}")
+sf.mark = len(sf.out)
 fcntl.ioctl(sf.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
 os.kill(sf.pid, __import__("signal").SIGWINCH)
+check(sf.expect("manual mode", 3), "a resize at an idle prompt is drawn at once, not at the next key (a tmux pane is resized all the time)")
+raw = sf.out[sf.mark:].decode("utf-8", "replace")
+check(re.search(r"\x1b\[1;26r", raw) is not None, f"the region was re-cut for the new height: {raw[-300:]!r}")
+check(re.search(r"\x1b\[30;1H[^\n]*manual mode", raw) is not None, "the bar is on the new last row")
+check("Corbie Nest" in clean(raw), "and the conversation is painted again for the new size, from the top of the transcript")
 sf.send("after resize")
 check(sf.expect("❯ after resize"), "the field follows a resize")
-raw = sf.out.decode("utf-8", "replace")
-check(re.search(r"\x1b\[1;26r", raw) is not None, f"the region was re-cut for the new height: {raw[-300:]!r}")
 sf.send("\r"); check(sf.expect("Echo: after resize"), "and the line still sends")
 check("› after resize" in sf.text(), "the submitted line goes into the transcript, not the field")
 sf.close()
@@ -420,8 +437,8 @@ check(re.search(r"\x1b\[1;9r", raw) is not None, f"the field grew to 8 rows and 
 sp.send("\r"); check(sp.expect("Echo: pasted line 1"), "the whole paste is sent as one message")
 check(requests()[-1]["messages"][-1]["content"].count("pasted line 8") == 1, "sent once, not twice")
 raw = sp.out.decode("utf-8", "replace")[-6000:]
-missing = [r for r in range(10, 17) if not re.search(r"\x1b\[%d;1H\x1b\[K" % r, raw)]
-check(not missing, f"every row the field gave back is wiped, so the paste is not repainted below the reply: rows {missing} left dirty")
+missing = [r for r in range(10, 17) if not re.search(r"\x1b\[%d;1H\x1b\[2K" % r, raw)]
+check(not missing, f"every row the field gave back is painted again from the transcript, so the paste does not stay below the reply: rows {missing} left dirty")
 sp.close()
 
 
@@ -658,7 +675,18 @@ check([m["content"] for m in msgs if m["role"] == "user"] == ["session one", "an
 s.send("/status\r"); check(s.expect("session    " + sid), "/status shows the session id")
 s.send("/clear\r"); s.expect("new conversation")
 s.send("fresh start\r"); check(s.expect("Echo: fresh start"), "reply")
-check(any(json.load(open(os.path.join(SESS, f)))["title"] == "fresh start" for f in os.listdir(SESS)), "/clear starts a new session file")
+def titles():
+    """The titles of the saved sessions. A file is written next to its place and renamed into it,
+    so the listing may name a temporary that is gone by the time it is opened."""
+    out = []
+    for f in os.listdir(SESS):
+        if not f.endswith(".json"): continue
+        try: out.append(json.load(open(os.path.join(SESS, f)))["title"])
+        except (OSError, ValueError, KeyError): pass
+    return out
+end = time.time() + 3   # the session is saved when the request is over — a moment after the reply was printed
+while "fresh start" not in titles() and time.time() < end: time.sleep(0.05)
+check("fresh start" in titles(), "/clear starts a new session file")
 
 print("test interactive: /init writes CORBIENEST.md and loads it")
 s.send("/mode auto\r"); s.expect("mode: auto")
@@ -917,6 +945,7 @@ def viewrange():   # the viewer's own "rows X-Y of Z" header (the window depends
     return tuple(int(x) for x in m[-1]) if m else None
 s.send("\x1b[5~"); check(s.expect("scrollback · rows"), f"PgUp opens the viewer: {s.text()[-200:]!r}")
 view = since(); first = viewrange()
+check("manual mode" in view.split("scrollback · rows")[-1] and "tokens" in view.split("scrollback · rows")[-1], f"where the window is has a line of its own: the status bar stays what it is: {view[-300:]!r}")
 check("c-05" in view and "d-30" not in view and "hello before" not in view, f"viewer shows an earlier window: {view[-400:]!r}")
 s.send("\x1b[5~"); s.expect("scrollback"); second = viewrange()
 check(first and second and second[0] < first[0], f"PgUp again scrolls further up: {first} -> {second}")
@@ -929,9 +958,224 @@ s.send("after view\r"); check(s.expect("Echo: after view"), "the editor works af
 s.send("\x1b[5~"); s.expect("scrollback")
 for _ in range(6): s.send("\x1b[6~", wait=0.3)
 check(s.expect("❯"), "prompt back"); time.sleep(0.2)
-check("❯" in s.text().split("scrollback")[-1], "PgDn at the bottom leaves the viewer")
+check(not scrolled(s), "PgDn at the bottom leaves the viewer")
 s.send("typed\r"); check(s.expect("Echo: typed"), "prompt usable again")
 s.send("\x04"); s.close()
+
+print("test interactive: the mouse wheel scrolls the conversation; the arrows stay the input field's")
+s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
+raw = s.out.decode("utf-8", "replace")
+check("\x1b[?1000h" in raw and "\x1b[?1006h" in raw, "the mouse is asked for, with SGR coordinates: otherwise the wheel arrives as arrow keys")
+def wheel(up, row=5, n=1): return ("\x1b[<%d;10;%dM" % (64 if up else 65, row)) * n   # the terminal has 40 rows: 1-36 are the conversation
+def quiet(sess, data):
+    """Send, and say whether nothing at all was drawn in answer."""
+    sess.send(data); sess.expect("(no such text)", 0.6); return len(sess.out) == sess.mark
+for pfx in "abc":
+    s.send("!seq -f '%s-%%02g' 1 30\r" % pfx); check(s.expect(pfx + "-30", 10), "30 rows printed")
+s.send("older prompt\r"); check(s.expect("Echo: older prompt"), "reply")
+s.send("newer prompt\r"); check(s.expect("Echo: newer prompt"), "reply")
+s.send("half typed"); s.expect("half typed")
+s.send(wheel(True)); check(s.expect("scrollback · rows"), f"the wheel over the conversation scrolls it back: {s.text()[-200:]!r}")
+first = viewrange()
+check("❯ half typed" in since() and "❯ newer prompt" not in since(), f"it does not walk the prompt history: the field keeps what was typed: {since()[-300:]!r}")
+s.send(wheel(True)); s.expect("scrollback"); second = viewrange()
+check(first and second and second[0] == first[0] - 3, f"a notch is three rows: {first} -> {second}")
+check(quiet(s, wheel(True, row=38)), "over the input field the wheel does nothing")
+check(quiet(s, wheel(False, row=40)), "nor over the status bar")
+check(quiet(s, "\x1b[<0;10;5M\x1b[<0;10;5m"), "a click does nothing: it is not typed, and it does not close the viewer")
+s.send(wheel(False, n=3)); check(not scrolled(s), "scrolling down to the last row leaves the viewer")
+check("❯ half typed" in since() and "Echo: newer prompt" in since(), f"with the tail of the transcript drawn again and the field as it was: {since()[-300:]!r}")
+check(quiet(s, wheel(False)), "at the prompt there is nothing below to scroll to")
+s.send("\x15"); s.send("\x1b[A"); check(s.expect("❯ newer prompt"), "arrow up is the prompt history, as before")
+s.send("\x1b[A"); check(s.expect("❯ older prompt"), "and again")
+s.send("\x15")
+s.send("\x1b[M" + chr(32 + 64) + chr(32 + 10) + chr(32 + 5)); check(s.expect("scrollback · rows"), "a terminal's old three-byte report is understood too")
+check("`*%" not in since(), "and its bytes are not typed into the field")
+s.send("\x1b"); check(not scrolled(s), "Esc returns to the prompt")
+s.send(wheel(True)); s.expect("scrollback")
+s.send("x"); check(s.expect("❯ x"), "a key typed in the viewer goes back to the prompt and into the message")
+s.send("\x15")
+
+print("test interactive: scrolling back while the model works")
+s.send("SLOW please\r"); check(s.expect("one"), "the reply starts")
+s.send(wheel(True, n=2)); check(s.expect("scrollback · rows"), f"the wheel scrolls back while the reply streams: {s.text()[-200:]!r}")
+check("generating" in since() and "manual mode" in since(), "the bar is still the bar: the mode, and that the model is working")
+time.sleep(1.3); s.expect("(no such text)", 0.2)
+check("four" not in since(), f"what arrives meanwhile is recorded, not painted over the window: {since()[-200:]!r}")
+s.send("\x1b"); check(s.expect("eight") and s.expect("tok/s"), "Esc goes back to the output, and the reply runs to its end")
+check("one two three four" in since(), f"what arrived meanwhile was painted on the way back: {since()[-300:]!r}")
+check("interrupted" not in since(), "that Esc left the viewer; it did not stop the model")
+s.send("SLOW again\r"); check(s.expect("one"), "another reply starts")
+s.send("\x1b[5~"); check(s.expect("scrollback · rows"), "PgUp scrolls back at once too, instead of when the turn is over")
+check(s.expect("End/Esc/Enter back", 10), "still reading when the reply ends: the window stays, now with the keyboard")
+s.send("\x1b[F"); check(not scrolled(s), "End goes back to the prompt")
+check("one two three four five six seven eight" in since(), f"with the reply that was written meanwhile: {since()[-300:]!r}")
+s.send("after reading\r"); check(s.expect("Echo: after reading"), "and the prompt works")
+s.send("SLOW third\r"); s.expect("one")
+s.send(wheel(True)); s.expect("scrollback")
+s.send("\x03"); check(s.expect("interrupted"), "Ctrl-C while scrolled back stops the model and returns to the output")
+s.send("\x04"); s.close()
+
+print("test interactive: suggestions under the input field while a /command or an @file is typed")
+SIB = tempfile.mkdtemp(prefix="crowsib_", dir=os.path.dirname(WORK))   # a directory next to the working directory
+os.makedirs(os.path.join(WORK, "sugsrc", "deep"))
+for rel in ("sugsrc/zebra_term.c", "sugsrc/deep/zebra_notes.md", "sugsrc/twin.txt", "sugsrc/deep/twin.txt"):
+    open(os.path.join(WORK, rel), "w").write("content of %s\n" % rel)
+open(os.path.join(SIB, "zeta_parser.c"), "w").write("content of the sibling\n")
+sib = "../" + os.path.basename(SIB)
+s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
+def listed():
+    """What the last redraw put under the input field: the list, its hint and the bar."""
+    s.expect("(no such text)", 0.3)
+    return since().rsplit("─", 1)[-1]
+s.send("/m"); s.send("o"); check(s.expect("pick a model from a menu"), f"typing /mo lists the commands it could become, each with what it does: {since()[-300:]!r}")
+view = listed()
+check("/models" in view and "permission mode: manual" in view and "/memory" in view and "/status" not in view, f"only the matching ones — a name that starts with it first, then one that contains it: {view!r}")
+check("tab complete · ↓ choose · esc close" in view, "and a line that says which keys work")
+check(re.search(r"\x1b\[1;27r", s.out.decode("utf-8", "replace")) is not None, "the list has rows of its own: the conversation region makes room")
+s.send("d"); s.send("e"); view = listed(); check("/mode" in view and "/memory" not in view, f"every letter narrows it down: {view!r}")
+s.send("\x7f\x7f"); check("/memory" in listed(), "and deleting widens it again")
+s.send("\x1b[B"); view = listed(); check("enter take it" in view and re.search(r"❯ /model\s+pick a model", view), f"arrow down steps into the list: {view!r}")
+s.send("\x1b[B\x1b[B"); view = listed(); check(re.search(r"❯ /mode\s+permission mode", view), f"and moves in it: {view!r}")
+s.send("\x1b[A"); view = listed(); check(re.search(r"❯ /models\s+list the models", view), "arrow up moves back")
+s.send("\x1b[B\r"); view = listed(); check("read-only: the model proposes a plan" in view, f"Enter takes the highlighted command — and its options are listed next: {view!r}")
+check("❯ /mode " in since() and "✓ mode" not in since(), "the command is in the field, not sent")
+s.send("p"); s.send("l"); view = listed(); check("plan" in view and "accept-edits" not in view, f"the options narrow down the same way: {view!r}")
+s.send("\t"); check(s.expect("❯ /mode plan"), "Tab completes the one that is left")
+s.send("\r"); check(s.expect("✓ mode: "), "and Enter sends the line")
+s.send("/mode manual\r"); s.expect("✓ mode: ")
+s.send("/stat\r"); check(s.expect("unknown command /stat"), "with nothing highlighted Enter sends what was typed: the list is only a preview")
+s.send("/h"); s.send("e"); check("commands, keys and input tricks" in listed(), "the list for /he")
+s.send("\x1b"); check("commands, keys" not in listed(), "Esc closes the list")
+check(re.search(r"\x1b\[1;36r", s.out[s.mark:].decode("utf-8", "replace")) is not None, "and the conversation gets its rows back")
+s.send("\x1b[A"); check(s.expect("❯ /stat"), "after which arrow up is the history again")
+check("model, context usage" not in listed(), "a recalled line brings no list up: the next arrow goes on through the history")
+s.send("\x1b[A"); check(s.expect("❯ /mode manual"), "as it does")
+s.send("\x15")
+s.send("/sta\t"); check(s.expect("❯ /status"), "Tab completes a command that is the only match")
+s.send("\x15")
+s.send("see @zebr"); s.send("a"); view = listed()
+check("sugsrc/zebra_term.c" in view and "sugsrc/deep/zebra_notes.md" in view, f"@ and part of a name finds the files it could be, wherever they are: {view!r}")
+check("twin.txt" not in view, "and only those")
+s.send("\t"); check("enter take it" in listed(), "Tab starts choosing when they have nothing more in common")
+s.send("\t"); check(s.expect("❯ see @sugsrc/zebra_term.c"), f"and takes the highlighted one: its path replaces what was typed: {since()[-200:]!r}")
+s.send("and @" + sib + "/z"); s.send("e"); check(sib + "/zeta_parser.c" in listed(), f"a directory in front — also one outside the working directory — is where the search is: {since()[-300:]!r}")
+s.send("\t"); check(s.expect("@" + sib + "/zeta_parser.c "), "Tab completes it")
+s.send("\r"); check(s.expect("Echo: see @sugsrc/zebra_term.c"), "the message is sent")
+check("(attached sugsrc/zebra_term.c" in since() and "(attached " + sib + "/zeta_parser.c" in since(), f"with both files attached: {since()[-400:]!r}")
+content = requests()[-1]["messages"][-1]["content"]
+check('<file path="sugsrc/zebra_term.c">' in content and "content of the sibling" in content, "and in the request")
+s.send("@sugsrc"); s.send("/"); view = listed()
+check("sugsrc/deep/" in view and "sugsrc/twin.txt" in view and "sugsrc/zebra_term.c" in view, f"a directory lists what is in it: {view!r}")
+s.send("\x15")
+s.send("/cd su"); s.send("g"); view = listed(); check("sugsrc/" in view and "zebra_term.c" not in view, f"/cd is offered the directories, and only those: {view!r}")
+s.send("\x15")
+s.send("look at @zebra_notes.md\r"); check(s.expect("Echo: look at @zebra_notes.md"), "a bare file name is sent as typed")
+check("(attached sugsrc/deep/zebra_notes.md" in since(), f"and the one file by that name is attached: {since()[-300:]!r}")
+check('<file path="sugsrc/deep/zebra_notes.md">' in requests()[-1]["messages"][-1]["content"], "under its real path")
+s.send("look at @twin.txt\r"); check(s.expect("Echo: look at @twin.txt"), "a name two files have is sent as it is")
+check("@twin.txt could be sugsrc/twin.txt, sugsrc/deep/twin.txt" in since(), f"both are named: {since()[-300:]!r}")
+check("<file" not in requests()[-1]["messages"][-1]["content"], "and neither is guessed")
+
+print("test interactive: the suggestions come up while the model works too, and their keys act at once")
+s.send("!sleep 7\r"); s.expect("sleep 7")
+s.send("/m"); s.send("o"); view = listed()
+check("/models" in view and "pick a model from a menu" in view and "tab complete · ↓ choose · esc close" in view, f"/mo typed while a command runs lists the commands it could become, as at the prompt: {view!r}")
+s.send("\x1b"); check("pick a model" not in listed(), "Esc closes the list")
+s.send("d"); view = listed(); check("/models" in view and "/memory" not in view, f"and stops nothing — the next letter brings the list back, narrowed down: {view!r}")
+s.send("\x1b[B\x1b[B\x1b[B"); view = listed(); check("enter take it" in view and re.search(r"❯ /mode\s+permission mode", view), f"arrow down steps into it and moves: {view!r}")
+s.send("\r"); view = listed(); check("read-only: the model proposes a plan" in view and "queued" not in view, f"Enter takes the highlighted command instead of sending the line, and its options are listed: {view!r}")
+s.send("p"); s.send("\t"); check(s.expect("❯ /mode plan"), "Tab completes the option")
+s.send("\r"); check(s.expect("plan mode on"), "and Enter, with nothing highlighted, sends the line: the command runs there and then")
+check(s.expect("exit code: 0", 12), f"the shell command ran to its end all the while: {since()[-300:]!r}")
+s.send("/mode manual\r"); s.expect("✓ mode: ")
+s.send("SLOW please\r"); s.expect("one")
+s.send("see @zebra_t"); s.send("e"); check("sugsrc/zebra_term.c" in listed(), "an @file is found while a reply streams")
+s.send("\t\t"); check(s.expect("❯ see @sugsrc/zebra_term.c"), "and Tab steps into the list and takes it")
+check(s.expect("eight") and s.expect("tok/s"), "the reply runs to its end")
+check(s.expect("❯ see @sugsrc/zebra_term.c"), "what was typed is in the prompt afterwards")
+s.send("\x15")
+s.send("\x04"); s.close()
+out, rc = run(["-m", "fake-coder:latest", "-T", "-p", "look at @zebra_notes.md"])
+check("(attached sugsrc/deep/zebra_notes.md" in out, f"-p finds a file by its name too: {out!r}")
+
+print("test interactive: a !line is completed the way a shell would: programs where a command goes, paths elsewhere")
+BINDIR = tempfile.mkdtemp(prefix="crowbin_")
+for name in ("zzcorbie-tool", "zzcorbie-tool-extra"):
+    open(os.path.join(BINDIR, name), "w").write('#!/bin/sh\necho "ran-%s $*"\n' % name); os.chmod(os.path.join(BINDIR, name), 0o755)
+open(os.path.join(BINDIR, "zzcorbie-notes.txt"), "w").write("not a program\n")
+s = Session(["-m", "fake-coder:latest"], env=dict(ENV, PATH=BINDIR + os.pathsep + ENV["PATH"])); s.expect("Ctrl-D to quit")
+s.send("!zzcor"); s.send("b"); view = listed()
+check("zzcorbie-tool" in view and "zzcorbie-tool-extra" in view and "zzcorbie-notes" not in view, f"the first word is offered the programs in $PATH that start with it: {view!r}")
+s.send("\t"); check(s.expect("❯ !zzcorbie-tool"), "Tab completes as far as they agree")
+s.send(" zebr"); s.send("a"); view = listed()
+check("sugsrc/zebra_term.c" in view and "sugsrc/deep/zebra_notes.md" in view, f"an argument is offered the files whose name starts with it, wherever they are: {view!r}")
+s.send("\t\t"); check(s.expect("❯ !zzcorbie-tool sugsrc/zebra_term.c"), "Tab steps into the list and takes one")
+s.send("\r"); check(s.expect("ran-zzcorbie-tool sugsrc/zebra_term.c"), "and the line runs as it stands")
+s.send("!"); view = listed(); check("zzcorbie-tool sugsrc/zebra_term.c" in view, f"a bare ! lists the lines that were run before, the newest first: {view!r}")
+s.send("\x1b[B\r"); check(s.expect("❯ !zzcorbie-tool sugsrc/zebra_term.c"), "and one of them is taken whole")
+s.send("\x15")
+s.send("!cat ebra_ter"); s.send("m"); check("zebra" not in listed(), "only the start of a name counts here: most words of a command are not files")
+s.send("\x15")
+s.send('!echo "zebr'); s.send("a"); check("zebra_term" not in listed(), "and inside quotes nothing is offered: that is text")
+s.send("\x15")
+s.send("!true | zzcor"); s.send("b"); check("zzcorbie-tool" in listed(), "after a pipe a command goes again")
+s.send("\x15")
+s.send("\x04"); s.close()
+shutil.rmtree(BINDIR, ignore_errors=True)
+shutil.rmtree(SIB, ignore_errors=True)
+
+print("test in tmux: the wheel reaches the app whatever tmux's own mouse setting, and a pane resize is drawn at once")
+if not shutil.which("tmux"): print("  (tmux is not installed: skipped)")
+else:
+    def tmux(sock, *a): return subprocess.run(["tmux", "-L", sock, *a], capture_output=True, text=True, env=ENV, cwd=WORK).stdout
+    def pane_has(sock, pat, t=8, want=True):
+        end = time.time() + t
+        while time.time() < end:
+            if (pat in tmux(sock, "capture-pane", "-p", "-t", "t")) == want: return True
+            time.sleep(0.1)
+        return False
+    for mouse in ("off", "on"):
+        sock = "crowtest%d%s" % (os.getpid(), mouse)
+        tmux(sock, "-f", "/dev/null", "new-session", "-d", "-s", "t", "-x", "90", "-y", "24", BIN + " -m fake-coder:latest; sleep 3")
+        tmux(sock, "set", "-g", "mouse", mouse); tmux(sock, "set", "-g", "status", "off")
+        pid, fd = pty.fork()   # a client in a pty is the terminal: what is written to it reaches tmux as input
+        if pid == 0:
+            os.environ["TERM"] = "xterm-256color"
+            os.execvp("tmux", ["tmux", "-L", sock, "attach", "-t", "t"])
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 90, 0, 0))
+        def feed(data, fd=fd):
+            os.write(fd, data.encode())
+            end = time.time() + 0.3
+            while time.time() < end:
+                if select.select([fd], [], [], 0.05)[0]:
+                    try: os.read(fd, 65536)
+                    except OSError: break
+        check(pane_has(sock, "shift+tab to switch mode"), f"mouse {mouse}: it starts in a tmux pane: {tmux(sock, 'capture-pane', '-p', '-t', 't')[-200:]!r}")
+        check(tmux(sock, "display", "-p", "-t", "t", "#{mouse_any_flag}").strip() == "1", f"mouse {mouse}: tmux knows the pane wants the mouse")
+        feed("!seq 1 60\r"); pane_has(sock, "+21 lines")
+        feed("kept in the field")
+        feed("\x1b[<64;10;5M\x1b[<64;10;5M")
+        check(pane_has(sock, "scrollback · rows"), f"mouse {mouse}: the wheel scrolls the conversation: {tmux(sock, 'capture-pane', '-p', '-t', 't')[-300:]!r}")
+        check(tmux(sock, "display", "-p", "-t", "t", "#{pane_in_mode}").strip() == "0", f"mouse {mouse}: tmux did not keep it for its copy mode")
+        check("❯ kept in the field" in tmux(sock, "capture-pane", "-p", "-t", "t"), f"mouse {mouse}: and it is not turned into arrow keys for the prompt history")
+        check("manual mode" in tmux(sock, "capture-pane", "-p", "-t", "t").rstrip("\n").split("\n")[-1], f"mouse {mouse}: the status bar is still on the last row")
+        feed("\x1b[<65;10;5M" * 3)
+        check(pane_has(sock, "scrollback · rows", want=False), f"mouse {mouse}: scrolling down returns to the prompt")
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 16, 60, 0, 0))
+        feed("")
+        end = time.time() + 5; lines = []
+        while time.time() < end:
+            lines = tmux(sock, "capture-pane", "-p", "-t", "t").rstrip("\n").split("\n")
+            if len(lines) == 16 and "manual mode" in lines[-1] and lines[-4].startswith("─" * 60): break
+            time.sleep(0.1)
+        check(len(lines) == 16 and "manual mode" in lines[-1] and "❯ kept in the field" in lines[-3] and lines[-4].startswith("─" * 60),
+              f"mouse {mouse}: a resized pane is drawn for its new size without a key being pressed: {lines[-5:]!r}")
+        tmux(sock, "kill-server")
+        try: os.close(fd)
+        except OSError: pass
+        try: os.waitpid(pid, 0)
+        except OSError: pass
 
 print("test interactive: /keepalive, /status placement, GPU placement warning")
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")

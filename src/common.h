@@ -58,6 +58,31 @@ char *expand_home(const char *path);   /* "~/x" -> "/home/u/x", malloc'd */
 int   is_dir(const char *path);
 int   is_file(const char *path);
 
+/* Finding the file a half-typed name means (the suggestions for "@file", and "@name" as sent).
+ * mention_start(): the offset just after the '@' of the mention the cursor (byte `cur`) is in —
+ * an '@' that starts a word — or -1. file_complete(): up to `max` paths for what was typed after
+ * it, best first: `typed` may carry a directory ("../lib/pa", "~/", "src/") — the search is below
+ * that one, the working directory otherwise — and its last part is matched against file names:
+ * those starting with it, those containing it, those with its letters in order. Paths come back
+ * the way they would be typed, a directory with a trailing '/'. file_find_named(): the one file
+ * below the working directory with that name (or path ending), malloc'd; NULL when there is none
+ * or more than one — *count says how many, and `names` (if given) lists the first few. */
+typedef struct { char *path; bool dir; } file_match;
+long  mention_start(const char *buf, size_t cur);
+int   file_complete(const char *typed, bool dirs_only, int max, file_match **out);
+void  file_matches_free(file_match *m, int n);
+char *file_find_named(const char *name, int *count, sbuf *names);
+
+/* The same for a "!line", which is the shell's. shell_word(): where the word the cursor (byte
+ * `cur`) is in starts, and whether a command goes there (*command) rather than an argument; -1
+ * inside quotes — that is text. command_complete(): the programs in $PATH whose name starts
+ * with `typed`, the shortest first, each once, at most `max` (the name is in .path).
+ * shell_escape(): a path as it has to be written there, malloc'd — a backslash before what the
+ * shell would take apart. */
+long  shell_word(const char *buf, size_t cur, bool *command);
+int   command_complete(const char *typed, int max, file_match **out);
+char *shell_escape(const char *s);
+
 /* URLs and HTML, for the web_fetch tool (in util.c so the unit tests can reach them) */
 bool  url_ok(const char *url);                                  /* http(s), sane, not cloud metadata */
 bool  url_host(const char *url, char *out, size_t n);           /* "host[:port]", lowercased */
@@ -287,7 +312,15 @@ char *term_ask_line(const char *prompt);
  * question appeared are never taken as the answer. */
 int term_confirm(const char *question, const char *always_label, const char *project_label, char **reason);
 
-void term_set_slash_commands(const char **cmds, int n);   /* tab completion */
+/* Suggestions under the input field while a "/command", an "@file" or a "!line" is being typed,
+ * and what Tab completes. main.c supplies them: for the text `buf` with the cursor at byte `cur`
+ * the hook returns how many there are (0 = none) in *items — malloc'd, like the strings in it;
+ * term.c frees them — and sets *from to where the word they would replace starts. `open` marks
+ * one that more is going to follow (a directory): no space is put after it and the list stays
+ * up. The hook is also asked about what is typed while the model works, i.e. from inside the
+ * poll of a live request: it may read whatever it likes and must change nothing. */
+typedef struct { char *text; char *desc; bool open; } term_sug;
+extern int (*term_suggest)(const char *buf, size_t cur, size_t *from, term_sug **items);
 /* Interactive list picker: returns chosen index or -1 if cancelled. */
 int term_select(const char *title, const char **items, const char **descs, int n, int current);
 
