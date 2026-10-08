@@ -11,6 +11,8 @@ consult) is libcurl behind `src/http.c`, the UI is ANSI escapes (`src/term.c`).
 make                 # builds ./corbienest  (needs cc, make, libcjson-dev, libcurl4-openssl-dev; links with -pthread)
 make release         # clean, optimized, stripped build (RELEASE_CFLAGS)
 make test            # C unit tests (tests/test_unit.c) + pty integration tests (tests/test_integration.py)
+make test-unit       # ... the first half alone: what CI runs (the pty tests are timing a hosted runner does not keep;
+make test-integration  #     the second half alone, also runnable in CI by hand: workflow_dispatch, "integration")
 ./corbienest           # needs an Ollama at $OLLAMA_HOST or 127.0.0.1:11434
 ```
 

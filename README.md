@@ -686,8 +686,15 @@ session files, so a crash or a kill mid-write cannot truncate any of them either
 ## Tests
 
 ```sh
-make test
+make test               # both suites: what a change has to pass
+make test-unit          # the C unit tests alone
+make test-integration   # the pty (and tmux) tests alone
 ```
+
+GitHub Actions builds with warnings as errors and runs the unit tests. The integration tests
+drive the program through a pty and assert on what arrives when — timing a shared runner does
+not keep — so there they run only on request (start the CI workflow by hand and tick
+*integration*). Run `make test` locally before pushing.
 
 - `tests/test_unit.c` — C unit tests: string buffer, file helpers, the HTTP client
   (chunked/content-length/abort/extra headers against a forked local server, and what a host
