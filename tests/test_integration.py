@@ -1173,9 +1173,6 @@ else:
         sock = "crowtest%d%s" % (os.getpid(), mouse)
         tmux(sock, "-f", "/dev/null", "new-session", "-d", "-s", "t", "-x", "90", "-y", "24", BIN + " -m fake-coder:latest; sleep 3")
         tmux(sock, "set", "-g", "mouse", mouse); tmux(sock, "set", "-g", "status", "off")
-        # a test types faster than anyone: tmux would take a line written in one go for a paste and hand it
-        # over in paste brackets, where Enter is a newline and submits nothing (seen on a loaded CI runner)
-        tmux(sock, "set", "-g", "assume-paste-time", "0")
         pid, fd = pty.fork()   # a client in a pty is the terminal: what is written to it reaches tmux as input
         if pid == 0:
             os.environ["TERM"] = "xterm-256color"
@@ -1188,6 +1185,12 @@ else:
                 if select.select([fd], [], [], 0.05)[0]:
                     try: os.read(fd, 65536)
                     except OSError: break
+        # The pane was drawn before any client came: what is typed must wait for this one to be attached. Until
+        # then its pty is an ordinary cooked terminal, where Enter becomes a line feed — which the client hands on
+        # once it is there, and which is a newline in the input field, not a submitted line (seen on a slow CI runner).
+        end = time.time() + 8
+        while time.time() < end and tmux(sock, "display", "-p", "-t", "t", "#{session_attached}").strip() != "1": time.sleep(0.05)
+        check(tmux(sock, "display", "-p", "-t", "t", "#{session_attached}").strip() == "1", f"mouse {mouse}: the client is attached")
         check(pane_has(sock, "shift+tab to switch mode"), f"mouse {mouse}: it starts in a tmux pane: {tmux(sock, 'capture-pane', '-p', '-t', 't')[-200:]!r}")
         check(tmux(sock, "display", "-p", "-t", "t", "#{mouse_any_flag}").strip() == "1", f"mouse {mouse}: tmux knows the pane wants the mouse")
         feed("!seq 1 60\r"); pane_has(sock, "+21 lines")
@@ -1439,6 +1442,11 @@ check("advisor=fake-big:latest" in open(CFG2_FILE).read(), "saved")
 s.send("/advisor effort high\r"); check(s.expect("advisor effort: high"), "/advisor effort LEVEL")
 check("effort.fake-big:latest=high" in open(CFG2_FILE).read(), "kept with the advisor's model, like any model's")
 s.send("/advisor ctx 8k\r"); check(s.expect("advisor context window: 8k"), "/advisor ctx")
+s.send("/advisor window\r"); check(s.expect("advisor window: 15 minutes"), "/advisor window: a quarter of an hour unless told otherwise")
+s.send("/advisor window 30\r"); check(s.expect("advisor window: 30 minutes") and "advisor_window=30" in open(CFG2_FILE).read(), "/advisor window MINUTES, saved")
+s.send("/advisor window off\r"); check(s.expect("advisor window: off") and "advisor_window=0" in open(CFG2_FILE).read(), "off: the limit holds for the whole request")
+s.send("/advisor window soon\r"); check(s.expect("usage: /advisor window"), "anything else is refused")
+s.send("/advisor window 15\r"); check(s.expect("advisor window: 15 minutes") and "advisor_window" not in open(CFG2_FILE).read(), "the default is not written")
 s.send("TOOL_ADVISOR now\r"); check(s.expect("⤷ advisor fake-big:latest"), "consulted"); check(s.expect("Tool said: ADVICE"), "advice used")
 adv = [r for r in requests() if r["model"] == "fake-big:latest"][-1]
 check(adv.get("think") == "high" and adv["options"]["num_ctx"] == 8192, f"its effort and its window: {adv.get('think')!r} {adv['options']!r}")
@@ -1604,6 +1612,18 @@ check("Consult it only when you are stuck" in sysmsg and "at most once per reque
 check(len([r for r in rs if r["model"] == "fake-big:latest"]) == 1 and "consulted 1 time in this request" in out, f"and stopped after one: {out[-300:]!r}")
 adv = [r for r in rs if r["model"] == "fake-big:latest"][0]
 check("under about 250 words" in adv["messages"][0]["content"] and "under about 250 words" in adv["messages"][1]["content"], "and asked for a short answer")
+check("the count starts again every 15 minutes" in sysmsg, "and that a long request gets its consultations again")
+# the limit is per request, but a request that runs long gets the consultations again: six calls a second apart
+n0 = len(requests())
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-big:latest", "--advisor-guidance", "light", "--advisor-window", "0.05", "--yolo", "-p", "ADVISOR_PACED"], env=ENVK)
+had = len([r for r in requests()[n0:] if r["model"] == "fake-big:latest"])
+check(rc == 0 and "Done pacing." in out and 2 <= had <= 3, f"with a window of three seconds the one consultation of light comes back as the request goes on: {had}")
+check(any(m["role"] == "tool" and "It can be asked again in about 1 minute" in m["content"] for m in [r for r in requests()[n0:] if r["model"] == "fake-coder:latest"][-1]["messages"]), "and in between the agent is told when")
+check("the count starts again every 3 seconds" in requests()[n0]["messages"][0]["content"], "its instructions say so")
+n0 = len(requests())
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-big:latest", "--advisor-guidance", "light", "--advisor-window", "off", "--yolo", "-p", "ADVISOR_PACED"], env=ENVK)
+had = len([r for r in requests()[n0:] if r["model"] == "fake-big:latest"])
+check(had == 1 and "starts again" not in requests()[n0]["messages"][0]["content"] and "asked again" not in out, f"with the window off the limit holds for the whole request: {had}")
 if os.path.exists(os.path.join(WORK, "made.txt")): os.remove(os.path.join(WORK, "made.txt"))
 out, rc, rs = guided("normal", "TOOL_WRITE please")
 check("reviews the work" not in out and os.path.exists(os.path.join(WORK, "made.txt")), "normal: no review of its own")

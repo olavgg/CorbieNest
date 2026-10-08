@@ -128,7 +128,7 @@ larger ones skipped.)
 | `/system [text\|clear]` | extra system instructions |
 | `/think on\|off\|auto`, `/think show\|hide` | *when* a thinking-capable model thinks: `auto` (default) lets it think about each request once and turns thinking off for the tool rounds that follow, `on` thinks on every call, `off` never. *How hard* is `/effort` (`/think low\|medium\|high\|max` still works, as an alias for it) |
 | `/effort [LEVEL\|default]` | how hard **this model** thinks, in the levels it has — see [Effort](#effort). No argument opens a picker of them; `default` leaves it to the model. Kept per model, shown next to the model's name in the status bar |
-| `/advisor [MODEL\|off]`, `/advisor guidance [LEVEL]`, `/advisor effort [LEVEL]`, `/advisor ctx N\|auto` | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud or hosted model is set by name: `/advisor gpt-oss:120b-cloud`, `/advisor anthropic:claude-opus-5`). `guidance` says how much the agent leans on it (`light`, `normal`, `strong`, `max`), `effort` how hard it thinks |
+| `/advisor [MODEL\|off]`, `/advisor guidance [LEVEL]`, `/advisor effort [LEVEL]`, `/advisor window MINUTES\|off`, `/advisor ctx N\|auto` | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud or hosted model is set by name: `/advisor gpt-oss:120b-cloud`, `/advisor anthropic:claude-opus-5`). `guidance` says how much the agent leans on it (`light`, `normal`, `strong`, `max`), `effort` how hard it thinks |
 | `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (`.corbienest/permissions`) |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
@@ -550,8 +550,14 @@ the advisor — more tokens spent on advice, fewer spent on the agent going the 
 | `strong` | 6 | after reading the code and before committing to an approach, before each non-trivial change, when a build or test fails in a way it does not understand | ≤ ~700 words, concrete: file, function, the lines to change | that, and a **review** of the work before a request ends in which files changed or four or more tool calls were made |
 | `max` | 10 | as `strong` | ≤ ~900 words, as concrete | as `strong`, and a **check** of the request's first change before it is made |
 
+The limit is per request — one message of yours, however much work it sets off — and a request
+that runs long gets its consultations again every **15 minutes**: `/advisor window MINUTES`
+changes that (`off` = the limit holds for the whole request), `--advisor-window` does it for one
+run, and it is saved as `advisor_window=`. When the limit is reached the agent is told how long
+until it can ask again.
+
 The review, the check and the stepping in do not count against the agent's consultations, and
-each happens at most once per request. They are what makes the advisor work with a small model: it
+each happens at most once per request (the stepping in once per window). They are what makes the advisor work with a small model: it
 is told to ask, but a model that is going wrong rarely thinks so, and these do not wait for it. They enter the conversation the way a consultation does — as an
 `advisor` call and its result — so the agent reads them as advice, not as something you said:
 

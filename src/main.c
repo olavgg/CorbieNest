@@ -27,6 +27,7 @@ static char  *g_memory = NULL;                    /* contents of MEMORY_PATH (se
 
 static char   g_session_id[64];                  /* current session (file stem under config_dir()/sessions) */
 static int    g_advisor_uses = 0;                /* consultations of the advisor in the current request (see run_advisor) */
+static time_t g_advisor_since = 0;               /* ... counted from here: a request that runs long gets them again (advisor_window_roll) */
 static bool   g_advisor_said = false;            /* run_advisor() printed what came of the tool call in hand (see run_turn) */
 static bool   g_advisor_reviewed = false;        /* this request's review before it ends has been had (guidance strong and up) */
 static bool   g_advisor_checked = false;         /* and the check of its first change (max) */
@@ -88,9 +89,10 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/memory idle", "off:wait for the next update or the exit instead" },
     { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST|remove:remove rule N|clear:remove them all" },
     { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host" },
-    { "/advisor", "off:no advisor|guidance:how much the agent leans on it|effort:how hard it thinks|ctx:its context window" },
+    { "/advisor", "off:no advisor|guidance:how much the agent leans on it|effort:how hard it thinks|window:minutes after which a long request gets its consultations again|ctx:its context window" },
     { "/advisor guidance", "light:consulted rarely|normal:the default — and brought in when tool calls keep failing|strong:also reviews the work before a request ends|max:also checks the first change before it is made" },
     { "/advisor ctx", "auto:the main window, within the advisor's bounds" },
+    { "/advisor window", "15:the default, a quarter of an hour|off:never: the limit holds for the whole request" },
     { "/usage", "price:what a model costs per million tokens — MODEL IN OUT, or MODEL default" },
     { "/skills", "reload:read the SKILL.md files again|new:scaffold a skill: /skills new NAME" },
     { "/system", "clear:remove the extra instructions" },
@@ -116,6 +118,14 @@ static void usage_add(const char *model, long in, long out, int calls) {
 static void usage_clear(void) {
     for (int i = 0; i < g_n_usage; i++) free(g_usage[i].model);
     free(g_usage); g_usage = NULL; g_n_usage = 0;
+}
+
+/* the advisor's window as it is said: "15 minutes", "90 seconds" */
+static const char *fmt_window(void) {
+    static char buf[32];
+    if (g_cfg.advisor_window % 60) snprintf(buf, sizeof buf, "%d second%s", g_cfg.advisor_window, g_cfg.advisor_window == 1 ? "" : "s");
+    else snprintf(buf, sizeof buf, "%d minute%s", g_cfg.advisor_window / 60, g_cfg.advisor_window == 60 ? "" : "s");
+    return buf;
 }
 
 /* one model call finished: fold its stats into the session totals — account() for the model
@@ -236,7 +246,7 @@ static int begin_request(void) {
     int first = cJSON_GetArraySize(g_messages);
     if (g_prev_request_first >= 0 && g_prev_request_first <= first) elide_old_tool_results(g_prev_request_first);
     g_prev_request_first = first;
-    g_advisor_uses = 0; g_advisor_reviewed = g_advisor_checked = g_advisor_stepped_in = false;
+    g_advisor_uses = 0; g_advisor_since = time(NULL); g_advisor_reviewed = g_advisor_checked = g_advisor_stepped_in = false;
     g_fail_rounds = 0; g_request_calls0 = g_session.tool_calls;
     tools_checkpoint_turn(first);
     return first;
@@ -974,8 +984,10 @@ static char *build_system_prompt(void) {
                     "do not try a second fix on a guess. It reviews your work by itself before a request ends in which you changed files or made several tool calls, "
                     "and it is brought in when your tool calls keep failing%s. ",
                     g->check_first_edit ? "; it also checks the first change of a request before it is made" : "");
-            if (g->uses == 1) sb_puts(&b, "Not for what a tool call can tell you, and at most once per request. ");
-            else sb_printf(&b, "Not for what a tool call can tell you, and at most %d times per request. ", g->uses);
+            if (g->uses == 1) sb_puts(&b, "Not for what a tool call can tell you, and at most once per request");
+            else sb_printf(&b, "Not for what a tool call can tell you, and at most %d times per request", g->uses);
+            if (g_cfg.advisor_window > 0) sb_printf(&b, " (in a request that runs long the count starts again every %s)", fmt_window());
+            sb_puts(&b, ". ");
             sb_puts(&b, "Weigh its advice seriously, but it cannot look at anything itself: "
                 "where a file or a command's output contradicts it, they are right — say so and carry on.\n");
         }
@@ -1659,12 +1671,28 @@ static int consult(const char *question, const char *what, sbuf *advice, sbuf *w
 
 /* The tool. Every outcome is one ⎿ line (run_turn prints nothing more for this tool) and one
  * result for the model; none of them ends the turn. */
+/* The limit is per request, and a request can run for an hour: what was a fair number for a
+ * question is then far too few for the job. So the count — and with it the one stepping-in —
+ * starts again every g_cfg.advisor_window seconds of a request (/advisor window; 0 = never).
+ * Bounded by the clock, it still cannot become two models talking to each other. */
+static void advisor_window_roll(void) {
+    time_t now = time(NULL);
+    if (g_cfg.advisor_window <= 0 || now - g_advisor_since < g_cfg.advisor_window) return;
+    g_advisor_uses = 0; g_advisor_stepped_in = false; g_advisor_since = now;
+}
+
 static int run_advisor(const char *question, sbuf *out) {
     g_advisor_said = true;
     int most = advisor_guidance()->uses;
+    advisor_window_roll();
     if (g_advisor_uses >= most) {   /* the tool stays on offer: taking it away would change the prompt, and with it the cache */
-        sb_printf(out, "error: the advisor has been consulted %d time%s in this request, which is the limit. Carry on with the advice you have; if you are still stuck, tell the user where and why.", most, most == 1 ? "" : "s");
-        printf("  " C_DIM "⎿ not asked: %d consultation%s per request is the limit (/advisor guidance)" C_RESET "\n", most, most == 1 ? "" : "s");
+        char again[96] = "";
+        if (g_cfg.advisor_window > 0) {
+            long left = (long)g_cfg.advisor_window - (long)(time(NULL) - g_advisor_since), mins = (left + 59) / 60;
+            snprintf(again, sizeof again, " It can be asked again in about %ld minute%s.", mins < 1 ? 1 : mins, mins <= 1 ? "" : "s");
+        }
+        sb_printf(out, "error: the advisor has been consulted %d time%s in this request, which is the limit.%s Carry on with the advice you have; if you are still stuck, tell the user where and why.", most, most == 1 ? "" : "s", again);
+        printf("  " C_DIM "⎿ not asked: %d consultation%s per request is the limit%s (/advisor guidance, /advisor window)" C_RESET "\n", most, most == 1 ? "" : "s", again[0] ? " for now" : "");
         return 1;
     }
     int k = ++g_advisor_uses;   /* whatever comes of it: a consultation that ends in nothing took its minutes as well */
@@ -1717,6 +1745,7 @@ static bool advisor_review_due(void) {
  * time — so the advisor is asked for it. Once per request: if its advice does not help, the
  * agent can still ask again itself, and the request cannot turn into a dialogue of two models. */
 static bool advisor_step_in_due(void) {
+    advisor_window_roll();
     return g_cfg.advisor && advisor_guidance()->step_in && !g_advisor_stepped_in && g_fail_rounds >= ADVISOR_FAIL_ROUNDS
         && g_model_tools && !g_cfg.no_tools;
 }
@@ -1808,6 +1837,7 @@ static void advisor_howto(void) {
     for (int i = 0; i < GUIDANCE_COUNT; i++)
         printf(C_DIM "    %-7s %s%s" C_RESET "\n", ADVISOR_GUIDANCE[i].name, ADVISOR_GUIDANCE[i].desc, &ADVISOR_GUIDANCE[i] == advisor_guidance() ? " · current" : "");
     printf(C_DIM "    from normal up it is also brought in, unasked, when tool calls keep failing" C_RESET "\n");
+    printf(C_DIM "  /advisor window MINUTES — a request that runs long gets its consultations again after that long (now %s; off = never)" C_RESET "\n", g_cfg.advisor_window > 0 ? fmt_window() : "off");
     printf(C_DIM "  /advisor effort LEVEL — how hard the advisor itself thinks, once one is set: the levels are the model's own\n"
                  "    (off, on, or low … max), bare it lists them, and default leaves it to the model" C_RESET "\n");
 }
@@ -1819,9 +1849,9 @@ static void advisor_report(void) {
     if (g_advisor_info_for && !strcmp(g_advisor_info_for, g_cfg.advisor)) printf(C_DIM " · effort %s" C_RESET, effort_label(g_cfg.advisor, &g_advisor_info));
     else if (effort_get(g_cfg.advisor)) printf(C_DIM " · effort %s" C_RESET, effort_get(g_cfg.advisor));
     advisor_plan p; advisor_plan_now(&p);
-    printf(C_DIM " · ctx %s%s · guidance %s · %d consultation%s this session · at most %d per request" C_RESET "\n", p.cloud ? "its own" : fmt_ctx(p.send_ctx > 0 ? p.send_ctx : g_cfg.num_ctx),
+    printf(C_DIM " · ctx %s%s · guidance %s · %d consultation%s this session · at most %d per request%s%s" C_RESET "\n", p.cloud ? "its own" : fmt_ctx(p.send_ctx > 0 ? p.send_ctx : g_cfg.num_ctx),
            p.same ? " (the main model's)" : p.api ? " (a hosted API)" : p.cloud ? " (a cloud model)" : g_cfg.advisor_ctx > 0 ? "" : " (auto)", g->name,
-           g_session.advisor_calls, g_session.advisor_calls == 1 ? "" : "s", g->uses);
+           g_session.advisor_calls, g_session.advisor_calls == 1 ? "" : "s", g->uses, g_cfg.advisor_window > 0 ? ", again every " : "", g_cfg.advisor_window > 0 ? fmt_window() : "");
 }
 
 /* what this advisor costs, said once when it is chosen */
@@ -1857,7 +1887,8 @@ static void advisor_set(const char *model) {
            g_model_tools && !g_cfg.no_tools ? "" : " · idle for now: the agent needs tools to ask it");
     if (g_advisor_err[0]) printf(C_YELLOW "  not checked: %s" C_RESET C_DIM " — it is tried at the first consultation" C_RESET "\n", g_advisor_err);
     const advisor_guidance_def *g = advisor_guidance();
-    printf(C_DIM "  consulted through the advisor tool, at most %d time%s per request · guidance %s (/advisor guidance)" C_RESET "\n", g->uses, g->uses == 1 ? "" : "s", g->name);
+    printf(C_DIM "  consulted through the advisor tool, at most %d time%s per request%s%s · guidance %s (/advisor guidance)" C_RESET "\n", g->uses, g->uses == 1 ? "" : "s",
+           g_cfg.advisor_window > 0 ? ", and again every " : "", g_cfg.advisor_window > 0 ? fmt_window() : "", g->name);
     advisor_caveat();
 }
 
@@ -1909,6 +1940,19 @@ static void cmd_advisor(const char *arg) {
         }
         effort_command("advisor ", g_cfg.advisor, &g_advisor_info, *v ? v : NULL);
         if (*v && advisor_is_main()) printf(C_DIM "  (the advisor is the model doing the work: this is its effort there too)" C_RESET "\n");
+        return;
+    }
+    if (arg && !strncmp(arg, "window", 6) && (arg[6] == ' ' || !arg[6])) {
+        const char *v = arg + 6; while (*v == ' ') v++;
+        char *end = NULL; double m = !strcmp(v, "off") ? 0 : strtod(v, &end);
+        if (!*v) { printf("advisor window: %s" C_DIM " — a request's count of consultations (%d at guidance %s) starts again after that long; /advisor window MINUTES|off" C_RESET "\n",
+                          g_cfg.advisor_window > 0 ? fmt_window() : "off", advisor_guidance()->uses, advisor_guidance()->name); return; }
+        if ((end && (*end || end == v)) || m < 0 || m > 24 * 60) { printf("usage: /advisor window MINUTES|off   (after that long a request gets its consultations again; default %d, off = never)\n", ADVISOR_WINDOW_DEFAULT / 60); return; }
+        g_cfg.advisor_window = (int)(m * 60 + 0.5); config_save();
+        if (g_cfg.advisor_window > 0) printf(C_GREEN "✓ advisor window: %s" C_RESET C_DIM " — up to %d consultation%s per request, and again every %s of one that runs long" C_RESET "\n",
+                                             fmt_window(), advisor_guidance()->uses, advisor_guidance()->uses == 1 ? "" : "s", fmt_window());
+        else printf(C_GREEN "✓ advisor window: off" C_RESET C_DIM " — %d consultation%s per request, however long it runs" C_RESET "\n", advisor_guidance()->uses, advisor_guidance()->uses == 1 ? "" : "s");
+        if (g_cfg.advisor && cJSON_GetArraySize(g_messages) > 0) printf(C_DIM "  the agent's instructions say so, so its next reply reads the conversation again" C_RESET "\n");
         return;
     }
     if (arg && !strncmp(arg, "ctx", 3) && (arg[3] == ' ' || !arg[3])) {
@@ -1975,7 +2019,7 @@ static int inject_queued(void) {
         free(msg); free(text); n++;
     }
     term_queue_mark();
-    if (n) { g_advisor_uses = 0; term_status_refresh(); printf("\n"); }   /* the user spoke: the advisor's budget is new, as it would be at the prompt */
+    if (n) { g_advisor_uses = 0; g_advisor_since = time(NULL); term_status_refresh(); printf("\n"); }   /* the user spoke: the advisor's budget is new, as it would be at the prompt */
     return n;
 }
 
@@ -2685,6 +2729,7 @@ static void cmd_help(void) {
            "                        detailed; from normal it is brought in, unasked, when tool calls keep failing; strong+ also reviews the work before a\n"
            "                        request ends, max checks the first change before it is made)\n"
            "                        /advisor effort [LEVEL] (how hard it thinks) · /advisor ctx N|auto (its context window; auto = the main one, at most 16k)\n"
+           "                        /advisor window MINUTES|off (a request that runs long gets its consultations again after that long; default 15)\n"
            "  /skills [reload|new NAME]  list skills (SKILL.md files); run one with /NAME [args]\n"
            "  /init                 have the model explore the project and write an AGENTS.md (project instructions)\n"
            "  /mode [name]          permission mode: manual · accept-edits · plan · auto (or press shift+tab to cycle)\n"
@@ -3650,6 +3695,7 @@ static void usage(void) {
            "      --advisor MODEL  a stronger model the agent may consult through the advisor tool (see /advisor); off = none;\n"
            "                       xai:MODEL, openai:MODEL, anthropic:MODEL for a hosted one (key from XAI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY)\n"
            "      --advisor-guidance LEVEL   how much the agent leans on it: light, normal (default), strong, max (see /advisor guidance)\n"
+           "      --advisor-window MINUTES   a request that runs long gets its consultations again after that long (default 15; off = never)\n"
            "      --draft N        draft_num_predict: speculative-decoding/MTP draft tokens per step (0 = off; default: the model's own)\n"
            "      --benchmark [N]  measure tokens per second at each context size the model supports (or just -c N):\n"
            "                       N timed runs (default 3) of a fixed prompt (or -p PROMPT) per size, then exit\n"
@@ -3660,7 +3706,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.advisor_guidance = GUIDANCE_NORMAL;
+    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.advisor_guidance = GUIDANCE_NORMAL; g_cfg.advisor_window = ADVISOR_WINDOW_DEFAULT;
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();
@@ -3693,6 +3739,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--show-thinking")) g_cfg.show_thinking = true;
         else if (!strcmp(a, "--effort")) cli_effort = NEEDARG();
         else if (!strcmp(a, "--advisor")) { const char *av = NEEDARG(); free(g_cfg.advisor); g_cfg.advisor = strcmp(av, "off") && strcmp(av, "none") ? xstrdup(av) : NULL; }
+        else if (!strcmp(a, "--advisor-window")) { const char *wv = NEEDARG(); char *we = NULL; double m = !strcmp(wv, "off") ? 0 : strtod(wv, &we); if ((we && (*we || we == wv)) || m < 0 || m > 24 * 60) { fprintf(stderr, "bad advisor window %s (minutes, or off)\n", wv); return 2; } g_cfg.advisor_window = (int)(m * 60 + 0.5); }
         else if (!strcmp(a, "--advisor-guidance")) { const char *gv = NEEDARG(); int n = advisor_guidance_parse(gv); if (n < 0) { fprintf(stderr, "bad advisor guidance %s (light, normal, strong or max)\n", gv); return 2; } g_cfg.advisor_guidance = n; }
         else if (!strcmp(a, "--draft")) { const char *dv = NEEDARG(); if (strspn(dv, "0123456789") != strlen(dv) || !*dv) { fprintf(stderr, "bad draft count %s (a number of tokens, 0 = off)\n", dv); return 2; } g_cfg.draft = atoi(dv); }
         else if (!strcmp(a, "--benchmark")) { bench_runs = 3; if (i + 1 < argc && argv[i+1][0] >= '1' && argv[i+1][0] <= '9' && strspn(argv[i+1], "0123456789") == strlen(argv[i+1])) bench_runs = atoi(argv[++i]); }

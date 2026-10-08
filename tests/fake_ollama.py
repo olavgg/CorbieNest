@@ -149,6 +149,15 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "grep", "arguments": {"pattern": "needle", "path": "."}}}])
         yield chunk(model, done=True)
         return
+    if "ADVISOR_PACED" in text:
+        # a long job: the agent asks the advisor again every second, six times, whatever it is told
+        results = [m for m in messages if m["role"] == "tool"]
+        if len(results) >= 6: yield chunk(model, "Done pacing.")
+        else:
+            if results: time.sleep(1.0)
+            yield chunk(model, tool_calls=[{"function": {"name": "advisor", "arguments": {"question": "and now?"}}}])
+        yield chunk(model, done=True)
+        return
     if last["role"] == "tool" and "ADVISOR_LOOP" in text and not last["content"].startswith("error: the advisor has been consulted"):
         # a model that cannot stop asking: the client has to be the one to say "enough"
         yield chunk(model, tool_calls=[{"function": {"name": "advisor", "arguments": {"question": "and now?"}}}])

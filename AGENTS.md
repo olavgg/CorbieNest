@@ -181,6 +181,11 @@ build must be warning-free with `-Wall -Wextra`.
   (`tool_result_failed()`); from `strong`, the review (files changed, or `ADVISOR_REVIEW_CALLS`
   tool calls).
   To make a level lean harder, add a trigger of that kind; stronger wording alone changes little.
+  The agent's own limit (`advisor_guidance()->uses`) is per request, and so that a request of an
+  hour is not held to the number that suits a question, `advisor_window_roll()` starts the count
+  — and the one stepping-in — again every `g_cfg.advisor_window` seconds (`/advisor window`, in
+  minutes; 0 = never). The clock is what bounds it; nothing else may reset the count mid-request
+  but a message of the user's.
 - Threads exist in one place, `http_job_*` in `http.c`, and do one thing: perform a prepared
   POST on a handle of their own and store the answer. Nothing else in this program is
   thread-safe and nothing else needs to be — keep it that way. `/orchestrate` runs several

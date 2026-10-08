@@ -414,6 +414,7 @@ void config_load(void) {
         else if (!strcmp(k, "advisor")) { free(g_cfg.advisor); g_cfg.advisor = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "advisor_ctx")) { int n = atoi(v); if (n == 0 || n >= ADVISOR_CTX_MIN) g_cfg.advisor_ctx = n; }
         else if (!strcmp(k, "workers")) { int n = atoi(v); if (n >= 1 && n <= ORCH_WORKERS_MAX) g_cfg.workers = n; }
+        else if (!strcmp(k, "advisor_window")) { double m = atof(v); if (m >= 0 && m <= 24 * 60) g_cfg.advisor_window = (int)(m * 60 + 0.5); }
         else if (!strcmp(k, "advisor_guidance")) { int n = advisor_guidance_parse(v); if (n >= 0) g_cfg.advisor_guidance = n; }
         else if (!strcmp(k, "show_thinking")) g_cfg.show_thinking = atoi(v) != 0;
         else if (!strcmp(k, "yolo")) { if (atoi(v)) g_cfg.mode = MODE_AUTO; }
@@ -451,6 +452,7 @@ void config_save(void) {
     if (g_cfg.advisor) sb_printf(&b, "advisor=%s\n", g_cfg.advisor);
     if (g_cfg.advisor_ctx > 0) sb_printf(&b, "advisor_ctx=%d\n", g_cfg.advisor_ctx);
     if (g_cfg.workers > 0) sb_printf(&b, "workers=%d\n", g_cfg.workers);
+    if (g_cfg.advisor_window != ADVISOR_WINDOW_DEFAULT) sb_printf(&b, "advisor_window=%g\n", g_cfg.advisor_window / 60.0);   /* in minutes, as it is typed */
     if (g_cfg.advisor_guidance != GUIDANCE_NORMAL) sb_printf(&b, "advisor_guidance=%s\n", advisor_guidance()->name);
     sb_printf(&b, "show_thinking=%d\n", g_cfg.show_thinking ? 1 : 0);
     sb_printf(&b, "mode=%s\n", mode_name(g_cfg.mode));

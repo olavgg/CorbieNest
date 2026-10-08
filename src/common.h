@@ -144,6 +144,7 @@ typedef struct {
 void  advisor_plan_for(const char *advisor, int trained_ctx, advisor_plan *p);   /* reads g_cfg.model, .num_ctx, .advisor_ctx, .advisor_guidance */
 /* The one user message of a consultation; `words` is how long the answer may be. malloc'd. */
 char *advisor_brief(cJSON *msgs, int keep, size_t budget, const char *env, bool plan_mode, const char *rules, const char *question, int words);
+#define ADVISOR_WINDOW_DEFAULT (15 * 60)   /* a long request gets its consultations again every quarter of an hour */
 #define ADVISOR_FAIL_ROUNDS 2    /* rounds of tool calls in a row with a failure in them before the advisor steps in (step_in) */
 #define ADVISOR_REVIEW_CALLS 4   /* tool calls from which a request is reviewed even though it wrote no file (review) */
 bool  tool_result_failed(const char *name, const char *result, bool error);   /* an error result, or a shell command that did not exit with 0 */
@@ -172,6 +173,7 @@ typedef struct {
     char *advisor;       /* the stronger model the agent may consult through the advisor tool (/advisor); NULL = none */
     int   advisor_ctx;   /* num_ctx of an advisor call; 0 = auto (see advisor_plan_for()) */
     int   advisor_guidance; /* how much the agent leans on it, GUIDANCE_* (/advisor guidance) */
+    int   advisor_window;   /* seconds after which a request's count of consultations starts again (/advisor window, given in minutes); 0 = never */
     int   workers;       /* tasks of /orchestrate that may run at the same time (/workers); 0 = ORCH_WORKERS_DEFAULT */
     bool  show_thinking; /* print thinking tokens */
     int   mode;          /* permission mode, see MODE_* */
