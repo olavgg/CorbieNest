@@ -8,7 +8,7 @@
 #include <stddef.h>
 #include <cjson/cJSON.h>
 
-#define CORBIE_VERSION "0.1.0"
+#define CORBIE_VERSION "0.2.0"
 
 /* ---------- ANSI colours ---------- */
 #define C_RESET   "\x1b[0m"
@@ -126,6 +126,7 @@ typedef struct {
     size_t brief_max;          /* bytes it is shown at most, whatever the window: reading it is what the user waits for */
     bool   review;             /* it reviews a request that changed files before the request ends */
     bool   check_first_edit;   /* it checks the first change of a request before the change is made */
+    bool   step_in;            /* it is brought in, unasked, when the agent's tool calls keep failing (ADVISOR_FAIL_ROUNDS) */
     const char *desc;          /* for the picker */
 } advisor_guidance_def;
 extern const advisor_guidance_def ADVISOR_GUIDANCE[GUIDANCE_COUNT];
@@ -143,6 +144,10 @@ typedef struct {
 void  advisor_plan_for(const char *advisor, int trained_ctx, advisor_plan *p);   /* reads g_cfg.model, .num_ctx, .advisor_ctx, .advisor_guidance */
 /* The one user message of a consultation; `words` is how long the answer may be. malloc'd. */
 char *advisor_brief(cJSON *msgs, int keep, size_t budget, const char *env, bool plan_mode, const char *rules, const char *question, int words);
+#define ADVISOR_WINDOW_DEFAULT (15 * 60)   /* a long request gets its consultations again every quarter of an hour */
+#define ADVISOR_FAIL_ROUNDS 2    /* rounds of tool calls in a row with a failure in them before the advisor steps in (step_in) */
+#define ADVISOR_REVIEW_CALLS 4   /* tool calls from which a request is reviewed even though it wrote no file (review) */
+bool  tool_result_failed(const char *name, const char *result, bool error);   /* an error result, or a shell command that did not exit with 0 */
 #define ADVISOR_REVIEW_OK "LGTM"   /* what the advisor answers a review or a check with when nothing needs to change */
 bool  advisor_approves(const char *advice);   /* the answer is ADVISOR_REVIEW_OK and not much more */
 const char *strip_think_block(const char *s);   /* past a leading <think>…</think> */
@@ -168,6 +173,8 @@ typedef struct {
     char *advisor;       /* the stronger model the agent may consult through the advisor tool (/advisor); NULL = none */
     int   advisor_ctx;   /* num_ctx of an advisor call; 0 = auto (see advisor_plan_for()) */
     int   advisor_guidance; /* how much the agent leans on it, GUIDANCE_* (/advisor guidance) */
+    int   advisor_window;   /* seconds after which a request's count of consultations starts again (/advisor window, given in minutes); 0 = never */
+    int   workers;       /* tasks of /orchestrate that may run at the same time (/workers); 0 = ORCH_WORKERS_DEFAULT */
     bool  show_thinking; /* print thinking tokens */
     int   mode;          /* permission mode, see MODE_* */
     bool  no_tools;      /* don't send tools at all */
@@ -240,6 +247,13 @@ extern const char *const *http_headers;   /* extra request headers ("Name: value
 int http_request(const char *base_url, const char *method, const char *path,
                  const char *body, sbuf *out, http_line_cb line_cb, void *ud,
                  http_result *res);
+/* A POST that a thread of its own performs — the model call of one of several workers. Started
+ * and collected on the main thread; see http.c for what the thread may touch (its own handle). */
+typedef struct http_job http_job;
+http_job *http_job_start(const char *base_url, const char *path, const char *body);   /* NULL = it could not be started */
+bool      http_job_done(http_job *j);
+void      http_job_cancel(http_job *j);                               /* it ends soon after, as aborted */
+int       http_job_finish(http_job *j, sbuf *out, http_result *res);  /* waits for it and frees it; returns as http_request() does */
 bool http_busy(void);   /* a request is in flight: do not start another (their settings are globals) */
 char *http_url(const char *base, const char *path);   /* base + path; "host" and "http://host" get Ollama's port 11434 (malloc'd) */
 
@@ -310,6 +324,13 @@ void        term_queue_mark(void);        /* everything queued so far is account
  * to end: when Enter is pressed while busy, term.c offers the line to this hook first and
  * only queues it as a message when the hook returns 0. Set by main.c. */
 extern int (*term_run_while_busy)(const char *line);
+/* A long result, folded: `head` is the one line that stays on screen and has TERM_FOLD_CLOSED in
+ * it; what is printed between the two calls is its body, out of sight until the head is clicked.
+ * False = no folding here (not in full-screen mode): print a preview instead. */
+#define TERM_FOLD_CLOSED "▸"
+#define TERM_FOLD_OPEN   "▾"
+bool        term_fold_begin(const char *head);
+void        term_fold_end(void);
 void        term_line_break(void);        /* start a fresh line if output is mid-line (the model may be mid-sentence) */
 void        term_editor_prefill(const char *text);   /* text appears in the editor at the next prompt (e.g. after /rewind) */
 char       *term_keys_to_text(const unsigned char *keys, size_t n);   /* raw keystrokes -> trimmed text (malloc'd) */
@@ -368,6 +389,8 @@ void        tools_permissions_clear(void);                /* removes the file */
 /* Checkpoints for /rewind: file states before write_file/edit_file, tagged with the request
  * ("turn" = index into the conversation) they happened in. */
 void tools_checkpoint_turn(int turn);              /* main.c: a request starts */
+void tools_checkpoint_step(int step);              /* a part of it that is looked at by itself (a task of /orchestrate); 0 = none */
+int  tools_checkpoint_diff(int turn, int step, sbuf *out);   /* what that step did to the files it wrote, as unified diffs; returns files that differ */
 int  tools_checkpoint_files(int turn, sbuf *names);/* files changed in that request or later */
 int  tools_checkpoint_restore(int turn);           /* put them back; returns files restored */
 void tools_checkpoint_clear(void);
@@ -439,6 +462,22 @@ void   model_think_profile(model_info *mi);   /* fill think_* from family/render
 int    ollama_model_show(const char *model, model_info *mi);    /* 0 ok, -1 unknown model / request failed (*mi is still zeroed) */
 extern model_info g_model_info;   /* the model in use (set by main.c) */
 
+/* ---------- /orchestrate: the pure half ----------
+ * The plan the orchestrating model writes is text — "TASK 1: title", the instructions under it,
+ * the next "TASK 2: …" — because that is what every model can write, markdown around it or not.
+ * orch_parse_plan() reads it: the tasks in order (at most ORCH_MAX_TASKS, numbered as they come,
+ * whatever numbers the model gave them), malloc'd; 0 when the text holds no task. */
+#define ORCH_MAX_TASKS 12
+#define ORCH_WORKERS_DEFAULT 3   /* tasks that may run at the same time, unless /workers says otherwise */
+#define ORCH_WORKERS_MAX 8
+typedef struct {
+    char *title, *body;
+    unsigned after;   /* the tasks (bit i = task i, earlier ones only) that must be accepted before this one starts: an
+                       * "AFTER: 1, 3" or "AFTER: none" line of the plan — and without one, the task before it */
+} orch_task;
+int  orch_parse_plan(const char *text, orch_task **tasks);
+void orch_tasks_free(orch_task *t, int n);
+
 /* ---------- prices: what /usage estimates the cost with ----------
  * USD per million input and output tokens. model_price() says what a model costs: 2 = a price
  * set with /usage price, 1 = the provider's list price as built in (hosted models only, by the
@@ -497,6 +536,8 @@ int ollama_poll_or_message(void);         /* http_interrupt_check for such a cal
  * caller can react to a specific server error instead of only seeing a NULL reply. */
 extern char ollama_error[512];
 /* Fetch model names. Returns cJSON array of strings (caller owns) or NULL. */
+char  *ollama_chat_request(cJSON *messages, cJSON *tools);   /* the body of a call that is not streamed (ollama_call applies); malloc'd */
+cJSON *ollama_chat_reply(const char *json, int status, bool tools, chat_stats *st, char *err, size_t n);   /* its answer as the assistant message; NULL + err */
 cJSON *ollama_list_models(void);
 cJSON *ollama_list_models_quiet(int wait_ms);   /* the same, silently: for the suggestions */
 int    ollama_ping(char *ver, size_t verlen);

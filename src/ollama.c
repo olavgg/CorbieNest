@@ -243,15 +243,14 @@ int ollama_poll_or_message(void) {
     return 0;
 }
 
-cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted) {
-    *aborted = false;
-    ollama_error[0] = 0;
-    if (stats) memset(stats, 0, sizeof *stats);
+/* The body of an /api/chat call as ollama_call and the configuration say it: the one place a
+ * request to the model is put together, streamed or not. malloc'd. */
+static char *chat_request(cJSON *messages, cJSON *tools, bool stream) {
     const char *model = ollama_call.model ? ollama_call.model : g_cfg.model;   /* the advisor call names its own */
     cJSON *req = cJSON_CreateObject();
     cJSON_AddStringToObject(req, "model", model);
     cJSON_AddItemReferenceToObject(req, "messages", messages);
-    cJSON_AddBoolToObject(req, "stream", true);
+    cJSON_AddBoolToObject(req, "stream", stream);
     if (tools && cJSON_GetArraySize(tools) > 0) cJSON_AddItemReferenceToObject(req, "tools", tools);
     /* thinking: whether, and how hard, is the model's own business — see think_decide() */
     static const model_info no_info;   /* a model we know nothing about: it cannot think, as far as we know */
@@ -277,6 +276,51 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
     if (g_cfg.draft >= 0 && !other) cJSON_AddNumberToObject(opts, "draft_num_predict", g_cfg.draft);   /* changing it reloads the model */
     char *body = cJSON_PrintUnformatted(req);
     cJSON_Delete(req);
+    return body;
+}
+
+/* ---------- a call that is not streamed: for a worker of /orchestrate ----------
+ * Several workers wait for the model at once, each on a thread that does nothing but the HTTP
+ * (http_job_*). So the call is asked for in one piece: ollama_chat_request() is its body — the
+ * same as a streamed call's, think and all — and ollama_chat_reply() turns the answer into the
+ * assistant message ollama_chat() would have built, with the same recovery of tool calls that
+ * came as text. Both run on the main thread; nothing is printed. NULL = it failed, and err says how. */
+char *ollama_chat_request(cJSON *messages, cJSON *tools) { return chat_request(messages, tools, false); }
+
+cJSON *ollama_chat_reply(const char *json, int status, bool tools, chat_stats *st, char *err, size_t n) {
+    memset(st, 0, sizeof *st); err[0] = 0;
+    cJSON *j = cJSON_Parse(json ? json : "");
+    cJSON *e = cJSON_GetObjectItemCaseSensitive(j, "error"), *m = cJSON_GetObjectItemCaseSensitive(j, "message");
+    if (cJSON_IsString(e) || status >= 400 || !cJSON_IsObject(m)) {
+        snprintf(err, n, "%s", cJSON_IsString(e) ? e->valuestring : status >= 400 ? "the server refused the call" : "no message in the server's answer");
+        cJSON_Delete(j);
+        return NULL;
+    }
+    cJSON *v;
+    if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(j, "prompt_eval_count"))) st->prompt_tokens = (int)v->valuedouble;
+    if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(j, "eval_count"))) st->eval_tokens = (int)v->valuedouble;
+    if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(j, "eval_duration"))) st->eval_seconds = v->valuedouble / 1e9;
+    if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(j, "prompt_eval_duration"))) st->prompt_seconds = v->valuedouble / 1e9;
+    if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(j, "total_duration"))) st->total_seconds = v->valuedouble / 1e9;
+    if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(j, "load_duration"))) st->load_seconds = v->valuedouble / 1e9;
+    if (cJSON_IsString(v = cJSON_GetObjectItemCaseSensitive(j, "done_reason"))) snprintf(st->done_reason, sizeof st->done_reason, "%s", v->valuestring);
+    cJSON *ct = cJSON_GetObjectItemCaseSensitive(m, "content"), *tc = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+    cJSON *msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(msg, "role", "assistant");
+    cJSON_AddStringToObject(msg, "content", cJSON_IsString(ct) ? ct->valuestring : "");
+    cJSON *calls = cJSON_IsArray(tc) && cJSON_GetArraySize(tc) > 0 ? cJSON_Duplicate(tc, 1) : NULL;
+    if (!calls && tools && cJSON_IsString(ct)) calls = parse_text_tool_calls(ct->valuestring);
+    if (calls) cJSON_AddItemToObject(msg, "tool_calls", calls);
+    cJSON_Delete(j);
+    return msg;
+}
+
+cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted) {
+    *aborted = false;
+    ollama_error[0] = 0;
+    if (stats) memset(stats, 0, sizeof *stats);
+    char *body = chat_request(messages, tools, true);
+    const char *model = ollama_call.model ? ollama_call.model : g_cfg.model;   /* (for what an error says) */
 
     chat_ctx c; memset(&c, 0, sizeof c);
     md_init(&c.md); sb_init(&c.content); sb_init(&c.thinking);

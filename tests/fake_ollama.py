@@ -7,8 +7,8 @@ a real model. It also stands in for the hosted APIs the advisor can consult, und
 /xai/v1, /openai/v1 (Chat Completions) and /anthropic/v1 (Messages), with the key
 "test-key". Run standalone: python3 fake_ollama.py PORT
 """
-import json, re, ssl, sys, time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import json, re, ssl, sys, threading, time
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 MODELS = [
     {"name": "fake-coder:latest", "model": "fake-coder:latest", "size": 1, "digest": "x",
@@ -38,6 +38,8 @@ CLOUD = {"fake-remote:cloud": {"details": {"parameter_size": "671B", "family": "
 EVICTED = set()   # models an advisor call pushed out of memory: gone from /api/ps until their next chat
 
 REQUEST_LOG = []
+INFLIGHT = {"now": 0, "max": 0}   # unstreamed chat calls under way (the workers of /orchestrate), and the most there were at once
+INFLIGHT_LOCK = threading.Lock()
 PROVIDER_LOG = []   # requests to the hosted APIs: path, headers (keys left out) and body
 
 # the hosted APIs: the models each one knows, and what Anthropic's model endpoint says of them
@@ -57,6 +59,17 @@ EFFORTS = {"xai": ("none", "low", "medium", "high", "xhigh"), "openai": ("none",
 def advisor_text(brief):
     """What the fake advisor says, whichever way it is reached. A review (before the request
     ends) and a check (of the first change) find something unless the request says APPROVE."""
+    if "# PLAN this request" in brief:   # /orchestrate: the plan, in the markdown a real model wraps it in
+        if "NOPLAN" in brief: return "I would rather talk this through first."
+        if "PARALLEL" in brief:   # two tasks that may overlap (each a slow answer), and one that waits for both
+            return ("TASK 1: first slow thing\nAFTER: none\nSLOW one\n\nTASK 2: second slow thing\nAFTER: none\nSLOW two\n\n"
+                    "TASK 3: wrap it up\nAFTER: 1, 2\nTOOL_WRITE the file made.txt.\n")
+        one = "TASK 1: make the file\nTOOL_WRITE the file made.txt.\nDONE WHEN: made.txt exists"
+        if "ONETASK" in brief: return one
+        return "Here is the plan.\n\n## " + one + "\n\n## **TASK 2:** say that it is there\nJust reply.\nDONE WHEN: you replied\n"
+    if "# REVIEW this task" in brief:    # ... and the review of a task: sent back once for REJECT, always for NEVERACCEPT
+        if "NEVERACCEPT" in brief or ("REJECT" in brief and "(attempt 1 of" in brief): return "REVIEW-FINDING the file should say who made it; check that."
+        return "LGTM"
     if "The agent has ended its turn" in brief:
         return "LGTM" if "APPROVE" in brief else "ADVICE: REVIEW-FINDING the test for the empty field is missing; add it."
     if "about to make the first change" in brief:
@@ -99,7 +112,7 @@ def script(model, messages, req):
             yield chunk(model, "NO_CHANGE")
         yield chunk(model, done=True)
         return
-    if messages[0]["role"] == "system" and "You are the advisor" in messages[0]["content"]:
+    if messages[0]["role"] == "system" and ("You are the advisor" in messages[0]["content"] or "You are the orchestrator" in messages[0]["content"]):
         # the advisor: one toolless call that is shown the conversation. Keywords sit in the
         # transcript it is handed (the user's request is quoted in it).
         brief = messages[-1]["content"]
@@ -136,9 +149,34 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "grep", "arguments": {"pattern": "needle", "path": "."}}}])
         yield chunk(model, done=True)
         return
+    if "ADVISOR_PACED" in text:
+        # a long job: the agent asks the advisor again every second, six times, whatever it is told
+        results = [m for m in messages if m["role"] == "tool"]
+        if len(results) >= 6: yield chunk(model, "Done pacing.")
+        else:
+            if results: time.sleep(1.0)
+            yield chunk(model, tool_calls=[{"function": {"name": "advisor", "arguments": {"question": "and now?"}}}])
+        yield chunk(model, done=True)
+        return
     if last["role"] == "tool" and "ADVISOR_LOOP" in text and not last["content"].startswith("error: the advisor has been consulted"):
         # a model that cannot stop asking: the client has to be the one to say "enough"
         yield chunk(model, tool_calls=[{"function": {"name": "advisor", "arguments": {"question": "and now?"}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_FAILS" in text:
+        # a command that fails every time: the agent goes on trying — until the advisor has been heard, or five tries
+        results = [m["content"] for m in messages if m["role"] == "tool"]
+        if any("ADVICE" in r for r in results) or len(results) >= 5:
+            yield chunk(model, "Gave up after %d tries." % len([r for r in results if "exit code" in r]))
+        else:
+            yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "echo nope-%d; exit 3" % len(results)}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_READS" in text:
+        # a request that only looks: four tool calls, no file written
+        results = [m for m in messages if m["role"] == "tool"]
+        if len(results) >= 4 or any(m.get("tool_name") == "advisor" for m in results): yield chunk(model, "Looked at it %d times." % len(results))
+        else: yield chunk(model, tool_calls=[{"function": {"name": "list_dir", "arguments": {"path": "."}}}])
         yield chunk(model, done=True)
         return
     if last["role"] == "tool":
@@ -188,6 +226,10 @@ def script(model, messages, req):
     if "TOOL_BIG" in text:
         # a tool round with a big result (300 numbered lines), for the elision test
         yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "seq -f 'line-%04g' 1 300"}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_MANY" in text:   # a result of several lines: folded in the transcript
+        yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "printf 'fold-line-%s\\n' 1 2 3 4 5"}}}])
         yield chunk(model, done=True)
         return
     if "TOOL_BASH" in text:
@@ -340,6 +382,9 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/api/version": return self._json(200, {"version": "0.0.0-fake"})
         if self.path == "/api/tags": return self._json(200, {"models": MODELS})
         if self.path == "/_requests": return self._json(200, REQUEST_LOG)
+        if self.path == "/_inflight":   # the most unstreamed chat calls that were under way at once, since last asked
+            with INFLIGHT_LOCK: most, INFLIGHT["max"] = INFLIGHT["max"], 0
+            return self._json(200, {"max": most})
         if self.path == "/api/ps":   # the loaded model: fake-slow is only half in GPU memory
             loaded = [{"name": "fake-coder:latest", "size": 8_000_000_000, "size_vram": 8_000_000_000},
                       {"name": "fake-slow:latest", "size": 8_000_000_000, "size_vram": 4_000_000_000}]
@@ -383,6 +428,22 @@ class H(BaseHTTPRequestHandler):
            and not any("elided to save context" in (m.get("content") or "") for m in tool_msgs):
             return self._json(500, {"error": "no user query found in messages"})
         gen = script(model, msgs, req)
+        if req.get("stream") is False:
+            # one answer in one piece (a worker of /orchestrate asks this way): the chunks, added up.
+            # How many such calls are under way at once is counted: that is what the workers' threads are for.
+            with INFLIGHT_LOCK:
+                INFLIGHT["now"] += 1; INFLIGHT["max"] = max(INFLIGHT["max"], INFLIGHT["now"])
+            try:
+                whole = {"model": model, "message": {"role": "assistant", "content": ""}, "done": True}
+                for c in gen:
+                    if c == "ERR": return self._json(500, {"error": "boom from fake"})
+                    d = json.loads(c); m = d.get("message", {})
+                    whole["message"]["content"] += m.get("content", "")
+                    if m.get("tool_calls"): whole["message"].setdefault("tool_calls", []).extend(m["tool_calls"])
+                    if d.get("done"): whole.update({k: v for k, v in d.items() if k != "message"})
+                return self._json(200, whole)
+            finally:
+                with INFLIGHT_LOCK: INFLIGHT["now"] -= 1
         self.send_response(200); self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Transfer-Encoding", "chunked"); self.end_headers()
         try:
@@ -396,7 +457,8 @@ class H(BaseHTTPRequestHandler):
             pass   # client interrupted (Ctrl-C) — expected
 
 def serve(port, certfile=None, keyfile=None):
-    srv = HTTPServer(("127.0.0.1", port), H)
+    srv = ThreadingHTTPServer(("127.0.0.1", port), H)   # several workers call at once
+    srv.daemon_threads = True
     if certfile:   # the same server behind TLS: https:// for Ollama and for the hosted APIs
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(certfile, keyfile)

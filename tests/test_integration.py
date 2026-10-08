@@ -351,6 +351,13 @@ class Session:
         except Exception: pass
 
 def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
+def click_rows(sess, rows=40):
+    """Left-click every row of the screen, top to bottom, and return what was drawn in answer:
+    a pty has no screen to say where a line is, and a click only acts on the head of a fold."""
+    at = len(sess.out)
+    for y in range(1, rows + 1): sess.send(f"\x1b[<0;5;{y}M\x1b[<0;5;{y}m", wait=0.01)
+    time.sleep(0.5); sess.expect("(no such text)", 0.3)
+    return clean(sess.out[at:].decode("utf-8", "replace"))
 def scrolled(sess):
     """Whether the chrome as last drawn says the conversation is scrolled back: the line for that
     is drawn right above the input field's upper rule. (The status bar says nothing about it —
@@ -482,7 +489,8 @@ check(s3.expect("Fetch this page?"), f"confirmation shown: {s3.text()[-300:]!r}"
 check(DOC_URL in s3.text(), "the whole url is shown before it is fetched")
 check(s3.expect(f"3. Yes, and always allow fetching from 127.0.0.1:{DOC_PORT} in this project"), f"per-host rule offered: {s3.text()[-400:]!r}")
 s3.send("p"); check(s3.expect(f"saved to .corbienest/permissions: fetch 127.0.0.1:{DOC_PORT}"), "host rule saved")
-check(s3.expect("Fake Docs", 15), "the page text is previewed"); s3.expect("tok/s")
+check(s3.expect("lines ·", 15), "the page text is folded under one line"); s3.expect("tok/s")
+check("Fake Docs" in click_rows(s3), "and a click on that line shows it")
 s3.send(f"TOOL_FETCH {DOC_URL}\r")
 check(s3.expect(f"auto-approved (project rule: fetch 127.0.0.1:{DOC_PORT})"), "the host is not asked about again"); s3.expect("tok/s")
 s3.send("/permissions\r"); check(s3.expect(f"web pages from 127.0.0.1:{DOC_PORT}"), "/permissions lists the host")
@@ -490,7 +498,8 @@ s3.send("/permissions clear\r"); s3.expect("permissions cleared")   # else that 
 s3.send("TOOL_SEARCH keycloak\r")
 check(s3.expect("Search the web?"), f"a search is confirmed too: {s3.text()[-300:]!r}")
 check(s3.expect(f"⌕ keycloak") and f"127.0.0.1:{DOC_PORT}" in s3.text(), "the query and the engine are shown")
-s3.send("y"); check(s3.expect("Keycloak Admin REST API", 15), "results previewed"); s3.expect("tok/s")
+s3.send("y"); check(s3.expect("lines ·", 15), "the results are folded too"); s3.expect("tok/s")
+check("Keycloak Admin REST API" in click_rows(s3), "and there on a click")
 s3.send("/web\r"); check(s3.expect(f"engine: http://127.0.0.1:{DOC_PORT}/search?q=%s"), "/web shows the engine")
 s3.send("/web engine https://example.org/s?q=%s\r"); check(s3.expect("✓ engine: https://example.org/s?q=%s"), "/web engine sets it")
 s3.send("/web engine default\r"); check(s3.expect("✓ engine: https://html.duckduckgo.com"), "/web engine default resets it")
@@ -1176,6 +1185,12 @@ else:
                 if select.select([fd], [], [], 0.05)[0]:
                     try: os.read(fd, 65536)
                     except OSError: break
+        # The pane was drawn before any client came: what is typed must wait for this one to be attached. Until
+        # then its pty is an ordinary cooked terminal, where Enter becomes a line feed — which the client hands on
+        # once it is there, and which is a newline in the input field, not a submitted line (seen on a slow CI runner).
+        end = time.time() + 8
+        while time.time() < end and tmux(sock, "display", "-p", "-t", "t", "#{session_attached}").strip() != "1": time.sleep(0.05)
+        check(tmux(sock, "display", "-p", "-t", "t", "#{session_attached}").strip() == "1", f"mouse {mouse}: the client is attached")
         check(pane_has(sock, "shift+tab to switch mode"), f"mouse {mouse}: it starts in a tmux pane: {tmux(sock, 'capture-pane', '-p', '-t', 't')[-200:]!r}")
         check(tmux(sock, "display", "-p", "-t", "t", "#{mouse_any_flag}").strip() == "1", f"mouse {mouse}: tmux knows the pane wants the mouse")
         feed("!seq 1 60\r"); pane_has(sock, "+21 lines")
@@ -1406,7 +1421,7 @@ check(adv["model"] == "fake-coder:latest" and adv["options"]["num_ctx"] == 8192 
 print("test interactive: /advisor")
 s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2); s.expect("Ctrl-D to quit")
 s.send("/advisor\r"); check(s.expect("ollama signin") and s.expect("anthropic:claude-opus-5") and s.expect("ANTHROPIC_API_KEY"), "/advisor says how a cloud and a hosted model are set up")
-check(s.expect("/advisor guidance LEVEL") and s.expect("when the work is hard · 3 per request · current") and s.expect("/advisor effort LEVEL"), "and what guidance and effort do")
+check(s.expect("/advisor guidance LEVEL") and s.expect("when the work is hard · 3 per request · current") and s.expect("brought in, unasked, when tool calls keep failing") and s.expect("/advisor effort LEVEL"), "and what guidance and effort do")
 check(s.expect("Select advisor"), "/advisor opens a picker"); check(s.expect("No advisor"), "with 'No advisor' first")
 s.send("\x1b"); check(s.expect("advisor unchanged: none"), "Esc leaves it")
 s.send("/advisor fake-bi"); s.send("g"); view = listed()
@@ -1427,6 +1442,11 @@ check("advisor=fake-big:latest" in open(CFG2_FILE).read(), "saved")
 s.send("/advisor effort high\r"); check(s.expect("advisor effort: high"), "/advisor effort LEVEL")
 check("effort.fake-big:latest=high" in open(CFG2_FILE).read(), "kept with the advisor's model, like any model's")
 s.send("/advisor ctx 8k\r"); check(s.expect("advisor context window: 8k"), "/advisor ctx")
+s.send("/advisor window\r"); check(s.expect("advisor window: 15 minutes"), "/advisor window: a quarter of an hour unless told otherwise")
+s.send("/advisor window 30\r"); check(s.expect("advisor window: 30 minutes") and "advisor_window=30" in open(CFG2_FILE).read(), "/advisor window MINUTES, saved")
+s.send("/advisor window off\r"); check(s.expect("advisor window: off") and "advisor_window=0" in open(CFG2_FILE).read(), "off: the limit holds for the whole request")
+s.send("/advisor window soon\r"); check(s.expect("usage: /advisor window"), "anything else is refused")
+s.send("/advisor window 15\r"); check(s.expect("advisor window: 15 minutes") and "advisor_window" not in open(CFG2_FILE).read(), "the default is not written")
 s.send("TOOL_ADVISOR now\r"); check(s.expect("⤷ advisor fake-big:latest"), "consulted"); check(s.expect("Tool said: ADVICE"), "advice used")
 adv = [r for r in requests() if r["model"] == "fake-big:latest"][-1]
 check(adv.get("think") == "high" and adv["options"]["num_ctx"] == 8192, f"its effort and its window: {adv.get('think')!r} {adv['options']!r}")
@@ -1592,6 +1612,18 @@ check("Consult it only when you are stuck" in sysmsg and "at most once per reque
 check(len([r for r in rs if r["model"] == "fake-big:latest"]) == 1 and "consulted 1 time in this request" in out, f"and stopped after one: {out[-300:]!r}")
 adv = [r for r in rs if r["model"] == "fake-big:latest"][0]
 check("under about 250 words" in adv["messages"][0]["content"] and "under about 250 words" in adv["messages"][1]["content"], "and asked for a short answer")
+check("the count starts again every 15 minutes" in sysmsg, "and that a long request gets its consultations again")
+# the limit is per request, but a request that runs long gets the consultations again: six calls a second apart
+n0 = len(requests())
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-big:latest", "--advisor-guidance", "light", "--advisor-window", "0.05", "--yolo", "-p", "ADVISOR_PACED"], env=ENVK)
+had = len([r for r in requests()[n0:] if r["model"] == "fake-big:latest"])
+check(rc == 0 and "Done pacing." in out and 2 <= had <= 3, f"with a window of three seconds the one consultation of light comes back as the request goes on: {had}")
+check(any(m["role"] == "tool" and "It can be asked again in about 1 minute" in m["content"] for m in [r for r in requests()[n0:] if r["model"] == "fake-coder:latest"][-1]["messages"]), "and in between the agent is told when")
+check("the count starts again every 3 seconds" in requests()[n0]["messages"][0]["content"], "its instructions say so")
+n0 = len(requests())
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "fake-big:latest", "--advisor-guidance", "light", "--advisor-window", "off", "--yolo", "-p", "ADVISOR_PACED"], env=ENVK)
+had = len([r for r in requests()[n0:] if r["model"] == "fake-big:latest"])
+check(had == 1 and "starts again" not in requests()[n0]["messages"][0]["content"] and "asked again" not in out, f"with the window off the limit holds for the whole request: {had}")
 if os.path.exists(os.path.join(WORK, "made.txt")): os.remove(os.path.join(WORK, "made.txt"))
 out, rc, rs = guided("normal", "TOOL_WRITE please")
 check("reviews the work" not in out and os.path.exists(os.path.join(WORK, "made.txt")), "normal: no review of its own")
@@ -1609,7 +1641,7 @@ check(m[-1]["role"] == "tool" and m[-1]["tool_name"] == "advisor" and "REVIEW-FI
 check(m[-2]["role"] == "assistant" and m[-2]["tool_calls"][-1]["function"]["name"] == "advisor", "that the agent's last reply now carries")
 check(len(main) == 3, f"one more round, not a loop: {len(main)}")
 sysmsg = main[0]["messages"][0]["content"]
-check("Lean on it" in sysmsg and "at most 6 times per request" in sysmsg and "It reviews your work by itself" in sysmsg, f"the agent is told how to lean on it: {sysmsg[-700:]!r}")
+check("Lean on it" in sysmsg and "at most 6 times per request" in sysmsg and "It reviews your work by itself" in sysmsg and "do not try a second fix on a guess" in sysmsg and "when your tool calls keep failing" in sysmsg, f"the agent is told how to lean on it: {sysmsg[-700:]!r}")
 adv = [r for r in rs if r["model"] == "fake-big:latest"][0]
 check("under about 700 words" in adv["messages"][0]["content"] and "exact steps" in adv["messages"][0]["content"], "the advisor is asked for concrete steps")
 os.remove(os.path.join(WORK, "made.txt"))
@@ -1617,6 +1649,23 @@ out, rc, rs = guided("strong", "TOOL_WRITE APPROVE")
 check("reviews the work" in out and "nothing to change" in out and len([r for r in rs if r["model"] == "fake-coder:latest"]) == 2, f"LGTM: the request ends there, no extra round: {out[-300:]!r}")
 out, rc, rs = guided("strong", "hello there")
 check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), "a request that changed nothing is not reviewed")
+out, rc, rs = guided("strong", "TOOL_READS APPROVE")
+check("reviews the work before the request ends" in out and "nothing to change" in out, f"unless it took several tool calls: then it is, file or no file: {out[-400:]!r}")
+out, rc, rs = guided("normal", "TOOL_READS APPROVE")
+check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), "(not at normal)")
+out, rc, rs = guided("strong", "TOOL_FAILS now")
+check(rc == 0 and "⤷ advisor fake-big:latest · steps in: the tool calls keep failing" in out, f"strong: when the tool calls keep failing the advisor is brought in, unasked: {out[-600:]!r}")
+check("Gave up after 2 tries." in out, f"after two failed rounds, not five: {out[-300:]!r}")
+main = [r for r in rs if r["model"] == "fake-coder:latest"]; m = main[-1]["messages"]
+check(m[-1]["role"] == "tool" and m[-1]["tool_name"] == "advisor" and "corbienest asked it, not you" in m[-1]["content"] and m[-2]["tool_name"] == "bash"
+      and [c["function"]["name"] for c in m[-3]["tool_calls"]] == ["bash", "advisor"], f"its advice is the result of an advisor call on the round that failed: {m[-3:]!r}")
+adv = [r for r in rs if r["model"] == "fake-big:latest"]
+check(len(adv) >= 1 and "failed for two rounds in a row" in adv[0]["messages"][-1]["content"] and "nope-1" in adv[0]["messages"][-1]["content"], "and it is shown the failures")
+out, rc, rs = guided("normal", "TOOL_FAILS now")
+check("steps in: the tool calls keep failing" in out and "Gave up after 2 tries." in out, f"at normal too: {out[-300:]!r}")
+check("It is brought in by itself when your tool calls keep failing" in rs[0]["messages"][0]["content"], "and the agent is told")
+out, rc, rs = guided("light", "TOOL_FAILS now")
+check("steps in" not in out and "Gave up after 5 tries." in out and not any(r["model"] == "fake-big:latest" for r in rs), f"at light the agent is left to it: {out[-300:]!r}")
 os.remove(os.path.join(WORK, "made.txt"))
 out, rc, rs = guided("strong", "TOOL_WRITE please", advisor="anthropic:claude-fake-opus")
 check("reviews the work before the request ends" in out and "Tool said: ADVICE: REVIEW-FINDING" in out, "a hosted advisor reviews the same way")
@@ -1633,7 +1682,7 @@ check("reviews the work" not in out, "nothing was changed, so there is nothing t
 out, rc, rs = guided("max", "TOOL_WRITE APPROVE")
 check("checks the first change" in out and "go ahead" in out and os.path.exists(os.path.join(WORK, "made.txt")), f"LGTM: the change is made: {out[-600:]!r}")
 check("reviews the work before the request ends" in out, "and reviewed before the request ends")
-check("and checks the first change of a request before it is made" in rs[0]["messages"][0]["content"], "the agent is told so")
+check("it also checks the first change of a request before it is made" in rs[0]["messages"][0]["content"], "the agent is told so")
 
 print("test interactive: /advisor guidance")
 s = Session(["-m", "fake-coder:latest", "--advisor", "fake-big:latest"], env=ENVK); s.expect("Ctrl-D to quit")
@@ -1645,6 +1694,126 @@ s.send("/status\r"); check(s.expect("guidance strong"), "/status shows it")
 s.send("/advisor guidance normal\r"); s.expect("advisor guidance: normal")
 check("advisor_guidance" not in open(CFG2_FILE).read(), "the default is not written")
 s.send("\x04"); s.close()
+shutil.rmtree(CFG2, ignore_errors=True)
+
+# ---------- folds: a long tool result is one line until it is clicked ----------
+print("test interactive: a tool result of several lines is folded, and a click unfolds it")
+s = Session(["-m", "fake-coder:latest", "--yolo"]); s.expect("Ctrl-D to quit")
+s.send("TOOL_MANY\r"); check(s.expect("▸ 6 lines · fold-line-1"), f"one line says how much there is and how it begins: {since_send(s)[-300:]!r}")
+check(s.expect("Tool said:") and s.expect("tok/s"), "the model gets the whole result all the same")
+check("fold-line-5" in requests()[-1]["messages"][-1]["content"], "all of it")
+check("     fold-line-3" not in s.text(), "the rest is not on screen")
+view = click_rows(s)
+check("▾ 6 lines · fold-line-1" in view and "     fold-line-3" in view and "     fold-line-5" in view, f"a click on the line shows the rest and turns the mark: {view[-400:]!r}")
+s.send("after the fold\r"); check(s.expect("Echo: after the fold"), "output goes on under an open fold")
+view = click_rows(s)
+check("▸ 6 lines · fold-line-1" in view and "     fold-line-3" not in view and "Echo: after the fold" in view, f"another click hides it again, and what came after is still there: {view[-400:]!r}")
+s.send("\x1b[5~"); time.sleep(0.3); view = click_rows(s)
+check("fold-line-3" in view, "scrolled back it works the same")
+s.send("\x1b"); s.send("\x04"); s.close()
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_MANY"])
+check("fold-line-3" in out and "▸" not in out, "without a screen to click on, the first lines are shown as before")
+
+# ---------- /orchestrate: the advisor model plans and reviews, the main model does the tasks ----------
+print("test interactive: /orchestrate")
+MADE = os.path.join(WORK, "made.txt")
+if os.path.exists(MADE): os.remove(MADE)
+os.makedirs(os.path.join(CFG2, "corbienest"), exist_ok=True)
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2); s.expect("Ctrl-D to quit")
+s.send("/orchestrate build it\r"); check(s.expect("no advisor is set"), "without an advisor there is nobody to plan")
+s.send("/advisor fake-big:latest\r"); s.expect("advisor: fake-big:latest")
+s.send("/orchestrate\r"); check(s.expect("usage: /orchestrate REQUEST"), "bare: what it does")
+n0 = len(requests())
+s.send("/orchestrate build the thing\r")
+check(s.expect("⤷ orchestrator fake-big:latest") and s.expect("plans the request"), "the advisor model is asked for a plan")
+check(s.expect("plan · 2 tasks") and s.expect("1. make the file") and s.expect("2. say that it is there"), f"the tasks of its plan are listed, markdown or not: {since_send(s)[-400:]!r}")
+check(s.expect("⤷ worker 1/2") and s.expect("write_file"), "the first task runs as a worker that may write")
+check(s.expect("reviews task 1/2") and s.expect("⎿ accepted"), "and is reviewed")
+check(s.expect("⤷ worker 2/2") and s.expect("reviews task 2/2"), "then the second")
+check(s.expect("orchestrated: 2 of 2 tasks accepted", 20) and s.expect("files written: made.txt"), f"the run ends with what came of it: {since_send(s)[-400:]!r}")
+check(open(MADE).read() == "made by fake\n", "the worker's file is there")
+reqs = requests()[n0:]
+plan_rq = [r for r in reqs if r["model"] == "fake-big:latest" and "# PLAN this request" in r["messages"][-1]["content"]]
+check(len(plan_rq) == 1 and "tools" not in plan_rq[0] and "build the thing" in plan_rq[0]["messages"][-1]["content"], "one plan call, toolless, with the request")
+rev = [r["messages"][-1]["content"] for r in reqs if r["model"] == "fake-big:latest" and "# REVIEW this task" in r["messages"][-1]["content"]]
+check(len(rev) == 2 and "+made by fake" in rev[0] and "b/made.txt" in rev[0] and "Tool said" in rev[0], f"the review is shown the task's diff and the worker's report: {rev[0][-500:] if rev else None!r}")
+check("(it wrote no file)" in rev[1] and "+made by fake" not in rev[1], "and the second task's review only what that task wrote")
+wk = [r for r in reqs if r["model"] == "fake-coder:latest" and "You are a worker agent" in r["messages"][0]["content"]]
+names = [t["function"]["name"] for t in wk[0].get("tools", [])]
+check(wk[0].get("stream") is False and "write_file" in names and "task" not in names and "advisor" not in names, f"a worker has the tools to change files, but no agents or advisor of its own: {names!r}")
+w2 = [r for r in wk if "# Your task (2 of 2)" in r["messages"][1]["content"]]
+check(w2 and "# Done before you" in w2[0]["messages"][1]["content"] and "TOOL_WRITE" not in w2[0]["messages"][1]["content"] and len(w2[0]["messages"]) == 2, "the second worker starts fresh: its task and the first one's report, not its transcript")
+s.send("and now?\r"); check(s.expect("Echo: and now?"), "the conversation goes on")
+roles = [m["role"] for m in requests()[-1]["messages"]]
+check(roles == ["system", "user", "assistant", "user"] and "[/orchestrate:" in requests()[-1]["messages"][2]["content"] and "## Task 1 of 2: make the file — accepted" in requests()[-1]["messages"][2]["content"],
+      f"in which the run is the request and one reply that says what came of each task: {roles!r}")
+s.send("/usage\r"); check(s.expect("usage") and s.expect("3 calls"), f"/usage counts the orchestrator's three calls — a plan and two reviews: {since_send(s)[-300:]!r}")
+os.remove(MADE)
+s.send("/orchestrate ONETASK REJECT it once\r")
+check(s.expect("plan · 1 task ·") and s.expect("⎿ sent back") and s.expect("REVIEW-FINDING"), "a task the reviewer does not accept is sent back with what it said")
+check(s.expect("second attempt") and s.expect("⎿ accepted") and s.expect("orchestrated: 1 of 1 task accepted", 20), f"and accepted when the worker has dealt with it: {since_send(s)[-400:]!r}")
+back = [r for r in requests() if r["model"] == "fake-coder:latest" and r["messages"][-1]["role"] == "user" and "does not accept it yet" in r["messages"][-1]["content"]]
+check(back and "REVIEW-FINDING" in back[-1]["messages"][-1]["content"] and len(back[-1]["messages"]) > 3, "the worker gets the reviewer's words in the conversation it already has")
+s.send("/orchestrate ONETASK NEVERACCEPT this\r")
+check(s.expect("last attempt", 20) and s.expect("orchestrated: 0 of 1 task accepted", 20) and s.expect("/rewind undoes what was written"), f"three attempts, then it stops and says so: {since_send(s)[-400:]!r}")
+s.send("/orchestrate NOPLAN please\r"); check(s.expect("no tasks in its answer") and s.expect("talk this through"), "an answer without a plan runs nothing")
+os.remove(MADE)
+s.send("/clear\r"); s.expect("new conversation")   # (the fake reads its keywords from the whole brief, and that has the conversation before in it)
+# tasks that do not wait for each other run at the same time: their model calls, each on a thread
+s.send("/workers\r"); check(s.expect("workers: 3"), "three at a time unless told otherwise")
+urllib.request.urlopen(f"{HOST}/_inflight").read()
+t0 = time.time(); s.send("/orchestrate PARALLEL work\r")
+check(s.expect("plan · 3 tasks") and s.expect("2. second slow thing  with the tasks before it") and s.expect("3. wrap it up  after 1 2"), f"the plan says what may overlap: {since_send(s)[-400:]!r}")
+check(s.expect("⤷ worker 1/3") and s.expect("⤷ worker 2/3"), "both start at once")
+check(s.expect("orchestrated: 3 of 3 tasks accepted", 30), f"and the run comes to its end: {since_send(s)[-500:]!r}")
+took = time.time() - t0
+most = json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"]
+check(most == 2, f"the two model calls were under way at the same time: {most}")
+check(took < 6.2, f"so the two slow tasks took the time of one, not of two (3.2 s each): {took:.1f}s")
+out3 = since_send(s)
+check(out3.index("⤷ worker 3/3") > out3.index("reviews task 2/3") and out3.index("⤷ worker 3/3") > out3.index("reviews task 1/3"), "the task that waits for both starts when both are accepted")
+w3 = [r for r in requests() if r["model"] == "fake-coder:latest" and len(r["messages"]) > 1 and "# Your task (3 of 3)" in r["messages"][1]["content"]]
+check(w3 and "## Task 1: first slow thing — accepted" in w3[0]["messages"][1]["content"] and "## Task 2: second slow thing — accepted" in w3[0]["messages"][1]["content"], "and is told what the two did")
+check(open(MADE).read() == "made by fake\n", "its file is written")
+os.remove(MADE)
+s.send("/clear\r"); s.expect("new conversation")
+s.send("/workers 1\r"); check(s.expect("workers = 1") and "workers=1" in open(CFG2_FILE).read(), "/workers N, saved")
+urllib.request.urlopen(f"{HOST}/_inflight").read()
+s.send("/orchestrate PARALLEL in turn\r"); check(s.expect("orchestrated: 3 of 3 tasks accepted", 40), "with one worker the same plan runs in turn")
+check(json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"] == 1, "one call at a time")
+os.remove(MADE)
+s.send("/workers 9\r"); check(s.expect("usage: /workers N"), "a number out of range is refused")
+s.send("/workers 3\r"); s.expect("workers = 3")
+s.send("/clear\r"); s.expect("new conversation")
+s.send("/orchestrate PARALLEL then stop\r"); s.expect("⤷ worker 2/3"); time.sleep(0.8); s.send("\x1b")
+check(s.expect("the run was stopped", 10) and s.expect("orchestrated: 0 of 3 tasks accepted", 10), f"Esc stops every worker that is under way: {since_send(s)[-400:]!r}")
+s.send("still there?\r"); check(s.expect("Echo: still there?", 10), "and the prompt is back at once")
+check("stopped by the user before it was finished" in requests()[-1]["messages"][-2]["content"] and "not started: the run was stopped" in requests()[-1]["messages"][-2]["content"], "with what came of each task in the conversation")
+s.send("/clear\r"); s.expect("new conversation")
+s.send("/mode plan\r"); s.expect("mode: plan")
+s.send("/orchestrate ONETASK in plan mode\r"); check(s.expect("plan · 1 task ·") and s.expect("plan mode: the tasks are not run"), "plan mode shows the plan and runs nothing")
+check(not os.path.exists(MADE), "nothing was written")
+s.send("/clear\r"); s.expect("new conversation"); s.send("/mode manual\r"); s.expect("mode: manual")
+s.send("/orchestrate ONETASK ask me first\r"); check(s.expect("Run this task with fake-coder:latest?"), "outside auto mode the plan is put to the user first")
+s.send("n"); time.sleep(0.3); s.send("\r"); check(s.expect("the plan was not run"), f"and No leaves it at that: {since_send(s)[-300:]!r}")
+check(not os.path.exists(MADE), "nothing was written then either")
+s.send("\x04"); s.close()
+print("test interactive: /orchestrate with a hosted model, and the banner")
+open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nadvisor=xai:grok-fake\n")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2)
+check(s.expect("advisor: xai:grok-fake") and s.expect("XAI_API_KEY is not set"), "the banner names the saved advisor, and says when its key is missing")
+s.expect("Ctrl-D to quit"); s.send("\x04"); s.close()
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
+check("advisor: xai:grok-fake" in s.text() and "is not set" not in s.text(), "with the key there it is just named")
+np = len(preqs())
+s.send("/orchestrate ONETASK through the API\r")
+check(s.expect("⤷ orchestrator xai:grok-fake") and s.expect("orchestrated: 1 of 1 task accepted", 20), f"a hosted model plans and reviews the same way: {since_send(s)[-400:]!r}")
+bodies = [r["body"]["messages"] for r in preqs()[np:] if r["provider"] == "xai"]
+check(len(bodies) == 2 and "You are the orchestrator" in bodies[0][0]["content"] and "# PLAN this request" in bodies[0][-1]["content"] and "+made by fake" in bodies[1][-1]["content"], "two calls to it: the plan, and the review with the diff")
+check(key_nowhere() is None, f"and the key was written nowhere: {key_nowhere()!r}")
+s.send("\x04"); s.close()
+os.remove(MADE)
 shutil.rmtree(CFG2, ignore_errors=True)
 
 # ---------- https: Ollama behind TLS, and a hosted API over it ----------

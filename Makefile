@@ -1,6 +1,6 @@
 CC      ?= cc
 CFLAGS  ?= -O2 -g -Wall -Wextra -std=gnu11
-LDLIBS  += -lcjson -lcurl
+LDLIBS  += -lcjson -lcurl -pthread
 PREFIX  ?= /usr/local
 
 SRC := src/main.c src/util.c src/http.c src/term.c src/tools.c src/ollama.c src/provider.c src/skills.c
@@ -28,11 +28,18 @@ LIBOBJ := $(filter-out src/main.o,$(OBJ))
 tests/test_unit: tests/test_unit.c $(LIBOBJ) src/common.h
 	$(CC) $(CFLAGS) -o $@ tests/test_unit.c $(LIBOBJ) $(LDLIBS)
 
-test: corbienest tests/test_unit
+# `make test` is both suites, and what a change has to pass. The two halves by themselves: the unit
+# tests need nothing but the build; the integration tests drive the program through a pty (and tmux),
+# which is timing a hosted CI runner does not keep — CI runs test-unit, and test-integration on request.
+test: test-unit test-integration
+
+test-unit: tests/test_unit
 	./tests/test_unit
+
+test-integration: corbienest
 	python3 tests/test_integration.py
 
 clean:
 	rm -f $(OBJ) corbienest tests/test_unit
 
-.PHONY: install clean test release
+.PHONY: install clean test test-unit test-integration release

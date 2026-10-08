@@ -121,12 +121,14 @@ larger ones skipped.)
 | `/status` | model, context usage, settings |
 | `/diff [git args]` | show `git diff` of the working tree (stat, patch, untracked files) for you only — nothing is added to the conversation; `/diff --staged`, `/diff HEAD~1` … pass through |
 | `/rewind` | (or **Esc Esc** at an empty prompt) pick an earlier request and go back: undo the file changes the model made since (files are checkpointed before every `write_file`/`edit_file`), truncate the conversation to just before it (the request text returns to the editor), or both |
+| `/orchestrate REQUEST` | the advisor model in charge: it plans the request as tasks, the main model does them as workers — several at a time where the plan allows — and the advisor reviews each; see [Orchestrating](#orchestrating) |
+| `/workers [N]` | how many tasks of `/orchestrate` may run at the same time (default 3, `1` = one after another) |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
 | `/usage`, `/usage price MODEL IN OUT\|default` | tokens per model in this session — the main model, the advisor — and the **estimated cost** of the hosted ones, at the provider's list price per million tokens (built in, as of October 2026) or the one you set with `price`. The same estimate is on each consultation's result line (`⎿ advice · 4.2k tokens · 12s · ≈ $0.03`) and in `/cost`. An estimate: what was billed is on the provider's usage page |
 | `/system [text\|clear]` | extra system instructions |
 | `/think on\|off\|auto`, `/think show\|hide` | *when* a thinking-capable model thinks: `auto` (default) lets it think about each request once and turns thinking off for the tool rounds that follow, `on` thinks on every call, `off` never. *How hard* is `/effort` (`/think low\|medium\|high\|max` still works, as an alias for it) |
 | `/effort [LEVEL\|default]` | how hard **this model** thinks, in the levels it has — see [Effort](#effort). No argument opens a picker of them; `default` leaves it to the model. Kept per model, shown next to the model's name in the status bar |
-| `/advisor [MODEL\|off]`, `/advisor guidance [LEVEL]`, `/advisor effort [LEVEL]`, `/advisor ctx N\|auto` | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud or hosted model is set by name: `/advisor gpt-oss:120b-cloud`, `/advisor anthropic:claude-opus-5`). `guidance` says how much the agent leans on it (`light`, `normal`, `strong`, `max`), `effort` how hard it thinks |
+| `/advisor [MODEL\|off]`, `/advisor guidance [LEVEL]`, `/advisor effort [LEVEL]`, `/advisor window MINUTES\|off`, `/advisor ctx N\|auto` | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud or hosted model is set by name: `/advisor gpt-oss:120b-cloud`, `/advisor anthropic:claude-opus-5`). `guidance` says how much the agent leans on it (`light`, `normal`, `strong`, `max`), `effort` how hard it thinks |
 | `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (`.corbienest/permissions`) |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
@@ -172,6 +174,11 @@ larger ones skipped.)
   to (Project / User / Feedback / Reference) and the line is appended, no model call involved.
 - Enter sends; Alt+Enter, Ctrl+J or a trailing `\` inserts a newline. Bracketed paste works.
 - Ctrl-C (or Esc) cancels a running generation / clears the line (twice on an empty line quits).
+- **Tool results are folded.** What `grep`, `cat` or a build prints is for the model; in the
+  transcript a result of more than one line is a single line — `▸ 42 lines · how it begins` — and
+  a **click on that line** shows the rest (`▾`), another click hides it again. It works at the
+  prompt, scrolled back and while the model is working. Without the full-screen UI (`-p`, a pipe)
+  the first lines are shown instead, as there is nothing to click.
 - The **mouse wheel** and PgUp/PgDn scroll back through the conversation (the alternate screen has
   no scrollback of its own, so corbienest keeps one) — at the prompt and while the model works:
   what arrives meanwhile is kept and shown when you scroll back down, and Esc returns to the
@@ -539,12 +546,19 @@ the advisor — more tokens spent on advice, fewer spent on the agent going the 
 | level | consultations per request | the agent is told to ask | advice | corbienest also asks |
 |---|---|---|---|---|
 | `light` | 1 | only when it is stuck | ≤ ~250 words | — |
-| `normal` (default) | 3 | when the work is hard (above) | ≤ ~400 words | — |
-| `strong` | 6 | after reading the code and before committing to an approach, before each non-trivial change, when a build or test fails in a way it does not understand | ≤ ~700 words, concrete: file, function, the lines to change | a **review** before a request that changed files ends |
-| `max` | 10 | as `strong` | ≤ ~900 words, as concrete | the review, and a **check** of the request's first change before it is made |
+| `normal` (default) | 3 | when the work is hard (above) | ≤ ~400 words | it is **brought in** when tool calls have failed two rounds in a row |
+| `strong` | 6 | after reading the code and before committing to an approach, before each non-trivial change, when a build or test fails in a way it does not understand | ≤ ~700 words, concrete: file, function, the lines to change | that, and a **review** of the work before a request ends in which files changed or four or more tool calls were made |
+| `max` | 10 | as `strong` | ≤ ~900 words, as concrete | as `strong`, and a **check** of the request's first change before it is made |
 
-The review and the check do not count against the agent's consultations, and each happens at
-most once per request. They enter the conversation the way a consultation does — as an
+The limit is per request — one message of yours, however much work it sets off — and a request
+that runs long gets its consultations again every **15 minutes**: `/advisor window MINUTES`
+changes that (`off` = the limit holds for the whole request), `--advisor-window` does it for one
+run, and it is saved as `advisor_window=`. When the limit is reached the agent is told how long
+until it can ask again.
+
+The review, the check and the stepping in do not count against the agent's consultations, and
+each happens at most once per request (the stepping in once per window). They are what makes the advisor work with a small model: it
+is told to ask, but a model that is going wrong rarely thinks so, and these do not wait for it. They enter the conversation the way a consultation does — as an
 `advisor` call and its result — so the agent reads them as advice, not as something you said:
 
 ```
@@ -561,6 +575,49 @@ round to act on it; where the files or a command's output show the advisor is wr
 is told to say so. Higher levels also show the advisor more of the conversation (up to 96 KB
 instead of 48). Changing the level changes the agent's instructions, so its next reply reads the
 conversation again.
+
+#### Orchestrating
+
+`/orchestrate REQUEST` turns the advisor round: the stronger model (the one `/advisor` names —
+hosted, cloud or a bigger local one) is in charge, and the model doing the work is its hands.
+
+```
+› /orchestrate add a --dry-run flag to the importer, with a test
+  ⤷ orchestrator anthropic:claude-opus-5 · plans the request · 5 KB · esc stops the run
+    ⎿ plan · 3 tasks · 3.1k tokens · 14s · ≈ $0.04:
+      1. Find where the importer writes
+      2. Add the flag
+      3. Test it
+  ⤷ worker 1/3 Find where the importer writes
+    [1] ⎿ grep(write_row)
+    [1] ⎿ report after 2 tool rounds: …
+  ⤷ orchestrator anthropic:claude-opus-5 · reviews task 1/3 · 1 KB · esc stops the run
+    ⎿ accepted · 1.2k tokens · 4s · ≈ $0.01
+  …
+✓ orchestrated: 3 of 3 tasks accepted · files written: src/import.c, tests/test_import.c
+```
+
+- **Plan.** The orchestrator is shown the request (with its `@files`), the project instructions,
+  a listing of the directory and the conversation so far, and answers with up to 12 tasks. It has
+  no tools, so a plan that needs to know the code first begins with a task that explores.
+  Outside auto mode you are asked before the tasks run; in plan mode they are only shown.
+- **Work.** Each task is an agent of its own on the main model, with a fresh context: its task
+  and the reports of the tasks before it. It has every tool but `task` and `advisor`, and its
+  writes go through the permission mode like any other.
+- **Review.** The orchestrator sees the task, the worker's report and the diff of the files it
+  wrote, and accepts it or sends it back with what to do — twice at most. A task that is still
+  not accepted takes the tasks that wait for it with it; the others go on. `/rewind` undoes the
+  whole run.
+- **Several at a time.** The planner may mark tasks that do not need each other and write
+  different files (`AFTER: none`, `AFTER: 1, 2`); those run at the same time, up to `/workers`
+  of them (default 3). What overlaps is the model calls — each on a thread of its own — while
+  the workers' tools, the confirmations and the reviews still happen one at a time, so their
+  lines in the transcript are tagged `[2]` with the task they belong to. A plan that marks
+  nothing runs in order. Whether it is faster is up to the server: Ollama answers parallel
+  calls to one model only with `OLLAMA_NUM_PARALLEL` above 1 (and the memory for it), and
+  queues them otherwise. A queued message or Esc stops every worker.
+- The expensive model never reads a worker's transcript — only plans, reports and diffs — so
+  its tokens stay few; `/usage` shows what they came to.
 
 #### Hosted advisors
 
@@ -629,8 +686,15 @@ session files, so a crash or a kill mid-write cannot truncate any of them either
 ## Tests
 
 ```sh
-make test
+make test               # both suites: what a change has to pass
+make test-unit          # the C unit tests alone
+make test-integration   # the pty (and tmux) tests alone
 ```
+
+GitHub Actions builds with warnings as errors and runs the unit tests. The integration tests
+drive the program through a pty and assert on what arrives when — timing a shared runner does
+not keep — so there they run only on request (start the CI workflow by hand and tick
+*integration*). Run `make test` locally before pushing.
 
 - `tests/test_unit.c` — C unit tests: string buffer, file helpers, the HTTP client
   (chunked/content-length/abort/extra headers against a forked local server, and what a host

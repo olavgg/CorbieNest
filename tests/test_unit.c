@@ -869,6 +869,11 @@ static void test_advisor(void) {
     CHECK(!advisor_approves("LGTM. You should still run the tests.") && !advisor_approves("LGTM once the import is fixed"));
     CHECK(!advisor_approves("LGTM overall. The parser now handles empty fields, the tests pass, and the change is small, which is good; one more thing to consider is the docs"));   /* too long to be only a yes */
     /* the levels, by name */
+    CHECK(!ADVISOR_GUIDANCE[GUIDANCE_LIGHT].step_in && ADVISOR_GUIDANCE[GUIDANCE_NORMAL].step_in && ADVISOR_GUIDANCE[GUIDANCE_STRONG].step_in && ADVISOR_GUIDANCE[GUIDANCE_MAX].step_in);
+    CHECK(tool_result_failed("bash", "make: *** [all] Error 1\nexit code: 2", false) && !tool_result_failed("bash", "ok\nexit code: 0", false));
+    CHECK(!tool_result_failed("bash", "the log says exit code: 1 somewhere\nexit code: 0", false));   /* the command's own last line counts */
+    CHECK(tool_result_failed("read_file", "error: no such file", true) && !tool_result_failed("read_file", "exit code: 3 is what the file says", false));
+    CHECK(!tool_result_failed("advisor", "error: the advisor has been consulted 6 times", true) && !tool_result_failed("bash", NULL, false));
     CHECK(advisor_guidance_parse("strong") == GUIDANCE_STRONG && advisor_guidance_parse("MAX") == GUIDANCE_MAX && advisor_guidance_parse("ultra") == -1);
     CHECK(ADVISOR_GUIDANCE[GUIDANCE_NORMAL].uses == 3 && !ADVISOR_GUIDANCE[GUIDANCE_NORMAL].review && ADVISOR_GUIDANCE[GUIDANCE_STRONG].review && ADVISOR_GUIDANCE[GUIDANCE_MAX].check_first_edit);
     for (int i = 1; i < GUIDANCE_COUNT; i++) CHECK(ADVISOR_GUIDANCE[i].uses > ADVISOR_GUIDANCE[i - 1].uses && ADVISOR_GUIDANCE[i].words > ADVISOR_GUIDANCE[i - 1].words);
@@ -980,6 +985,33 @@ static cJSON *jget(cJSON *o, const char *path) {   /* "a.b.0.c" */
     return o;
 }
 static const char *jstr_at(cJSON *o, const char *path) { cJSON *v = jget(o, path); return cJSON_IsString(v) ? v->valuestring : NULL; }
+
+static void test_orchestrate(void) {
+    orch_task *t = NULL;
+    int n = orch_parse_plan("Here is the plan.\n\nTASK 1: add the flag\nEdit src/a.c: add --dry.\nDONE WHEN: make passes\n\n"
+                            "## **Task 2:** document it\nTask 2 depends on the flag being there.\n- README.md\n\ntask 7 - run the tests\nmake test\n", &t);
+    CHECK(n == 3);
+    CHECK_STR(t[0].title, "add the flag"); CHECK_STR(t[0].body, "Edit src/a.c: add --dry.\nDONE WHEN: make passes");
+    CHECK_STR(t[1].title, "document it"); CHECK(strstr(t[1].body, "Task 2 depends on the flag") && strstr(t[1].body, "- README.md"));   /* a sentence is not a header, markdown is no obstacle */
+    CHECK_STR(t[2].title, "run the tests"); CHECK_STR(t[2].body, "make test");                                                       /* numbered as they come */
+    CHECK(t[0].after == 0 && t[1].after == 1u && t[2].after == 2u);   /* a plan that says nothing runs in order */
+    orch_tasks_free(t, n);
+    n = orch_parse_plan("TASK 1: a\nAFTER: none\ndo a\n\nTASK 2: b\n**AFTER:** none\ndo b\n\nTASK 3: c\nAfter: tasks 1 and 2\ndo c\n\nTASK 4: d\ndo d after lunch\n\nTASK 5: e\nAFTER: 5, 9, 1\ndo e\n", &t);
+    CHECK(n == 5 && t[0].after == 0 && t[1].after == 0 && t[2].after == 3u && t[3].after == 4u);   /* none, none, both, and — unsaid — the one before */
+    CHECK(t[4].after == 1u);                                             /* itself and a task that is not there do not count */
+    CHECK_STR(t[2].body, "do c"); CHECK_STR(t[3].body, "do d after lunch");   /* the line is no part of the instructions; a sentence stays */
+    orch_tasks_free(t, n);
+    n = orch_parse_plan("TASK 1\nJust the instructions.\n\nTASK 2: —\n", &t);
+    CHECK(n == 2); CHECK_STR(t[0].title, ""); CHECK_STR(t[0].body, "Just the instructions.");
+    orch_tasks_free(t, n);
+    CHECK(orch_parse_plan("I would rather talk first.\nThe task is unclear.", &t) == 0 && t == NULL);
+    CHECK(orch_parse_plan("", &t) == 0 && orch_parse_plan(NULL, &t) == 0);
+    sbuf many; sb_init(&many);
+    for (int i = 1; i <= ORCH_MAX_TASKS + 3; i++) sb_printf(&many, "TASK %d: step %d\ndo %d\n", i, i, i);
+    n = orch_parse_plan(many.data, &t);
+    CHECK(n == ORCH_MAX_TASKS); CHECK_STR(t[n - 1].body, "do 12");   /* no more than that, and the last one kept whole */
+    orch_tasks_free(t, n); sb_free(&many);
+}
 
 static void test_provider(void) {
     const char *model = NULL;
@@ -1151,7 +1183,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider },
+        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "orchestrate", test_orchestrate },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

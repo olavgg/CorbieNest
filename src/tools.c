@@ -156,16 +156,18 @@ static const char *perm_match(int kind, const char *cmd) {
  * first, so a file edited several times ends up at its oldest saved state. In memory
  * only (per process), capped at CKPT_MAX_BYTES. */
 #define CKPT_MAX_BYTES (64u * 1024 * 1024)
-typedef struct { int turn; char *path; char *content; size_t len; bool existed; } ckpt_t;
+typedef struct { int turn; char *path; char *content; size_t len; bool existed; int step; } ckpt_t;
 static ckpt_t *g_ckpt; static int g_ckpt_n, g_ckpt_cap; static size_t g_ckpt_bytes; static int g_ckpt_turn = -1;
+static int g_ckpt_step = 0;   /* a part of the request that is looked at by itself (a task of /orchestrate); 0 = none */
 
-void tools_checkpoint_turn(int turn) { g_ckpt_turn = turn; }
+void tools_checkpoint_turn(int turn) { g_ckpt_turn = turn; g_ckpt_step = 0; }
+void tools_checkpoint_step(int step) { g_ckpt_step = step; }
 static void ckpt_free(ckpt_t *c) { free(c->path); free(c->content); g_ckpt_bytes -= c->len; }
 void tools_checkpoint_clear(void) { for (int i = 0; i < g_ckpt_n; i++) ckpt_free(&g_ckpt[i]); g_ckpt_n = 0; }
 static void ckpt_save(const char *path) {
     if (g_ckpt_turn < 0) return;
-    for (int i = 0; i < g_ckpt_n; i++) if (g_ckpt[i].turn == g_ckpt_turn && !strcmp(g_ckpt[i].path, path)) return;   /* first state in this turn wins */
-    ckpt_t c = { g_ckpt_turn, xstrdup(path), NULL, 0, false };
+    for (int i = 0; i < g_ckpt_n; i++) if (g_ckpt[i].turn == g_ckpt_turn && g_ckpt[i].step == g_ckpt_step && !strcmp(g_ckpt[i].path, path)) return;   /* first state in this turn (and step) wins */
+    ckpt_t c = { g_ckpt_turn, xstrdup(path), NULL, 0, false, g_ckpt_step };
     if (is_file(path)) { c.content = read_whole_file(path, &c.len, CKPT_MAX_BYTES); if (!c.content) { free(c.path); return; } c.existed = true; }
     while (g_ckpt_n && g_ckpt_bytes + c.len > CKPT_MAX_BYTES) { ckpt_free(&g_ckpt[0]); memmove(g_ckpt, g_ckpt + 1, sizeof *g_ckpt * (size_t)(g_ckpt_n - 1)); g_ckpt_n--; }
     if (g_ckpt_n == g_ckpt_cap) { g_ckpt_cap = g_ckpt_cap ? g_ckpt_cap * 2 : 32; g_ckpt = xrealloc(g_ckpt, sizeof *g_ckpt * (size_t)g_ckpt_cap); }
@@ -183,6 +185,35 @@ int tools_checkpoint_files(int turn, sbuf *names) {
     }
     return n;
 }
+/* What step `step` of request `turn` did to the files it wrote: a unified diff of each, from
+ * the state saved before its first write to what is on disk now, appended to `out`. Returns the
+ * number of files that differ. diff(1) does the comparing — it is on every POSIX system, and
+ * writing the saved state to a temporary file for it is all it takes. */
+int tools_checkpoint_diff(int turn, int step, sbuf *out) {
+    int n = 0;
+    const char *tmpdir = getenv("TMPDIR");
+    for (int i = 0; i < g_ckpt_n; i++) {
+        ckpt_t *c = &g_ckpt[i];
+        if (c->turn != turn || c->step != step) continue;
+        char tmp[1100]; snprintf(tmp, sizeof tmp, "%s/corbienest_was_XXXXXX", tmpdir && *tmpdir ? tmpdir : "/tmp");
+        int fd = mkstemp(tmp);
+        if (fd < 0) continue;
+        size_t off = 0;
+        while (c->existed && off < c->len) { ssize_t w = write(fd, c->content + off, c->len - off); if (w <= 0) break; off += (size_t)w; }
+        close(fd);
+        char *qold = shell_escape(tmp), *qnew = shell_escape(is_file(c->path) ? c->path : "/dev/null"), *qname = shell_escape(c->path);
+        sbuf cmd; sb_init(&cmd);
+        sb_printf(&cmd, "diff -u -L a/%s -L b/%s %s %s 2>&1", qname, qname, qold, qnew);
+        FILE *p = popen(cmd.data, "r");
+        size_t before = out->len;
+        if (p) { char buf[4096]; size_t k; while ((k = fread(buf, 1, sizeof buf, p)) > 0) sb_append(out, buf, k); pclose(p); }
+        if (out->len > before) { n++; if (out->data[out->len - 1] != '\n') sb_putc(out, '\n'); }
+        sb_free(&cmd); free(qold); free(qnew); free(qname);
+        unlink(tmp);
+    }
+    return n;
+}
+
 int tools_checkpoint_restore(int turn) {
     int n = 0;
     for (int i = g_ckpt_n - 1; i >= 0; i--) {
