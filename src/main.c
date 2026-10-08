@@ -30,6 +30,9 @@ static int    g_advisor_uses = 0;                /* consultations of the advisor
 static bool   g_advisor_said = false;            /* run_advisor() printed what came of the tool call in hand (see run_turn) */
 static bool   g_advisor_reviewed = false;        /* this request's review before it ends has been had (guidance strong and up) */
 static bool   g_advisor_checked = false;         /* and the check of its first change (max) */
+static bool   g_advisor_stepped_in = false;      /* and its stepping in when the tool calls kept failing (normal and up) */
+static int    g_fail_rounds = 0;                 /* rounds of tool calls in a row, in this request, with a failure in them */
+static int    g_request_calls0 = 0;              /* g_session.tool_calls when this request began */
 
 /* The commands, each with the line the suggestions under the input field show for it. */
 static const struct { const char *name, *desc; } SLASH_CMDS[] = {
@@ -86,7 +89,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST|remove:remove rule N|clear:remove them all" },
     { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host" },
     { "/advisor", "off:no advisor|guidance:how much the agent leans on it|effort:how hard it thinks|ctx:its context window" },
-    { "/advisor guidance", "light:consulted rarely|normal:the default|strong:also reviews the work before a request ends|max:also checks the first change before it is made" },
+    { "/advisor guidance", "light:consulted rarely|normal:the default — and brought in when tool calls keep failing|strong:also reviews the work before a request ends|max:also checks the first change before it is made" },
     { "/advisor ctx", "auto:the main window, within the advisor's bounds" },
     { "/usage", "price:what a model costs per million tokens — MODEL IN OUT, or MODEL default" },
     { "/skills", "reload:read the SKILL.md files again|new:scaffold a skill: /skills new NAME" },
@@ -233,7 +236,8 @@ static int begin_request(void) {
     int first = cJSON_GetArraySize(g_messages);
     if (g_prev_request_first >= 0 && g_prev_request_first <= first) elide_old_tool_results(g_prev_request_first);
     g_prev_request_first = first;
-    g_advisor_uses = 0; g_advisor_reviewed = g_advisor_checked = false;
+    g_advisor_uses = 0; g_advisor_reviewed = g_advisor_checked = g_advisor_stepped_in = false;
+    g_fail_rounds = 0; g_request_calls0 = g_session.tool_calls;
     tools_checkpoint_turn(first);
     return first;
 }
@@ -960,13 +964,16 @@ static char *build_system_prompt(void) {
             if (g_cfg.advisor_guidance == GUIDANCE_LIGHT)
                 sb_puts(&b, "Consult it only when you are stuck: when the same error has survived two fixes or a result makes no sense. ");
             else if (g_cfg.advisor_guidance == GUIDANCE_NORMAL)
-                sb_puts(&b, "Consult it when the work is hard: "
-                    "before you commit to an approach for a non-trivial change (explore first, then ask — put your plan in the question — then edit), when the same error has survived two fixes "
-                    "or a result makes no sense, and before you call a difficult task done (after the build or the tests have run, so it sees their output). ");
+                sb_puts(&b, "Use it — a wrong turn costs more than a question. Consult it "
+                    "before you commit to an approach for a non-trivial change (explore first, then ask — put your plan in the question — then edit), as soon as a fix of yours has not worked "
+                    "or a result makes no sense, and before you call a difficult task done (after the build or the tests have run, so it sees their output). "
+                    "It is brought in by itself when your tool calls keep failing. ");
             else
-                sb_printf(&b, "Lean on it: once you have read the code involved, ask before you commit to an approach (put your plan in the question), again before each non-trivial change, "
-                    "and whenever a build or a test fails in a way you do not understand at once. It reviews your work by itself before a request in which you changed files ends%s. ",
-                    g->check_first_edit ? ", and checks the first change of a request before it is made" : "");
+                sb_printf(&b, "Lean on it — it is there to be used, and a wrong turn costs more than a question: once you have read the code involved, ask before you commit to an approach "
+                    "(put your plan in the question), again before each non-trivial change, and as soon as a build, a test or a command fails in a way you do not understand at once — "
+                    "do not try a second fix on a guess. It reviews your work by itself before a request ends in which you changed files or made several tool calls, "
+                    "and it is brought in when your tool calls keep failing%s. ",
+                    g->check_first_edit ? "; it also checks the first change of a request before it is made" : "");
             if (g->uses == 1) sb_puts(&b, "Not for what a tool call can tell you, and at most once per request. ");
             else sb_printf(&b, "Not for what a tool call can tell you, and at most %d times per request. ", g->uses);
             sb_puts(&b, "Weigh its advice seriously, but it cannot look at anything itself: "
@@ -1701,7 +1708,33 @@ static void advisor_inject(cJSON *reply, const char *label, const char *result) 
 /* guidance strong and up: before a request that changed files ends, the advisor looks at it */
 static bool advisor_review_due(void) {
     return g_cfg.advisor && advisor_guidance()->review && !g_advisor_reviewed && g_model_tools && !g_cfg.no_tools
-        && g_cfg.mode != MODE_PLAN && g_prev_request_first >= 0 && tools_checkpoint_files(g_prev_request_first, NULL) > 0;
+        && g_cfg.mode != MODE_PLAN && g_prev_request_first >= 0
+        && (tools_checkpoint_files(g_prev_request_first, NULL) > 0 || g_session.tool_calls - g_request_calls0 >= ADVISOR_REVIEW_CALLS);
+}
+
+/* normal and up: the tool calls have failed ADVISOR_FAIL_ROUNDS rounds in a row. A small model
+ * goes on guessing at this point far more often than it asks, and each guess is a round of its
+ * time — so the advisor is asked for it. Once per request: if its advice does not help, the
+ * agent can still ask again itself, and the request cannot turn into a dialogue of two models. */
+static bool advisor_step_in_due(void) {
+    return g_cfg.advisor && advisor_guidance()->step_in && !g_advisor_stepped_in && g_fail_rounds >= ADVISOR_FAIL_ROUNDS
+        && g_model_tools && !g_cfg.no_tools;
+}
+static void advisor_step_in(cJSON *reply) {
+    g_advisor_stepped_in = true;
+    sbuf advice, why; sb_init(&advice); sb_init(&why);
+    int r = consult("The agent's tool calls have failed for " "two" " rounds in a row — the calls and their results are the last things in the conversation above. "
+                    "It has not asked you; you are brought in because it may be guessing. What is going wrong, and what exactly should it do next? "
+                    "If its approach is the problem, say which to take instead.",
+                    "steps in: the tool calls keep failing", &advice, &why);
+    if (r == ADVICE_GIVEN) {
+        sbuf res; sb_init(&res);
+        sb_printf(&res, "%s\n\n[the advisor (%s) was brought in because your tool calls failed %d rounds in a row — corbienest asked it, not you. Act on what it says, "
+                        "or where the files or a command's output show it is wrong, say so.]", advice.data, g_cfg.advisor, ADVISOR_FAIL_ROUNDS);
+        advisor_inject(reply, "(the tool calls keep failing)", res.data);
+        sb_free(&res);
+    }
+    sb_free(&advice); sb_free(&why);
 }
 
 /* The review. True when it found something: the advice is in the conversation and the agent
@@ -1774,6 +1807,7 @@ static void advisor_howto(void) {
                  "  /advisor guidance LEVEL — how much the agent leans on it" C_RESET "\n");
     for (int i = 0; i < GUIDANCE_COUNT; i++)
         printf(C_DIM "    %-7s %s%s" C_RESET "\n", ADVISOR_GUIDANCE[i].name, ADVISOR_GUIDANCE[i].desc, &ADVISOR_GUIDANCE[i] == advisor_guidance() ? " · current" : "");
+    printf(C_DIM "    from normal up it is also brought in, unasked, when tool calls keep failing" C_RESET "\n");
     printf(C_DIM "  /advisor effort LEVEL — how hard the advisor itself thinks, once one is set: the levels are the model's own\n"
                  "    (off, on, or low … max), bare it lists them, and default leaves it to the model" C_RESET "\n");
 }
@@ -2055,6 +2089,7 @@ static bool run_turn(void) {
         cJSON *call;
         round_first = cJSON_GetArraySize(g_messages);
         bool cut = false;   /* a message arrived mid-round: start nothing more, let it through */
+        bool failed = false;   /* a call of this round failed (see advisor_step_in) */
         cJSON_ArrayForEach(call, calls) {
             cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
             cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
@@ -2095,10 +2130,13 @@ static bool run_turn(void) {
             else if (ts == TOOL_DENIED) printf("  ⎿  " C_RED "denied" C_RESET "\n");
             else if (ts == TOOL_ERROR) printf("  ⎿  " C_RED "%s" C_RESET "\n", res);
             else print_result_folded(res, (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8);
+            if (tool_result_failed(name, res, ts == TOOL_ERROR)) failed = true;
             cJSON_AddItemToArray(g_messages, tool_result_message(name, res));
             sb_free(&out);
             if (parsed) cJSON_Delete(parsed);
         }
+        g_fail_rounds = failed ? g_fail_rounds + 1 : 0;
+        if (!cut && advisor_step_in_due()) advisor_step_in(reply);
         printf("\n");
         inject_queued();   /* messages the user queued meanwhile go in before the next model call */
     }
@@ -2644,7 +2682,8 @@ static void cmd_help(void) {
            "                        (NAME-cloud, after `ollama signin`) or a hosted API: xai:MODEL, openai:MODEL, anthropic:MODEL (key from XAI_API_KEY,\n"
            "                        OPENAI_API_KEY, ANTHROPIC_API_KEY). It is shown the conversation and answers with advice; it has no tools.\n"
            "                        /advisor guidance light|normal|strong|max (how much the agent leans on it: consultations per request, how\n"
-           "                        detailed; strong+ also reviews the work before a request ends, max checks the first change before it is made)\n"
+           "                        detailed; from normal it is brought in, unasked, when tool calls keep failing; strong+ also reviews the work before a\n"
+           "                        request ends, max checks the first change before it is made)\n"
            "                        /advisor effort [LEVEL] (how hard it thinks) · /advisor ctx N|auto (its context window; auto = the main one, at most 16k)\n"
            "  /skills [reload|new NAME]  list skills (SKILL.md files); run one with /NAME [args]\n"
            "  /init                 have the model explore the project and write an AGENTS.md (project instructions)\n"

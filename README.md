@@ -546,12 +546,13 @@ the advisor — more tokens spent on advice, fewer spent on the agent going the 
 | level | consultations per request | the agent is told to ask | advice | corbienest also asks |
 |---|---|---|---|---|
 | `light` | 1 | only when it is stuck | ≤ ~250 words | — |
-| `normal` (default) | 3 | when the work is hard (above) | ≤ ~400 words | — |
-| `strong` | 6 | after reading the code and before committing to an approach, before each non-trivial change, when a build or test fails in a way it does not understand | ≤ ~700 words, concrete: file, function, the lines to change | a **review** before a request that changed files ends |
-| `max` | 10 | as `strong` | ≤ ~900 words, as concrete | the review, and a **check** of the request's first change before it is made |
+| `normal` (default) | 3 | when the work is hard (above) | ≤ ~400 words | it is **brought in** when tool calls have failed two rounds in a row |
+| `strong` | 6 | after reading the code and before committing to an approach, before each non-trivial change, when a build or test fails in a way it does not understand | ≤ ~700 words, concrete: file, function, the lines to change | that, and a **review** of the work before a request ends in which files changed or four or more tool calls were made |
+| `max` | 10 | as `strong` | ≤ ~900 words, as concrete | as `strong`, and a **check** of the request's first change before it is made |
 
-The review and the check do not count against the agent's consultations, and each happens at
-most once per request. They enter the conversation the way a consultation does — as an
+The review, the check and the stepping in do not count against the agent's consultations, and
+each happens at most once per request. They are what makes the advisor work with a small model: it
+is told to ask, but a model that is going wrong rarely thinks so, and these do not wait for it. They enter the conversation the way a consultation does — as an
 `advisor` call and its result — so the agent reads them as advice, not as something you said:
 
 ```

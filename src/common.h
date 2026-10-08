@@ -126,6 +126,7 @@ typedef struct {
     size_t brief_max;          /* bytes it is shown at most, whatever the window: reading it is what the user waits for */
     bool   review;             /* it reviews a request that changed files before the request ends */
     bool   check_first_edit;   /* it checks the first change of a request before the change is made */
+    bool   step_in;            /* it is brought in, unasked, when the agent's tool calls keep failing (ADVISOR_FAIL_ROUNDS) */
     const char *desc;          /* for the picker */
 } advisor_guidance_def;
 extern const advisor_guidance_def ADVISOR_GUIDANCE[GUIDANCE_COUNT];
@@ -143,6 +144,9 @@ typedef struct {
 void  advisor_plan_for(const char *advisor, int trained_ctx, advisor_plan *p);   /* reads g_cfg.model, .num_ctx, .advisor_ctx, .advisor_guidance */
 /* The one user message of a consultation; `words` is how long the answer may be. malloc'd. */
 char *advisor_brief(cJSON *msgs, int keep, size_t budget, const char *env, bool plan_mode, const char *rules, const char *question, int words);
+#define ADVISOR_FAIL_ROUNDS 2    /* rounds of tool calls in a row with a failure in them before the advisor steps in (step_in) */
+#define ADVISOR_REVIEW_CALLS 4   /* tool calls from which a request is reviewed even though it wrote no file (review) */
+bool  tool_result_failed(const char *name, const char *result, bool error);   /* an error result, or a shell command that did not exit with 0 */
 #define ADVISOR_REVIEW_OK "LGTM"   /* what the advisor answers a review or a check with when nothing needs to change */
 bool  advisor_approves(const char *advice);   /* the answer is ADVISOR_REVIEW_OK and not much more */
 const char *strip_think_block(const char *s);   /* past a leading <think>…</think> */

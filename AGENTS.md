@@ -174,8 +174,13 @@ build must be warning-free with `-Wall -Wextra`.
   `advisor` call on the agent's own reply plus its result (`advisor_inject()`, or the held-back
   change's own tool result) — never as a `user` message: the user did not say it, and a
   conversation of calls and results is the one shape every chat template renders. Each happens
-  at most once per request (`g_advisor_reviewed`/`g_advisor_checked`, reset in
-  `begin_request()`), whatever comes of it, so it cannot loop.
+  at most once per request (`g_advisor_reviewed`/`g_advisor_checked`/`g_advisor_stepped_in`, reset in
+  `begin_request()`), whatever comes of it, so it cannot loop. A small model does not ask when
+  it should, so being told to is not what the levels rest on: corbienest asks for it — from `normal`,
+  `advisor_step_in()` once `ADVISOR_FAIL_ROUNDS` rounds of tool calls in a row had a failure
+  (`tool_result_failed()`); from `strong`, the review (files changed, or `ADVISOR_REVIEW_CALLS`
+  tool calls).
+  To make a level lean harder, add a trigger of that kind; stronger wording alone changes little.
 - Threads exist in one place, `http_job_*` in `http.c`, and do one thing: perform a prepared
   POST on a handle of their own and store the answer. Nothing else in this program is
   thread-safe and nothing else needs to be — keep it that way. `/orchestrate` runs several

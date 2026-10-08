@@ -1173,6 +1173,9 @@ else:
         sock = "crowtest%d%s" % (os.getpid(), mouse)
         tmux(sock, "-f", "/dev/null", "new-session", "-d", "-s", "t", "-x", "90", "-y", "24", BIN + " -m fake-coder:latest; sleep 3")
         tmux(sock, "set", "-g", "mouse", mouse); tmux(sock, "set", "-g", "status", "off")
+        # a test types faster than anyone: tmux would take a line written in one go for a paste and hand it
+        # over in paste brackets, where Enter is a newline and submits nothing (seen on a loaded CI runner)
+        tmux(sock, "set", "-g", "assume-paste-time", "0")
         pid, fd = pty.fork()   # a client in a pty is the terminal: what is written to it reaches tmux as input
         if pid == 0:
             os.environ["TERM"] = "xterm-256color"
@@ -1415,7 +1418,7 @@ check(adv["model"] == "fake-coder:latest" and adv["options"]["num_ctx"] == 8192 
 print("test interactive: /advisor")
 s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2); s.expect("Ctrl-D to quit")
 s.send("/advisor\r"); check(s.expect("ollama signin") and s.expect("anthropic:claude-opus-5") and s.expect("ANTHROPIC_API_KEY"), "/advisor says how a cloud and a hosted model are set up")
-check(s.expect("/advisor guidance LEVEL") and s.expect("when the work is hard · 3 per request · current") and s.expect("/advisor effort LEVEL"), "and what guidance and effort do")
+check(s.expect("/advisor guidance LEVEL") and s.expect("when the work is hard · 3 per request · current") and s.expect("brought in, unasked, when tool calls keep failing") and s.expect("/advisor effort LEVEL"), "and what guidance and effort do")
 check(s.expect("Select advisor"), "/advisor opens a picker"); check(s.expect("No advisor"), "with 'No advisor' first")
 s.send("\x1b"); check(s.expect("advisor unchanged: none"), "Esc leaves it")
 s.send("/advisor fake-bi"); s.send("g"); view = listed()
@@ -1618,7 +1621,7 @@ check(m[-1]["role"] == "tool" and m[-1]["tool_name"] == "advisor" and "REVIEW-FI
 check(m[-2]["role"] == "assistant" and m[-2]["tool_calls"][-1]["function"]["name"] == "advisor", "that the agent's last reply now carries")
 check(len(main) == 3, f"one more round, not a loop: {len(main)}")
 sysmsg = main[0]["messages"][0]["content"]
-check("Lean on it" in sysmsg and "at most 6 times per request" in sysmsg and "It reviews your work by itself" in sysmsg, f"the agent is told how to lean on it: {sysmsg[-700:]!r}")
+check("Lean on it" in sysmsg and "at most 6 times per request" in sysmsg and "It reviews your work by itself" in sysmsg and "do not try a second fix on a guess" in sysmsg and "when your tool calls keep failing" in sysmsg, f"the agent is told how to lean on it: {sysmsg[-700:]!r}")
 adv = [r for r in rs if r["model"] == "fake-big:latest"][0]
 check("under about 700 words" in adv["messages"][0]["content"] and "exact steps" in adv["messages"][0]["content"], "the advisor is asked for concrete steps")
 os.remove(os.path.join(WORK, "made.txt"))
@@ -1626,6 +1629,23 @@ out, rc, rs = guided("strong", "TOOL_WRITE APPROVE")
 check("reviews the work" in out and "nothing to change" in out and len([r for r in rs if r["model"] == "fake-coder:latest"]) == 2, f"LGTM: the request ends there, no extra round: {out[-300:]!r}")
 out, rc, rs = guided("strong", "hello there")
 check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), "a request that changed nothing is not reviewed")
+out, rc, rs = guided("strong", "TOOL_READS APPROVE")
+check("reviews the work before the request ends" in out and "nothing to change" in out, f"unless it took several tool calls: then it is, file or no file: {out[-400:]!r}")
+out, rc, rs = guided("normal", "TOOL_READS APPROVE")
+check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), "(not at normal)")
+out, rc, rs = guided("strong", "TOOL_FAILS now")
+check(rc == 0 and "⤷ advisor fake-big:latest · steps in: the tool calls keep failing" in out, f"strong: when the tool calls keep failing the advisor is brought in, unasked: {out[-600:]!r}")
+check("Gave up after 2 tries." in out, f"after two failed rounds, not five: {out[-300:]!r}")
+main = [r for r in rs if r["model"] == "fake-coder:latest"]; m = main[-1]["messages"]
+check(m[-1]["role"] == "tool" and m[-1]["tool_name"] == "advisor" and "corbienest asked it, not you" in m[-1]["content"] and m[-2]["tool_name"] == "bash"
+      and [c["function"]["name"] for c in m[-3]["tool_calls"]] == ["bash", "advisor"], f"its advice is the result of an advisor call on the round that failed: {m[-3:]!r}")
+adv = [r for r in rs if r["model"] == "fake-big:latest"]
+check(len(adv) >= 1 and "failed for two rounds in a row" in adv[0]["messages"][-1]["content"] and "nope-1" in adv[0]["messages"][-1]["content"], "and it is shown the failures")
+out, rc, rs = guided("normal", "TOOL_FAILS now")
+check("steps in: the tool calls keep failing" in out and "Gave up after 2 tries." in out, f"at normal too: {out[-300:]!r}")
+check("It is brought in by itself when your tool calls keep failing" in rs[0]["messages"][0]["content"], "and the agent is told")
+out, rc, rs = guided("light", "TOOL_FAILS now")
+check("steps in" not in out and "Gave up after 5 tries." in out and not any(r["model"] == "fake-big:latest" for r in rs), f"at light the agent is left to it: {out[-300:]!r}")
 os.remove(os.path.join(WORK, "made.txt"))
 out, rc, rs = guided("strong", "TOOL_WRITE please", advisor="anthropic:claude-fake-opus")
 check("reviews the work before the request ends" in out and "Tool said: ADVICE: REVIEW-FINDING" in out, "a hosted advisor reviews the same way")
@@ -1642,7 +1662,7 @@ check("reviews the work" not in out, "nothing was changed, so there is nothing t
 out, rc, rs = guided("max", "TOOL_WRITE APPROVE")
 check("checks the first change" in out and "go ahead" in out and os.path.exists(os.path.join(WORK, "made.txt")), f"LGTM: the change is made: {out[-600:]!r}")
 check("reviews the work before the request ends" in out, "and reviewed before the request ends")
-check("and checks the first change of a request before it is made" in rs[0]["messages"][0]["content"], "the agent is told so")
+check("it also checks the first change of a request before it is made" in rs[0]["messages"][0]["content"], "the agent is told so")
 
 print("test interactive: /advisor guidance")
 s = Session(["-m", "fake-coder:latest", "--advisor", "fake-big:latest"], env=ENVK); s.expect("Ctrl-D to quit")

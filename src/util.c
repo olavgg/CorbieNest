@@ -1240,11 +1240,23 @@ char *transcript_text(cJSON *msgs, int keep, size_t budget) {
  * also before the request's first change is made. The advice gets longer and more concrete the
  * higher it goes: the reader is a model that follows steps better than it follows advice. */
 const advisor_guidance_def ADVISOR_GUIDANCE[GUIDANCE_COUNT] = {
-    { "light",  1, 250, 32 * 1024, false, false, "only when the agent is stuck · 1 consultation per request · short answers" },
-    { "normal", 3, 400, 48 * 1024, false, false, "when the work is hard · 3 per request" },
-    { "strong", 6, 700, 96 * 1024, true,  false, "early and often · 6 per request · concrete steps · reviews the work before a request that changed files ends" },
-    { "max",   10, 900, 96 * 1024, true,  true,  "as strong, 10 per request · and checks the first change of a request before it is made" },
+    { "light",  1, 250, 32 * 1024, false, false, false, "only when the agent is stuck · 1 consultation per request · short answers" },
+    { "normal", 3, 400, 48 * 1024, false, false, true,  "when the work is hard · 3 per request" },
+    { "strong", 6, 700, 96 * 1024, true,  false, true,  "early and often · 6 per request · concrete steps · and reviews the work before a request ends" },
+    { "max",   10, 900, 96 * 1024, true,  true,  true,  "as strong, 10 per request · and checks the first change of a request before it is made" },
 };
+
+/* What counts as a tool call that failed, for the advisor stepping in: a result that is an error,
+ * or a shell command whose last line says it did not exit with 0. A consultation that could not
+ * be had is not one — asking the advisor about the advisor helps nobody. */
+bool tool_result_failed(const char *name, const char *result, bool error) {
+    if (!name || !strcmp(name, "advisor")) return false;
+    if (error) return true;
+    if (strcmp(name, "bash") || !result) return false;
+    const char *p = NULL;
+    for (const char *q = result; (q = strstr(q, "exit code: ")); q += 11) p = q;   /* the last one: the command's output may say it too */
+    return p && atoi(p + 11) != 0;
+}
 const advisor_guidance_def *advisor_guidance(void) {
     int g = g_cfg.advisor_guidance;
     return &ADVISOR_GUIDANCE[g >= 0 && g < GUIDANCE_COUNT ? g : GUIDANCE_NORMAL];

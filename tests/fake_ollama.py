@@ -154,6 +154,22 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "advisor", "arguments": {"question": "and now?"}}}])
         yield chunk(model, done=True)
         return
+    if "TOOL_FAILS" in text:
+        # a command that fails every time: the agent goes on trying — until the advisor has been heard, or five tries
+        results = [m["content"] for m in messages if m["role"] == "tool"]
+        if any("ADVICE" in r for r in results) or len(results) >= 5:
+            yield chunk(model, "Gave up after %d tries." % len([r for r in results if "exit code" in r]))
+        else:
+            yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "echo nope-%d; exit 3" % len(results)}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_READS" in text:
+        # a request that only looks: four tool calls, no file written
+        results = [m for m in messages if m["role"] == "tool"]
+        if len(results) >= 4 or any(m.get("tool_name") == "advisor" for m in results): yield chunk(model, "Looked at it %d times." % len(results))
+        else: yield chunk(model, tool_calls=[{"function": {"name": "list_dir", "arguments": {"path": "."}}}])
+        yield chunk(model, done=True)
+        return
     if last["role"] == "tool":
         # after a tool result: summarise it
         yield chunk(model, "Tool said: ")

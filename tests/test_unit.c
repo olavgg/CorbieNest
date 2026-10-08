@@ -869,6 +869,11 @@ static void test_advisor(void) {
     CHECK(!advisor_approves("LGTM. You should still run the tests.") && !advisor_approves("LGTM once the import is fixed"));
     CHECK(!advisor_approves("LGTM overall. The parser now handles empty fields, the tests pass, and the change is small, which is good; one more thing to consider is the docs"));   /* too long to be only a yes */
     /* the levels, by name */
+    CHECK(!ADVISOR_GUIDANCE[GUIDANCE_LIGHT].step_in && ADVISOR_GUIDANCE[GUIDANCE_NORMAL].step_in && ADVISOR_GUIDANCE[GUIDANCE_STRONG].step_in && ADVISOR_GUIDANCE[GUIDANCE_MAX].step_in);
+    CHECK(tool_result_failed("bash", "make: *** [all] Error 1\nexit code: 2", false) && !tool_result_failed("bash", "ok\nexit code: 0", false));
+    CHECK(!tool_result_failed("bash", "the log says exit code: 1 somewhere\nexit code: 0", false));   /* the command's own last line counts */
+    CHECK(tool_result_failed("read_file", "error: no such file", true) && !tool_result_failed("read_file", "exit code: 3 is what the file says", false));
+    CHECK(!tool_result_failed("advisor", "error: the advisor has been consulted 6 times", true) && !tool_result_failed("bash", NULL, false));
     CHECK(advisor_guidance_parse("strong") == GUIDANCE_STRONG && advisor_guidance_parse("MAX") == GUIDANCE_MAX && advisor_guidance_parse("ultra") == -1);
     CHECK(ADVISOR_GUIDANCE[GUIDANCE_NORMAL].uses == 3 && !ADVISOR_GUIDANCE[GUIDANCE_NORMAL].review && ADVISOR_GUIDANCE[GUIDANCE_STRONG].review && ADVISOR_GUIDANCE[GUIDANCE_MAX].check_first_edit);
     for (int i = 1; i < GUIDANCE_COUNT; i++) CHECK(ADVISOR_GUIDANCE[i].uses > ADVISOR_GUIDANCE[i - 1].uses && ADVISOR_GUIDANCE[i].words > ADVISOR_GUIDANCE[i - 1].words);
