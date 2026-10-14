@@ -1,0 +1,90 @@
+name: Release
+
+# A pushed tag "v*" becomes a GitHub release with the binaries attached. For a tag that is
+# already there, start the workflow by hand and name it: the binaries are built from that tag
+# and added to its release (which is created if there is none).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing tag to build and attach binaries to (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false   # one platform that does not build must not keep the other's binary back
+      matrix:
+        include:
+          # the oldest runners on offer: a binary runs on its glibc and anything newer
+          - { name: linux-x86_64, runner: ubuntu-22.04 }
+          - { name: linux-arm64, runner: ubuntu-22.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install cJSON and libcurl
+        run: sudo apt-get update && sudo apt-get install -y libcjson-dev libcurl4-openssl-dev
+
+      - name: Build (optimized, stripped, warnings are errors)
+        run: make release RELEASE_CFLAGS="-O2 -std=gnu11 -Wall -Wextra -Werror -DNDEBUG"
+
+      - name: The binary is the version the tag says
+        run: |
+          have="v$(./corbienest --version | awk '{print $2}')"
+          echo "binary: $have, tag: $TAG"
+          test "$have" = "$TAG" || { echo "::error::the tag is $TAG but the binary says $have (CORBIE_VERSION in src/common.h)"; exit 1; }
+
+      - name: Unit tests
+        run: make test-unit
+
+      - name: Package
+        run: |
+          dir="corbienest-$TAG-${{ matrix.name }}"
+          mkdir "$dir"
+          cp corbienest README.md LICENSE "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+          sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            corbienest-*.tar.gz
+            corbienest-*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: attach to the release
+    needs: build
+    if: ${{ !cancelled() }}   # with whatever was built: see fail-fast above
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release if there is none, and attach the binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -l dist
+          test -n "$(ls dist/*.tar.gz 2>/dev/null)" || { echo "::error::no platform built"; exit 1; }
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "Corbie Nest ${TAG#v}" --generate-notes --notes \
+          "The binaries are built on Ubuntu 22.04 and need cJSON and libcurl at run time: \`sudo apt install libcjson1 libcurl4\` (or your distribution's packages of the same). Unpack, and put \`corbienest\` somewhere on your \`PATH\`."
+          fi
+          gh release upload "$TAG" dist/* --clobber

@@ -74,7 +74,10 @@ def transcript(s): return clean(CHROME.sub("", s))
 # between "autowrap off" and "autowrap on" — and so is the viewer's window. That is old text
 # in the byte stream, not output: expect() must not take a line that was merely painted again
 # for the one it is waiting for. since()/text() still show it, for the tests that are about it.
-REPAINT = re.compile(r"\x1b\[\?7l.*?\x1b\[\?7h", re.S)
+# A repaint that has begun but whose end has not been read yet is one all the same: on a loaded machine the
+# output comes in pieces, and the half that is there would otherwise pass for new output (it did, on CI: an old
+# "worker 2/3" was taken for the one a test was waiting for). So an unfinished one is cut off up to the end.
+REPAINT = re.compile(r"\x1b\[\?7l.*?(?:\x1b\[\?7h|\Z)", re.S)
 def fresh(s): return REPAINT.sub("", s)
 
 WORK = tempfile.mkdtemp(prefix="crowtest_")
@@ -314,6 +317,9 @@ out, rc = run(["-m", "nope:latest", "--benchmark"]); check(rc == 1 and "not foun
 out, rc = run(["-m", "fake-coder:latest", "--draft", "x", "-p", "hi"]); check(rc == 2, "bad --draft rejected")
 
 # ---------- interactive via pty ----------
+# How much of the output one read may take. A loaded machine hands it over in small pieces — a repaint cut in
+# two, a line without its end — and CORBIE_TEST_READ=200 makes this one do the same, to see what a CI runner sees.
+READ_MAX = int(os.environ.get("CORBIE_TEST_READ", "65536"))
 class Session:
     def __init__(self, args=(), cols=100, rows=40, env=None):
         self.pid, self.fd = pty.fork()
@@ -329,7 +335,7 @@ class Session:
         while time.time() < end:
             r, _, _ = select.select([self.fd], [], [], 0.1)
             if r:
-                try: d = os.read(self.fd, 65536)
+                try: d = os.read(self.fd, READ_MAX)
                 except OSError: return False
                 if not d: return False
                 self.out += d
