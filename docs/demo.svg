@@ -66,16 +66,16 @@
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
 <rect x="85.2" y="200" width="8.4" height="20" fill="#161a24"/>
-<rect x="93.6" y="200" width="134.4" height="20" fill="#161a24"/>
-<rect x="228" y="200" width="92.4" height="20" fill="#161a24"/>
-<rect x="320.4" y="200" width="462" height="20" fill="#161a24"/>
+<rect x="93.6" y="200" width="75.6" height="20" fill="#161a24"/>
+<rect x="169.2" y="200" width="92.4" height="20" fill="#161a24"/>
+<rect x="261.6" y="200" width="520.8" height="20" fill="#161a24"/>
 <rect x="782.4" y="200" width="8.4" height="20" fill="#161a24"/>
 <text y="212" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
-<tspan x="93.6">                </tspan>
-<tspan x="228" font-weight="600">Corbie Nest</tspan>
-<tspan x="320.4"> v0.3.0 — local coding agent for Ollama                </tspan>
+<tspan x="93.6">         </tspan>
+<tspan x="169.2" font-weight="600">Corbie Nest</tspan>
+<tspan x="261.6"> v0.3.0 — a coding agent for local and hosted models          </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
 <rect x="85.2" y="220" width="8.4" height="20" fill="#161a24"/>
