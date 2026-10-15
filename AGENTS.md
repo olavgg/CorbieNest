@@ -52,6 +52,15 @@ consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), 
   character as associated text). A shifted or AltGr key is its typed character (`eff_text`), and Ctrl+letter
   is the capital in `id` (Ctrl+a = id 'A' + Ctrl), so either case.
 
+## Commits
+
+- Every feature or fix gets its own git commit, made when it is done and checked (both builds
+  warning-free, `make test` passing). Not one commit for several features.
+- Commit only the files of that change. The working tree may hold other people's uncommitted work:
+  stage by path (`git add <files>`), never `git add -A`, and leave their changes alone.
+- Commit messages say what changed and why, in the imperative mood, with the subject under ~72 columns.
+- Push only when the user asks for it.
+
 ## Build, run, test
 
 ```sh
