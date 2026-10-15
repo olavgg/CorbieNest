@@ -1,138 +1,315 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="809" height="596" viewBox="0 0 809 596" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="14">
-<rect width="809" height="596" rx="8" fill="#0d1117" stroke="#30363d"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="876" height="716" viewBox="0 0 876 716" font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="14">
+<rect width="876" height="716" rx="8" fill="#0d1117" stroke="#30363d"/>
 <text y="32" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#ff8700">╭──────────────────────────────────────────────────────────────╮</tspan>
+<tspan x="18" fill="#e5e9f0" font-weight="600">Corbie Nest</tspan>
+<tspan x="110.4" fill="#737578"> v0.3.0 · /banner shows the box again</tspan>
 </text>
 <text y="52" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#ff8700">│</tspan>
-<tspan x="26.4"> </tspan>
-<tspan x="34.8" font-weight="600">🐦‍⬛ Corbie Nest</tspan>
-<tspan x="160.8"> v0.2.0 — local coding agent for Ollama</tspan>
+<tspan x="18" fill="#737578">/help for commands · @file to attach · !cmd for shell · shift+tab to switch mode · Ctrl-D to quit</tspan>
 </text>
 <text y="72" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#ff8700">│</tspan>
-<tspan x="26.4"> </tspan>
-<tspan x="34.8" fill-opacity="0.62">model:</tspan>
-<tspan x="85.2"> qwen3-coder:30b</tspan>
 </text>
 <text y="92" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#ff8700">│</tspan>
-<tspan x="26.4"> </tspan>
-<tspan x="34.8" fill-opacity="0.62">host: </tspan>
-<tspan x="85.2"> http://127.0.0.1:11434 </tspan>
-<tspan x="286.8" fill="#3fb950">● connected</tspan>
 </text>
 <text y="112" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#ff8700">│</tspan>
-<tspan x="26.4"> </tspan>
-<tspan x="34.8" fill-opacity="0.62">cwd:  </tspan>
-<tspan x="85.2"> ~/projects/myapp</tspan>
 </text>
 <text y="132" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#ff8700">╰──────────────────────────────────────────────────────────────╯</tspan>
 </text>
+<rect x="85.2" y="140" width="672" height="20" fill="#161a24"/>
+<rect x="757.2" y="140" width="8.4" height="20" fill="#161a24"/>
+<rect x="765.6" y="140" width="8.4" height="20" fill="#161a24"/>
+<rect x="774" y="140" width="8.4" height="20" fill="#161a24"/>
+<rect x="782.4" y="140" width="8.4" height="20" fill="#161a24"/>
 <text y="152" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#ff8700" font-weight="600">› </tspan>
-<tspan x="34.8" fill-opacity="0.62">fix the failing test in tests/test_parser.py</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">╭───────────────────────────────────────────────────────────────────────────────</tspan>
+<tspan x="757.2" fill="#3a8fb8" font-weight="600">[</tspan>
+<tspan x="765.6" fill="#e6fbff" font-weight="600">×</tspan>
+<tspan x="774" fill="#3a8fb8" font-weight="600">]</tspan>
+<tspan x="782.4" fill="#4a6a8a" font-weight="600">╮</tspan>
 </text>
+<rect x="85.2" y="160" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="160" width="151.2" height="20" fill="#161a24"/>
+<rect x="244.8" y="160" width="386.4" height="20" fill="#161a24"/>
+<rect x="631.2" y="160" width="151.2" height="20" fill="#161a24"/>
+<rect x="782.4" y="160" width="8.4" height="20" fill="#161a24"/>
 <text y="172" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                  </tspan>
+<tspan x="244.8" fill="#e6fbff" font-weight="600">▄▀▀ ▄▀▀▄ █▀▀▄ █▀▀▄ ▀█▀ █▀▀    █▄ █ █▀▀ ▄▀▀ ▀█▀</tspan>
+<tspan x="631.2">                  </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="180" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="180" width="151.2" height="20" fill="#161a24"/>
+<rect x="244.8" y="180" width="386.4" height="20" fill="#161a24"/>
+<rect x="631.2" y="180" width="151.2" height="20" fill="#161a24"/>
+<rect x="782.4" y="180" width="8.4" height="20" fill="#161a24"/>
 <text y="192" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#3fb950">●</tspan>
-<tspan x="26.4"> </tspan>
-<tspan x="34.8" font-weight="600">bash</tspan>
-<tspan x="68.4" fill-opacity="0.62">(python3 -m pytest tests/test_parser.py -q)</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                  </tspan>
+<tspan x="244.8" fill="#e6fbff" font-weight="600">█   █  █ █▀▀▄ █▀▀▄  █  █▀▀    █ ▀█ █▀▀ ▀▀▄  █ </tspan>
+<tspan x="631.2">                  </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="200" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="200" width="151.2" height="20" fill="#161a24"/>
+<rect x="244.8" y="200" width="386.4" height="20" fill="#161a24"/>
+<rect x="631.2" y="200" width="151.2" height="20" fill="#161a24"/>
+<rect x="782.4" y="200" width="8.4" height="20" fill="#161a24"/>
 <text y="212" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18">  </tspan>
-<tspan x="34.8" fill-opacity="0.62">$ </tspan>
-<tspan x="51.6" font-weight="600">python3 -m pytest tests/test_parser.py -q</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                  </tspan>
+<tspan x="244.8" fill="#e6fbff" font-weight="600">▀▀▀ ▀▀▀▀ ▀  ▀ ▀▀▀  ▀▀▀ ▀▀▀    ▀  ▀ ▀▀▀ ▄▄▀  ▀ </tspan>
+<tspan x="631.2">                  </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="220" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="220" width="134.4" height="20" fill="#161a24"/>
+<rect x="228" y="220" width="92.4" height="20" fill="#161a24"/>
+<rect x="320.4" y="220" width="462" height="20" fill="#161a24"/>
+<rect x="782.4" y="220" width="8.4" height="20" fill="#161a24"/>
 <text y="232" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18">  </tspan>
-<tspan x="34.8" fill="#d29922">Run this command?</tspan>
-<tspan x="177.6">  </tspan>
-<tspan x="194.4" fill="#3fb950">yes</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                </tspan>
+<tspan x="228" font-weight="600">Corbie Nest</tspan>
+<tspan x="320.4"> v0.3.0 — local coding agent for Ollama                </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="240" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="240" width="688.8" height="20" fill="#161a24"/>
+<rect x="782.4" y="240" width="8.4" height="20" fill="#161a24"/>
 <text y="252" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18">  ⎿  </tspan>
-<tspan x="60" fill-opacity="0.62">F.</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                         ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀                         </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="260" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="260" width="277.2" height="20" fill="#161a24"/>
+<rect x="370.8" y="260" width="50.4" height="20" fill="#161a24"/>
+<rect x="421.2" y="260" width="361.2" height="20" fill="#161a24"/>
+<rect x="782.4" y="260" width="8.4" height="20" fill="#161a24"/>
 <text y="272" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18">     </tspan>
-<tspan x="60" fill-opacity="0.62">… +12 lines</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                         ⠀⠀⠀⠀⠀⠀⠀⠀</tspan>
+<tspan x="370.8" fill="#6b7890">⣀⣤⣶⣶⣶⣤</tspan>
+<tspan x="421.2">⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀                         </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="280" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="280" width="210" height="20" fill="#161a24"/>
+<rect x="303.6" y="280" width="126" height="20" fill="#161a24"/>
+<rect x="429.6" y="280" width="8.4" height="20" fill="#161a24"/>
+<rect x="438" y="280" width="50.4" height="20" fill="#161a24"/>
+<rect x="488.4" y="280" width="294" height="20" fill="#161a24"/>
+<rect x="782.4" y="280" width="8.4" height="20" fill="#161a24"/>
 <text y="292" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#3fb950">●</tspan>
-<tspan x="26.4"> </tspan>
-<tspan x="34.8" font-weight="600">read_file</tspan>
-<tspan x="110.4" fill-opacity="0.62">(src/parser.py)</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                         </tspan>
+<tspan x="303.6" fill="#6b7890">⢀⣀⣠⣤⣴⣶⣿⣿⣿⣿⣿⣿⣿⣿⡇</tspan>
+<tspan x="429.6">⠀</tspan>
+<tspan x="438" fill="#6b7890">⣀⣀⣀⣀⣀⣀</tspan>
+<tspan x="488.4">⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀                         </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="300" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="300" width="235.2" height="20" fill="#161a24"/>
+<rect x="328.8" y="300" width="92.4" height="20" fill="#161a24"/>
+<rect x="421.2" y="300" width="25.2" height="20" fill="#161a24"/>
+<rect x="446.4" y="300" width="58.8" height="20" fill="#161a24"/>
+<rect x="505.2" y="300" width="277.2" height="20" fill="#161a24"/>
+<rect x="782.4" y="300" width="8.4" height="20" fill="#161a24"/>
 <text y="312" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#3fb950">●</tspan>
-<tspan x="26.4"> </tspan>
-<tspan x="34.8" font-weight="600">edit_file</tspan>
-<tspan x="110.4" fill-opacity="0.62">(src/parser.py)</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                         ⠀⠀⠀</tspan>
+<tspan x="328.8" fill="#6b7890">⠈⠉⠉⠛⠛⠛⣿⣿⣿⣿⣿</tspan>
+<tspan x="421.2" fill="#a9b6cc">⣿⣿⣿</tspan>
+<tspan x="446.4" fill="#6b7890">⣿⣿⣿⣿⣿⣿⣆</tspan>
+<tspan x="505.2">⠀⠀⠀⠀⠀⠀⠀⠀                         </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="320" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="320" width="294" height="20" fill="#161a24"/>
+<rect x="387.6" y="320" width="25.2" height="20" fill="#161a24"/>
+<rect x="412.8" y="320" width="117.6" height="20" fill="#161a24"/>
+<rect x="530.4" y="320" width="252" height="20" fill="#161a24"/>
+<rect x="782.4" y="320" width="8.4" height="20" fill="#161a24"/>
 <text y="332" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18">  </tspan>
-<tspan x="34.8" fill="#ff7b72">- if tok == "":</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                         ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀</tspan>
+<tspan x="387.6" fill="#6b7890">⠉⣽⣿</tspan>
+<tspan x="412.8" fill="#a9b6cc">⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣶⣄</tspan>
+<tspan x="530.4">⠀⠀⠀⠀⠀                         </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="340" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="340" width="302.4" height="20" fill="#161a24"/>
+<rect x="396" y="340" width="33.6" height="20" fill="#161a24"/>
+<rect x="429.6" y="340" width="109.2" height="20" fill="#161a24"/>
+<rect x="538.8" y="340" width="8.4" height="20" fill="#161a24"/>
+<rect x="547.2" y="340" width="235.2" height="20" fill="#161a24"/>
+<rect x="782.4" y="340" width="8.4" height="20" fill="#161a24"/>
 <text y="352" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18">  </tspan>
-<tspan x="34.8" fill="#3fb950">+ if tok == "" or tok is None:</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                         ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀</tspan>
+<tspan x="396" fill="#6b7890">⠹⣿⣿⣿</tspan>
+<tspan x="429.6" fill="#a9b6cc">⣿⣿⣿⣿⣿⡿⠿⢿⣿⣿⣿⣯⣁</tspan>
+<tspan x="538.8" fill="#6b7890">⡀</tspan>
+<tspan x="547.2">⠀⠀⠀                         </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="360" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="360" width="319.2" height="20" fill="#161a24"/>
+<rect x="412.8" y="360" width="50.4" height="20" fill="#161a24"/>
+<rect x="463.2" y="360" width="25.2" height="20" fill="#161a24"/>
+<rect x="488.4" y="360" width="75.6" height="20" fill="#161a24"/>
+<rect x="564" y="360" width="218.4" height="20" fill="#161a24"/>
+<rect x="782.4" y="360" width="8.4" height="20" fill="#161a24"/>
 <text y="372" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18">  </tspan>
-<tspan x="34.8" fill="#d29922">Apply this edit?</tspan>
-<tspan x="169.2">  </tspan>
-<tspan x="186" fill="#3fb950">yes</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                         ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀</tspan>
+<tspan x="412.8" fill="#6b7890">⠉⠉⣿⠉⢹⡏</tspan>
+<tspan x="463.2">⠀⠀⠀</tspan>
+<tspan x="488.4" fill="#6b7890">⠘⠻⠿⠿⣿⣿⣿⣿⡖</tspan>
+<tspan x="564">⠀                         </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="380" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="380" width="294" height="20" fill="#161a24"/>
+<rect x="387.6" y="380" width="42" height="20" fill="#161a24"/>
+<rect x="429.6" y="380" width="8.4" height="20" fill="#161a24"/>
+<rect x="438" y="380" width="8.4" height="20" fill="#161a24"/>
+<rect x="446.4" y="380" width="16.8" height="20" fill="#161a24"/>
+<rect x="463.2" y="380" width="42" height="20" fill="#161a24"/>
+<rect x="505.2" y="380" width="33.6" height="20" fill="#161a24"/>
+<rect x="538.8" y="380" width="16.8" height="20" fill="#161a24"/>
+<rect x="555.6" y="380" width="226.8" height="20" fill="#161a24"/>
+<rect x="782.4" y="380" width="8.4" height="20" fill="#161a24"/>
 <text y="392" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#3fb950">●</tspan>
-<tspan x="26.4"> </tspan>
-<tspan x="34.8" font-weight="600">bash</tspan>
-<tspan x="68.4" fill-opacity="0.62">(python3 -m pytest tests/test_parser.py -q)</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                         ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀</tspan>
+<tspan x="387.6" fill="#7a6650">⣤⣤⣤⣤⣤</tspan>
+<tspan x="429.6" fill="#6b7890">⣿</tspan>
+<tspan x="438" fill="#7a6650">⣤</tspan>
+<tspan x="446.4" fill="#6b7890">⣼⣧</tspan>
+<tspan x="463.2" fill="#7a6650">⣤⣤⣤⣤⣤</tspan>
+<tspan x="505.2">⠀⠀⠀⠀</tspan>
+<tspan x="538.8" fill="#6b7890">⠈⠉</tspan>
+<tspan x="555.6">⠀⠀                         </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="400" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="400" width="688.8" height="20" fill="#161a24"/>
+<rect x="782.4" y="400" width="8.4" height="20" fill="#161a24"/>
 <text y="412" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18">  ⎿  </tspan>
-<tspan x="60" fill-opacity="0.62">..</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6"> model: qwen3-coder:30b · ctx 32k                                                 </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="420" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="420" width="201.6" height="20" fill="#161a24"/>
+<rect x="295.2" y="420" width="92.4" height="20" fill="#161a24"/>
+<rect x="387.6" y="420" width="394.8" height="20" fill="#161a24"/>
+<rect x="782.4" y="420" width="8.4" height="20" fill="#161a24"/>
 <text y="432" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18">     </tspan>
-<tspan x="60" fill-opacity="0.62">exit code: 0</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6"> host:  127.0.0.1:20402 </tspan>
+<tspan x="295.2" fill="#a3be8c">● connected</tspan>
+<tspan x="387.6">                                               </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="440" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="440" width="688.8" height="20" fill="#161a24"/>
+<rect x="782.4" y="440" width="8.4" height="20" fill="#161a24"/>
 <text y="452" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#3fb950">●</tspan>
-<tspan x="26.4"> Fixed the None handling in </tspan>
-<tspan x="261.6" fill="#39c5cf">`src/parser.py:42`</tspan>
-<tspan x="412.8">; both tests pass.</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6"> cwd:   /tmp/demo/projects/myapp                                                  </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="460" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="460" width="688.8" height="20" fill="#161a24"/>
+<rect x="782.4" y="460" width="8.4" height="20" fill="#161a24"/>
 <text y="472" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18">  </tspan>
-<tspan x="34.8" fill="#8b949e">↳ 4120 in · 210 out · 62.3 tok/s · 4.1s · ctx 12%</tspan>
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6"> ui:    notcurses · /ui to switch                                                 </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
+<rect x="85.2" y="480" width="529.2" height="20" fill="#161a24"/>
+<rect x="614.4" y="480" width="8.4" height="20" fill="#161a24"/>
+<rect x="622.8" y="480" width="8.4" height="20" fill="#161a24"/>
+<rect x="631.2" y="480" width="8.4" height="20" fill="#161a24"/>
+<rect x="639.6" y="480" width="8.4" height="20" fill="#161a24"/>
+<rect x="648" y="480" width="142.8" height="20" fill="#161a24"/>
 <text y="492" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">╰──────────────────────────────────────────────────────────────</tspan>
+<tspan x="614.4" fill="#e6fbff">─</tspan>
+<tspan x="622.8" fill="#8fe3ff">─</tspan>
+<tspan x="631.2" fill="#4fb8e0">─</tspan>
+<tspan x="639.6" fill="#3a8fb8">─</tspan>
+<tspan x="648" fill="#4a6a8a">────────────────╯</tspan>
 </text>
 <text y="512" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill-opacity="0.62">────────────────────────────────────────────────────────────────────────────────────────</tspan>
 </text>
 <text y="532" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#ff8700" font-weight="600">❯ </tspan>
-<tspan x="34.8">and now make it handle the empty file case</tspan>
 </text>
 <text y="552" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill-opacity="0.62">────────────────────────────────────────────────────────────────────────────────────────</tspan>
 </text>
 <text y="572" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18"> </tspan>
-<tspan x="26.4" fill-opacity="0.62">⏵  manual mode</tspan>
-<tspan x="144" fill-opacity="0.62"> (shift+tab to cycle)</tspan>
-<tspan x="320.4" fill-opacity="0.62"> │ </tspan>
-<tspan x="345.6">qwen2.5-coder:7b</tspan>
-<tspan x="480" fill-opacity="0.62"> │ </tspan>
-<tspan x="505.2">4.3k tokens (↑4.1k ↓210)</tspan>
-<tspan x="706.8" fill-opacity="0.62"> │ </tspan>
-<tspan x="732">ctx 12%</tspan>
+</text>
+<text y="592" xml:space="preserve" fill="#c9d1d9">
+</text>
+<text y="612" xml:space="preserve" fill="#c9d1d9">
+</text>
+<text y="632" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#5fd75f">╭───────────────────────────────────────────────────────────────────────────────────────────[ready]╮</tspan>
+</text>
+<rect x="34.8" y="640" width="8.4" height="20" fill="#151922"/>
+<rect x="43.2" y="640" width="8.4" height="20" fill="#151922"/>
+<rect x="51.6" y="640" width="8.4" height="20" fill="#e5e9f0"/>
+<rect x="60" y="640" width="781.2" height="20" fill="#151922"/>
+<text y="652" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#5fd75f">│</tspan>
+<tspan x="26.4"> </tspan>
+<tspan x="34.8" fill="#f0883e">❯</tspan>
+<tspan x="43.2"> </tspan>
+<tspan x="51.6" fill="#161a24"> </tspan>
+<tspan x="60">                                                                                             </tspan>
+<tspan x="841.2"> </tspan>
+<tspan x="849.6" fill="#5fd75f">│</tspan>
+</text>
+<text y="672" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#5fd75f">╰───────────────────────────────────────────────────────────────</tspan>
+<tspan x="555.6">⏵  manual mode</tspan>
+<tspan x="673.2" fill="#585858"> (shift+tab to cycle)</tspan>
+<tspan x="849.6" fill="#5fd75f">╯</tspan>
+</text>
+<rect x="18" y="680" width="142.8" height="20" fill="#161a24"/>
+<rect x="160.8" y="680" width="25.2" height="20" fill="#161a24"/>
+<rect x="186" y="680" width="336" height="20" fill="#161a24"/>
+<rect x="522" y="680" width="327.6" height="20" fill="#161a24"/>
+<rect x="849.6" y="680" width="8.4" height="20" fill="#161a24"/>
+<text y="692" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18" fill="#e5e9f0">  qwen3-coder:30b</tspan>
+<tspan x="160.8" fill="#7e828a"> │ </tspan>
+<tspan x="186" fill="#e5e9f0">0 tokens (↑0 ↓0)                        </tspan>
+<tspan x="522" fill="#af5f87">/tmp/demo/projects/myapp  · branch main</tspan>
+<tspan x="849.6"> </tspan>
 </text>
 </svg>
