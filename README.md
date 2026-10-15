@@ -6,7 +6,7 @@ with `--advisor anthropic:claude-opus-5.5` when a stronger model should be consu
 files, grep the codebase, and run shell and git commands — each mutating action
 is shown to you and confirmed before it runs.
 
-![A corbienest session: the agent runs pytest, reads and edits src/parser.py, re-runs the tests and reports back, with the input field and status bar pinned to the bottom of the screen.](docs/demo.svg)
+![corbienest on the notcurses screen: the banner with the block-letter title, the input field pinned to the bottom, and the status bar with the model, the tokens, and the folder and git branch.](docs/demo.svg)
 
 corbienest takes over the terminal (alternate screen) while it runs, like Claude Code: the
 conversation scrolls in the upper part, and the bottom of the screen is the app's: an input
