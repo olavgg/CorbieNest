@@ -2744,6 +2744,7 @@ typedef struct {
     int attempt, rounds, round_first;
     sbuf out, objection;         /* its last report, and what the orchestrator last held against it */
     const char *model;           /* the model it runs on (NULL = g_cfg.model); /goal's candidates differ */
+    char *role_model;            /* the model its role names, a copy: the skills may be reloaded during the run */
     model_info info; bool has_info;   /* that model's capabilities, when it is a local model other than the main one */
     char *root;                  /* /goal: the worktree it works in */
     char commit[64];             /* /goal: the commit of its work, which is what it is kept by */
@@ -2757,6 +2758,7 @@ typedef struct {
     int first; size_t budget;    /* the request's checkpoint turn; bytes a review may take */
     bool aborted;                /* the user stopped the run */
     const goal_ctx *goal;        /* /goal: candidates, not tasks — no reviews, a metric instead (NULL for /orchestrate) */
+    char *contract;              /* the plan's CONTRACT: block: what the tasks share, shown to every worker (NULL: none) */
 } orch_run;
 #define GOAL_METRIC_TIMEOUT 900
 #define GOAL_GIT "GIT_AUTHOR_NAME=corbienest GIT_AUTHOR_EMAIL=corbienest@localhost GIT_COMMITTER_NAME=corbienest GIT_COMMITTER_EMAIL=corbienest@localhost "
@@ -2808,6 +2810,24 @@ static void goal_system(sbuf *sp, const orch_run *r, const orch_worker *w) {
                 "`GOAL: IMPOSSIBLE <why>` (you are sure it cannot be met), or neither (you are not sure yet).\n");
 }
 
+/* The model a role names, for the worker that does the role's task. A local model must be on the server (its
+ * capabilities are read now, as /goal reads them), a hosted one must have its key. Failing that the worker keeps
+ * the model in use, and the line says why. */
+static void worker_role_model(orch_worker *w, const skill_t *role) {
+    if (provider_find(role->model, NULL)) {
+        const char *hd[4]; sbuf keep; char why[256]; sb_init(&keep);
+        bool ok = provider_call_headers(role->model, hd, &keep, why, sizeof why);
+        sb_free(&keep);
+        if (!ok) { printf("  " C_YELLOW "role %s: %s — the model in use" C_RESET "\n", role->name, why); return; }
+    } else if (ollama_model_show(role->model, &w->info) == 0) {
+        w->has_info = true;
+    } else {
+        printf("  " C_YELLOW "role %s: ollama does not have %s — the model in use" C_RESET "\n", role->name, role->model);
+        return;
+    }
+    w->role_model = xstrdup(role->model); w->model = w->role_model;
+}
+
 static void worker_begin(orch_run *r, int i) {
     orch_worker *w = &r->w[i];
     w->msgs = cJSON_CreateArray(); w->attempt = 1;
@@ -2821,6 +2841,16 @@ static void worker_begin(orch_run *r, int i) {
                    "End with ONE final message, your report: what you changed and in which files, what you checked and how, and anything left undone or that you are unsure of. "
                    "The orchestrator sees only that report and the diff of the files you wrote.", g_cwd);
     if (g_project_instructions) sb_puts(&sp, g_project_instructions);
+    /* a role (a skill named by the plan) adds its instructions, and may name the model; one that is not there is the default worker */
+    const skill_t *role = NULL;
+    if (!r->goal && r->tasks[i].role) {
+        role = skill_find(r->tasks[i].role);
+        if (!role) printf("  " C_DIM "role %s is not a skill here: the default worker" C_RESET "\n", r->tasks[i].role);
+        else {
+            sb_printf(&sp, "\n\n# Your role: %s\n", role->name); sb_puts(&sp, role->body);
+            if (role->model) worker_role_model(w, role);
+        }
+    }
     w->sp_bytes = sp.len;
     cJSON *m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "system"); cJSON_AddStringToObject(m, "content", sp.data); cJSON_AddItemToArray(w->msgs, m);
     sb_free(&sp);
@@ -2832,10 +2862,12 @@ static void worker_begin(orch_run *r, int i) {
         if (!any) { sb_puts(&u, "\n\n# Done before you\n"); any = true; }
         sb_printf(&u, "## Task %d: %s — %s\n", j + 1, r->tasks[j].title, r->w[j].status); sb_put_cut(&u, r->w[j].out.data ? r->w[j].out.data : "", 2048); sb_puts(&u, "\n\n");
     }
-    sb_printf(&u, "%s# Your task (%d of %d): %s\n%s", any ? "" : "\n\n", i + 1, r->nt, r->tasks[i].title, r->tasks[i].body);
+    if (r->contract) { sb_puts(&u, "\n# The contract (what all the tasks share)\n"); sb_put_cut(&u, r->contract, 4096); sb_putc(&u, '\n'); }
+    sb_printf(&u, "%s# Your task (%d of %d): %s\n%s", any || r->contract ? "" : "\n\n", i + 1, r->nt, r->tasks[i].title, r->tasks[i].body);
     m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", u.data); cJSON_AddItemToArray(w->msgs, m);
     sb_free(&u);
-    printf("  " C_CYAN "⤷ worker %d/%d" C_RESET " " C_BOLD "%s" C_RESET "\n", i + 1, r->nt, r->tasks[i].title);
+    printf("  " C_CYAN "⤷ worker %d/%d" C_RESET " " C_BOLD "%s" C_RESET "%s%s%s\n", i + 1, r->nt, r->tasks[i].title,
+           role ? C_DIM "  · role " : "", role ? role->name : "", role ? C_RESET : "");
     worker_call(r, i);
 }
 
@@ -3032,7 +3064,8 @@ static int cmd_orchestrate(const char *arg) {
     char *plan_text = orch_ask("plans the request", brief.data, &st, &how);
     sb_free(&brief);
     orch_task *tasks = NULL;
-    int nt = plan_text ? orch_parse_plan(plan_text, &tasks) : 0, accepted = 0;
+    char *contract = NULL;
+    int nt = plan_text ? orch_parse_plan_ex(plan_text, &tasks, &contract) : 0, accepted = 0;
     char spent[96];
     if (how != ADVICE_GIVEN) {
         aborted = how != ADVICE_NONE;
@@ -3076,7 +3109,7 @@ static int cmd_orchestrate(const char *arg) {
 
         if (go) {
             int maxpar = g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT;
-            orch_run run = { arg, tasks, xmalloc(sizeof(orch_worker) * (size_t)nt), nt, cJSON_CreateArray(), first, budget, false, NULL };
+            orch_run run = { arg, tasks, xmalloc(sizeof(orch_worker) * (size_t)nt), nt, cJSON_CreateArray(), first, budget, false, NULL, .contract = contract };
             memset(run.w, 0, sizeof(orch_worker) * (size_t)nt);
             for (int i = 0; i < nt; i++) { sb_init(&run.w[i].out); sb_init(&run.w[i].objection); }
             /* what a worker may call: everything but another agent and the advisor (its reviewer is the orchestrator) */
@@ -3096,6 +3129,7 @@ static int cmd_orchestrate(const char *arg) {
                 if (!task_ok(w) && w->objection.len) { sb_puts(&report, "\n\nThe orchestrator's objection:\n"); sb_put_cut(&report, w->objection.data, 2048); }
                 sb_putc(&report, '\n');
                 if (w->msgs) cJSON_Delete(w->msgs);
+                free(w->role_model);
                 sb_free(&w->out); sb_free(&w->objection);
             }
             free(run.w); cJSON_Delete(run.tools);
@@ -3110,6 +3144,7 @@ static int cmd_orchestrate(const char *arg) {
     add_message("assistant", report.data ? report.data : "[/orchestrate: nothing was done]");
     sb_free(&report); free(plan_text); free(request);
     if (tasks) orch_tasks_free(tasks, nt);
+    free(contract);
     session_save();
     memory_note(first, aborted);
     return aborted ? -1 : 0;
