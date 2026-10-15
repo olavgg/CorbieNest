@@ -2655,7 +2655,16 @@ static char *expand_mentions(const char *input) {
 #define ORCH_REPLY_MIN 2048    /* tokens a plan may take, whatever the guidance allows a piece of advice */
 static bool g_orch_no_ask = false;   /* "run these tasks?" was answered with "don't ask again" in this session */
 
+/* The roles the planner may name: every skill is one (its instructions and its model are the worker's). */
+static void orch_roles(sbuf *b) {
+    int n = skills_count();
+    if (!n) { sb_puts(b, "No roles are defined: leave out ROLE:.\n"); return; }
+    sb_puts(b, "Roles you may name with ROLE: (a role is a skill: its instructions and model are the worker's):\n");
+    for (int i = 0; i < n; i++) sb_printf(b, "- %s: %.120s\n", skill_get(i)->name, skill_get(i)->desc);
+}
+
 static void orch_system(sbuf *b, int workers) {
+    sbuf roles; sb_init(&roles); orch_roles(&roles);
     sb_printf(b,
         "You are the orchestrator of Corbie Nest (corbienest), a coding agent in the user's terminal. You do not do the work yourself. "
         "You split the user's request into tasks for worker agents, and afterwards you review what each one did.\n\n"
@@ -2664,18 +2673,25 @@ static void orch_system(sbuf *b, int workers) {
         "and you have none: you see what you are shown here and nothing else, so never claim to have read a file or run anything.\n\n"
         "When you are asked to PLAN, answer with the plan and nothing else, in exactly this shape:\n\n"
         "TASK 1: <short title>\n<what to do>\nDONE WHEN: <how to tell it is done>\n\nTASK 2: <short title>\n...\n\n"
+        "Under a title a task may have two lines more: \"ROLE: <name>\", the role from the list below that fits the task (the worker then runs with that role's instructions "
+        "and model), and \"OWNS: <paths>\", the files or directories the task may write, comma-separated. A plan may open with a \"CONTRACT:\" block, before its first task, "
+        "that states what the tasks share (names, signatures, fields, paths, packages), written once: every worker is shown it.\n"
         "- As few tasks as the request needs, at most %d. A small request is one task.\n"
         "- Every task stands by itself: name the files, the functions, the commands to run and what must not change. A worker knows nothing you do not tell it, and cannot ask.\n"
         "- Order them so that each builds on finished work; no two tasks change the same lines.\n"
+        "- An OWNS: list is a promise: the task writes only there. Tasks that may run at the same time must not own the same paths; a file several tasks must change belongs to one later task.\n"
         "%s"
         "- Where you would need to read the code first, make the first task an exploration that reports what it found: the later workers get that report.\n"
-        "- Where the project has a build or tests, a task says to run them.\n\n"
+        "- Where the project has a build or tests, a task says to run them. When the request changes code, the last task builds the project, runs its tests and fixes what fails.\n"
+        "%s\n"
         "When you are asked to REVIEW a task, you are shown the task, the worker's report and the diff of the files it wrote. "
         "If the task is done and correct, answer with " ADVISOR_REVIEW_OK " alone. Otherwise say exactly what is wrong or missing and what to do about it, "
         "briefly: your answer goes to the worker as its next instruction. Do not ask for more than the task asked for.", ORCH_MAX_TASKS,
         workers > 1 ? "- The tasks run one after another unless you say otherwise. Tasks that do not need each other's result AND write different files may run at the same time: "
                       "give such a task a line \"AFTER: none\" (it can start at once) or \"AFTER: 1, 2\" (the tasks that must be finished first), right under its title. "
-                      "A task without that line waits for the task before it. When in doubt, leave the line out.\n" : "");
+                      "A task without that line waits for the task before it. When in doubt, leave the line out.\n" : "",
+        roles.data);
+    sb_free(&roles);
 }
 
 /* One call of the orchestrating model, with its line in the transcript. The answer, malloc'd,
