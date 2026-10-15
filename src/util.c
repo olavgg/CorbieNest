@@ -1666,12 +1666,14 @@ int git_branch(const char *dir, char *out, size_t n) {
     snprintf(cur, sizeof cur, "%s", dir);
     for (;;) {
         snprintf(gitp, sizeof gitp, "%s/.git", cur);
-        struct stat st;
-        if (stat(gitp, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) snprintf(head, sizeof head, "%s/HEAD", gitp);
+        /* opened once and asked through the descriptor (a stat, then an open of the name, could see another file) */
+        int fd = open(gitp, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            struct stat st;
+            if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) { close(fd); snprintf(head, sizeof head, "%s/HEAD", gitp); }
             else {   /* "gitdir: PATH": a linked worktree */
-                FILE *f = fopen(gitp, "r"); char line[1024] = "";
-                if (!f) return 0;
+                FILE *f = fdopen(fd, "r"); char line[1024] = "";
+                if (!f) { close(fd); return 0; }
                 if (!fgets(line, sizeof line, f)) line[0] = 0;
                 fclose(f);
                 size_t l = strlen(line); while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
