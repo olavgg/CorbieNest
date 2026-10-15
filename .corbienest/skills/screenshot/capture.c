@@ -10,11 +10,13 @@
  * The bytes go to OUT; screen.c draws them. Built by the Makefile next to this file. */
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <ftw.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/select.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -30,6 +32,12 @@ static double now(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+/* nftw callback: removes what it visits (files first, then the directories: FTW_DEPTH) */
+static int rm_entry(const char *path, const struct stat *sb, int flag, struct FTW *ftw) {
+    (void)sb; (void)flag; (void)ftw;
+    return remove(path);
 }
 
 static int has(const unsigned char *b, size_t n, const char *pat) {
@@ -99,6 +107,7 @@ int main(int argc, char **argv) {
     kill(pid, SIGKILL);
     waitpid(pid, NULL, 0);
     free(abs);
+    nftw(home, rm_entry, 16, FTW_DEPTH | FTW_PHYS);   /* the scratch config the program wrote */
 
     FILE *f = fopen(out, "wb");
     if (!f) { perror(out); return 1; }
