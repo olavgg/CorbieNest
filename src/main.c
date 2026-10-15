@@ -3514,6 +3514,7 @@ static void cmd_ui(const char *arg) {
     /* the same command line, with --ui and --resume replaced */
     char **na = xmalloc(sizeof *na * (size_t)(g_argc + 6));
     int n = 0;
+    na[n++] = g_argv[0];   /* execv's argv[0] */
     for (int i = 1; i < g_argc; i++) {
         const char *a = g_argv[i];
         if (!strcmp(a, "--ui")) { i++; continue; }
