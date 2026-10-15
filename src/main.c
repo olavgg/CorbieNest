@@ -52,6 +52,8 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/advisor", "a stronger model the agent may consult: a local one, or Claude, ChatGPT, Grok by API key" },
     { "/subagent", "the model sub-agents (task) run on, and how hard it thinks" },
     { "/orchestrate", "the advisor model plans the request as tasks, this model does them, the advisor reviews each" },
+    { "/goal", "candidates in git worktrees, on one or more models, race to a metric: the best score is kept" },
+    { "/btw", "a side question: answered from the conversation, and not kept in it" },
     { "/workers", "how many tasks of /orchestrate may run at the same time" },
     { "/mode", "permission mode: manual, accept-edits, plan, auto" },
     { "/yolo", "auto mode on or off: every tool call approved" },
@@ -86,6 +88,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
  * out in suggest(): the levels are the model's, the directories the disk's.) */
 static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/ui", "ansi:the ANSI screen (default)|notcurses:the notcurses screen: planes, true colour (needs notcurses installed at build time)" },
+    { "/goal", "min:a lower score is better|max:a higher score is better (the default)|-n:rounds, 1 to 10|-k:candidates, 2 to 8|-m:models, a,b,c (round-robin)" },
     { "/mode", "manual:ask before every edit and command|accept-edits:file edits go ahead, commands still ask|plan:read-only: the model proposes a plan|auto:nothing asks (dangerous)" },
     { "/think", "on:think on every call|off:do not think|auto:think once per request, not after every tool result|show:show the thinking|hide:hide the thinking" },
     { "/yolo", "on:approve every tool call (dangerous)|off:back to manual confirmations" },
@@ -354,7 +357,8 @@ static int g_mem_pending = 0;     /* finished requests since the last flush */
 static bool g_mem_exiting = false;/* the last flush, on the way out: say that Ctrl-C skips it */
 
 /* The model that does the work is a local one, or Anthropic (anthropic:MODEL / claude:MODEL).
- * xAI and OpenAI stay advisors: a turn never sends their prefix to Ollama. */
+ * xAI, OpenAI, DeepSeek and Kimi stay advisors here: a turn never sends their prefix to Ollama, and the sub-agents
+ * and /model stay Ollama or Anthropic. The workers of /goal may be any of them (worker_remote()). */
 static bool model_messages(const char *name) {
     const provider_def *p = name ? provider_find(name, NULL) : NULL;
     return p && p->style == PROVIDER_MESSAGES;
@@ -2707,6 +2711,13 @@ static void orch_spent(const chat_stats *st, char *out, size_t n) {
     snprintf(out, n, "%s tokens · %.0fs%s", tk, st->total_seconds, cost);
 }
 
+/* /goal: what a round's candidates are told beyond a /orchestrate run */
+typedef struct {
+    const goal_spec *spec;       /* the metric, its direction, the goal */
+    double base;                 /* the best score so far: a candidate must beat it */
+    const char *prior;           /* what the other candidates of the last round did (NULL in the first) */
+} goal_ctx;
+
 /* A task of the run and the worker doing it. */
 enum { T_WAITING, T_RUNNING, T_ACCEPTED, T_UNREVIEWED, T_REJECTED, T_FAILED, T_STOPPED, T_SKIPPED };
 typedef struct {
@@ -2716,6 +2727,12 @@ typedef struct {
     http_job *job;               /* the model call it is waiting for (T_RUNNING) */
     int attempt, rounds, round_first;
     sbuf out, objection;         /* its last report, and what the orchestrator last held against it */
+    const char *model;           /* the model it runs on (NULL = g_cfg.model); /goal's candidates differ */
+    model_info info; bool has_info;   /* that model's capabilities, when it is a local model other than the main one */
+    char *root;                  /* /goal: the worktree it works in */
+    char commit[64];             /* /goal: the commit of its work, which is what it is kept by */
+    double metric; bool scored;  /* /goal: what the metric said of it */
+    int verdict; char why[200];  /* /goal: its GOAL: line */
 } orch_worker;
 typedef struct {
     const char *request;         /* as the user typed it */
@@ -2723,7 +2740,12 @@ typedef struct {
     cJSON *tools;                /* what a worker may call */
     int first; size_t budget;    /* the request's checkpoint turn; bytes a review may take */
     bool aborted;                /* the user stopped the run */
+    const goal_ctx *goal;        /* /goal: candidates, not tasks — no reviews, a metric instead (NULL for /orchestrate) */
 } orch_run;
+#define GOAL_METRIC_TIMEOUT 900
+#define GOAL_GIT "GIT_AUTHOR_NAME=corbienest GIT_AUTHOR_EMAIL=corbienest@localhost GIT_COMMITTER_NAME=corbienest GIT_COMMITTER_EMAIL=corbienest@localhost "
+static const char *worker_model(const orch_worker *w) { return w->model ? w->model : g_cfg.model; }
+static bool worker_remote(const orch_worker *w) { return provider_find(worker_model(w), NULL) != NULL; }
 static bool task_ok(const orch_worker *w) { return w->state == T_ACCEPTED || w->state == T_UNREVIEWED; }
 static void task_end(orch_worker *w, int state, const char *status) { w->state = state; w->status = status; }
 
@@ -2735,12 +2757,13 @@ static void worker_call(orch_run *r, int i) {
         (double)(w->sp_bytes + tools_bytes() + conv_bytes(w->msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0))
         elide_tool_results(w->msgs, w->round_first);
     ollama_call.followup = w->rounds > 0 || w->attempt > 1;   /* think=auto: think about the task once, not after every tool result */
+    if (w->model) { ollama_call.model = w->model; ollama_call.info = w->has_info ? &w->info : NULL; }
     char *body, why[512] = "";
-    if (model_hosted()) {
+    if (worker_remote(w)) {
         const char *hdrs[4]; sbuf keep;
-        const provider_def *p = provider_find(g_cfg.model, NULL);
+        const provider_def *p = provider_find(worker_model(w), NULL);
         body = provider_turn_request(w->msgs, r->tools);   /* reads ollama_call; the headers are built here, the thread reads nothing */
-        bool ok = body && p && provider_call_headers(g_cfg.model, hdrs, &keep, why, sizeof why);
+        bool ok = body && p && provider_call_headers(worker_model(w), hdrs, &keep, why, sizeof why);
         w->job = ok ? http_job_start(provider_base_url(p), provider_chat_path(p), body, hdrs) : NULL;
         if (ok) sb_free(&keep);
     } else {
@@ -2753,11 +2776,28 @@ static void worker_call(orch_run *r, int i) {
     else { printf("    " C_RED "[%d] ⎿ %s" C_RESET "\n", i + 1, why[0] ? why : "the model call could not be started"); task_end(w, T_FAILED, "failed: the model call could not be started"); }
 }
 
+/* /goal: a candidate is one of several at the same goal, each in a copy of the project of its own */
+static void goal_system(sbuf *sp, const orch_run *r, const orch_worker *w) {
+    const goal_ctx *g = r->goal;
+    sb_printf(sp, "You are a candidate agent of Corbie Nest (corbienest), a coding agent in the user's terminal. "
+                  "Several candidates work at the same goal at the same time, each in a copy of the project of its own, some of them on other models; "
+                  "the one whose result scores best is kept and the others are thrown away.\nWorking directory (your copy): %s\n", w->root);
+    sb_printf(sp, "The score is what the command `%s` prints in your copy once you are done: its last line is a number, and %s is better. "
+                  "The best score so far is %.6g.\n", g->spec->metric, g->spec->lower ? "lower" : "higher", g->base);
+    if (g->prior && *g->prior) sb_printf(sp, "\n%s\n", g->prior);
+    sb_puts(sp, "\nWork toward the goal in your copy: change what it needs, measure with the command yourself where you can, and try an approach that differs from the others'. "
+                "Do not ask questions; make a reasonable assumption and say which. Your write_file and edit_file refuse paths outside your copy, and bash runs in it, "
+                "but a shell command can still name a path outside it: do not.\n"
+                "End with ONE final message: what you changed, the score, and on the last line exactly one of `GOAL: REACHED` (you believe the goal is met), "
+                "`GOAL: IMPOSSIBLE <why>` (you are sure it cannot be met), or neither (you are not sure yet).\n");
+}
+
 static void worker_begin(orch_run *r, int i) {
     orch_worker *w = &r->w[i];
     w->msgs = cJSON_CreateArray(); w->attempt = 1;
     sbuf sp; sb_init(&sp);
-    sb_printf(&sp, "You are a worker agent of Corbie Nest (corbienest), a coding agent in the user's terminal. An orchestrator split the user's request into tasks; "
+    if (r->goal) goal_system(&sp, r, w);
+    else sb_printf(&sp, "You are a worker agent of Corbie Nest (corbienest), a coding agent in the user's terminal. An orchestrator split the user's request into tasks; "
                    "you do ONE of them, in the user's project, with your tools.\nWorking directory: %s\n"
                    "Do this task and only this task — not the others; some of them may be under way at this very moment, in files that are not yours to touch. "
                    "Read the code before you change it (batch independent reads and searches into one reply rather than one per turn), change no more than the task needs, "
@@ -2769,9 +2809,9 @@ static void worker_begin(orch_run *r, int i) {
     cJSON *m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "system"); cJSON_AddStringToObject(m, "content", sp.data); cJSON_AddItemToArray(w->msgs, m);
     sb_free(&sp);
     sbuf u; sb_init(&u);
-    sb_puts(&u, "# The user's request (for context — you do one part of it)\n"); sb_put_cut(&u, r->request, 4096);
+    sb_puts(&u, r->goal ? "# The goal (you are one of several candidates at it)\n" : "# The user's request (for context — you do one part of it)\n"); sb_put_cut(&u, r->request, 4096);
     bool any = false;
-    for (int j = 0; j < r->nt; j++) {   /* what is finished as this one starts, in the plan's order */
+    for (int j = 0; !r->goal && j < r->nt; j++) {   /* what is finished as this one starts, in the plan's order */
         if (!task_ok(&r->w[j])) continue;
         if (!any) { sb_puts(&u, "\n\n# Done before you\n"); any = true; }
         sb_printf(&u, "## Task %d: %s — %s\n", j + 1, r->tasks[j].title, r->w[j].status); sb_put_cut(&u, r->w[j].out.data ? r->w[j].out.data : "", 2048); sb_puts(&u, "\n\n");
@@ -2822,15 +2862,37 @@ static void worker_review(orch_run *r, int i) {
     free(verdict);
 }
 
+/* /goal: a candidate has reported. Its work is committed in its copy (the commit is what it is kept by), and the metric is run there. */
+static void goal_finish(orch_run *r, int i) {
+    orch_worker *w = &r->w[i];
+    w->verdict = goal_verdict(w->out.data, w->why, sizeof w->why);
+    sbuf o; sb_init(&o); bool intr = false;
+    tools_shell_in(w->root, GOAL_GIT "git add -A >/dev/null 2>&1 && " GOAL_GIT "git commit -q --no-verify --allow-empty -m corbie-goal-candidate >/dev/null 2>&1; git rev-parse --verify -q HEAD 2>/dev/null",
+                   120, &o, &intr, "committing a candidate", "committing");
+    if (intr) { r->aborted = true; task_end(w, T_STOPPED, "stopped by the user before it was measured"); sb_free(&o); return; }
+    size_t n = o.data ? strlen(o.data) : 0;
+    while (n && (o.data[n - 1] == '\n' || o.data[n - 1] == ' ')) n--;
+    if (n < 40) { printf("    " C_RED "[%d] ⎿ its work could not be committed" C_RESET "\n", i + 1); sb_free(&o); task_end(w, T_FAILED, "failed: its work could not be committed"); return; }
+    snprintf(w->commit, sizeof w->commit, "%.*s", (int)(n < 63 ? n : 63), o.data);
+    sb_clear(&o);
+    int rc = tools_shell_in(w->root, r->goal->spec->metric, GOAL_METRIC_TIMEOUT, &o, &intr, "measuring a candidate", "measuring");
+    if (intr) { r->aborted = true; task_end(w, T_STOPPED, "stopped by the user before it was measured"); sb_free(&o); return; }
+    w->scored = rc == 0 && goal_number(o.data, &w->metric);
+    if (w->scored) printf("    " C_DIM "[%d] ⎿ score %.6g" C_RESET "\n", i + 1, w->metric);
+    else printf("    " C_RED "[%d] ⎿ no score: the metric printed no number" C_RESET "\n", i + 1);
+    sb_free(&o);
+    task_end(w, w->scored ? T_ACCEPTED : T_FAILED, w->scored ? "scored" : "no score");
+}
+
 /* the worker's model call has come back: run the tools it asked for and call again, or take its report to the review */
 static void worker_step(orch_run *r, int i) {
     orch_worker *w = &r->w[i];
     sbuf body; sb_init(&body); http_result res;
     int rc = http_job_finish(w->job, &body, &res);
     w->job = NULL;
-    ratelimit_set(g_cfg.model, &res.rl);   /* (a worker's call is a call of the main model) */
+    ratelimit_set(worker_model(w), &res.rl);   /* (a worker's call is a call of its own model: the main one unless /goal named another) */
     chat_stats st; char err[512] = "";
-    cJSON *reply = rc == 0 ? (model_hosted() ? provider_turn_reply(g_cfg.model, body.data, res.status, &st, err, sizeof err)
+    cJSON *reply = rc == 0 ? (worker_remote(w) ? provider_turn_reply(worker_model(w), body.data, res.status, &st, err, sizeof err)
                                             : ollama_chat_reply(body.data, res.status, true, &st, err, sizeof err)) : NULL;
     if (rc != 0) snprintf(err, sizeof err, "%s", res.err);
     sb_free(&body);
@@ -2843,7 +2905,7 @@ static void worker_step(orch_run *r, int i) {
         sb_clear(&w->out); sb_puts(&w->out, cJSON_IsString(content) && content->valuestring[0] ? content->valuestring : "(it returned an empty report)");
         printf("    " C_DIM "[%d] ⎿ report after %d tool round%s:" C_RESET "\n", i + 1, w->rounds, w->rounds == 1 ? "" : "s");
         print_result_preview(w->out.data, 6);
-        worker_review(r, i);
+        if (r->goal) goal_finish(r, i); else worker_review(r, i);
         return;
     }
     if (w->rounds >= SUBAGENT_ITERS) {
@@ -2865,8 +2927,10 @@ static void worker_step(orch_run *r, int i) {
         printf("    " C_DIM "[%d] ⎿ %s%s%s%s" C_RESET "\n", i + 1, name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
         sbuf o; sb_init(&o);
         g_session.tool_calls++;
+        bool entered = w->root && tools_enter(w->root);   /* a /goal candidate's calls run in its copy, and stay in it */
         if (!strcmp(name, "task") || !strcmp(name, "advisor")) sb_printf(&o, "error: %s is not available to a worker; do the task with the other tools and report", name);
         else tools_execute(name, args, &o);
+        if (entered) tools_leave();
         cJSON_AddItemToArray(w->msgs, tool_result_message(name, tool_call_id(call), o.data ? o.data : ""));
         sb_free(&o);
         if (parsed) cJSON_Delete(parsed);
@@ -2996,7 +3060,7 @@ static int cmd_orchestrate(const char *arg) {
 
         if (go) {
             int maxpar = g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT;
-            orch_run run = { arg, tasks, xmalloc(sizeof(orch_worker) * (size_t)nt), nt, cJSON_CreateArray(), first, budget, false };
+            orch_run run = { arg, tasks, xmalloc(sizeof(orch_worker) * (size_t)nt), nt, cJSON_CreateArray(), first, budget, false, NULL };
             memset(run.w, 0, sizeof(orch_worker) * (size_t)nt);
             for (int i = 0; i < nt; i++) { sb_init(&run.w[i].out); sb_init(&run.w[i].objection); }
             /* what a worker may call: everything but another agent and the advisor (its reviewer is the orchestrator) */
@@ -3033,6 +3097,306 @@ static int cmd_orchestrate(const char *arg) {
     session_save();
     memory_note(first, aborted);
     return aborted ? -1 : 0;
+}
+
+/* ---------- /goal: candidates in git worktrees, a metric decides ----------
+ * /goal "METRIC" [min|max] [-n ROUNDS] [-k CANDIDATES] [-m MODEL,...] GOAL. The metric is a shell
+ * command whose last line is a number. The work is snapshotted first — the working tree as it is,
+ * uncommitted and untracked files included, in a commit made through a temporary index, so neither
+ * the index nor HEAD is touched — and every candidate starts from that snapshot in a git worktree of
+ * its own under the config directory. The candidates of a round run on the orchestrate scheduler
+ * (orch_schedule, worker_*), each on its model (-m, round-robin), with its tool calls inside its copy
+ * (tools_enter). When a candidate reports, its work is committed and the metric run in its copy; the
+ * best score that beats the best so far is kept and the next round starts from it, the others being told
+ * what they did. The run stops at ROUNDS, when a kept candidate says GOAL: REACHED and the metric agrees,
+ * or when every candidate of a round says GOAL: IMPOSSIBLE. The kept result is applied to the working
+ * tree as uncommitted changes — only if the tree still is the snapshot — and is also a branch
+ * (corbie-goal/ID). Every worktree is removed on the way out. Bash is the one escape: a shell command
+ * can name a path outside the copy, and nothing stops it. */
+static void goal_usage(void) {
+    printf("usage: /goal \"METRIC\" [min|max] [-n ROUNDS] [-k CANDIDATES] [-m MODEL,MODEL,...] GOAL\n"
+           C_DIM "  METRIC is a shell command whose last line is a number (higher is better; min: lower). Each round, CANDIDATES copies of the project (git worktrees)"
+           " try the goal at once, on the models named (round-robin); the best score is kept. A candidate may say the goal is IMPOSSIBLE." C_RESET "\n");
+}
+
+/* a string as one shell word */
+static void sbq(sbuf *b, const char *s) {
+    sb_putc(b, '\'');
+    for (; *s; s++) { if (*s == '\'') sb_puts(b, "'\\''"); else sb_putc(b, *s); }
+    sb_putc(b, '\'');
+}
+
+/* a copy of s without its trailing newlines and blanks, malloc'd */
+static char *goal_trim(const char *s) {
+    size_t n = s ? strlen(s) : 0;
+    while (n && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
+    char *t = xmalloc(n + 1); memcpy(t, s ? s : "", n); t[n] = 0;
+    return t;
+}
+
+/* git worktree remove of one copy, and nothing else */
+static void goal_remove_copy(const char *top, const char *dir) {
+    sbuf c, o; sb_init(&c); sb_init(&o); bool intr = false;
+    sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " worktree remove --force "); sbq(&c, dir); sb_puts(&c, " >/dev/null 2>&1");
+    tools_shell_in(NULL, c.data, 120, &o, &intr, "removing a copy", "worktree");
+    sb_free(&c); sb_free(&o);
+}
+
+/* the metric of a commit, in a copy of its own that is made and removed here: 1 scored, 0 not, -1 stopped */
+static int goal_measure(const char *top, const char *commit, const char *dir, const goal_spec *spec, const char *what, double *v) {
+    sbuf c, o; sb_init(&c); sb_init(&o); bool intr = false;
+    sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " worktree add --detach "); sbq(&c, dir); sb_putc(&c, ' '); sbq(&c, commit); sb_puts(&c, " >/dev/null 2>&1");
+    if (tools_shell_in(NULL, c.data, 120, &o, &intr, what, "worktree") != 0) { sb_free(&c); sb_free(&o); printf("  " C_RED "⎿ cannot make a copy to measure in" C_RESET "\n"); return 0; }
+    sb_clear(&o);
+    int rc = tools_shell_in(dir, spec->metric, GOAL_METRIC_TIMEOUT, &o, &intr, what, "measuring");
+    int got = intr ? -1 : (rc == 0 && goal_number(o.data, v)) ? 1 : 0;
+    sb_free(&o);
+    goal_remove_copy(top, dir);
+    sb_free(&c);
+    return got;
+}
+
+static int cmd_goal(const char *arg) {
+    if (!arg || !*arg) { goal_usage(); return 0; }
+    goal_spec spec; char err[200];
+    if (!goal_parse(arg, &spec, err, sizeof err)) { printf(C_RED "✗ %s" C_RESET "\n", err); goal_usage(); return 0; }
+    if (!is_dir(".git")) { printf(C_DIM "/goal needs a git repository: its candidates are git worktrees of it" C_RESET "\n"); goal_spec_free(&spec); return 0; }
+    if (!g_model_tools || g_cfg.no_tools) { printf(C_DIM "/goal needs tools: the candidates work with them (/tools, or another /model)" C_RESET "\n"); goal_spec_free(&spec); return 0; }
+    /* every model named must be usable now: a hosted one has its key, a local one is on the server */
+    model_info pre[ORCH_WORKERS_MAX];
+    memset(pre, 0, sizeof pre);
+    for (int k = 0; k < spec.nmodels; k++) {
+        const char *m = spec.models[k];
+        if (provider_find(m, NULL)) {
+            const char *hd[4]; sbuf keep; char why[256]; sb_init(&keep);
+            bool ok = provider_call_headers(m, hd, &keep, why, sizeof why);
+            sb_free(&keep);
+            if (!ok) { printf(C_RED "✗ %s: %s" C_RESET "\n", m, why); goal_spec_free(&spec); return 0; }
+        } else if (ollama_model_show(m, &pre[k]) != 0) { printf(C_RED "✗ %s: ollama does not have that model" C_RESET "\n", m); goal_spec_free(&spec); return 0; }
+    }
+
+    char id[64]; snprintf(id, sizeof id, "%ld-%ld", (long)time(NULL), (long)getpid());
+    sbuf rb; sb_init(&rb); sb_printf(&rb, "%s/goals/%s", config_dir(), id); char *root = sb_detach(&rb);
+    int first = begin_request();
+    add_message("user", spec.task);
+    sbuf o, c; sb_init(&o); sb_init(&c); bool intr = false;
+    sb_puts(&c, "mkdir -p "); sbq(&c, root);
+    tools_shell_in(NULL, c.data, 30, &o, &intr, "preparing the goal", "goal");
+    sb_clear(&c); sb_clear(&o);
+
+    /* the snapshot: the tree as it is, in a commit of its own */
+    sb_puts(&c, "git rev-parse --show-toplevel");
+    int rc = tools_shell_in(NULL, c.data, 30, &o, &intr, "reading the repository", "repository");
+    char *top = goal_trim(rc == 0 ? o.data : "");
+    sb_clear(&c); sb_clear(&o);
+    char tree[64] = "", snap[64] = "";
+    if (rc == 0 && top[0]) {
+        sb_puts(&c, "cd "); sbq(&c, top);
+        sb_puts(&c, " && T=$(mktemp -u) && GIT_INDEX_FILE=$T git add -A && TREE=$(GIT_INDEX_FILE=$T git write-tree) && rm -f $T && P= && if git rev-parse -q --verify HEAD >/dev/null; then P='-p HEAD'; fi"
+                    " && S=$(" GOAL_GIT "git commit-tree $TREE $P -m corbie-goal-snapshot) && echo \"$TREE $S\"");
+        rc = tools_shell_in(NULL, c.data, 300, &o, &intr, "snapshotting the working tree", "snapshot");
+        if (rc != 0 || sscanf(o.data ? o.data : "", "%63s %63s", tree, snap) != 2) rc = -1;
+    }
+    sb_clear(&c); sb_clear(&o);
+    if (rc != 0 || !snap[0]) {
+        printf(C_RED "✗ cannot snapshot the working tree of this repository" C_RESET "\n");
+        sb_puts(&c, "rm -rf "); sbq(&c, root); tools_shell_in(NULL, c.data, 60, &o, &intr, "cleaning up", "goal");
+        sb_free(&c); sb_free(&o); free(top); free(root); goal_spec_free(&spec);
+        add_message("assistant", "[/goal: the working tree could not be snapshotted; nothing was run.]");
+        return 0;
+    }
+    sb_free(&c); sb_free(&o);
+    printf("  " C_CYAN "⤷ goal" C_RESET " " C_BOLD "%s" C_RESET C_DIM " · %s %s · %d round%s × %d candidate%s · esc stops it" C_RESET "\n",
+           spec.task, spec.lower ? "min" : "max", spec.metric, spec.rounds, spec.rounds == 1 ? "" : "s", spec.cands, spec.cands == 1 ? "" : "s");
+
+    char dirbuf[1200];
+    snprintf(dirbuf, sizeof dirbuf, "%s/base", root);
+    double base = 0;
+    int got = goal_measure(top, snap, dirbuf, &spec, "measuring the baseline", &base);
+    bool aborted = got < 0;
+    if (got == 0 && !aborted) printf(C_RED "✗ the metric printed no number on the working tree as it is" C_RESET "\n");
+    if (got == 1) printf("  " C_DIM "⎿ baseline score %.6g" C_RESET "\n", base);
+    double best = base, base0 = base;
+    char cur[64], winner[64] = ""; snprintf(cur, sizeof cur, "%s", snap);
+    sbuf prior; sb_init(&prior);
+    bool stop = aborted || got != 1;
+    int K = spec.cands;
+    for (int round = 1; round <= spec.rounds && !stop; round++) {
+        printf("  " C_CYAN "⤷ goal round %d/%d" C_RESET C_DIM " · %d candidate%s from %.12s · best %.6g" C_RESET "\n", round, spec.rounds, K, K == 1 ? "" : "s", cur, best);
+        orch_task *tasks = xmalloc(sizeof *tasks * (size_t)K);
+        orch_worker *ws = xmalloc(sizeof *ws * (size_t)K);
+        memset(ws, 0, sizeof *ws * (size_t)K);
+        char **dirs = xmalloc(sizeof *dirs * (size_t)K);
+        goal_ctx gc = { &spec, best, prior.len ? prior.data : NULL };
+        for (int k = 0; k < K; k++) {
+            const char *model = spec.nmodels ? spec.models[k % spec.nmodels] : NULL;
+            if (model && !strcmp(model, g_cfg.model)) model = NULL;
+            char title[200];
+            snprintf(title, sizeof title, "candidate %d of %d%s%s", k + 1, K, model ? " on " : "", model ? model : "");
+            tasks[k].title = xstrdup(title);
+            tasks[k].body = xstrdup("Make the goal true in your copy, as the goal describes it, and report.");
+            tasks[k].after = 0;
+            ws[k].model = model;
+            if (model && !provider_find(model, NULL)) {
+                int idx = k % spec.nmodels;
+                ws[k].info = pre[idx]; ws[k].has_info = true;
+            }
+            dirs[k] = xmalloc(1200);
+            snprintf(dirs[k], 1200, "%s/r%d-%d", root, round, k + 1);
+            sb_clear(&c);
+            sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " worktree add --detach "); sbq(&c, dirs[k]); sb_putc(&c, ' '); sbq(&c, cur); sb_puts(&c, " >/dev/null 2>&1");
+            if (tools_shell_in(NULL, c.data, 120, &o, &intr, "making a candidate's copy", "worktree") != 0) {
+                printf("  " C_RED "⎿ candidate %d: its copy could not be made" C_RESET "\n", k + 1);
+                ws[k].state = T_FAILED; ws[k].status = "failed: its copy could not be made";
+                free(dirs[k]); dirs[k] = NULL;
+                continue;
+            }
+            ws[k].root = dirs[k];
+            sb_clear(&o);
+        }
+        orch_run run = { .request = spec.task, .tasks = tasks, .w = ws, .nt = K, .tools = cJSON_CreateArray(), .first = first, .goal = &gc };
+        cJSON *t;
+        cJSON_ArrayForEach(t, g_tools) {
+            cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function"), *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+            if (cJSON_IsString(nm) && strcmp(nm->valuestring, "task") && strcmp(nm->valuestring, "advisor")) cJSON_AddItemReferenceToArray(run.tools, t);
+        }
+        orch_schedule(&run, K);
+        if (run.aborted) aborted = true;
+
+        /* the round's outcome: the best candidate that beats the best so far, and whether all of them gave up */
+        int win = -1; bool all_imp = true;
+        sb_clear(&prior); sb_puts(&prior, "# The candidates of the last round (the scores are the metric's)\n");
+        for (int k = 0; k < K; k++) {
+            orch_worker *w = &ws[k];
+            if (w->verdict != GOAL_IMPOSSIBLE) all_imp = false;
+            if (w->scored && goal_better(w->metric, best, spec.lower) && (win < 0 || goal_better(w->metric, ws[win].metric, spec.lower))) win = k;
+            char sc[48]; if (w->scored) snprintf(sc, sizeof sc, "score %.6g", w->metric); else snprintf(sc, sizeof sc, "no score");
+            sb_printf(&prior, "- candidate %d (%s): %s", k + 1, worker_model(w), sc);
+            if (w->verdict == GOAL_IMPOSSIBLE) sb_printf(&prior, ", it says the goal is impossible: %s", w->why);
+            if (w->out.len) { sb_puts(&prior, " — "); sb_put_cut(&prior, w->out.data, 400); }
+            sb_putc(&prior, '\n');
+        }
+        bool reached = false;
+        if (win >= 0) {
+            snprintf(winner, sizeof winner, "%s", ws[win].commit);
+            snprintf(cur, sizeof cur, "%s", ws[win].commit);
+            best = ws[win].metric;
+            reached = ws[win].verdict == GOAL_REACHED;
+            printf("  " C_GREEN "⎿ candidate %d kept: score %.6g" C_RESET "\n", win + 1, best);
+        } else if (!aborted) printf("  " C_YELLOW "⎿ no candidate beat %.6g: the run stops" C_RESET "\n", best);
+        if (reached) { printf("  " C_GREEN "⎿ the kept candidate says the goal is reached, and its score agrees" C_RESET "\n"); stop = true; }
+        if (all_imp) { printf("  " C_YELLOW "⎿ every candidate says the goal is IMPOSSIBLE" C_RESET "\n"); stop = true; }
+        if (win < 0 || aborted) stop = true;
+
+        for (int k = 0; k < K; k++) {
+            if (dirs[k]) goal_remove_copy(top, dirs[k]);
+            free(dirs[k]);
+            free(tasks[k].title); free(tasks[k].body);
+            if (ws[k].msgs) cJSON_Delete(ws[k].msgs);
+            sb_free(&ws[k].out); sb_free(&ws[k].objection);
+        }
+        free(dirs); free(ws); free(tasks); cJSON_Delete(run.tools);
+    }
+
+    /* the kept result: measured once more, applied as uncommitted changes if the tree is still the snapshot, and kept as a branch */
+    sbuf report; sb_init(&report);
+    char id_branch[96]; snprintf(id_branch, sizeof id_branch, "corbie-goal/%s", id);
+    bool kept = winner[0] != 0 && !aborted;
+    if (kept) {
+        double again = 0;
+        snprintf(dirbuf, sizeof dirbuf, "%s/check", root);
+        int g2 = goal_measure(top, winner, dirbuf, &spec, "checking the kept candidate", &again);
+        if (g2 == 1 && goal_better(again, base0, spec.lower)) best = again;
+        else { printf("  " C_RED "⎿ the kept candidate did not hold up on the second measurement: nothing is applied" C_RESET "\n"); kept = false; }
+    }
+    int applied = 0;
+    if (kept) {
+        sb_clear(&c); sb_clear(&o);
+        sb_puts(&c, "cd "); sbq(&c, top);
+        sb_puts(&c, " && T=$(mktemp -u) && GIT_INDEX_FILE=$T git add -A && GIT_INDEX_FILE=$T git write-tree; rm -f $T");
+        tools_shell_in(NULL, c.data, 300, &o, &intr, "checking the working tree", "checking");
+        bool same = o.data && !strncmp(o.data, tree, strlen(tree)) && strlen(tree) > 0;
+        sb_clear(&c); sb_clear(&o);
+        if (!same) printf("  " C_YELLOW "⎿ the working tree changed during the goal: nothing is applied; the result is branch %s" C_RESET "\n", id_branch);
+        else {
+            sb_puts(&c, "cd "); sbq(&c, top); sb_puts(&c, " && git diff --name-only "); sb_puts(&c, snap); sb_putc(&c, ' '); sb_puts(&c, winner);
+            tools_shell_in(NULL, c.data, 120, &o, &intr, "reading the result", "result");
+            for (char *p = o.data; p && *p; ) {   /* each file the result changes is saved first, so /rewind undoes the goal */
+                char *e = strchr(p, '\n'); size_t len = e ? (size_t)(e - p) : strlen(p);
+                if (len) { char *abs = xmalloc(strlen(top) + len + 2); sprintf(abs, "%s/%.*s", top, (int)len, p); tools_checkpoint_path(abs); free(abs); }
+                if (!e) break;
+                p = e + 1;
+            }
+            sb_clear(&c); sb_clear(&o);
+            sb_puts(&c, "cd "); sbq(&c, top); sb_puts(&c, " && git diff --binary "); sb_puts(&c, snap); sb_putc(&c, ' '); sb_puts(&c, winner); sb_puts(&c, " | git apply");
+            rc = tools_shell_in(NULL, c.data, 300, &o, &intr, "applying the kept candidate", "applying");
+            if (rc == 0) {
+                applied = 1;
+                printf("  " C_GREEN "✓ applied as uncommitted changes" C_RESET C_DIM " · %s" C_RESET "\n", id_branch);
+            } else printf("  " C_RED "⎿ the result did not apply cleanly: it is branch %s" C_RESET "\n", id_branch);
+        }
+        sb_clear(&c); sb_clear(&o);
+        sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " branch "); sb_puts(&c, id_branch); sb_putc(&c, ' '); sb_puts(&c, winner);
+        tools_shell_in(NULL, c.data, 60, &o, &intr, "keeping the result", "branch");
+        sb_clear(&c); sb_clear(&o);
+    }
+    printf("%s%s goal: score %.6g → %.6g%s" C_RESET "\n", aborted ? C_YELLOW : applied ? C_GREEN : C_YELLOW, aborted ? "!" : applied ? "✓" : "·",
+           base0, best, aborted ? " — the run was stopped" : applied ? "" : " — nothing applied");
+    sb_printf(&report, "[/goal: %s, %d round%s × %d candidate%s; the score went from %.6g to %.6g%s%s. %s]\n",
+              spec.task, spec.rounds, spec.rounds == 1 ? "" : "s", K, K == 1 ? "" : "s", base0, best,
+              applied ? "; the result is applied to the working tree as uncommitted changes and kept as branch " : "", applied ? id_branch : "",
+              aborted ? "The run was stopped." : applied ? "" : "Nothing was applied.");
+    add_message("assistant", report.data);
+    sb_free(&report);
+
+    /* cleanup on every way out: the copies, the snapshot's worktrees, the folder */
+    sb_clear(&c); sb_clear(&o);
+    sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " worktree prune >/dev/null 2>&1; rm -rf "); sbq(&c, root);
+    tools_shell_in(NULL, c.data, 120, &o, &intr, "cleaning up", "goal");
+    sb_free(&c); sb_free(&o); sb_free(&prior);
+    free(top); free(root); goal_spec_free(&spec);
+    session_save();
+    memory_note(first, aborted);
+    return aborted ? -1 : 0;
+}
+
+/* ---------- /btw: a side question, answered from the conversation and not kept in it ----------
+ * The question goes to the model with the conversation so far as its context (the same prefix, so the
+ * prompt cache serves most of it), and the answer is printed. Nothing joins g_messages, the session is
+ * not saved and the memory is not updated for it. Tools are offered as in a turn, so the prompt is the
+ * same, but a tool call in the answer is not run: the answer is text. */
+static int cmd_btw(const char *arg) {
+    if (!arg || !*arg) { printf(C_DIM "usage: /btw QUESTION — a side question: the model answers from the conversation so far, and the answer is not kept in it" C_RESET "\n"); return 0; }
+    cJSON *msgs = messages_with_system();
+    sbuf q; sb_init(&q);
+    sb_puts(&q, "(A side question, asked aside. Answer it briefly, from what has been done so far. Do not call tools.)\n\n");
+    sb_puts(&q, arg);
+    cJSON *u = cJSON_CreateObject();
+    cJSON_AddStringToObject(u, "role", "user");
+    cJSON_AddStringToObject(u, "content", q.data);
+    sb_free(&q);
+    cJSON_AddItemToArray(msgs, u);
+    cJSON *tools = g_model_tools && !g_cfg.no_tools ? tools_for_mode() : NULL;
+    printf(C_CYAN "? " C_RESET C_BOLD "%s" C_RESET "\n", arg);
+    chat_stats st; bool aborted = false;
+    ollama_call.busy = "side question";
+    cJSON *reply = model_chat(msgs, tools, &st, &aborted);
+    ollama_call_reset();
+    if (tools && tools != g_tools) cJSON_Delete(tools);
+    cJSON_Delete(msgs);
+    account(&st);
+    term_status_refresh();
+    if (!reply) {
+        if (!aborted) printf(C_RED "✗ no answer" C_RESET "\n");
+        return aborted ? -1 : 0;
+    }
+    cJSON *content = cJSON_GetObjectItemCaseSensitive(reply, "content");
+    cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
+    if (calls && cJSON_GetArraySize(calls) > 0) printf(C_DIM "(it asked for a tool; /btw answers in text, so none was run)" C_RESET "\n");
+    else if (!cJSON_IsString(content) || !content->valuestring[0]) printf(C_DIM "(no answer)" C_RESET "\n");
+    cJSON_Delete(reply);
+    print_stats(&st);
+    return 0;
 }
 
 /* ---------- /init: have the model write AGENTS.md ---------- */
@@ -3117,6 +3481,9 @@ static void cmd_help(void) {
            "                        no argument opens a picker, default leaves it to the model. Kept per model; a level is sent with every call\n"
            "  /orchestrate REQUEST  the advisor model in charge: it plans the request as tasks, this model does them as workers with a fresh context\n"
            "                        each — those that do not wait for each other at the same time — and the advisor reviews every task's report and diff\n"
+           "  /goal \"METRIC\" [min|max] [-n R] [-k K] [-m MODEL,...] GOAL\n"
+           "                        candidates in git worktrees race to the goal, each on its model; the metric's best is kept as uncommitted changes\n"
+           "  /btw QUESTION         a side question: the model answers from the conversation so far; the answer is printed, not kept in it\n"
            "  /workers [N]          how many tasks of /orchestrate may run at the same time (the model calls, each on a thread; default 3, 1 = in turn)\n"
            "  /advisor [MODEL|off]  a stronger model the agent may consult when the work is hard (the advisor tool): a bigger local model, a cloud one\n"
            "                        (NAME-cloud, after `ollama signin`) or a hosted API: xai:MODEL, openai:MODEL, anthropic:MODEL (key from XAI_API_KEY,\n"
@@ -3607,6 +3974,8 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/rewind")) return cmd_rewind();
     else if (!strcmp(cmd, "/init")) return cmd_init();
     else if (!strcmp(cmd, "/orchestrate")) return cmd_orchestrate(arg);
+    else if (!strcmp(cmd, "/goal")) return cmd_goal(arg);
+    else if (!strcmp(cmd, "/btw")) return cmd_btw(arg);
     else if (!strcmp(cmd, "/status") || !strcmp(cmd, "/cost")) cmd_status();
     else if (!strcmp(cmd, "/system")) {
         if (!arg) printf("extra system prompt: %s\n", g_cfg.system_prompt ? g_cfg.system_prompt : C_DIM "(none)" C_RESET);

@@ -1192,6 +1192,13 @@ static void test_goal(void) {
     CHECK(!goal_parse("\"cat score\" -k 1 x", &g, err, sizeof err) && strstr(err, "-k"));
     CHECK(!goal_parse("\"cat score\" -k many x", &g, err, sizeof err) && strstr(err, "number"));
     CHECK(!goal_parse("   ", &g, err, sizeof err) && strstr(err, "metric"));
+    CHECK(goal_parse("\"make bench\" -m xai:grok-4.7,deepseek-chat,claude-opus-5 -k 3 faster", &g, err, sizeof err));
+    CHECK(g.nmodels == 3 && !strcmp(g.models[0], "xai:grok-4.7") && !strcmp(g.models[1], "deepseek-chat") && !strcmp(g.models[2], "claude-opus-5") && g.cands == 3);
+    CHECK_STR(g.task, "faster");
+    goal_spec_free(&g);
+    CHECK(!goal_parse("\"x\" -m a,,b go", &g, err, sizeof err) && strstr(err, "empty model"));
+    CHECK(!goal_parse("\"x\" -m go", &g, err, sizeof err) && strstr(err, "no goal"));   /* -m takes the next word as its list: no goal is left */
+    CHECK(!goal_parse("\"x\" -m", &g, err, sizeof err) && strstr(err, "-m needs"));
     CHECK(!goal_parse("\"cat score\"   \n", &g, err, sizeof err) && strstr(err, "no goal"));
     double v;
     CHECK(goal_number("warming up\n1.5 s\n  42.25  \n\n", &v) && v == 42.25);

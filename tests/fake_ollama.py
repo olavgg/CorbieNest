@@ -49,6 +49,7 @@ PROVIDER_KEY = "test-key"
 ADAPTIVE = {"thinking": {"supported": True, "types": {"enabled": {"supported": False}, "adaptive": {"supported": True}}},
             "effort": dict({"supported": True}, **{l: {"supported": True} for l in ("low", "medium", "high", "xhigh", "max")})}
 BUDGET = {"thinking": {"supported": True, "types": {"enabled": {"supported": True}, "adaptive": {"supported": False}}}, "effort": {"supported": False}}
+SCORES = {"grok": 9, "deepseek": 7, "kimi": 3}   # what TOOL_SCORE writes, by the model's name (5 otherwise)
 PROVIDER_MODELS = {
     "xai": {"grok-fake": {}},
     "openai": {"gpt-fake": {}},   # takes reasoning_effort up to high, like the gpt-5 family
@@ -328,6 +329,13 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "printf 'fold-line-%s\\n' 1 2 3 4 5"}}}])
         yield chunk(model, done=True)
         return
+    if "TOOL_SCORE" in text:   # a /goal candidate: writes the score file, then reports
+        if last["role"] == "tool":
+            yield chunk(model, "Tool said: " + str(last["content"]).strip().splitlines()[0][:60])
+        else:
+            yield chunk(model, tool_calls=[{"function": {"name": "write_file", "arguments": {"path": "score", "content": "5\n"}}}])
+        yield chunk(model, done=True)
+        return
     if "TOOL_BASH" in text:
         yield chunk(model, "Running it.")
         yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "echo hello-from-tool"}}}])
@@ -450,8 +458,9 @@ class H(BaseHTTPRequestHandler):
         if prov == "anthropic":
             if rest != "/messages": return self._json(404, {"type": "error", "error": {"type": "not_found_error", "message": "Not found"}})
             return self._messages(model, req)
+        if "tools" in req: return self._cc_turn(prov, model, req)   # a worker's turn (the tool calls of /goal)
         if rest != "/chat/completions": return self._json(404, {"error": {"message": "Unknown request URL"}})
-        if "max_tokens" in req:
+        if prov == "openai" and "max_tokens" in req:
             return self._json(400, {"error": {"message": "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."}})
         eff = req.get("reasoning_effort")
         if eff is not None and eff not in EFFORTS[prov]:
@@ -465,6 +474,23 @@ class H(BaseHTTPRequestHandler):
                                 "choices": [{"index": 0, "message": msg, "finish_reason": why}],
                                 "usage": dict({"prompt_tokens": 2000, "completion_tokens": 150, "total_tokens": 2150},
                                               **({"prompt_tokens_details": {"cached_tokens": 1500}} if "CACHE" in brief else {}))})
+    def _cc_turn(self, prov, model, req):
+        """A worker's Chat Completions turn: TOOL_SCORE writes the score file (the score is the model's own, see SCORES), then reports."""
+        msgs = req.get("messages") or []
+        last = msgs[-1] if msgs else {}
+        text = "\n".join(m["content"] for m in msgs if m.get("role") in ("user", "system") and isinstance(m.get("content"), str))
+        if last.get("role") == "tool":
+            first = str(last.get("content") or "").strip().splitlines()[:1]
+            msg, why = {"role": "assistant", "content": "Tool said: " + (first[0][:60] if first else "")}, "stop"
+        elif "TOOL_SCORE" in text:
+            score = next((v for k, v in SCORES.items() if k in model), 5)
+            msg = {"role": "assistant", "content": "", "tool_calls": [{"id": "call_score_1", "type": "function",
+                   "function": {"name": "write_file", "arguments": json.dumps({"path": "score", "content": f"{score}\n"})}}]}
+            why = "tool_calls"
+        else:
+            msg, why = {"role": "assistant", "content": "Done."}, "stop"
+        return self._json(200, {"id": "chatcmpl-fake", "object": "chat.completion", "model": model, "choices": [{"index": 0, "message": msg, "finish_reason": why}],
+                                "usage": {"prompt_tokens": 120, "completion_tokens": 12, "total_tokens": 132}})
     def _messages(self, model, req):
         caps = PROVIDER_MODELS["anthropic"][model]["capabilities"]
         bad = lambda m: self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": m}})

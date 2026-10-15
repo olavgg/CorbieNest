@@ -619,6 +619,7 @@ typedef struct {
     int   rounds;      /* rounds of candidates, at most GOAL_ROUNDS_MAX */
     int   cands;       /* candidates per round, at most ORCH_WORKERS_MAX */
     char *task;        /* what the goal is (malloc'd) */
+    char **models; int nmodels;   /* -m a,b,c: candidate k runs models[k % nmodels]; none = the model in use for all (malloc'd) */
 } goal_spec;
 #define GOAL_ROUNDS_MAX 10
 enum { GOAL_NONE, GOAL_REACHED, GOAL_IMPOSSIBLE };

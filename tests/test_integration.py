@@ -10,7 +10,8 @@ import inspect, json, os, pty, re, select, shutil, socket, struct, subprocess, s
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BIN = os.path.join(HERE, "..", "corbienest")
+# CORBIE_BIN: run the suite on a copy of the binary, so a rebuild of the tree cannot pull it away mid-run
+BIN = os.environ.get("CORBIE_BIN") or os.path.join(HERE, "..", "corbienest")
 sys.path.insert(0, HERE)
 import fake_ollama
 
@@ -339,10 +340,10 @@ out, rc = run(["-m", "fake-coder:latest", "--draft", "x", "-p", "hi"]); check(rc
 # two, a line without its end — and CORBIE_TEST_READ=200 makes this one do the same, to see what a CI runner sees.
 READ_MAX = int(os.environ.get("CORBIE_TEST_READ", "65536"))
 class Session:
-    def __init__(self, args=(), cols=100, rows=40, env=None):
+    def __init__(self, args=(), cols=100, rows=40, env=None, cwd=None):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
-            os.chdir(WORK)
+            os.chdir(cwd or WORK)
             # the child inherits the shell's environment: a hosted key the shell exports must not reach it unless the test gives one
             for k in ("XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
                 if k not in (env or ENV): os.environ.pop(k, None)
@@ -2076,6 +2077,68 @@ check("temperature=0.3" in cfg and "keep_alive=30m" in cfg,
       f"and it is A's whole state: the last writer wins, which atomicity does not change: {cfg!r}")
 check(not [f for f in os.listdir(os.path.join(CFG, "corbienest")) if ".tmp" in f], "no temporary files left behind")
 ha.send("\x04"); hb.send("\x04"); ha.close(); hb.close()
+
+# ---------- /goal: candidates in git worktrees race to a metric ----------
+def make_repo():
+    d = tempfile.mkdtemp(prefix="crowgoal_")
+    subprocess.run(["git", "init", "-q", d], check=True)
+    for k, v in (("user.name", "t"), ("user.email", "t@t")): subprocess.run(["git", "-C", d, "config", k, v], check=True)
+    open(os.path.join(d, "README.md"), "w").write("hi\n")
+    subprocess.run(["git", "-C", d, "add", "-A"], check=True)
+    subprocess.run(["git", "-C", d, "commit", "-qm", "init"], check=True)
+    return d
+GOALENV = dict(ENVK, DEEPSEEK_API_KEY="test-key", DEEPSEEK_BASE_URL=f"{HOST}/deepseek", MOONSHOT_API_KEY="test-key", MOONSHOT_BASE_URL=f"{HOST}/kimi/v1")
+def provider_requests(): return json.loads(urllib.request.urlopen(f"{HOST}/_provider_requests").read())
+
+print("test goal: a local model and xAI race in worktrees; the higher score is applied, the copies are gone")
+repo = make_repo()
+g = Session(["--yolo", "-m", "fake-coder:latest"], cwd=repo, env=GOALENV)
+check(g.expect("❯", 20), "the goal session starts")
+g.send('/goal "cat score 2>/dev/null || echo 0" max -n 1 -k 2 -m fake-coder:latest,xai:grok-fake TOOL_SCORE raise the score\r')
+check(g.expect("goal: score 0 → 9", 180), f"the grok candidate scores 9 over the local one's 5 and is kept: {g.text()[-500:]!r}")
+g.close()
+score = open(os.path.join(repo, "score")).read() if os.path.exists(os.path.join(repo, "score")) else ""
+check(score == "9\n", f"the kept result is applied to the working tree: {score!r}")
+wt = subprocess.run(["git", "-C", repo, "worktree", "list"], capture_output=True, text=True).stdout.strip().splitlines()
+check(len(wt) == 1, f"no candidate's worktree is left behind: {wt}")
+br = subprocess.run(["git", "-C", repo, "branch", "--list", "corbie-goal/*"], capture_output=True, text=True).stdout.strip()
+check(br.startswith("* ") or br.startswith("  corbie-goal/"), f"the kept result is kept as a branch: {br!r}")
+left = os.listdir(os.path.join(CFG, "corbienest", "goals")) if os.path.isdir(os.path.join(CFG, "corbienest", "goals")) else []
+check(left == [], f"the goal's folder is removed: {left}")
+xai = [r for r in provider_requests() if r.get("provider") == "xai" and "tools" in r.get("body", {})]
+check(xai and xai[-1]["body"]["model"] == "grok-fake" and xai[-1]["body"]["messages"][0]["role"] == "system", f"the xAI candidate was sent a Chat Completions turn with its tools: {len(xai)} request(s)")
+
+print("test goal: DeepSeek and Kimi race; Kimi's K2 thinking is off, and the higher score wins")
+repo2 = make_repo()
+g = Session(["--yolo", "-m", "fake-coder:latest"], cwd=repo2, env=GOALENV)
+check(g.expect("❯", 20), "the second goal session starts")
+g.send('/goal "cat score 2>/dev/null || echo 0" max -n 1 -k 2 -m deepseek:deepseek-flash,kimi:kimi-k2.6 TOOL_SCORE raise the score\r')
+check(g.expect("goal: score 0 → 7", 180), f"DeepSeek's 7 beats Kimi's 3 and is kept: {g.text()[-500:]!r}")
+g.close()
+score2 = open(os.path.join(repo2, "score")).read() if os.path.exists(os.path.join(repo2, "score")) else ""
+check(score2 == "7\n", f"DeepSeek's result is applied: {score2!r}")
+kimi = [r["body"] for r in provider_requests() if r.get("provider") == "kimi" and "tools" in r.get("body", {})]
+check(kimi and kimi[-1].get("thinking") == {"type": "disabled"} and kimi[-1]["model"] == "kimi-k2.6", f"Kimi's K2 request has thinking disabled: {kimi[-1:]}")
+ds = [r for r in provider_requests() if r.get("provider") == "deepseek" and "tools" in r.get("body", {})]
+check(ds and "max_tokens" in ds[-1]["body"] and "max_completion_tokens" not in ds[-1]["body"], "DeepSeek gets max_tokens, not OpenAI's max_completion_tokens")
+shutil.rmtree(repo, ignore_errors=True); shutil.rmtree(repo2, ignore_errors=True)
+
+print("test interactive: /btw answers from the conversation so far, and nothing it says is kept in it")
+b = Session(["-m", "fake-coder:latest"])
+check(b.expect("❯", 20), "btw session starts")
+b.send("first remark\r"); check(b.expect("Echo: first remark"), "a normal exchange first")
+n_before = len(requests()[-1]["messages"])
+b.send("/btw what did I say first\r")
+check(b.expect("? what did I say first") and b.expect("Echo:", 20), f"the side question is asked and answered: {since_send(b)[-300:]!r}")
+side = requests()[-1]["messages"]
+check(side[-1]["role"] == "user" and "side question" in side[-1]["content"] and len(side) == n_before + 1, f"the side call carries the conversation and the question: {len(side)} messages")
+check("side question" not in json.dumps(requests()[-2]["messages"]), "the answer is not in the conversation the next request sends")
+b.expect("❯", 5)
+b.send("second remark\r"); check(b.expect("Echo: second remark"), "the next message goes on from the conversation as it was")
+nxt = requests()[-1]["messages"]
+check(not any("side question" in (m.get("content") or "") for m in nxt), "the side question is in no later request")
+check(sum(1 for m in nxt if m.get("role") == "user") == 2, f"and the conversation has only the two real messages: {[m.get('role') for m in nxt]}")
+b.close()
 
 shutil.rmtree(WORK, ignore_errors=True); shutil.rmtree(CFG, ignore_errors=True)
 print(f"{passed} checks passed, {failed} failed")

@@ -1849,6 +1849,25 @@ bool goal_parse(const char *arg, goal_spec *g, char *err, size_t errn) {
         size_t n = (size_t)(e - p);
         if (n == 3 && !strncmp(p, "min", 3)) { g->lower = true; p = e; continue; }
         if (n == 3 && !strncmp(p, "max", 3)) { g->lower = false; p = e; continue; }
+        if (n == 2 && !strncmp(p, "-m", 2)) {
+            const char *v = goal_skip_space(e), *ve = v;
+            while (*ve && *ve != ' ' && *ve != '\t') ve++;
+            if (ve == v) { snprintf(err, errn, "-m needs a list of models, a,b,c"); goal_spec_free(g); return false; }
+            int cnt = 1; for (const char *c = v; c < ve; c++) if (*c == ',') cnt++;
+            if (cnt > ORCH_WORKERS_MAX) { snprintf(err, errn, "-m: at most %d models", ORCH_WORKERS_MAX); goal_spec_free(g); return false; }
+            char **list = xmalloc(sizeof *list * (size_t)cnt); int k = 0;
+            for (const char *c = v; c <= ve; ) {
+                const char *comma = c; while (comma < ve && *comma != ',') comma++;
+                if (comma == c) { for (int j = 0; j < k; j++) free(list[j]); free(list); snprintf(err, errn, "-m: an empty model name in the list"); goal_spec_free(g); return false; }
+                list[k] = xmalloc((size_t)(comma - c) + 1); memcpy(list[k], c, (size_t)(comma - c)); list[k][comma - c] = 0; k++;
+                c = comma + 1;
+                if (comma == ve) break;
+            }
+            for (int j = 0; j < g->nmodels; j++) free(g->models[j]);
+            free(g->models);
+            g->models = list; g->nmodels = k;
+            p = ve; continue;
+        }
         if (n == 2 && (!strncmp(p, "-n", 2) || !strncmp(p, "-k", 2))) {
             bool rounds = p[1] == 'n';
             const char *v = goal_skip_space(e);
@@ -1870,7 +1889,12 @@ bool goal_parse(const char *arg, goal_spec *g, char *err, size_t errn) {
     return true;
 }
 
-void goal_spec_free(goal_spec *g) { free(g->metric); free(g->task); memset(g, 0, sizeof *g); }
+void goal_spec_free(goal_spec *g) {
+    free(g->metric); free(g->task);
+    for (int i = 0; i < g->nmodels; i++) free(g->models[i]);
+    free(g->models);
+    memset(g, 0, sizeof *g);
+}
 
 bool goal_number(const char *out, double *v) {
     if (!out) return false;
