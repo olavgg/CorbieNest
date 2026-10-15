@@ -4027,9 +4027,47 @@ static void banner_size(void) {
     g_box.n = 0;
 }
 
+/* the title "CORBIE NEST" in block letters, three rows (box_title); the letters the title uses */
+static const struct { char ch; const char *row[3]; } BLOCK_FONT[] = {
+    { 'C', { "▄▀▀", "█  ", "▀▀▀" } }, { 'O', { "▄▀▀▄", "█  █", "▀▀▀▀" } }, { 'R', { "█▀▀▄", "█▀▀▄", "▀  ▀" } },
+    { 'B', { "█▀▀▄", "█▀▀▄", "▀▀▀ " } }, { 'I', { "▀█▀", " █ ", "▀▀▀" } }, { 'E', { "█▀▀", "█▀▀", "▀▀▀" } },
+    { 'N', { "█▄ █", "█ ▀█", "▀  ▀" } }, { 'S', { "▄▀▀", "▀▀▄", "▄▄▀" } }, { 'T', { "▀█▀", " █ ", " ▀ " } },
+    { ' ', { "  ", "  ", "  " } },
+};
+/* the title in block letters as three box items, a gap between the letters when the box has room for it; a box
+ * too narrow for the letters keeps the plain name (false, nothing added) */
+static bool box_title(void) {
+    static const char *WORD = "CORBIE NEST";
+    int inner = g_box.bw - 4;
+    for (int gap = 1; gap >= 0; gap--) {
+        sbuf r[3]; for (int i = 0; i < 3; i++) sb_init(&r[i]);
+        int w = 0;
+        for (const char *p = WORD; *p; p++) {
+            size_t g = 0;
+            while (BLOCK_FONT[g].ch != *p) g++;
+            int gw = 0;
+            for (int i = 0; i < 3; i++) if (plain_width(BLOCK_FONT[g].row[i]) > gw) gw = plain_width(BLOCK_FONT[g].row[i]);
+            for (int i = 0; i < 3; i++) {
+                if (p != WORD && gap) sb_putc(&r[i], ' ');
+                sb_puts(&r[i], BLOCK_FONT[g].row[i]);
+                for (int c = plain_width(BLOCK_FONT[g].row[i]); c < gw; c++) sb_putc(&r[i], ' ');
+            }
+            w += gw + (p != WORD && gap ? 1 : 0);
+        }
+        if (w <= inner) {
+            for (int i = 0; i < 3; i++) { box_add(1, C_BOLD "\x1b[38;2;230;251;255m%s" C_RESET, r[i].data ? r[i].data : ""); }
+            for (int i = 0; i < 3; i++) sb_free(&r[i]);
+            return true;
+        }
+        for (int i = 0; i < 3; i++) sb_free(&r[i]);
+    }
+    return false;
+}
+
 /* the box's items, read now: the model, the host, the advisor, the mode; and the two warnings */
 static void banner_items(bool need_ollama, int ok) {
     g_host_note[0] = g_advisor_note[0] = 0;
+    box_title();   /* the block letters, when the box is wide enough (the name is on the line below either way) */
     box_add(1, C_BOLD "Corbie Nest" C_RESET " v%s — local coding agent for Ollama", CORBIE_VERSION);
     for (int r = 0; r < CROW_ROWS; r++) { box_add(2, ""); g_box.it[g_box.n - 1].crow = r; }
     const char *eff = g_cfg.model ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
