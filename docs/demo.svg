@@ -13,20 +13,31 @@
 </text>
 <text y="112" xml:space="preserve" fill="#c9d1d9">
 </text>
+<rect x="85.2" y="120" width="672" height="20" fill="#161a24"/>
+<rect x="757.2" y="120" width="8.4" height="20" fill="#161a24"/>
+<rect x="765.6" y="120" width="8.4" height="20" fill="#161a24"/>
+<rect x="774" y="120" width="8.4" height="20" fill="#161a24"/>
+<rect x="782.4" y="120" width="8.4" height="20" fill="#161a24"/>
 <text y="132" xml:space="preserve" fill="#c9d1d9">
-</text>
-<rect x="85.2" y="140" width="672" height="20" fill="#161a24"/>
-<rect x="757.2" y="140" width="8.4" height="20" fill="#161a24"/>
-<rect x="765.6" y="140" width="8.4" height="20" fill="#161a24"/>
-<rect x="774" y="140" width="8.4" height="20" fill="#161a24"/>
-<rect x="782.4" y="140" width="8.4" height="20" fill="#161a24"/>
-<text y="152" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">╭───────────────────────────────────────────────────────────────────────────────</tspan>
 <tspan x="757.2" fill="#3a8fb8" font-weight="600">[</tspan>
 <tspan x="765.6" fill="#e6fbff" font-weight="600">×</tspan>
 <tspan x="774" fill="#3a8fb8" font-weight="600">]</tspan>
 <tspan x="782.4" fill="#4a6a8a" font-weight="600">╮</tspan>
+</text>
+<rect x="85.2" y="140" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="140" width="151.2" height="20" fill="#161a24"/>
+<rect x="244.8" y="140" width="386.4" height="20" fill="#161a24"/>
+<rect x="631.2" y="140" width="151.2" height="20" fill="#161a24"/>
+<rect x="782.4" y="140" width="8.4" height="20" fill="#161a24"/>
+<text y="152" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                  </tspan>
+<tspan x="244.8" fill="#e6fbff" font-weight="600">▄▀▀ ▄▀▀▄ █▀▀▄ █▀▀▄ ▀█▀ █▀▀    █▄ █ █▀▀ ▄▀▀ ▀█▀</tspan>
+<tspan x="631.2">                  </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
 <rect x="85.2" y="160" width="8.4" height="20" fill="#161a24"/>
 <rect x="93.6" y="160" width="151.2" height="20" fill="#161a24"/>
@@ -37,7 +48,7 @@
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
 <tspan x="93.6">                  </tspan>
-<tspan x="244.8" fill="#e6fbff" font-weight="600">▄▀▀ ▄▀▀▄ █▀▀▄ █▀▀▄ ▀█▀ █▀▀    █▄ █ █▀▀ ▄▀▀ ▀█▀</tspan>
+<tspan x="244.8" fill="#e6fbff" font-weight="600">█   █  █ █▀▀▄ █▀▀▄  █  █▀▀    █ ▀█ █▀▀ ▀▀▄  █ </tspan>
 <tspan x="631.2">                  </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
@@ -50,29 +61,16 @@
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
 <tspan x="93.6">                  </tspan>
-<tspan x="244.8" fill="#e6fbff" font-weight="600">█   █  █ █▀▀▄ █▀▀▄  █  █▀▀    █ ▀█ █▀▀ ▀▀▄  █ </tspan>
-<tspan x="631.2">                  </tspan>
-<tspan x="782.4" fill="#4a6a8a">│</tspan>
-</text>
-<rect x="85.2" y="200" width="8.4" height="20" fill="#161a24"/>
-<rect x="93.6" y="200" width="151.2" height="20" fill="#161a24"/>
-<rect x="244.8" y="200" width="386.4" height="20" fill="#161a24"/>
-<rect x="631.2" y="200" width="151.2" height="20" fill="#161a24"/>
-<rect x="782.4" y="200" width="8.4" height="20" fill="#161a24"/>
-<text y="212" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18">        </tspan>
-<tspan x="85.2" fill="#4a6a8a">│</tspan>
-<tspan x="93.6">                  </tspan>
 <tspan x="244.8" fill="#e6fbff" font-weight="600">▀▀▀ ▀▀▀▀ ▀  ▀ ▀▀▀  ▀▀▀ ▀▀▀    ▀  ▀ ▀▀▀ ▄▄▀  ▀ </tspan>
 <tspan x="631.2">                  </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
-<rect x="85.2" y="220" width="8.4" height="20" fill="#161a24"/>
-<rect x="93.6" y="220" width="134.4" height="20" fill="#161a24"/>
-<rect x="228" y="220" width="92.4" height="20" fill="#161a24"/>
-<rect x="320.4" y="220" width="462" height="20" fill="#161a24"/>
-<rect x="782.4" y="220" width="8.4" height="20" fill="#161a24"/>
-<text y="232" xml:space="preserve" fill="#c9d1d9">
+<rect x="85.2" y="200" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="200" width="134.4" height="20" fill="#161a24"/>
+<rect x="228" y="200" width="92.4" height="20" fill="#161a24"/>
+<rect x="320.4" y="200" width="462" height="20" fill="#161a24"/>
+<rect x="782.4" y="200" width="8.4" height="20" fill="#161a24"/>
+<text y="212" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
 <tspan x="93.6">                </tspan>
@@ -80,21 +78,21 @@
 <tspan x="320.4"> v0.3.0 — local coding agent for Ollama                </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
-<rect x="85.2" y="240" width="8.4" height="20" fill="#161a24"/>
-<rect x="93.6" y="240" width="688.8" height="20" fill="#161a24"/>
-<rect x="782.4" y="240" width="8.4" height="20" fill="#161a24"/>
-<text y="252" xml:space="preserve" fill="#c9d1d9">
+<rect x="85.2" y="220" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="220" width="688.8" height="20" fill="#161a24"/>
+<rect x="782.4" y="220" width="8.4" height="20" fill="#161a24"/>
+<text y="232" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
 <tspan x="93.6">                         ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀                         </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
-<rect x="85.2" y="260" width="8.4" height="20" fill="#161a24"/>
-<rect x="93.6" y="260" width="277.2" height="20" fill="#161a24"/>
-<rect x="370.8" y="260" width="50.4" height="20" fill="#161a24"/>
-<rect x="421.2" y="260" width="361.2" height="20" fill="#161a24"/>
-<rect x="782.4" y="260" width="8.4" height="20" fill="#161a24"/>
-<text y="272" xml:space="preserve" fill="#c9d1d9">
+<rect x="85.2" y="240" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="240" width="277.2" height="20" fill="#161a24"/>
+<rect x="370.8" y="240" width="50.4" height="20" fill="#161a24"/>
+<rect x="421.2" y="240" width="361.2" height="20" fill="#161a24"/>
+<rect x="782.4" y="240" width="8.4" height="20" fill="#161a24"/>
+<text y="252" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
 <tspan x="93.6">                         ⠀⠀⠀⠀⠀⠀⠀⠀</tspan>
@@ -102,14 +100,14 @@
 <tspan x="421.2">⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀                         </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
-<rect x="85.2" y="280" width="8.4" height="20" fill="#161a24"/>
-<rect x="93.6" y="280" width="210" height="20" fill="#161a24"/>
-<rect x="303.6" y="280" width="126" height="20" fill="#161a24"/>
-<rect x="429.6" y="280" width="8.4" height="20" fill="#161a24"/>
-<rect x="438" y="280" width="50.4" height="20" fill="#161a24"/>
-<rect x="488.4" y="280" width="294" height="20" fill="#161a24"/>
-<rect x="782.4" y="280" width="8.4" height="20" fill="#161a24"/>
-<text y="292" xml:space="preserve" fill="#c9d1d9">
+<rect x="85.2" y="260" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="260" width="210" height="20" fill="#161a24"/>
+<rect x="303.6" y="260" width="126" height="20" fill="#161a24"/>
+<rect x="429.6" y="260" width="8.4" height="20" fill="#161a24"/>
+<rect x="438" y="260" width="50.4" height="20" fill="#161a24"/>
+<rect x="488.4" y="260" width="294" height="20" fill="#161a24"/>
+<rect x="782.4" y="260" width="8.4" height="20" fill="#161a24"/>
+<text y="272" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
 <tspan x="93.6">                         </tspan>
@@ -119,14 +117,14 @@
 <tspan x="488.4">⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀                         </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
-<rect x="85.2" y="300" width="8.4" height="20" fill="#161a24"/>
-<rect x="93.6" y="300" width="235.2" height="20" fill="#161a24"/>
-<rect x="328.8" y="300" width="92.4" height="20" fill="#161a24"/>
-<rect x="421.2" y="300" width="25.2" height="20" fill="#161a24"/>
-<rect x="446.4" y="300" width="58.8" height="20" fill="#161a24"/>
-<rect x="505.2" y="300" width="277.2" height="20" fill="#161a24"/>
-<rect x="782.4" y="300" width="8.4" height="20" fill="#161a24"/>
-<text y="312" xml:space="preserve" fill="#c9d1d9">
+<rect x="85.2" y="280" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="280" width="235.2" height="20" fill="#161a24"/>
+<rect x="328.8" y="280" width="92.4" height="20" fill="#161a24"/>
+<rect x="421.2" y="280" width="25.2" height="20" fill="#161a24"/>
+<rect x="446.4" y="280" width="58.8" height="20" fill="#161a24"/>
+<rect x="505.2" y="280" width="277.2" height="20" fill="#161a24"/>
+<rect x="782.4" y="280" width="8.4" height="20" fill="#161a24"/>
+<text y="292" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
 <tspan x="93.6">                         ⠀⠀⠀</tspan>
@@ -136,13 +134,13 @@
 <tspan x="505.2">⠀⠀⠀⠀⠀⠀⠀⠀                         </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
-<rect x="85.2" y="320" width="8.4" height="20" fill="#161a24"/>
-<rect x="93.6" y="320" width="294" height="20" fill="#161a24"/>
-<rect x="387.6" y="320" width="25.2" height="20" fill="#161a24"/>
-<rect x="412.8" y="320" width="117.6" height="20" fill="#161a24"/>
-<rect x="530.4" y="320" width="252" height="20" fill="#161a24"/>
-<rect x="782.4" y="320" width="8.4" height="20" fill="#161a24"/>
-<text y="332" xml:space="preserve" fill="#c9d1d9">
+<rect x="85.2" y="300" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="300" width="294" height="20" fill="#161a24"/>
+<rect x="387.6" y="300" width="25.2" height="20" fill="#161a24"/>
+<rect x="412.8" y="300" width="117.6" height="20" fill="#161a24"/>
+<rect x="530.4" y="300" width="252" height="20" fill="#161a24"/>
+<rect x="782.4" y="300" width="8.4" height="20" fill="#161a24"/>
+<text y="312" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
 <tspan x="93.6">                         ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀</tspan>
@@ -151,14 +149,14 @@
 <tspan x="530.4">⠀⠀⠀⠀⠀                         </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
-<rect x="85.2" y="340" width="8.4" height="20" fill="#161a24"/>
-<rect x="93.6" y="340" width="302.4" height="20" fill="#161a24"/>
-<rect x="396" y="340" width="33.6" height="20" fill="#161a24"/>
-<rect x="429.6" y="340" width="109.2" height="20" fill="#161a24"/>
-<rect x="538.8" y="340" width="8.4" height="20" fill="#161a24"/>
-<rect x="547.2" y="340" width="235.2" height="20" fill="#161a24"/>
-<rect x="782.4" y="340" width="8.4" height="20" fill="#161a24"/>
-<text y="352" xml:space="preserve" fill="#c9d1d9">
+<rect x="85.2" y="320" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="320" width="302.4" height="20" fill="#161a24"/>
+<rect x="396" y="320" width="33.6" height="20" fill="#161a24"/>
+<rect x="429.6" y="320" width="109.2" height="20" fill="#161a24"/>
+<rect x="538.8" y="320" width="8.4" height="20" fill="#161a24"/>
+<rect x="547.2" y="320" width="235.2" height="20" fill="#161a24"/>
+<rect x="782.4" y="320" width="8.4" height="20" fill="#161a24"/>
+<text y="332" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
 <tspan x="93.6">                         ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀</tspan>
@@ -168,14 +166,14 @@
 <tspan x="547.2">⠀⠀⠀                         </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
-<rect x="85.2" y="360" width="8.4" height="20" fill="#161a24"/>
-<rect x="93.6" y="360" width="319.2" height="20" fill="#161a24"/>
-<rect x="412.8" y="360" width="50.4" height="20" fill="#161a24"/>
-<rect x="463.2" y="360" width="25.2" height="20" fill="#161a24"/>
-<rect x="488.4" y="360" width="75.6" height="20" fill="#161a24"/>
-<rect x="564" y="360" width="218.4" height="20" fill="#161a24"/>
-<rect x="782.4" y="360" width="8.4" height="20" fill="#161a24"/>
-<text y="372" xml:space="preserve" fill="#c9d1d9">
+<rect x="85.2" y="340" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="340" width="319.2" height="20" fill="#161a24"/>
+<rect x="412.8" y="340" width="50.4" height="20" fill="#161a24"/>
+<rect x="463.2" y="340" width="25.2" height="20" fill="#161a24"/>
+<rect x="488.4" y="340" width="75.6" height="20" fill="#161a24"/>
+<rect x="564" y="340" width="218.4" height="20" fill="#161a24"/>
+<rect x="782.4" y="340" width="8.4" height="20" fill="#161a24"/>
+<text y="352" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
 <tspan x="93.6">                         ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀</tspan>
@@ -185,18 +183,18 @@
 <tspan x="564">⠀                         </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
-<rect x="85.2" y="380" width="8.4" height="20" fill="#161a24"/>
-<rect x="93.6" y="380" width="294" height="20" fill="#161a24"/>
-<rect x="387.6" y="380" width="42" height="20" fill="#161a24"/>
-<rect x="429.6" y="380" width="8.4" height="20" fill="#161a24"/>
-<rect x="438" y="380" width="8.4" height="20" fill="#161a24"/>
-<rect x="446.4" y="380" width="16.8" height="20" fill="#161a24"/>
-<rect x="463.2" y="380" width="42" height="20" fill="#161a24"/>
-<rect x="505.2" y="380" width="33.6" height="20" fill="#161a24"/>
-<rect x="538.8" y="380" width="16.8" height="20" fill="#161a24"/>
-<rect x="555.6" y="380" width="226.8" height="20" fill="#161a24"/>
-<rect x="782.4" y="380" width="8.4" height="20" fill="#161a24"/>
-<text y="392" xml:space="preserve" fill="#c9d1d9">
+<rect x="85.2" y="360" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="360" width="294" height="20" fill="#161a24"/>
+<rect x="387.6" y="360" width="42" height="20" fill="#161a24"/>
+<rect x="429.6" y="360" width="8.4" height="20" fill="#161a24"/>
+<rect x="438" y="360" width="8.4" height="20" fill="#161a24"/>
+<rect x="446.4" y="360" width="16.8" height="20" fill="#161a24"/>
+<rect x="463.2" y="360" width="42" height="20" fill="#161a24"/>
+<rect x="505.2" y="360" width="33.6" height="20" fill="#161a24"/>
+<rect x="538.8" y="360" width="16.8" height="20" fill="#161a24"/>
+<rect x="555.6" y="360" width="226.8" height="20" fill="#161a24"/>
+<rect x="782.4" y="360" width="8.4" height="20" fill="#161a24"/>
+<text y="372" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
 <tspan x="93.6">                         ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀</tspan>
@@ -208,6 +206,15 @@
 <tspan x="505.2">⠀⠀⠀⠀</tspan>
 <tspan x="538.8" fill="#6b7890">⠈⠉</tspan>
 <tspan x="555.6">⠀⠀                         </tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
+</text>
+<rect x="85.2" y="380" width="8.4" height="20" fill="#161a24"/>
+<rect x="93.6" y="380" width="688.8" height="20" fill="#161a24"/>
+<rect x="782.4" y="380" width="8.4" height="20" fill="#161a24"/>
+<text y="392" xml:space="preserve" fill="#c9d1d9">
+<tspan x="18">        </tspan>
+<tspan x="85.2" fill="#4a6a8a">│</tspan>
+<tspan x="93.6">                                                                                  </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
 <rect x="85.2" y="400" width="8.4" height="20" fill="#161a24"/>
