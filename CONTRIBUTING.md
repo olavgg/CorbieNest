@@ -23,7 +23,8 @@ That is exactly what CI runs.
 ## Ground rules
 
 - **No new dependencies.** C11, libc, POSIX, cJSON and libcurl. No ncurses, no readline.
-  HTTP is libcurl behind `src/http.c`, the UI is ANSI escapes (`src/term.c`).
+  HTTP is libcurl behind `src/http.c`, the UI is ANSI escapes (`src/term.c`). The notcurses screen
+  (`src/term_nc.c`) is built only when notcurses is installed; it is never required to compile.
 - **Read [AGENTS.md](AGENTS.md) first.** It is the working guide for this codebase: what each
   file owns, and the conventions that are easy to break (width-aware drawing, never reading
   stdin outside `src/term.c`, everything that waits must poll `term_poll_interrupt()`,

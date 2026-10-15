@@ -92,6 +92,7 @@ static long long now_ms(void) {
 typedef struct {
     body_sink sink;
     long long last_rx;   /* when the server last sent anything: headers count */
+    ratelimit_info rl;   /* the response's rate-limit headers */
 } xfer;
 
 static size_t on_body(char *p, size_t size, size_t n, void *ud) {
@@ -101,7 +102,8 @@ static size_t on_body(char *p, size_t size, size_t n, void *ud) {
     return x->sink.abort ? 0 : len;   /* anything but len: libcurl stops the transfer */
 }
 static size_t on_header(char *p, size_t size, size_t n, void *ud) {
-    (void)p; xfer *x = ud; x->last_rx = now_ms();
+    xfer *x = ud; x->last_rx = now_ms();
+    ratelimit_header(&x->rl, p, size * n);
     return size * n;
 }
 
@@ -214,6 +216,7 @@ int http_request(const char *base_url, const char *method, const char *path,
     }
     long code = 0; curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
     res->status = (int)code;
+    res->rl = x.rl;
     if (rv != 0) {}
     else if (interrupted || x.sink.abort) res->aborted = true;
     else if (silent) { snprintf(res->err, sizeof res->err, "recv: timed out — the server sent nothing for %d s", http_idle_timeout_ms / 1000); rv = -1; }
@@ -256,7 +259,12 @@ struct http_job {
     char *data; size_t len, cap;      /* the answer */
     atomic_bool cancel, done;
     CURLcode cc;
+    ratelimit_info rl;                /* the answer's rate-limit headers (written by its thread, read after the join) */
 };
+static size_t job_header(char *p, size_t size, size_t n, void *ud) {
+    ratelimit_header(&((http_job *)ud)->rl, p, size * n);
+    return size * n;
+}
 static size_t job_body(char *p, size_t size, size_t n, void *ud) {
     http_job *j = ud; size_t len = size * n;
     if (j->len + len + 1 > j->cap) {
@@ -289,6 +297,8 @@ http_job *http_job_start(const char *base_url, const char *path, const char *bod
     j->hdrs = easy_setup(j->h, j->url, "POST", j->body, headers, j->errbuf);
     curl_easy_setopt(j->h, CURLOPT_WRITEFUNCTION, job_body);
     curl_easy_setopt(j->h, CURLOPT_WRITEDATA, j);
+    curl_easy_setopt(j->h, CURLOPT_HEADERFUNCTION, job_header);
+    curl_easy_setopt(j->h, CURLOPT_HEADERDATA, j);
     curl_easy_setopt(j->h, CURLOPT_XFERINFOFUNCTION, job_progress);
     curl_easy_setopt(j->h, CURLOPT_XFERINFODATA, j);
     curl_easy_setopt(j->h, CURLOPT_NOPROGRESS, 0L);
@@ -312,6 +322,7 @@ int http_job_finish(http_job *j, sbuf *out, http_result *res) {
     int rv = 0;
     long code = 0; curl_easy_getinfo(j->h, CURLINFO_RESPONSE_CODE, &code);
     res->status = (int)code;
+    res->rl = j->rl;
     if (atomic_load(&j->cancel)) res->aborted = true;
     else if (j->cc != CURLE_OK) {
         const char *why = j->errbuf[0] ? j->errbuf : curl_easy_strerror(j->cc);

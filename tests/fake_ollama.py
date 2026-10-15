@@ -97,6 +97,16 @@ def _flat(content):
         elif b.get("type") == "tool_result": parts.append(b.get("content") or "")
     return "\n".join(parts)
 
+def _typed(m):
+    """The text the user typed in a message, or None (an assistant turn, or only tool results)."""
+    if m.get("role") != "user": return None
+    c = m.get("content")
+    if isinstance(c, str): return c
+    if isinstance(c, list):
+        t = [b.get("text") or "" for b in c if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(t) if t else None
+    return None
+
 def _tool_results(req):
     out = []
     for m in req.get("messages") or []:
@@ -108,7 +118,12 @@ def _tool_results(req):
 def _turn_blocks(req):
     """The same keywords as script(), as Messages content blocks. A tool_result is answered
     before the keyword that produced the call is seen again, or the model never stops."""
+    typed = [t for t in (_typed(m) for m in (req.get("messages") or [])) if t is not None]   # what the user typed (a merged turn's text only)
+    if typed and "TOOL_LOOP" in typed[-1]:  # the user's own message asks for it: a call every time, until the loop guard stops it
+        return [{"type": "tool_use", "id": "toolu_loop", "name": "bash", "input": {"command": "echo looping"}}], "tool_use"
     results = _tool_results(req)
+    if typed and "TOOL_BINARY" in typed[-1] and not results:   # a command whose output is not UTF-8 (a binary file, a cut)
+        return [{"type": "tool_use", "id": "toolu_bin", "name": "bash", "input": {"command": "printf 'bad \\377 byte'"}}], "tool_use"
     if results:
         line = results[-1].strip().splitlines()[0][:60] if results[-1].strip() else ""
         return [{"type": "text", "text": "Tool said: " + line}], "end_turn"
@@ -457,6 +472,15 @@ class H(BaseHTTPRequestHandler):
         if th and not caps["thinking"]["types"].get(th, {}).get("supported"): return bad(f"thinking.type: {th} is not supported on this model")
         if "output_config" in req and not caps["effort"]["supported"]: return bad("output_config.effort: not supported on this model")
         if not isinstance(req.get("max_tokens"), int): return bad("messages: malformed")
+        msgs = req.get("messages") or []
+        for i, m in enumerate(msgs):  # as the real API: every tool_use answered by a tool_result right after it
+            uses = [b.get("id") for b in (m.get("content") if isinstance(m.get("content"), list) else []) if isinstance(b, dict) and b.get("type") == "tool_use"]
+            nxt = msgs[i + 1].get("content") if i + 1 < len(msgs) else None
+            have = [b.get("tool_use_id") for b in (nxt if isinstance(nxt, list) else []) if isinstance(b, dict) and b.get("type") == "tool_result"]
+            missing = [u for u in uses if u not in have]
+            if missing:
+                return bad(f"messages.{i + 1}: `tool_use` ids were found without `tool_result` blocks immediately after: {', '.join(missing)}. "
+                           "Each `tool_use` block must have a corresponding `tool_result` block in the next message.")
         if _advisor_shape(req):
             brief = req["messages"][0]["content"]
             if "SLOWADVICE" in brief: time.sleep(3)
@@ -500,7 +524,10 @@ class H(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
-        req = json.loads(self.rfile.read(n) or b"{}")
+        raw = self.rfile.read(n) or b"{}"
+        try: raw.decode("utf-8")
+        except UnicodeDecodeError: return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "The request body is not valid JSON: invalid unicode code point"}})
+        req = json.loads(raw)
         model = req.get("model", "")
         prov, rest = self._provider()
         if prov: return self._provider_post(prov, rest, req)

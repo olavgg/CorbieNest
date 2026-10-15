@@ -418,6 +418,7 @@ void config_load(void) {
         else if (!strcmp(k, "advisor_window")) { double m = atof(v); if (m >= 0 && m <= 24 * 60) g_cfg.advisor_window = (int)(m * 60 + 0.5); }
         else if (!strcmp(k, "advisor_guidance")) { int n = advisor_guidance_parse(v); if (n >= 0) g_cfg.advisor_guidance = n; }
         else if (!strcmp(k, "show_thinking")) g_cfg.show_thinking = atoi(v) != 0;
+        else if (!strcmp(k, "ui")) { free(g_cfg.ui); g_cfg.ui = !strcmp(v, "notcurses") ? xstrdup("notcurses") : NULL; }
         else if (!strcmp(k, "yolo")) { if (atoi(v)) g_cfg.mode = MODE_AUTO; }
         else if (!strcmp(k, "mode")) { int m = mode_parse(v); if (m >= 0) g_cfg.mode = m; }
         else if (!strcmp(k, "memory")) g_cfg.memory = atoi(v) != 0;
@@ -465,6 +466,7 @@ void config_save(void) {
     sb_printf(&b, "memory_every=%d\n", g_cfg.memory_every);
     sb_printf(&b, "memory_idle=%d\n", g_cfg.memory_idle);
     sb_printf(&b, "keep_alive=%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "");
+    if (g_cfg.ui) sb_printf(&b, "ui=%s\n", g_cfg.ui);
     write_whole_file_atomic(path, b.data, b.len);
     sb_free(&b);
 }
@@ -1210,6 +1212,174 @@ void sb_put_cut(sbuf *b, const char *s, size_t cap) {
     sb_append(b, t, tail);
 }
 
+/* ---------- what a request body must satisfy ----------
+ * The server parses the body as strict JSON: one byte of invalid UTF-8 (a cut that split a
+ * character, a binary file in a command's output) makes the whole request refused. cJSON does not
+ * check, so the text is made valid where it enters the conversation. */
+static size_t utf8_seq_len(const unsigned char *p, size_t left) {
+    unsigned char c = p[0];
+    size_t n = c < 0x80 ? 1 : (c >> 5) == 0x6 && c >= 0xC2 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E && c <= 0xF4 ? 4 : 0;
+    if (!n || n > left) return 0;
+    if (n == 1) return 1;
+    unsigned lo = 0x80, hi = 0xBF;   /* the second byte has its own bounds for E0, ED, F0, F4 */
+    if (p[1] < lo || p[1] > hi) return 0;
+    if (c == 0xE0) lo = 0xA0; else if (c == 0xED) hi = 0x9F; else if (c == 0xF0) lo = 0x90; else if (c == 0xF4) hi = 0x8F;
+    if (p[1] < lo || p[1] > hi) return 0;
+    for (size_t i = 2; i < n; i++) if (p[i] < 0x80 || p[i] > 0xBF) return 0;
+    return n;
+}
+
+/* true when buf ends inside an escape sequence or a UTF-8 character: what follows it is then not
+ * the rest of that sequence, so nothing may be written between the two (the stdout hook splices
+ * cursor moves between chunks, and a chunk can end anywhere in a large write). */
+bool tail_incomplete(const char *buf, size_t n) {
+    size_t from = n > 64 ? n - 64 : 0;
+    const unsigned char *b = (const unsigned char *)buf;
+    /* an escape sequence that starts in the tail and has not ended */
+    size_t e = n;
+    for (size_t k = n; k > from; k--) if (b[k - 1] == 0x1b) { e = k - 1; break; }
+    if (e < n) {
+        if (e + 1 == n) return true;                              /* a lone ESC */
+        unsigned char c = b[e + 1];
+        if (c == '[') {                                           /* CSI: parameters, then a final byte 0x40-0x7e */
+            size_t j = e + 2;
+            while (j < n && b[j] >= 0x20 && b[j] <= 0x3f) j++;
+            if (j == n) return true;
+        } else if (c == ']') {                                    /* OSC: ends at BEL or ESC \ */
+            size_t j = e + 2; bool ended = false;
+            for (; j < n; j++) {
+                if (b[j] == 0x07) { ended = true; break; }
+                if (b[j] == 0x1b && j + 1 < n && b[j + 1] == '\\') { ended = true; break; }
+            }
+            if (!ended) return true;
+        } else if (c >= 0x20 && c <= 0x2f) {                     /* an intermediate byte: one final byte follows */
+            if (e + 2 >= n) return true;
+        }
+    }
+    /* a UTF-8 character whose continuation bytes have not all come */
+    for (size_t k = n, seen = 0; k > from && seen < 4; k--, seen++) {
+        unsigned char c = b[k - 1];
+        if ((c & 0xC0) == 0x80) continue;                         /* a continuation byte: look further back */
+        size_t want = c >= 0xF0 && c <= 0xF4 ? 4 : c >= 0xE0 ? 3 : c >= 0xC2 && c < 0xE0 ? 2 : 1;
+        return want > 1 && n - (k - 1) < want;
+    }
+    return false;
+}
+
+bool utf8_ok(const char *s, size_t len) {
+    const unsigned char *p = (const unsigned char *)s;
+    for (size_t i = 0; i < len;) {
+        size_t n = utf8_seq_len(p + i, len - i);
+        if (!n) return false;
+        i += n;
+    }
+    return true;
+}
+
+char *utf8_fix(const char *s) {
+    size_t len = strlen(s);
+    if (utf8_ok(s, len)) return xstrdup(s);
+    sbuf b; sb_init(&b);
+    const unsigned char *p = (const unsigned char *)s;
+    for (size_t i = 0; i < len;) {
+        size_t n = utf8_seq_len(p + i, len - i);
+        if (n) { sb_append(&b, s + i, n); i += n; }
+        else { sb_puts(&b, "\xEF\xBF\xBD"); i++; }   /* U+FFFD for each bad byte */
+    }
+    return sb_detach(&b);
+}
+
+size_t utf8_cut(const char *s, size_t len, size_t cap) {
+    if (cap >= len) return len;
+    size_t n = cap;
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;   /* s[n] starts a character: the prefix ends on a boundary */
+    return n;
+}
+
+/* The first line of a shell command, as a fold's head: the leading blank lines and the trailing
+ * whitespace go, control characters become spaces, and the line is cut to `width` columns (a
+ * character is a column; the cut ends with "…"). Returns how many lines follow the first one,
+ * not counting blank ones at the end: 0 means the command is one line and needs no fold. */
+int cmd_head(const char *cmd, int width, char *out, size_t n) {
+    size_t len = strlen(cmd), s = 0, e = len;
+    while (s < len && isspace((unsigned char)cmd[s])) s++;
+    while (e > s && isspace((unsigned char)cmd[e - 1])) e--;
+    int more = 0;
+    for (size_t i = s; i < e; i++) if (cmd[i] == '\n') more++;
+    size_t fl = strcspn(cmd + s, "\n");
+    if (s + fl > e) fl = e - s;
+    while (fl > 0 && isspace((unsigned char)cmd[s + fl - 1])) fl--;
+    int columns = 0;
+    for (size_t i = 0; i < fl; i++) if (((unsigned char)cmd[s + i] & 0xC0) != 0x80) columns++;
+    bool cut = columns > width;
+    int limit = cut ? width - 1 : width; if (limit < 0) limit = 0;
+    size_t o = 0; int cols = 0;
+    if (n == 0) return more;
+    for (size_t i = 0; i < fl; i++) {
+        unsigned char c = (unsigned char)cmd[s + i];
+        bool lead = (c & 0xC0) != 0x80;
+        if (lead && cols == limit) break;
+        if (lead) cols++;
+        if (c < 32 || c == 127) c = ' ';
+        if (o + 1 >= n) break;
+        out[o++] = (char)c;
+    }
+    if (cut && o + 3 < n) { memcpy(out + o, "\xe2\x80\xa6", 3); o += 3; }   /* … */
+    out[o] = 0;
+    return more;
+}
+
+/* A tool result for a call the conversation has no answer to (see messages_repair). */
+static cJSON *orphan_result(const char *name, cJSON *id) {
+    cJSON *tm = cJSON_CreateObject();
+    cJSON_AddStringToObject(tm, "role", "tool");
+    cJSON_AddStringToObject(tm, "tool_name", name);
+    if (cJSON_IsString(id) && id->valuestring[0]) cJSON_AddStringToObject(tm, "tool_call_id", id->valuestring);
+    cJSON_AddStringToObject(tm, "content",
+        "not run: the request stopped before this call ran (its tool round hit the limit, or was interrupted). "
+        "The user's next message follows; call the tool again if it is still needed.");
+    return tm;
+}
+
+static const char *msg_role(cJSON *m) {
+    cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role");
+    return cJSON_IsString(r) ? r->valuestring : "";
+}
+
+int messages_repair(cJSON *msgs) {
+    int fixed = 0;
+    for (int i = 0; i < cJSON_GetArraySize(msgs); i++) {
+        cJSON *m = cJSON_GetArrayItem(msgs, i);
+        cJSON *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+        if (cJSON_IsString(c) && !utf8_ok(c->valuestring, strlen(c->valuestring))) {
+            char *clean = utf8_fix(c->valuestring);
+            cJSON_SetValuestring(c, clean); free(clean); fixed++;
+        }
+        cJSON *tc = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+        if (strcmp(msg_role(m), "assistant") || !cJSON_IsArray(tc)) continue;
+        /* the run of tool results that follows this reply: each call needs one of them */
+        int end = i + 1;
+        while (end < cJSON_GetArraySize(msgs) && !strcmp(msg_role(cJSON_GetArrayItem(msgs, end)), "tool")) end++;
+        cJSON *call;
+        cJSON_ArrayForEach(call, tc) {
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(call, "id");
+            cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
+            cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+            if (!cJSON_IsString(id) || !id->valuestring[0]) continue;   /* no id, nothing to match it by */
+            bool answered = false;
+            for (int k = i + 1; k < end && !answered; k++) {
+                cJSON *rid = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(msgs, k), "tool_call_id");
+                answered = cJSON_IsString(rid) && !strcmp(rid->valuestring, id->valuestring);
+            }
+            if (answered) continue;
+            cJSON_InsertItemInArray(msgs, end, orphan_result(cJSON_IsString(nm) ? nm->valuestring : "?", id));
+            end++; fixed++;
+        }
+        i = end - 1;
+    }
+    return fixed;
+}
+
 /* one message as a block, or NULL when it says nothing (an assistant turn that only called the advisor) */
 static char *transcript_block(cJSON *m, size_t budget) {
     cJSON *role = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
@@ -1556,4 +1726,195 @@ void agent_log_add(sbuf *log, const char *text, size_t cap) {
     sbuf b; sb_init(&b);
     sb_append(&b, NOTE, nl); sb_append(&b, log->data, log->len);
     sb_free(log); *log = b;
+}
+
+/* "[Pasted text #K +N lines]" at s[i..]: its K and N and the byte after it, or false */
+static bool paste_token_at(const char *s, size_t len, size_t i, int *k, int *nl, size_t *end) {
+    static const char HEAD[] = "[Pasted text #";
+    size_t h = sizeof HEAD - 1;
+    if (i + h > len || memcmp(s + i, HEAD, h)) return false;
+    size_t p = i + h; long kv = 0, nv = 0;
+    if (p >= len || s[p] < '0' || s[p] > '9') return false;
+    while (p < len && s[p] >= '0' && s[p] <= '9' && kv < 100000) kv = kv * 10 + (s[p++] - '0');
+    if (kv < 1 || p + 2 > len || memcmp(s + p, " +", 2)) return false;
+    p += 2;
+    if (p >= len || s[p] < '0' || s[p] > '9') return false;
+    while (p < len && s[p] >= '0' && s[p] <= '9' && nv < 100000) nv = nv * 10 + (s[p++] - '0');
+    if (nv < 1 || p + 7 > len || memcmp(s + p, " lines]", 7)) return false;
+    *k = (int)kv; *nl = (int)nv; *end = p + 7;
+    return true;
+}
+size_t paste_tokens(const char *s, size_t len, size_t (*sp)[2], int *ks, int *ns, size_t max) {
+    size_t n = 0;
+    for (size_t i = 0; i < len && n < max; i++) {
+        int k, nl; size_t end;
+        if (s[i] == '[' && paste_token_at(s, len, i, &k, &nl, &end)) {
+            if (sp) { sp[n][0] = i; sp[n][1] = end; }
+            if (ks) ks[n] = k;
+            if (ns) ns[n] = nl;
+            n++; i = end - 1;
+        }
+    }
+    return n;
+}
+char *paste_expand(const char *s, size_t len, const char *const *texts, const int *lines, int n) {
+    sbuf o; sb_init(&o);
+    for (size_t i = 0; i < len; i++) {
+        int k, nl; size_t end;
+        if (s[i] == '[' && paste_token_at(s, len, i, &k, &nl, &end) && k <= n && nl == lines[k - 1]) {
+            sb_puts(&o, texts[k - 1]); i = end - 1;
+        } else sb_putc(&o, s[i]);
+    }
+    return sb_detach(&o);
+}
+
+/* ---------- rate limits of a response (anthropic-ratelimit-* headers) ---------- */
+/* One header line as libcurl hands it over ("name: value", CRLF at the end); only the
+ * requests and token headers of the limits count, the tokens-* aggregate is left out. */
+void ratelimit_header(ratelimit_info *rl, const char *line, size_t n) {
+    static const char P[] = "anthropic-ratelimit-";
+    size_t pl = sizeof P - 1;
+    if (n < pl || strncasecmp(line, P, pl)) return;
+    const char *colon = memchr(line, ':', n);
+    if (!colon) return;
+    size_t nl = (size_t)(colon - line);
+    char name[64], val[64];
+    if (nl >= sizeof name) return;
+    memcpy(name, line, nl); name[nl] = 0;
+    for (char *q = name; *q; q++) *q = (char)tolower((unsigned char)*q);
+    const char *v = colon + 1; const char *end = line + n;
+    while (v < end && (*v == ' ' || *v == '\t')) v++;
+    while (end > v && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ' || end[-1] == '\t')) end--;
+    if ((size_t)(end - v) >= sizeof val) return;
+    memcpy(val, v, (size_t)(end - v)); val[end - v] = 0;
+    const char *what = name + pl;
+    long long *slot = NULL;
+    if (!strncmp(what, "requests-", 9)) {
+        if (!strcmp(what + 9, "limit")) slot = &rl->req_lim; else if (!strcmp(what + 9, "remaining")) slot = &rl->req_rem;
+    } else if (!strncmp(what, "input-tokens-", 13)) {
+        if (!strcmp(what + 13, "limit")) slot = &rl->in_lim; else if (!strcmp(what + 13, "remaining")) slot = &rl->in_rem;
+        else if (!strcmp(what + 13, "reset")) { snprintf(rl->reset, sizeof rl->reset, "%.39s", val); rl->have = true; return; }
+    } else if (!strncmp(what, "output-tokens-", 14)) {
+        if (!strcmp(what + 14, "limit")) slot = &rl->out_lim; else if (!strcmp(what + 14, "remaining")) slot = &rl->out_rem;
+    }
+    if (!slot) return;
+    char *e; long long x = strtoll(val, &e, 10);
+    if (e == val || *e) return;
+    *slot = x; rl->have = true;
+}
+
+/* The last rate limits seen per model this session: /usage shows them under each hosted model. */
+#define RATELIMIT_MAX 16
+static struct { char model[128]; ratelimit_info rl; } g_ratelimits[RATELIMIT_MAX];
+static int g_n_ratelimits = 0;
+void ratelimit_set(const char *model, const ratelimit_info *rl) {
+    if (!model || !rl || !rl->have) return;
+    for (int i = 0; i < g_n_ratelimits; i++)
+        if (!strcmp(g_ratelimits[i].model, model)) { g_ratelimits[i].rl = *rl; return; }
+    if (g_n_ratelimits == RATELIMIT_MAX) return;
+    snprintf(g_ratelimits[g_n_ratelimits].model, sizeof g_ratelimits[0].model, "%s", model);
+    g_ratelimits[g_n_ratelimits++].rl = *rl;
+}
+bool ratelimit_get(const char *model, ratelimit_info *out) {
+    for (int i = 0; model && i < g_n_ratelimits; i++)
+        if (!strcmp(g_ratelimits[i].model, model)) { *out = g_ratelimits[i].rl; return true; }
+    return false;
+}
+
+/* ---------- /goal: the pure half (see common.h) ---------- */
+static const char *goal_skip_space(const char *p) { while (*p == ' ' || *p == '\t') p++; return p; }
+
+bool goal_parse(const char *arg, goal_spec *g, char *err, size_t errn) {
+    memset(g, 0, sizeof *g);
+    g->rounds = 3; g->cands = ORCH_WORKERS_DEFAULT;
+    const char *p = goal_skip_space(arg);
+    if (!*p) { snprintf(err, errn, "no metric command"); return false; }
+    sbuf m; sb_init(&m);
+    if (*p == '"' || *p == '\'') {
+        char q = *p++;
+        const char *e = strchr(p, q);
+        if (!e) { sb_free(&m); snprintf(err, errn, "the metric command has no closing %c", q); return false; }
+        sb_append(&m, p, (size_t)(e - p)); p = e + 1;
+    } else {
+        const char *e = p; while (*e && *e != ' ' && *e != '\t') e++;
+        sb_append(&m, p, (size_t)(e - p)); p = e;
+    }
+    if (!m.len) { sb_free(&m); snprintf(err, errn, "no metric command"); return false; }
+    g->metric = sb_detach(&m);
+    for (;;) {   /* options, in any order, before the task */
+        p = goal_skip_space(p);
+        const char *e = p; while (*e && *e != ' ' && *e != '\t') e++;
+        size_t n = (size_t)(e - p);
+        if (n == 3 && !strncmp(p, "min", 3)) { g->lower = true; p = e; continue; }
+        if (n == 3 && !strncmp(p, "max", 3)) { g->lower = false; p = e; continue; }
+        if (n == 2 && (!strncmp(p, "-n", 2) || !strncmp(p, "-k", 2))) {
+            bool rounds = p[1] == 'n';
+            const char *v = goal_skip_space(e);
+            char *end; long k = strtol(v, &end, 10);
+            if (end == v || (*end && *end != ' ' && *end != '\t')) { snprintf(err, errn, "%.2s needs a number", rounds ? "-n" : "-k"); goal_spec_free(g); return false; }
+            if (rounds && (k < 1 || k > GOAL_ROUNDS_MAX)) { snprintf(err, errn, "-n: 1 to %d rounds", GOAL_ROUNDS_MAX); goal_spec_free(g); return false; }
+            if (!rounds && (k < 2 || k > ORCH_WORKERS_MAX)) { snprintf(err, errn, "-k: 2 to %d candidates (one candidate has nothing to fight)", ORCH_WORKERS_MAX); goal_spec_free(g); return false; }
+            if (rounds) g->rounds = (int)k; else g->cands = (int)k;
+            p = end; continue;
+        }
+        break;
+    }
+    p = goal_skip_space(p);
+    while (*p == '\n' || *p == '\r') p++;
+    size_t tl = strlen(p);
+    while (tl && (p[tl - 1] == ' ' || p[tl - 1] == '\t' || p[tl - 1] == '\n' || p[tl - 1] == '\r')) tl--;
+    if (!tl) { snprintf(err, errn, "no goal: say what to reach after the options"); goal_spec_free(g); return false; }
+    g->task = xmalloc(tl + 1); memcpy(g->task, p, tl); g->task[tl] = 0;
+    return true;
+}
+
+void goal_spec_free(goal_spec *g) { free(g->metric); free(g->task); memset(g, 0, sizeof *g); }
+
+bool goal_number(const char *out, double *v) {
+    if (!out) return false;
+    size_t n = strlen(out);
+    while (n && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' ' || out[n - 1] == '\t')) n--;
+    size_t start = n;
+    while (start > 0 && out[start - 1] != '\n') start--;   /* the last line */
+    while (start < n && (out[start] == ' ' || out[start] == '\t')) start++;
+    if (start >= n) return false;
+    char line[64];
+    if (n - start >= sizeof line) return false;
+    memcpy(line, out + start, n - start); line[n - start] = 0;
+    char *end; double d = strtod(line, &end);
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end || end == line || d != d || d - d != 0) return false;   /* nothing after the number; not nan, not inf */
+    *v = d;
+    return true;
+}
+
+bool goal_better(double v, double best, bool lower) { return lower ? v < best : v > best; }
+
+int goal_verdict(const char *report, char *why, size_t n) {
+    int found = GOAL_NONE;
+    if (why && n) why[0] = 0;
+    if (!report) return GOAL_NONE;
+    for (const char *line = report; *line; ) {
+        const char *e = strchr(line, '\n'); size_t len = e ? (size_t)(e - line) : strlen(line);
+        const char *p = line;
+        while (p < line + len && (*p == ' ' || *p == '\t' || *p == '*' || *p == '`' || *p == '#')) p++;
+        if (line + len - p >= 5 && !strncasecmp(p, "GOAL:", 5)) {
+            p = goal_skip_space(p + 5);
+            if (line + len - p >= 7 && !strncasecmp(p, "REACHED", 7)) { found = GOAL_REACHED; if (why && n) why[0] = 0; }
+            else if (line + len - p >= 10 && !strncasecmp(p, "IMPOSSIBLE", 10)) {
+                found = GOAL_IMPOSSIBLE;
+                if (why && n) {
+                    const char *r = goal_skip_space(p + 10);
+                    while (r < line + len && (*r == ':' || *r == '-' || *r == '*' || *r == ' ')) r++;
+                    const char *re = line + len;
+                    while (re > r && (re[-1] == '*' || re[-1] == '`' || re[-1] == ' ' || re[-1] == '\r')) re--;
+                    size_t k = (size_t)(re - r); if (k >= n) k = n - 1;
+                    memcpy(why, r, k); why[k] = 0;
+                }
+            }
+        }
+        if (!e) break;
+        line = e + 1;
+    }
+    return found;
 }

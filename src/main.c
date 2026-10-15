@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -57,6 +58,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/tools", "tool calling on or off" },
     { "/web", "web_search and web_fetch: on, off, engine URL" },
     { "/max_iters", "tool rounds one request may run" },
+    { "/ui", "the screen: ansi, or notcurses (restarts into this session)" },
     { "/ctx", "context window: a size, max, default — or a picker" },
     { "/temp", "temperature (-1 = the server's default)" },
     { "/host", "the ollama host" },
@@ -72,6 +74,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/init", "have the model write AGENTS.md for this project" },
     { "/cost", "tokens, model calls and time of this session" },
     { "/usage", "tokens per model, the advisor's too, and the estimated cost of the hosted ones" },
+    { "/banner", "the Corbie Nest box again, as a window: close it with its X or Esc" },
     { "/diff", "the working-tree diff, without sending it to the model" },
     { "/rewind", "go back to an earlier request: files, conversation or both" },
     { "/quit", "leave" },
@@ -82,6 +85,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
  * them. The key is the command line up to the word being typed. (/effort and /cd are worked
  * out in suggest(): the levels are the model's, the directories the disk's.) */
 static const struct { const char *after, *opts; } SLASH_ARGS[] = {
+    { "/ui", "ansi:the ANSI screen (default)|notcurses:the notcurses screen: planes, true colour (needs notcurses installed at build time)" },
     { "/mode", "manual:ask before every edit and command|accept-edits:file edits go ahead, commands still ask|plan:read-only: the model proposes a plan|auto:nothing asks (dangerous)" },
     { "/think", "on:think on every call|off:do not think|auto:think once per request, not after every tool result|show:show the thinking|hide:hide the thinking" },
     { "/yolo", "on:approve every tool call (dangerous)|off:back to manual confirmations" },
@@ -274,6 +278,10 @@ static void apply_pending(void) {
 /* a user request starts: remember where it begins in the conversation (for /rewind, memory) */
 static int begin_request(void) {
     apply_pending();
+    /* a conversation that came from a stopped request (or a session saved by one) may hold calls without
+     * results and text the server refuses: mend it before the next request goes out */
+    int mended = messages_repair(g_messages);
+    if (mended) printf(C_GRAY "⋯ mended the conversation: %d fix%s (unanswered tool calls, invalid UTF-8)" C_RESET "\n", mended, mended == 1 ? "" : "es");
     int first = cJSON_GetArraySize(g_messages);
     if (g_prev_request_first >= 0 && g_prev_request_first <= first) elide_old_tool_results(g_prev_request_first);
     g_prev_request_first = first;
@@ -392,11 +400,14 @@ static void memory_extract(int first) {
         sbuf b; sb_init(&b);
         if (!strcmp(r, "tool")) { cJSON *tn = cJSON_GetObjectItemCaseSensitive(m, "tool_name"); sb_printf(&b, "[result of %s]\n", cJSON_IsString(tn) ? tn->valuestring : "tool"); }
         if (cJSON_IsString(c) && c->valuestring[0]) {
-            size_t len = strlen(c->valuestring), cap = 4000;
-            sb_append(&b, c->valuestring, len < cap ? len : cap);
-            if (len > cap) sb_puts(&b, "\n[…truncated]");
+            size_t len = strlen(c->valuestring), cap = 4000, keep = utf8_cut(c->valuestring, len, cap);
+            sb_append(&b, c->valuestring, keep);
+            if (len > keep) sb_puts(&b, "\n[…truncated]");
         }
-        if (cJSON_IsArray(tc)) { char *t = cJSON_PrintUnformatted(tc); sb_printf(&b, "%s[tool calls] %.600s", b.len ? "\n" : "", t); free(t); }
+        if (cJSON_IsArray(tc)) {
+            char *t = cJSON_PrintUnformatted(tc); size_t tl = strlen(t);
+            sb_printf(&b, "%s[tool calls] %.*s", b.len ? "\n" : "", (int)utf8_cut(t, tl, 600), t); free(t);
+        }
         if (!b.len) sb_puts(&b, "(empty)");
         cJSON_AddStringToObject(n, "content", b.data); sb_free(&b);
         cJSON_AddItemToArray(msgs, n);
@@ -564,7 +575,7 @@ static void cmd_memory(const char *arg) {
  * latest SESSIONS_KEEP files are kept. */
 #define SESSIONS_KEEP 100
 static void print_result_preview(const char *text, int lines);
-static void print_result_folded(const char *text, int preview_lines);
+static void print_result_folded(const char *text, int preview_lines, const char *lead);
 
 static const char *sessions_dir(void) {
     static char d[1200];
@@ -795,11 +806,28 @@ static void usage_price(const char *v) {
     }
 }
 
+/* The last response's rate limits of a hosted model, as a line of /usage ("" when there are none):
+ * what is left of each per-minute limit, and when the input limit is back in full. */
+static void usage_limits_line(const char *model, sbuf *o) {
+    ratelimit_info rl;
+    if (!provider_find(model, NULL) || !ratelimit_get(model, &rl) || !rl.have) return;
+    char a[32], b[32], c[32], d[32];
+    fmt_tokens(rl.in_rem, a, sizeof a); fmt_tokens(rl.in_lim, b, sizeof b);
+    fmt_tokens(rl.out_rem, c, sizeof c); fmt_tokens(rl.out_lim, d, sizeof d);
+    sb_printf(o, "      " C_DIM "limits at its last reply: input %s of %s · output %s of %s · requests %lld of %lld a minute",
+              a, b, c, d, rl.req_rem, rl.req_lim);
+    if (strlen(rl.reset) >= 16) sb_printf(o, " · input back in full at %.5sZ UTC", rl.reset + 11);   /* HH:MM from RFC 3339 */
+    sb_puts(o, C_RESET "\n");
+}
+
+/* /usage: the session's tokens and cost per model. On a full-screen conversation it comes up as a
+ * centred window that the running request goes on underneath (Esc closes it); otherwise it is printed. */
 static void cmd_usage(const char *arg) {
     if (arg && !strncmp(arg, "price", 5) && (arg[5] == ' ' || !arg[5])) { usage_price(arg + 5); return; }
     if (arg) { printf("usage: /usage   ·   /usage price MODEL IN OUT   ·   /usage price MODEL default\n"); return; }
     if (!g_n_usage) { printf(C_DIM "no model has been called in this session yet" C_RESET "\n"); return; }
-    printf(C_BOLD "usage" C_RESET C_DIM " (this session: the tokens each API counted, input ↑ (cached included) and output ↓)" C_RESET "\n");
+    sbuf o; sb_init(&o);
+    sb_printf(&o, C_BOLD "usage" C_RESET C_DIM " (this session: the tokens each API counted, input ↑ (cached included) and output ↓)" C_RESET "\n");
     int w = 0;
     for (int i = 0; i < g_n_usage; i++) { int l = (int)strlen(g_usage[i].model); if (l > w) w = l; }
     if (w > 40) w = 40;
@@ -808,28 +836,31 @@ static void cmd_usage(const char *arg) {
         const usage_row *u = &g_usage[i];
         char tin[32], tout[32], usd[32]; fmt_tokens(u->in, tin, sizeof tin); fmt_tokens(u->out, tout, sizeof tout);
         double pi = 0, po = 0; int known = model_price(u->model, &pi, &po);
-        printf("  %-*s  %4d call%s  ↑%-6s ↓%-6s  ", w, u->model, u->calls, u->calls == 1 ? " " : "s", tin, tout);
+        sb_printf(&o, "  %-*s  %4d call%s  ↑%-6s ↓%-6s  ", w, u->model, u->calls, u->calls == 1 ? " " : "s", tin, tout);
         if (known) {
             int kn = 0; double cost = usage_cost_usd(u->model, u->in, u->out, u->cr, u->cw, &kn);
             total += cost; priced = true;
             fmt_usd(cost, usd, sizeof usd);
-            printf("≈ %s" C_DIM "  ($%g in · $%g out per million, %s)" C_RESET "\n", usd, pi, po, known == 2 ? "set with /usage price" : "list price");
+            sb_printf(&o, "≈ %s" C_DIM "  ($%g in · $%g out per million, %s)" C_RESET "\n", usd, pi, po, known == 2 ? "set with /usage price" : "list price");
         } else if (provider_find(u->model, NULL)) {
             unknown = true;
-            printf(C_YELLOW "no price known" C_RESET C_DIM " — /usage price %s IN OUT" C_RESET "\n", u->model);
-        } else if (model_is_cloud(u->model)) printf(C_DIM "an Ollama cloud model: on your ollama.com plan" C_RESET "\n");
-        else printf(C_DIM "local: no charge" C_RESET "\n");
+            sb_printf(&o, C_YELLOW "no price known" C_RESET C_DIM " — /usage price %s IN OUT" C_RESET "\n", u->model);
+        } else if (model_is_cloud(u->model)) sb_printf(&o, C_DIM "an Ollama cloud model: on your ollama.com plan" C_RESET "\n");
+        else sb_printf(&o, C_DIM "local: no charge" C_RESET "\n");
         if (u->cr || u->cw) {   /* the cache: its hits are billed at a fraction of the input, its writes above it */
             char tr[32], tw[32]; fmt_tokens(u->cr, tr, sizeof tr); fmt_tokens(u->cw, tw, sizeof tw);
-            printf(C_DIM "      ⟳ cache: %s read at %.3g%% of the input price" C_RESET "\n", tr, 100 * model_cache_read_ratio(u->model));
-            if (u->cw) printf(C_DIM "      ⟳ cache: %s written at %.4g× the input price" C_RESET "\n", tw, model_cache_write_ratio(u->model));
+            sb_printf(&o, C_DIM "      ⟳ cache: %s read at %.3g%% of the input price" C_RESET "\n", tr, 100 * model_cache_read_ratio(u->model));
+            if (u->cw) sb_printf(&o, C_DIM "      ⟳ cache: %s written at %.4g× the input price" C_RESET "\n", tw, model_cache_write_ratio(u->model));
         }
+        usage_limits_line(u->model, &o);
     }
     if (priced) {
         char usd[32]; fmt_usd(total, usd, sizeof usd);
-        printf("  estimated cost  " C_BOLD "≈ %s" C_RESET "%s\n", usd, unknown ? C_DIM "  (without the models that have no price)" C_RESET : "");
-        printf(C_DIM "  an estimate from token counts and prices per million tokens — what the provider bills is on its own usage page" C_RESET "\n");
+        sb_printf(&o, "  estimated cost  " C_BOLD "≈ %s" C_RESET "%s\n", usd, unknown ? C_DIM "  (without the models that have no price)" C_RESET : "");
+        sb_printf(&o, C_DIM "  an estimate from token counts and prices per million tokens — what the provider bills is on its own usage page" C_RESET "\n");
     }
+    if (!term_overlay_show(o.data)) fputs(o.data, stdout);
+    sb_free(&o);
 }
 
 /* ---------- /cost ---------- */
@@ -975,7 +1006,7 @@ static void cmd_permissions(const char *arg) {
     if (arg && !strcmp(arg, "clear")) { tools_permissions_clear(); printf(C_GREEN "✓ project permissions cleared" C_RESET "\n"); return; }
     if (arg && *arg) { printf("usage: /permissions [add edit|add bash <words>|add fetch <host>|remove N|clear]\n"); return; }
     int n = tools_permissions_count();
-    printf(C_BOLD "project permissions" C_RESET C_DIM " (.corbienest/permissions — answers of \"always allow … in this project\")" C_RESET "\n");
+    printf(C_BOLD "project permissions" C_RESET C_DIM " (kept in %s/permissions — answers of \"always allow … in this project\")" C_RESET "\n", config_dir());
     if (!n) printf(C_DIM "  none — pick \"always allow … in this project\" (p) at a confirmation, or /permissions add bash git status" C_RESET "\n");
     for (int i = 0; i < n; i++) {
         const char *r = tools_permissions_get(i);
@@ -1021,6 +1052,7 @@ static char *build_system_prompt(void) {
             "instead of asking the user to paste files or run commands for you.\n", tools_summary_line());
         sb_puts(&b,
             "- Explore first: use list_dir / grep / read_file to understand relevant code before changing it.\n"
+            "- Batch independent calls: when you need several reads, searches or fetches that do not depend on each other's results, request them all in one reply rather than one per turn.\n"
             "- Always read a file before editing it. Use edit_file for targeted changes (old_string must match exactly); "
             "use write_file only for new files or full rewrites.\n"
             "- Use bash for shell work: git (status, diff, log, add, commit, branch...), building, running tests, "
@@ -1034,6 +1066,7 @@ static char *build_system_prompt(void) {
             "them — the version this project uses (check its lockfile, manifest or image tag). Say which page you "
             "used; skip the web when the repo answers it.\n");
         sb_puts(&b,
+            "- When the user says they are finished and want to leave (\"exit\", \"bye\", \"that's all\"), reply with a short goodbye and call exit in the same turn; the program ends after that reply. Do not call exit otherwise.\n"
             "- Use task to hand a broad, self-contained investigation (\"find all places that…\", \"how does X work across the code\") to a read-only sub-agent "
             "and get back a report, keeping the noise out of this conversation; give it a complete prompt, it knows nothing of this chat.\n");
         if (g_cfg.advisor) {   /* no model name in it: changing the advisor leaves the prompt, and its cache, alone (the guidance does not) */
@@ -1114,9 +1147,11 @@ static cJSON *messages_with_system(void) {
 }
 
 static void add_message(const char *role, const char *content) {
+    char *clean = utf8_fix(content);   /* a pasted or @mentioned file may not be UTF-8 */
     cJSON *m = cJSON_CreateObject();
     cJSON_AddStringToObject(m, "role", role);
-    cJSON_AddStringToObject(m, "content", content);
+    cJSON_AddStringToObject(m, "content", clean);
+    free(clean);
     cJSON_AddItemToArray(g_messages, m);
 }
 
@@ -1340,23 +1375,8 @@ static void print_result_preview(const char *text, int max_lines) {
  * is for the model, and the user asked for it out of the way — and a click on that line shows
  * it (term_fold_begin). Where nothing can be clicked, the first lines are shown as before. */
 #define FOLD_MAX_LINES 400
-static void print_result_folded(const char *text, int preview_lines) {
-    int total = 0;
-    for (const char *p = text; *p; p++) if (*p == '\n') total++;
-    if (*text && text[strlen(text) - 1] != '\n') total++;
-    if (total < 2) { print_result_preview(text, preview_lines); return; }
-    size_t n = strcspn(text, "\n");
-    char count[48]; snprintf(count, sizeof count, TERM_FOLD_CLOSED " %d lines · ", total);
-    int w = term_width() - 6 - (int)strlen(count); if (w < 12) w = 12;   /* "  ⎿  " prefix + ellipsis */
-    size_t cut = n > (size_t)w ? (size_t)w : n;
-    while (cut > 0 && cut < n && ((unsigned char)text[cut] & 0xC0) == 0x80) cut--;   /* don't split UTF-8 */
-    sbuf head; sb_init(&head);
-    sb_printf(&head, "  ⎿  " C_DIM "%s", count);
-    for (size_t i = 0; i < cut; i++) sb_putc(&head, (unsigned char)text[i] < 32 || text[i] == 127 ? ' ' : text[i]);
-    sb_printf(&head, "%s" C_RESET, cut < n ? "…" : "");
-    bool folded = term_fold_begin(head.data);
-    sb_free(&head);
-    if (!folded) { print_result_preview(text, preview_lines); return; }
+/* the body of an open fold: `total` lines of plain text, at most FOLD_MAX_LINES of them */
+static void fold_body(const char *text, int total) {
     int lines = 0;
     for (const char *p = text; *p && lines < FOLD_MAX_LINES; lines++) {
         size_t len = strcspn(p, "\n");
@@ -1366,6 +1386,42 @@ static void print_result_folded(const char *text, int preview_lines) {
         p += len; if (*p == '\n') p++;
     }
     if (total > lines) printf("     " C_DIM "… +%d lines" C_RESET "\n", total - lines);
+}
+static int count_lines(const char *text) {
+    int total = 0;
+    for (const char *p = text; *p; p++) if (*p == '\n') total++;
+    if (*text && text[strlen(text) - 1] != '\n') total++;
+    return total;
+}
+/* columns a string takes on the screen: its escapes do not count */
+static int plain_width(const char *s) {
+    int w = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == 27) { while (*p && *p != 'm') p++; if (!*p) break; continue; }
+        if (((unsigned char)*p & 0xC0) != 0x80) w++;
+    }
+    return w;
+}
+/* `lead` is what the head starts with (NULL: the usual "  ⎿  "); a bash call's result line passes its
+ * header, so the call is one line with its output's fold on it */
+static void print_result_folded(const char *text, int preview_lines, const char *lead) {
+    int total = count_lines(text);
+    bool plain = !lead;
+    if (plain) lead = "  ⎿  ";
+    if (total < 2 && plain) { print_result_preview(text, preview_lines); return; }
+    size_t n = strcspn(text, "\n");
+    char count[48]; snprintf(count, sizeof count, TERM_FOLD_CLOSED " %d lines · ", total);
+    int w = term_width() - plain_width(lead) - 1 - (int)strlen(count); if (w < 12) w = 12;   /* the ellipsis */
+    size_t cut = n > (size_t)w ? (size_t)w : n;
+    while (cut > 0 && cut < n && ((unsigned char)text[cut] & 0xC0) == 0x80) cut--;   /* don't split UTF-8 */
+    sbuf head; sb_init(&head);
+    sb_printf(&head, "%s" C_DIM "%s", lead, count);
+    for (size_t i = 0; i < cut; i++) sb_putc(&head, (unsigned char)text[i] < 32 || text[i] == 127 ? ' ' : text[i]);
+    sb_printf(&head, "%s" C_RESET, cut < n ? "…" : "");
+    bool folded = term_fold_begin(head.data);
+    sb_free(&head);
+    if (!folded) { if (!plain) printf("%s\n", lead); print_result_preview(text, preview_lines); return; }
+    fold_body(text, total);
     term_fold_end();
 }
 
@@ -1421,6 +1477,7 @@ static void tool_arg_summary(const char *name, cJSON *args, char *out, size_t n)
     if (v) {
         snprintf(out, n, "%.*s", room, v);
         char *nl = strchr(out, '\n'); if (nl) *nl = 0;
+        if (nl && (int)strlen(out) < room && strlen(out) + 4 <= n) strcat(out, "…");   /* more lines follow: the header shows the first one only, within room */
         size_t vl = strcspn(v, "\n");
         if (vl > (size_t)room) {   /* truncated: back off to a UTF-8 boundary and add an ellipsis */
             size_t cut = (size_t)room - 1;
@@ -1443,19 +1500,18 @@ static void tool_arg_summary(const char *name, cJSON *args, char *out, size_t n)
  * TOOL_RESULT_PCT of the window; the middle goes, both ends stay, and the note tells the model
  * how to get the rest. */
 #define TOOL_RESULT_PCT 25
-/* The result a tool call gets when the user's message cut the round short: the model has to
- * know the call did not happen, and that what follows is why. */
+/* The result a tool call gets when it did not run because the request was interrupted (Esc or
+ * Ctrl-C): the model has to know the call did not happen. */
 static const char *TOOL_NOT_RUN =
-    "not run: the user sent a message while this tool round was in flight, so the calls that had "
-    "not started were skipped. Their message follows below — read it first, and call this tool "
-    "again if it is still what you need.";
+    "not run: the user interrupted the work before this tool call started. The user's next message "
+    "follows; call this tool again if it is still needed.";
 
 static const char *tool_call_id(cJSON *call) {
     cJSON *id = call ? cJSON_GetObjectItemCaseSensitive(call, "id") : NULL;
     return cJSON_IsString(id) && id->valuestring[0] ? id->valuestring : NULL;
 }
 
-static cJSON *tool_result_message(const char *name, const char *id, const char *res) {
+static cJSON *tool_result_build(const char *name, const char *id, const char *res) {
     cJSON *tm = cJSON_CreateObject();
     cJSON_AddStringToObject(tm, "role", "tool");
     cJSON_AddStringToObject(tm, "tool_name", name);
@@ -1477,6 +1533,29 @@ static cJSON *tool_result_message(const char *name, const char *id, const char *
     sb_free(&b);
     printf("  ⎿  " C_GRAY "result trimmed to %zu KB: more than %d%% of the context window" C_RESET "\n", cap / 1024, TOOL_RESULT_PCT);
     return tm;
+}
+
+/* every result enters the conversation valid UTF-8: a command's output may be binary, and one bad byte
+ * makes the next request body invalid JSON (see messages_repair in util.c) */
+static cJSON *tool_result_message(const char *name, const char *id, const char *res) {
+    char *clean = utf8_fix(res);
+    cJSON *tm = tool_result_build(name, id, clean);
+    free(clean);
+    return tm;
+}
+
+/* the name of a call as the model made it */
+static const char *call_name(cJSON *call) {
+    cJSON *fn = call ? cJSON_GetObjectItemCaseSensitive(call, "function") : NULL;
+    cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+    return cJSON_IsString(nm) ? nm->valuestring : "?";
+}
+
+/* A reply's calls that the request stops before running: each still gets a result, so the
+ * conversation stays well-formed (the server refuses a tool call without its result). */
+static void answer_calls_unrun(cJSON *calls, const char *why) {
+    cJSON *call;
+    cJSON_ArrayForEach(call, calls) cJSON_AddItemToArray(g_messages, tool_result_message(call_name(call), tool_call_id(call), why));
 }
 
 /* tools to offer the model in the current mode (plan mode drops the mutating ones) */
@@ -1638,6 +1717,7 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
     sb_printf(&sp, "You are a sub-agent of Corbie Nest (corbienest), a terminal coding agent. The main agent delegated one self-contained task to you.\n"
                    "Working directory: %s\n"
                    "You have read-only tools: read_file, list_dir, grep, bash (for read-only shell commands such as git log, find, wc; do not modify files, do not run interactive programs)%s. "
+                   "Batch independent calls: when you need several reads, searches or fetches that do not depend on each other's results, request them all in one reply rather than one per turn. "
                    "Do the research thoroughly, then finish with ONE final message: a clear, complete report with concrete file paths, line numbers and code snippets where useful — "
                    "the main agent sees only that final message, nothing else you did. Do not ask questions; make reasonable assumptions and state them.",
                    g_cwd, g_cfg.web ? " and web_search/web_fetch for the documentation of external projects" : "");
@@ -1656,7 +1736,6 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
             !strcmp(name, "web_fetch") || !strcmp(name, "web_search")) cJSON_AddItemReferenceToArray(tools, t);
     }
     int rc = 1, tool_rounds = 0, round_first = -1;
-    bool stopped_early = false;   /* the user sent a message: report what it has and get out */
     bool interrupted = false;     /* the user stopped it (Esc / Ctrl-C) */
     const char *final = NULL;
     for (int iter = 0; iter <= SUBAGENT_ITERS; iter++) {
@@ -1685,7 +1764,6 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         if (iter == SUBAGENT_ITERS) { sb_printf(out, "error: sub-agent stopped after %d tool rounds without a report", SUBAGENT_ITERS); if (cJSON_IsString(content) && content->valuestring[0]) sb_printf(out, "\nIts last message:\n%s", content->valuestring); break; }
         cJSON *call;
         round_first = cJSON_GetArraySize(msgs);
-        bool cut = false;   /* a message arrived mid-round: start nothing more */
         cJSON_ArrayForEach(call, calls) {
             cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
             cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
@@ -1694,13 +1772,6 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
             cJSON *parsed = NULL;
             if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
             char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
-            if (!cut && term_queue_new()) cut = true;
-            if (cut) {
-                printf("    " C_DIM "⎿ %s — not run" C_RESET "\n", name);
-                cJSON_AddItemToArray(msgs, tool_result_message(name, tool_call_id(call), TOOL_NOT_RUN));
-                if (parsed) cJSON_Delete(parsed);
-                continue;
-            }
             printf("    " C_DIM "⎿ %s%s%s%s" C_RESET "\n", name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
             agent_say(rec, "› "); agent_say(rec, name); agent_say(rec, summ[0] ? "(" : ""); agent_say(rec, summ); agent_say(rec, summ[0] ? ")\n" : "\n");
             char act[200]; snprintf(act, sizeof act, "%s%s%s%s", name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
@@ -1719,25 +1790,14 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         }
         tool_rounds++;
         if (term_poll_interrupt()) { sb_puts(out, "error: sub-agent interrupted by the user"); interrupted = true; break; }
-        /* The user is talking to the main agent: half a report now beats a whole one after
-         * another twenty rounds of research it may no longer want. */
-        if (term_queue_new()) {
-            sb_printf(out, "The sub-agent was stopped after %d tool round%s because the user sent a message that comes first. What it had gathered so far:\n%s",
-                      tool_rounds, tool_rounds == 1 ? "" : "s",
-                      cJSON_IsString(content) && content->valuestring[0] ? content->valuestring : "(nothing reported yet)");
-            stopped_early = true; rc = 0; break;
-        }
     }
-    if (stopped_early) {
-        printf("    " C_YELLOW "⎿ stopped after %d tool round%s — your message goes first" C_RESET "\n",
-               tool_rounds, tool_rounds == 1 ? "" : "s");
-    } else if (rc == 0) {
+    if (rc == 0) {
         sb_printf(out, "%s", final && *final ? final : "(the sub-agent returned an empty report)");
         printf("    " C_DIM "⎿ report after %d tool round%s:" C_RESET "\n", tool_rounds, tool_rounds == 1 ? "" : "s");
         print_result_preview(final && *final ? final : "(empty)", 8);
     } else printf("    " C_RED "⎿ %s" C_RESET "\n", out->data ? out->data : "sub-agent failed");
     if (rec) {
-        rec->state = stopped_early || interrupted ? AG_STOPPED : rc == 0 ? AG_DONE : AG_FAILED;
+        rec->state = interrupted ? AG_STOPPED : rc == 0 ? AG_DONE : AG_FAILED;
         agent_say(rec, rc == 0 ? "report:\n" : "result:\n");
         agent_say(rec, out->data ? out->data : "");
         agent_say(rec, "\n");
@@ -1824,7 +1884,7 @@ static void advisor_system(sbuf *b) {
 }
 
 enum { CONSULT_ASKED, CONSULT_REVIEW, CONSULT_CHECK };                /* the agent asked; corbienest did (guidance strong/max) */
-enum { ADVICE_GIVEN, ADVICE_NONE, ADVICE_STOPPED, ADVICE_SKIPPED };  /* what came of it */
+enum { ADVICE_GIVEN, ADVICE_NONE, ADVICE_SKIPPED };  /* what came of it (ADVICE_SKIPPED: Esc or Ctrl-C) */
 
 /* One toolless call to the advisor model — a hosted API or a model on the Ollama server — with
  * a system prompt and one user message, accounted to it. The answer, malloc'd, or NULL: then
@@ -1842,7 +1902,7 @@ static char *advisor_call(const char *sys, const char *user, const advisor_plan 
         cJSON *m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "system"); cJSON_AddStringToObject(m, "content", sys); cJSON_AddItemToArray(msgs, m);
         m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", user); cJSON_AddItemToArray(msgs, m);
         ollama_quiet = true;
-        ollama_call.busy = label; ollama_call.num_predict = reply; ollama_call.stop_on_message = true; ollama_call.idle_ms = ADVISOR_IDLE_MS;
+        ollama_call.busy = label; ollama_call.num_predict = reply; ollama_call.idle_ms = ADVISOR_IDLE_MS;
         ollama_call.model = g_cfg.advisor; ollama_call.info = known ? &g_advisor_info : NULL;
         ollama_call.num_ctx = plan->send_ctx; ollama_call.keep_alive = plan->keep_alive;
         cJSON *rep = ollama_chat(msgs, NULL, &r->st, &r->aborted);
@@ -1868,8 +1928,9 @@ static void cost_note(const char *model, const chat_stats *st, char *out, size_t
     snprintf(out, n, " · ≈ %s", usd);
 }
 
-/* One consultation. Prints the ⤷ line and one ⎿ line for whatever comes of it; the advice (for
- * ADVICE_GIVEN, and what there was of it for ADVICE_STOPPED) goes into `advice`, and for
+/* One consultation. Prints the ⤷ line, then for ADVICE_GIVEN the advice as a fold (its head says how
+ * long it is; a click shows it, the preview where there are no folds) and for anything else one ⎿
+ * line for whatever comes of it; the advice (for ADVICE_GIVEN) goes into `advice`, and for
  * ADVICE_NONE the tool result that says why there is none into `why`. `what` is the middle of
  * the ⤷ line ("consultation 1 of 3 in this request"). */
 static int consult(const char *question, const char *what, sbuf *advice, sbuf *why) {
@@ -1902,11 +1963,7 @@ static int consult(const char *question, const char *what, sbuf *advice, sbuf *w
     int res = ADVICE_NONE;
     const char *text = strip_think_block(answer ? answer : "");
     bool cut = !strcmp(st.done_reason, "length");
-    if (aborted && ollama_stopped_for_message) {
-        if (*text) sb_puts(advice, text);
-        printf("    " C_YELLOW "⎿ stopped — your message goes first" C_RESET "\n");
-        res = ADVICE_STOPPED;
-    } else if (aborted) {
+    if (aborted) {
         printf("    " C_RED "⎿ interrupted" C_RESET "\n");
         res = ADVICE_SKIPPED;
     } else if (!answer && not_found) {
@@ -1926,8 +1983,16 @@ static int consult(const char *question, const char *what, sbuf *advice, sbuf *w
         if (cut) sb_puts(advice, "\n[… the answer was cut off here: the advisor ran out of tokens]");
         char tk[32]; fmt_tokens(st.prompt_tokens + st.eval_tokens, tk, sizeof tk);
         char cost[48]; cost_note(g_cfg.advisor, &st, cost, sizeof cost);   /* a model with a price: what this one consultation came to */
-        printf("    " C_DIM "⎿ advice · %s tokens · %.0fs%s%s:" C_RESET "\n", tk, st.total_seconds, cost, st.load_seconds >= 1 ? " (of which loading the model)" : "");
-        print_result_preview(text, 12);
+        sbuf info; sb_init(&info);   /* the head: plain text, so it can be cut to the width */
+        sb_printf(&info, "advice · %s tokens · %.0fs%s%s · %d lines", tk, st.total_seconds, cost, st.load_seconds >= 1 ? " (of which loading the model)" : "", count_lines(advice->data));
+        int w = term_width() - 8; if (w < 20) w = 20;   /* "    ▸ " prefix */
+        size_t cut = info.len > (size_t)w ? (size_t)w : info.len;
+        while (cut > 0 && cut < info.len && ((unsigned char)info.data[cut] & 0xC0) == 0x80) cut--;   /* don't split UTF-8 */
+        sbuf head; sb_init(&head);
+        sb_printf(&head, "    %s " C_DIM "%.*s%s" C_RESET, TERM_FOLD_CLOSED, (int)cut, info.data, cut < info.len ? "…" : "");
+        if (term_fold_begin(head.data)) { fold_body(advice->data, count_lines(advice->data)); term_fold_end(); }   /* a click shows the advice */
+        else { printf("    " C_DIM "%.*s%s" C_RESET "\n", (int)cut, info.data, cut < info.len ? "…" : ""); print_result_preview(text, 12); }   /* no folds here: as before */
+        sb_free(&head); sb_free(&info);
         res = ADVICE_GIVEN;
     }
     if (main_was_loaded && !aborted && ollama_model_placement(g_cfg.model, &sz, &vram) != 0)
@@ -1970,11 +2035,6 @@ static int run_advisor(const char *question, sbuf *out) {
     case ADVICE_GIVEN:
         sb_printf(out, "%s\n\n[advice from %s — consultation %d of %d in this request. Weigh it seriously, but where the files or a command's output contradict it, they are right: say so and adapt.]",
                   advice.data, g_cfg.advisor, k, most);
-        rc = 0; break;
-    case ADVICE_STOPPED:
-        g_advisor_uses--;   /* the user cut in: that is not the agent's consultation spent */
-        sb_puts(out, "The advisor was not heard out: the user sent a message, and that comes first. Read it; consult the advisor again afterwards if you still need to.");
-        if (advice.len) sb_printf(out, "\nWhat it had written so far:\n%s", advice.data);
         rc = 0; break;
     case ADVICE_SKIPPED:
         sb_puts(out, "error: the consultation was interrupted by the user — carry on without it, and do not consult the advisor again for this request unless the user asks");
@@ -2078,7 +2138,7 @@ static bool advisor_check_due(const char *tool) {
 }
 
 /* The check. ADVICE_GIVEN with objections: the change is held back and *out is the tool result
- * that says why; ADVICE_STOPPED: the user's message goes first; anything else: go ahead. */
+ * that says why; anything else: go ahead. */
 static int advisor_check(const char *tool, cJSON *args, sbuf *out) {
     g_advisor_checked = true;
     char *a = args ? cJSON_PrintUnformatted(args) : xstrdup("{}");
@@ -2095,7 +2155,7 @@ static int advisor_check(const char *tool, cJSON *args, sbuf *out) {
         sb_printf(out, "not applied: the advisor (%s) checked this change before it was made — corbienest asked it, not you — and says:\n%s\n\n"
                        "[Reconsider, then make the change you settle on: this one again if the files or a command's output show the advisor is wrong.]", g_cfg.advisor, advice.data);
     else if (r == ADVICE_GIVEN) { printf("    " C_GREEN "⎿ go ahead" C_RESET "\n"); r = ADVICE_NONE; }
-    else if (r != ADVICE_STOPPED) r = ADVICE_NONE;
+    else r = ADVICE_NONE;
     sb_free(&advice); sb_free(&why);
     return r;
 }
@@ -2296,8 +2356,8 @@ static void echo_queued(const char *text) {
 /* Deliver plain messages queued while the model was working (Claude Code style): they are
  * appended as user messages so the model sees them on its next call. Slash / ! lines stay
  * queued for the REPL to run after the turn, but they do not hold the messages behind them
- * back — those are what the model is waiting for. Marking the queue afterwards is what tells
- * the rest of the turn that nothing is waiting any more.
+ * back — those are what the model is waiting for. A queued message never stops work in flight;
+ * one that arrives mid-turn goes in before the turn's next model call, the rest wait for the REPL.
  * Returns the number of messages injected. */
 static int inject_queued(void) {
     int n = 0;
@@ -2308,7 +2368,6 @@ static int inject_queued(void) {
         add_message("user", msg);
         free(msg); free(text); n++;
     }
-    term_queue_mark();
     if (n) { g_advisor_uses = 0; g_advisor_since = time(NULL); term_status_refresh(); printf("\n"); }   /* the user spoke: the advisor's budget is new, as it would be at the prompt */
     return n;
 }
@@ -2355,9 +2414,6 @@ static bool run_turn(void) {
     int iters = 0, shrinks = 0, empties = 0;
     int round_first = -1;   /* where this round's tool results start (-1 before the first round) */
     g_session.turns++;
-    /* Messages already queued when the turn starts (the REPL sends them one after another) are
-     * delivered the normal way; only what the user types from here on cuts into the work. */
-    term_queue_mark();
     for (;;) {
         if (shrink_context(round_first >= 0 ? round_first : cJSON_GetArraySize(g_messages))) round_first = -1;
         cJSON *msgs = messages_with_system();
@@ -2409,6 +2465,7 @@ static bool run_turn(void) {
                 printf(C_DIM "  nothing was added to the conversation; send another message to continue, or /model to try a different one" C_RESET "\n");
                 return false;
             }
+            if (aborted && calls && cJSON_GetArraySize(calls) > 0) answer_calls_unrun(calls, TOOL_NOT_RUN);
             print_stats(&st);
             /* guidance strong and up: the advisor looks at a request that changed files before it
              * ends; what it finds goes to the agent, which gets another round for it */
@@ -2418,11 +2475,13 @@ static bool run_turn(void) {
         }
         if (++iters > g_cfg.max_iters) {
             printf(C_YELLOW "⚠ stopped after %d tool rounds (loop guard). Send a message to continue." C_RESET "\n", g_cfg.max_iters);
+            /* the reply that asked for these calls is already in the conversation: answer them, or the next request is refused */
+            answer_calls_unrun(calls, "not run: this request reached its tool-round limit (/max_iters) before the call ran. "
+                                      "The user's next message follows; call the tool again if it is still needed.");
             return false;
         }
         cJSON *call;
         round_first = cJSON_GetArraySize(g_messages);
-        bool cut = false;   /* a message arrived mid-round: start nothing more, let it through */
         bool failed = false;   /* a call of this round failed (see advisor_step_in) */
         cJSON_ArrayForEach(call, calls) {
             cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
@@ -2432,24 +2491,26 @@ static bool run_turn(void) {
             cJSON *parsed = NULL;
             if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
             char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
-            if (!cut && term_queue_new()) cut = true;
-            if (cut) {
-                printf(C_DIM "○" C_RESET " " C_BOLD "%s" C_RESET, name);
+            /* a bash call is one line, grey: its header goes with its result (the fold's head), after the approval;
+             * short of that the usual header comes first. The summary is kept to half the width, for the output's count. */
+            bool bashline = !strcmp(name, "bash");
+            char lead[480] = "";
+            if (bashline) {
+                char head[300];
+                int room = term_width() / 2 - 10; if (room < 20) room = 20;
+                snprintf(head, sizeof head, "%s", summ);
+                if ((int)strlen(head) > room) { size_t cut = (size_t)room - 1; while (cut > 0 && ((unsigned char)head[cut] & 0xC0) == 0x80) cut--; snprintf(head + cut, sizeof head - cut, "…"); }
+                snprintf(lead, sizeof lead, C_GRAY "● bash(%s)" C_RESET "  ", head);
+            } else {
+                printf(C_GREEN "●" C_RESET " " C_BOLD "%s" C_RESET, name);
                 if (summ[0]) printf(C_DIM "(%s)" C_RESET, summ);
-                printf("\n  ⎿  " C_DIM "not run — your message goes to the model first" C_RESET "\n");
-                cJSON_AddItemToArray(g_messages, tool_result_message(name, tool_call_id(call), TOOL_NOT_RUN));
-                if (parsed) cJSON_Delete(parsed);
-                continue;
+                printf("\n");
             }
-            printf(C_GREEN "●" C_RESET " " C_BOLD "%s" C_RESET, name);
-            if (summ[0]) printf(C_DIM "(%s)" C_RESET, summ);
-            printf("\n");
             sbuf out; sb_init(&out);
             if (advisor_check_due(name)) {   /* guidance max: the advisor looks at the request's first change before it is made */
                 int v = advisor_check(name, args, &out);
                 if (v != ADVICE_NONE) {
-                    if (v == ADVICE_STOPPED) { cut = true; sb_clear(&out); sb_puts(&out, TOOL_NOT_RUN); }
-                    else printf("  ⎿  " C_YELLOW "held back — the advisor sees a problem with it" C_RESET "\n");
+                    printf("  ⎿  " C_YELLOW "held back — the advisor sees a problem with it" C_RESET "\n");
                     cJSON_AddItemToArray(g_messages, tool_result_message(name, tool_call_id(call), out.data));
                     sb_free(&out);
                     if (parsed) cJSON_Delete(parsed);
@@ -2461,18 +2522,18 @@ static bool run_turn(void) {
             tool_status ts = tools_execute(name, args, &out);
             const char *res = out.data ? out.data : "";
             if (g_advisor_said) {}   /* run_advisor() has said what came of it: the advice is not shown twice */
-            else if (ts == TOOL_DENIED) printf("  ⎿  " C_RED "denied" C_RESET "\n");
-            else if (ts == TOOL_ERROR) printf("  ⎿  " C_RED "%s" C_RESET "\n", res);
-            else print_result_folded(res, (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8);
+            else if (ts == TOOL_DENIED) printf("%s" C_RED "denied" C_RESET "\n", bashline ? lead : "  ⎿  ");
+            else if (ts == TOOL_ERROR) printf("%s" C_RED "%s" C_RESET "\n", bashline ? lead : "  ⎿  ", res);
+            else print_result_folded(res, (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8, bashline ? lead : NULL);
             if (tool_result_failed(name, res, ts == TOOL_ERROR)) failed = true;
             cJSON_AddItemToArray(g_messages, tool_result_message(name, tool_call_id(call), res));
             sb_free(&out);
             if (parsed) cJSON_Delete(parsed);
         }
         g_fail_rounds = failed ? g_fail_rounds + 1 : 0;
-        if (!cut && advisor_step_in_due()) advisor_step_in(reply);
+        if (advisor_step_in_due()) advisor_step_in(reply);
         printf("\n");
-        inject_queued();   /* messages the user queued meanwhile go in before the next model call */
+        inject_queued();   /* messages the user queued meanwhile go in before the next model call (they never stop a call) */
     }
 }
 
@@ -2590,8 +2651,7 @@ static char *orch_ask(const char *what, const char *user, chat_stats *st, int *h
     *st = ar.st;
     const char *text = strip_think_block(answer ? answer : "");
     char *out = NULL;
-    if (ar.aborted && ollama_stopped_for_message) { printf("    " C_YELLOW "⎿ stopped — your message goes first" C_RESET "\n"); *how = ADVICE_STOPPED; }
-    else if (ar.aborted) { printf("    " C_RED "⎿ interrupted" C_RESET "\n"); *how = ADVICE_SKIPPED; }
+    if (ar.aborted) { printf("    " C_RED "⎿ interrupted" C_RESET "\n"); *how = ADVICE_SKIPPED; }
     else if (!answer) {
         if (ar.signin) printf("    " C_YELLOW "⎿ a cloud model needs an account: run \"ollama signin\" in a shell, then ask again" C_RESET "\n");
         else printf("    " C_RED "⎿ no answer: %s" C_RESET "\n", ar.err);
@@ -2663,7 +2723,7 @@ static void worker_begin(orch_run *r, int i) {
     sb_printf(&sp, "You are a worker agent of Corbie Nest (corbienest), a coding agent in the user's terminal. An orchestrator split the user's request into tasks; "
                    "you do ONE of them, in the user's project, with your tools.\nWorking directory: %s\n"
                    "Do this task and only this task — not the others; some of them may be under way at this very moment, in files that are not yours to touch. "
-                   "Read the code before you change it, change no more than the task needs, "
+                   "Read the code before you change it (batch independent reads and searches into one reply rather than one per turn), change no more than the task needs, "
                    "and check your work where you can (build it, run the test). Do not ask questions: make a reasonable assumption and say which.\n"
                    "End with ONE final message, your report: what you changed and in which files, what you checked and how, and anything left undone or that you are unsure of. "
                    "The orchestrator sees only that report and the diff of the files you wrote.", g_cwd);
@@ -2701,7 +2761,7 @@ static void worker_review(orch_run *r, int i) {
     chat_stats st; int how;
     char *verdict = orch_ask(what, rb.data, &st, &how);
     sb_free(&rb); sb_free(&diff);
-    if (how == ADVICE_STOPPED || how == ADVICE_SKIPPED) { task_end(w, T_STOPPED, "done, but the run was stopped before its review"); r->aborted = true; }
+    if (how == ADVICE_SKIPPED) { task_end(w, T_STOPPED, "done, but the run was stopped before its review"); r->aborted = true; }
     else if (how != ADVICE_GIVEN) task_end(w, T_UNREVIEWED, "done, not reviewed (the orchestrator could not be asked)");
     else if (advisor_approves(verdict)) {
         orch_spent(&st, spent, sizeof spent);
@@ -2731,6 +2791,7 @@ static void worker_step(orch_run *r, int i) {
     sbuf body; sb_init(&body); http_result res;
     int rc = http_job_finish(w->job, &body, &res);
     w->job = NULL;
+    ratelimit_set(g_cfg.model, &res.rl);   /* (a worker's call is a call of the main model) */
     chat_stats st; char err[512] = "";
     cJSON *reply = rc == 0 ? (model_hosted() ? provider_turn_reply(g_cfg.model, body.data, res.status, &st, err, sizeof err)
                                             : ollama_chat_reply(body.data, res.status, true, &st, err, sizeof err)) : NULL;
@@ -2756,7 +2817,6 @@ static void worker_step(orch_run *r, int i) {
     }
     w->round_first = cJSON_GetArraySize(w->msgs);
     tools_checkpoint_step(i + 1);   /* what it writes is this task's, whatever the others write meanwhile */
-    bool cut = false;               /* the user spoke mid-round: start nothing more */
     cJSON_ArrayForEach(call, calls) {
         cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
         cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
@@ -2765,22 +2825,18 @@ static void worker_step(orch_run *r, int i) {
         cJSON *parsed = NULL;
         if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
         char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
-        if (!cut && term_queue_new()) cut = true;
-        if (cut) cJSON_AddItemToArray(w->msgs, tool_result_message(name, tool_call_id(call), TOOL_NOT_RUN));
-        else {
-            printf("    " C_DIM "[%d] ⎿ %s%s%s%s" C_RESET "\n", i + 1, name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
-            sbuf o; sb_init(&o);
-            g_session.tool_calls++;
-            if (!strcmp(name, "task") || !strcmp(name, "advisor")) sb_printf(&o, "error: %s is not available to a worker; do the task with the other tools and report", name);
-            else tools_execute(name, args, &o);
-            cJSON_AddItemToArray(w->msgs, tool_result_message(name, tool_call_id(call), o.data ? o.data : ""));
-            sb_free(&o);
-        }
+        printf("    " C_DIM "[%d] ⎿ %s%s%s%s" C_RESET "\n", i + 1, name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
+        sbuf o; sb_init(&o);
+        g_session.tool_calls++;
+        if (!strcmp(name, "task") || !strcmp(name, "advisor")) sb_printf(&o, "error: %s is not available to a worker; do the task with the other tools and report", name);
+        else tools_execute(name, args, &o);
+        cJSON_AddItemToArray(w->msgs, tool_result_message(name, tool_call_id(call), o.data ? o.data : ""));
+        sb_free(&o);
         if (parsed) cJSON_Delete(parsed);
     }
     tools_checkpoint_step(0);
     w->rounds++;
-    if (cut || term_poll_interrupt()) { task_end(w, T_STOPPED, "stopped by the user before it was finished"); r->aborted = true; return; }
+    if (term_poll_interrupt()) { task_end(w, T_STOPPED, "stopped by the user before it was finished"); r->aborted = true; return; }
     worker_call(r, i);
 }
 
@@ -2810,13 +2866,13 @@ static void orch_schedule(orch_run *r, int maxpar) {
         for (int i = 0; i < r->nt && !r->aborted; i++)
             if (r->w[i].state == T_RUNNING && http_job_done(r->w[i].job)) { worker_step(r, i); stepped = true; label[0] = 0; }   /* (a tool or a review took the bar: say it again) */
         if (stepped) continue;
-        if (term_poll_interrupt() || term_queue_new()) { r->aborted = true; break; }
+        if (term_poll_interrupt()) { r->aborted = true; break; }
         term_busy_tick();
         nanosleep(&(struct timespec){ 0, 50 * 1000 * 1000 }, NULL);
     }
     term_busy(NULL);
     if (!r->aborted) return;
-    printf(C_YELLOW "⏹ the run was stopped%s" C_RESET "\n", term_queue_new() ? " — your message goes first" : "");
+    printf(C_YELLOW "⏹ the run was stopped" C_RESET "\n");
     for (int i = 0; i < r->nt; i++) if (r->w[i].state == T_RUNNING) http_job_cancel(r->w[i].job);
     for (int i = 0; i < r->nt; i++) {
         orch_worker *w = &r->w[i];
@@ -2842,7 +2898,6 @@ static int cmd_orchestrate(const char *arg) {
     char *request = expand_mentions(arg);
     int first = begin_request();
     add_message("user", request);
-    term_queue_mark();
     struct utsname un; uname(&un);
     sbuf brief; sb_init(&brief);
     sb_printf(&brief, "# Where the work happens\nWorking directory: %s · %s %s · git repository: %s · the workers are the model %s\n", g_cwd, un.sysname, un.machine, is_dir(".git") ? "yes" : "no", g_cfg.model);
@@ -3037,11 +3092,12 @@ static void cmd_help(void) {
            "  /skills [reload|new NAME]  list skills (SKILL.md files); run one with /NAME [args]\n"
            "  /init                 have the model explore the project and write an AGENTS.md (project instructions)\n"
            "  /mode [name]          permission mode: manual · accept-edits · plan · auto (or press shift+tab to cycle)\n"
-           "  /permissions [...]    list the project's saved \"always allow\" rules (.corbienest/permissions); add/remove/clear\n"
+           "  /permissions [...]    list the project's saved \"always allow\" rules (kept in the config directory, not in the project); add/remove/clear\n"
            "  /web [on|off|engine URL]  let the model look documentation up with web_search/web_fetch (on by default); set the search engine\n"
            "  /yolo [on|off]        shortcut for /mode auto / /mode manual (dangerous!)\n"
            "  /tools on|off         enable/disable tool calling\n"
            "  /max_iters [N]        tool rounds one request may run before the loop guard stops it (default 100); takes effect at once, even mid-turn\n"
+           "  /ui [ansi|notcurses]  the screen: ansi (default) or notcurses (needs notcurses installed at build time); restarts into this session\n"
            "  /ctx [N|Nk|max]       context window: no argument opens a size picker; N/64k/max/default set it\n"
            "  /temp X               set temperature (-1 = server default)\n"
            "  /host URL             set ollama host (default http://127.0.0.1:11434)\n"
@@ -3105,16 +3161,26 @@ static void cmd_models(void) {
     cJSON_Delete(list);
 }
 
+static cJSON *model_list_get(int slot, const provider_def *p, const char **why);
+static int provider_slot_of(const provider_def *p) { int slot = 1; while (provider_at(slot - 1) != p) slot++; return slot; }
+
+/* /model's picker: the Ollama server's models, then the hosted ones that can do the work (the Messages
+ * providers, named "anthropic:ID"). xAI and OpenAI are advisors only and are not offered here. A list
+ * that cannot be had says why, under the menu's place; the menu is empty only when both are. */
 static void cmd_model_picker(void) {
-    cJSON *list = ollama_list_models();
-    if (!list) return;
-    int n = cJSON_GetArraySize(list);
-    if (n == 0) { printf(C_YELLOW "no models installed — run: ollama pull <model>" C_RESET "\n"); cJSON_Delete(list); return; }
+    cJSON *list = ollama_list_models();   /* NULL: the server is down, and it has said so */
+    const provider_def *hp = NULL, *p;
+    for (int i = 0; (p = provider_at(i)); i++) if (p->style == PROVIDER_MESSAGES && !hp) hp = p;
+    const char *why = NULL;
+    cJSON *hosted = hp ? model_list_get(provider_slot_of(hp), hp, &why) : NULL;
+    int nl = list ? cJSON_GetArraySize(list) : 0, nh = hosted ? cJSON_GetArraySize(hosted) : 0, n = nl + nh;
+    if (hp && !hosted && why) printf(C_DIM "%s models: %s" C_RESET "\n", hp->label, why);
+    if (n == 0) { if (list) printf(C_YELLOW "no models installed — run: ollama pull <model>" C_RESET "\n"); cJSON_Delete(list); return; }
     const char **names = xmalloc(sizeof(char*) * (size_t)n);
     const char **descs = xmalloc(sizeof(char*) * (size_t)n);
-    char **descbuf = xmalloc(sizeof(char*) * (size_t)n);
-    int current = -1;
-    for (int i = 0; i < n; i++) {
+    char **own = xmalloc(sizeof(char*) * (size_t)n * 2);   /* what this function allocated: descriptions, and the hosted names */
+    int nown = 0, current = -1;
+    for (int i = 0; i < nl; i++) {
         cJSON *m = cJSON_GetArrayItem(list, i);
         names[i] = cJSON_GetObjectItemCaseSensitive(m, "name")->valuestring;
         bool tools = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(m, "tools"));
@@ -3122,7 +3188,19 @@ static void cmd_model_picker(void) {
         const char *size = cJSON_GetObjectItemCaseSensitive(m, "size")->valuestring;
         sbuf d; sb_init(&d);
         sb_printf(&d, "%-7s %s%s", size, tools ? "tools" : "chat-only", think ? " · thinking" : "");
-        descbuf[i] = sb_detach(&d); descs[i] = descbuf[i];
+        char *dt = sb_detach(&d); own[nown++] = dt; descs[i] = dt;
+        if (g_cfg.model && !strcmp(names[i], g_cfg.model)) current = i;
+    }
+    for (int j = 0; j < nh; j++) {
+        int i = nl + j;
+        cJSON *m = cJSON_GetArrayItem(hosted, j);
+        cJSON *id = cJSON_GetObjectItemCaseSensitive(m, "id"), *name = cJSON_GetObjectItemCaseSensitive(m, "name");
+        if (!cJSON_IsString(id)) { names[i] = descs[i] = ""; continue; }
+        sbuf nm; sb_init(&nm); sb_printf(&nm, "%s:%s", hp->name, id->valuestring);
+        char *nt = sb_detach(&nm); own[nown++] = nt; names[i] = nt;
+        sbuf d; sb_init(&d);
+        sb_printf(&d, "%s%s%s", hp->label, cJSON_IsString(name) ? " · " : "", cJSON_IsString(name) ? name->valuestring : "");
+        char *dt = sb_detach(&d); own[nown++] = dt; descs[i] = dt;
         if (g_cfg.model && !strcmp(names[i], g_cfg.model)) current = i;
     }
     int r = term_select("Select model", names, descs, n, current);
@@ -3131,8 +3209,8 @@ static void cmd_model_picker(void) {
         refresh_model_caps(false); config_save();
         printf(C_GREEN "✓ model set to %s" C_RESET "%s%s\n", g_cfg.model, g_model_tools ? "" : C_DIM " (chat-only: no tool support)" C_RESET, model_effort_note());
     } else printf(C_DIM "model unchanged: %s" C_RESET "\n", g_cfg.model);
-    for (int i = 0; i < n; i++) free(descbuf[i]);
-    free(descbuf); free(names); free(descs); cJSON_Delete(list);
+    for (int i = 0; i < nown; i++) free(own[i]);
+    free(own); free(names); free(descs); cJSON_Delete(list);   /* (the hosted list is the cache's: not freed here) */
 }
 
 /* ---------- /effort: how hard a model thinks ----------
@@ -3409,6 +3487,55 @@ static void cmd_history(const char *arg) {
 
 /* returns 1 to quit, -1 if a skill's model turn was interrupted */
 static void host_warning(const char *lead);
+/* the command line the program was started with: /ui starts it again with the screen changed */
+static char **g_argv = NULL;
+static int g_argc = 0;
+
+/* /ui [ansi|notcurses]: the choice is saved, the session with it, and the program starts again on the
+ * same session (--resume) with the other screen. Only from the prompt: a turn in flight keeps its screen. */
+static void cmd_ui(const char *arg) {
+    const char *now = g_cfg.ui ? "notcurses" : "ansi";
+    if (!arg) {
+        printf("screen: %s%s" C_RESET "%s\n", now, g_ui_nc ? " (running)" : "",
+               nc_compiled() ? "" : C_DIM "  · notcurses is not in this build (it was not installed when built)" C_RESET);
+        printf(C_DIM "  /ui ansi | /ui notcurses" C_RESET "\n");
+        return;
+    }
+    if (strcmp(arg, "ansi") && strcmp(arg, "notcurses")) { printf("usage: /ui ansi|notcurses\n"); return; }
+    if (!strcmp(arg, "notcurses") && !nc_compiled()) {
+        printf(C_YELLOW "the notcurses screen is not in this build: install notcurses (libnotcurses-dev) and run make again" C_RESET "\n");
+        return;
+    }
+    if (!strcmp(arg, now) && (g_ui_nc == (!strcmp(arg, "notcurses")))) { printf("already on the %s screen\n", arg); return; }
+    free(g_cfg.ui); g_cfg.ui = !strcmp(arg, "notcurses") ? xstrdup("notcurses") : NULL;
+    config_save();
+    if (g_mem_pending) memory_flush();
+    session_save();
+    /* the same command line, with --ui and --resume replaced */
+    char **na = xmalloc(sizeof *na * (size_t)(g_argc + 6));
+    int n = 0;
+    for (int i = 1; i < g_argc; i++) {
+        const char *a = g_argv[i];
+        if (!strcmp(a, "--ui")) { i++; continue; }
+        if (!strcmp(a, "--continue")) continue;
+        if (!strcmp(a, "-r") || !strcmp(a, "--resume")) { if (i + 1 < g_argc && g_argv[i + 1][0] != '-') i++; continue; }
+        na[n++] = g_argv[i];
+    }
+    na[n++] = "--ui"; na[n++] = (char *)arg;
+    na[n++] = "--resume"; na[n++] = g_session_id;
+    na[n] = NULL;
+    printf(C_DIM "restarting on the %s screen, in this session…" C_RESET "\n", arg);
+    fflush(stdout);
+    term_restore();
+    execv("/proc/self/exe", na);
+    /* only reached when the restart failed: the session is saved, and the program is still running */
+    fprintf(stderr, "corbienest: could not restart (%s); still on the old screen — restart it with --resume %s\n", strerror(errno), g_session_id);
+    if (g_ui_nc) term_fullscreen(true);   /* the notcurses screen was given back above: take it again */
+    free(na);
+}
+
+static void cmd_banner(void);
+
 static int handle_slash(char *line) {
     char *cmd = line, *arg = strchr(line, ' ');
     if (arg) { *arg++ = 0; while (*arg == ' ') arg++; if (!*arg) arg = NULL; }
@@ -3437,6 +3564,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
     else if (!strcmp(cmd, "/cost")) cmd_cost();
     else if (!strcmp(cmd, "/usage")) cmd_usage(arg);
+    else if (!strcmp(cmd, "/banner")) cmd_banner();
     else if (!strcmp(cmd, "/diff")) cmd_diff(arg);
     else if (!strcmp(cmd, "/rewind")) return cmd_rewind();
     else if (!strcmp(cmd, "/init")) return cmd_init();
@@ -3518,6 +3646,7 @@ static int handle_slash(char *line) {
             printf(C_GREEN "✓ workers = %d" C_RESET C_DIM "%s" C_RESET "\n", n, n > 1 ? " — whether they overlap is the server's to say too: an Ollama with one slot (OLLAMA_NUM_PARALLEL) answers them in turn" : " — one task after another");
         }
     }
+    else if (!strcmp(cmd, "/ui")) cmd_ui(arg);
     else if (!strcmp(cmd, "/max_iters") || !strcmp(cmd, "/max-iters")) {
         if (!arg) printf("max_iters: %d tool rounds per request\n", g_cfg.max_iters);
         else {
@@ -3674,42 +3803,262 @@ static bool ollama_needed(void) {   /* the working model is local, or the adviso
     return !model_hosted() || (g_cfg.advisor && !provider_find(g_cfg.advisor, NULL));
 }
 
-static void banner(void) {
-    bool need_ollama = ollama_needed();
-    char ver[128] = "";
-    int ok = need_ollama ? ollama_ping(ver, sizeof ver) : 0;
+/* The crow: 32x8 braille cells (a 64x32 dot silhouette), one picture per wing position, coloured per cell (SGR in the
+ * string, so widths are the braille's). Frames 0-2 are the flap; frame 3 is the folded wing. */
+#define CROW_ROWS 8
+#define CROW_W 32   /* columns */
+static const char *CROW[4][CROW_ROWS] = {
+    {   /* wings up */
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;169;182;204m⢀⣴⣿⣷⡶⠂[0m⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⣀⣤⣶⣶⣶⣤[0m⠀⠀⠀[38;2;169;182;204m⣴⣿⣿⣿⡿⠁[0m⠀⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "[38;2;107;120;144m⢀⣀⣠⣤⣴⣶⣿⣿⣿⣿⣿⣿⣿⣿⡇[38;2;169;182;204m⣠⣾⣿⣿⣿⣟[38;2;107;120;144m⣀[0m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀[38;2;107;120;144m⠈⠉⠉⠛⠛⠛⣿⣿⣿⣿⣿[38;2;169;182;204m⣿⣿⣿⣿⣿⣿[38;2;107;120;144m⣿⣿⣿⣆[0m⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⠉⣽⣿⣿⣿[38;2;169;182;204m⣿⣿⣿⣿[38;2;107;120;144m⣿⣿⣿⣿⠟[0m⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⠹⣿⣿⣿⣿⣿⣿⣿⣿⡿⠟⢿⣿⣶⣦⣤⣀⡀[0m⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⠉⠉⣿⠉⢹⡏[0m⠀⠀⠀[38;2;107;120;144m⠘⠻⠿⠿⣿⣿⣿⣿⡖[0m⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;122;102;80m⣤⣤⣤⣤⣤[38;2;107;120;144m⣿[38;2;122;102;80m⣤[38;2;107;120;144m⣼⣧[38;2;122;102;80m⣤⣤⣤⣤⣤[0m⠀⠀⠀⠀[38;2;107;120;144m⠈⠉[0m⠀⠀[0m",
+    },
+    {   /* wings mid */
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⣀⣤⣶⣶⣶⣤[0m⠀⠀⠀⠀⠀⠀⠀⠀[38;2;169;182;204m⣀⣠⣄[0m⠀⠀⠀⠀⠀⠀⠀[0m",
+        "[38;2;107;120;144m⢀⣀⣠⣤⣴⣶⣿⣿⣿⣿⣿⣿⣿⣿⡇[0m⠀[38;2;107;120;144m⣀[38;2;169;182;204m⣀⣠⣴⣶⣿⣿⣿⣿⣿⠆[0m⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀[38;2;107;120;144m⠈⠉⠉⠛⠛⠛⣿⣿⣿⣿⣿[38;2;169;182;204m⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠋[0m⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⠉⣽⣿⣿⣿[38;2;169;182;204m⣿⣿⣿⣿⣿⣿⣿⣿[38;2;107;120;144m⠟[0m⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⠹⣿⣿⣿⣿⣿⣿⣿⣿⡿⠟⢿⣿⣶⣦⣤⣀⡀[0m⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⠉⠉⣿⠉⢹⡏[0m⠀⠀⠀[38;2;107;120;144m⠘⠻⠿⠿⣿⣿⣿⣿⡖[0m⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;122;102;80m⣤⣤⣤⣤⣤[38;2;107;120;144m⣿[38;2;122;102;80m⣤[38;2;107;120;144m⣼⣧[38;2;122;102;80m⣤⣤⣤⣤⣤[0m⠀⠀⠀⠀[38;2;107;120;144m⠈⠉[0m⠀⠀[0m",
+    },
+    {   /* wings low */
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⣀⣤⣶⣶⣶⣤[0m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "[38;2;107;120;144m⢀⣀⣠⣤⣴⣶⣿⣿⣿⣿⣿⣿⣿⣿⡇[0m⠀[38;2;107;120;144m⣀⣀⣀⣀⣀⣀[0m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀[38;2;107;120;144m⠈⠉⠉⠛⠛⠛⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣆[0m⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⠉⣽⣿⣿[38;2;169;182;204m⣿⣿⣿⣿⣿⣿⣿⣿⣿⣟⣀⡀[0m⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⠹⣿⣿⣿[38;2;169;182;204m⣿⣿⣿⣿⣿⡿⠿⢿⣿⣿⣿⣯[38;2;107;120;144m⣀⡀[0m⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⠉⠉⣿⠉⢹⡏[0m⠀⠀⠀[38;2;107;120;144m⠘⠻⠿[38;2;169;182;204m⠿[38;2;107;120;144m⣿⣿⣿⣿⡖[0m⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;122;102;80m⣤⣤⣤⣤⣤[38;2;107;120;144m⣿[38;2;122;102;80m⣤[38;2;107;120;144m⣼⣧[38;2;122;102;80m⣤⣤⣤⣤⣤[0m⠀⠀⠀⠀[38;2;107;120;144m⠈⠉[0m⠀⠀[0m",
+    },
+    {   /* wings folded (holds) */
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⣀⣤⣶⣶⣶⣤[0m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "[38;2;107;120;144m⢀⣀⣠⣤⣴⣶⣿⣿⣿⣿⣿⣿⣿⣿⡇[0m⠀[38;2;107;120;144m⣀⣀⣀⣀⣀⣀[0m⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀[38;2;107;120;144m⠈⠉⠉⠛⠛⠛⣿⣿⣿⣿⣿[38;2;169;182;204m⣿⣿⣿[38;2;107;120;144m⣿⣿⣿⣿⣿⣿⣆[0m⠀⠀⠀⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⠉⣽⣿[38;2;169;182;204m⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣶⣄[0m⠀⠀⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⠹⣿⣿⣿[38;2;169;182;204m⣿⣿⣿⣿⣿⡿⠿⢿⣿⣿⣿⣯⣁[38;2;107;120;144m⡀[0m⠀⠀⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;107;120;144m⠉⠉⣿⠉⢹⡏[0m⠀⠀⠀[38;2;107;120;144m⠘⠻⠿⠿⣿⣿⣿⣿⡖[0m⠀[0m",
+        "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[38;2;122;102;80m⣤⣤⣤⣤⣤[38;2;107;120;144m⣿[38;2;122;102;80m⣤[38;2;107;120;144m⣼⣧[38;2;122;102;80m⣤⣤⣤⣤⣤[0m⠀⠀⠀⠀[38;2;107;120;144m⠈⠉[0m⠀⠀[0m",
+    },
+};
+
+/* ---------- the banner: a framed box, centred, its crow flapping and a spark round the border ----------
+ * The box is built again on every tick (banner_tick) and kept in the scrollback's lines, so the screen and
+ * the modal (term.c: term_banner_draw) shows the same thing on both screens. Items are lines of the box; the crow's
+ * rows are items of their own (kind 2) so the picture can change with its wings. */
+#define BANNER_MAX_W 84   /* the box is as wide as the terminal less one column, up to this, and centred */
+#define BOX_ITEMS 24
+#define BOX_ROWS (BOX_ITEMS + 2)
+#define CROW_FLAP_TICKS 10                      /* the flap: frames 0,1,2,1,0,1,2,1,0 then the folded wing (3) */
+#define SPARK_TICKS 30                          /* the spark's lap: 30 ticks of TICK_MS (100 ms), once every 3 s */
+#define SPARK_TAIL 4
+static const int CROW_FLAP[CROW_FLAP_TICKS] = { 0, 1, 2, 1, 0, 1, 2, 1, 0, 3 };
+static const char *BOX_EDGE = "\x1b[38;2;74;106;138m";   /* #4A6A8A, a slate blue */
+static const int SPARK_RGB[SPARK_TAIL][3] = { { 230, 251, 255 }, { 143, 227, 255 }, { 79, 184, 224 }, { 58, 143, 184 } };
+
+struct box_item { int kind; int crow; sbuf text; };   /* kind: 0 left, 1 centred, 2 a row of the crow */
+static struct { int ml, bw, n, t; struct box_item it[BOX_ITEMS]; } g_box;
+static sbuf g_box_out[BOX_ROWS];                     /* the lines of the box as drawn now */
+
+static void box_add(int kind, const char *fmt, ...) {
+    if (g_box.n >= BOX_ITEMS) return;
+    struct box_item *b = &g_box.it[g_box.n++];
+    b->kind = kind; b->crow = -1; sb_init(&b->text);
+    char buf[2048]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    sb_puts(&b->text, buf);
+}
+
+/* `s` in `cols` columns (its escapes kept); when it is longer, the first cols-1 columns and an ellipsis */
+static void box_cut(sbuf *o, const char *s, int cols) {
+    if (plain_width(s) <= cols) { sb_puts(o, s); return; }
+    int w = 0; const char *p = s;
+    while (*p) {
+        if (*p == 27) { const char *q = p; while (*q && *q != 'm') q++; if (*q) q++; sb_append(o, p, (size_t)(q - p)); p = q; continue; }
+        size_t len = 1; while (((unsigned char)p[len] & 0xC0) == 0x80) len++;
+        if (w + 1 > cols - 1) break;
+        sb_append(o, p, len); w++; p += len;
+    }
+    sb_puts(o, "…" C_RESET);
+}
+
+/* the border's cells run round once: index k of the perimeter, from the top left corner, clockwise */
+static int box_perim(int bw, int H) { return 2 * (bw - 1) + 2 * (H - 1); }
+static int box_k(int bw, int H, int row, int x) {
+    if (row == 0) return x;
+    if (row == H - 1) return (bw - 1) + (H - 1) + (bw - 1 - x);
+    if (x == bw - 1) return (bw - 1) + row;
+    return 2 * (bw - 1) + (H - 1) + (H - 1 - row);
+}
+/* one border cell: the spark's colours on its tail, the edge's elsewhere */
+/* one border cell. `*last` is the colour the terminal already has (-1: none, 0: the edge, 1..: the spark's tail):
+ * a colour is sent only when it changes, so a run of edge cells costs one escape (over ssh every byte counts) */
+static void box_edge(sbuf *o, int k, int spark, int P, const char *glyph, int *last) {
+    int d = spark < 0 ? -1 : ((spark - k) % P + P) % P;
+    int want = d >= 0 && d < SPARK_TAIL ? 1 + d : 0;
+    if (*last != want) {
+        if (want) sb_printf(o, "\x1b[38;2;%d;%d;%dm", SPARK_RGB[d][0], SPARK_RGB[d][1], SPARK_RGB[d][2]);
+        else sb_puts(o, BOX_EDGE);
+        *last = want;
+    }
+    sb_puts(o, glyph);
+}
+
+/* the box as it is drawn: the crow's `frame`, the spark at perimeter index `spark` (-1: none). Returns its rows. */
+static int box_lines(int frame, int spark) {
+    int bw = g_box.bw, H = g_box.n + 2, P = box_perim(bw, H), inner = bw - 4;
+    for (int row = 0; row < H; row++) {
+        sbuf *o = &g_box_out[row]; sb_clear(o);
+        int last = -1;   /* the colour the terminal has, along this row */
+        if (row == 0 || row == H - 1) {
+            int bx = bw - BANNER_X_FROM_RIGHT - BANNER_X_W / 2;   /* the close button's first cell */
+            for (int x = 0; x < bw; x++) {
+                if (row == 0 && x >= bx && x < bx + BANNER_X_W) {   /* "[×]": bold, the × brightest: the close button */
+                    if (x == bx + 1) sb_puts(o, "\x1b[1;38;2;230;251;255m×");
+                    else sb_printf(o, "\x1b[1;38;2;%d;%d;%dm%s", SPARK_RGB[3][0], SPARK_RGB[3][1], SPARK_RGB[3][2], x == bx ? "[" : "]");
+                    last = -1;   /* the button's colours: the next edge cell names its own */
+                    continue;
+                }
+                const char *g = x == 0 ? (row == 0 ? "╭" : "╰") : x == bw - 1 ? (row == 0 ? "╮" : "╯") : "─";
+                box_edge(o, box_k(bw, H, row, x), spark, P, g, &last);
+            }
+            sb_puts(o, C_RESET);
+            continue;
+        }
+        const struct box_item *it = &g_box.it[row - 1];
+        box_edge(o, box_k(bw, H, row, 0), spark, P, "│", &last);
+        sb_puts(o, C_RESET " ");
+        sbuf t; sb_init(&t);
+        if (it->kind == 2) sb_puts(&t, CROW[frame][it->crow]);
+        else box_cut(&t, it->text.data ? it->text.data : "", inner);
+        int w = plain_width(t.data ? t.data : ""), lp = it->kind == 0 ? 0 : (inner - w) / 2;
+        for (int i = 0; i < lp; i++) sb_putc(o, ' ');
+        if (t.data) sb_append(o, t.data, t.len);
+        for (int i = lp + w; i < inner; i++) sb_putc(o, ' ');
+        sb_free(&t);
+        sb_puts(o, C_RESET " ");
+        last = -1;   /* the text may have set any colour: the right edge names its own */
+        box_edge(o, box_k(bw, H, row, bw - 1), spark, P, "│", &last);
+        sb_puts(o, C_RESET);
+    }
+    return H;
+}
+
+/* the frame and the spark at tick t (still: the folded wing, no spark) */
+static void box_state(int t, bool still, int *frame, int *spark) {
+    if (still) { *frame = 3; *spark = -1; return; }
+    int c = t % SPARK_TICKS;
+    *frame = c < CROW_FLAP_TICKS ? CROW_FLAP[c] : 3;
+    int P = box_perim(g_box.bw, g_box.n + 2);
+    *spark = (int)(((long)t * P) / SPARK_TICKS) % P;
+}
+
+static void banner_tick(bool still) {
+    if (!term_banner_open()) return;   /* the animation runs while the modal is up */
+    int frame, spark;
+    box_state(g_box.t, still, &frame, &spark);
+    if (!still) g_box.t++;
+    int H = box_lines(frame, spark);
+    const char *ls[BOX_ROWS];
+    for (int i = 0; i < H; i++) ls[i] = g_box_out[i].data ? g_box_out[i].data : "";
+    term_banner_draw(ls, H, g_box.bw);
+}
+
+/* the warning about plain http, as text for the box (host_warning prints it for /host) */
+static bool host_warning_text(char *out, size_t n) {
+    if (!url_cleartext(g_cfg.host) || url_is_local(g_cfg.host)) return false;
+    char h[256] = ""; url_hostname(g_cfg.host, h, sizeof h);
+    snprintf(out, n, C_YELLOW "⚠ plain http to %s: the conversation crosses the network unencrypted" C_RESET C_DIM " (an https:// host keeps it private)" C_RESET, h);
+    return true;
+}
+
+static char g_host_note[400] = "";      /* the plain-http warning, for the transcript under the entry line */
+static char g_advisor_note[200] = "";   /* a hosted advisor without its key: said in the transcript too */
+
+static void banner_size(void) {
     int w = term_width(); if (w < 40) w = 40;
-    printf(C_ORANGE "╭"); for (int i = 0; i < w - 2; i++) printf("─"); printf("╮" C_RESET "\n");
-    printf(C_ORANGE "│" C_RESET " " C_BOLD "🐦‍⬛ Corbie Nest" C_RESET " v%s — local coding agent for Ollama\n", CORBIE_VERSION);
+    g_box.bw = w - 1 < BANNER_MAX_W ? w - 1 : BANNER_MAX_W;   /* one column short of the screen: a full row would wrap */
+    g_box.ml = (w - g_box.bw) / 2;
+    g_box.n = 0;
+}
+
+/* the box's items, read now: the model, the host, the advisor, the mode; and the two warnings */
+static void banner_items(bool need_ollama, int ok) {
+    g_host_note[0] = g_advisor_note[0] = 0;
+    box_add(1, C_BOLD "Corbie Nest" C_RESET " v%s — local coding agent for Ollama", CORBIE_VERSION);
+    for (int r = 0; r < CROW_ROWS; r++) { box_add(2, ""); g_box.it[g_box.n - 1].crow = r; }
     const char *eff = g_cfg.model ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
-    printf(C_ORANGE "│" C_RESET " " C_DIM "model:" C_RESET " %s%s" C_DIM " · ctx %s%s%s%s%s" C_RESET "\n", g_cfg.model ? g_cfg.model : "(none)", g_model_tools ? "" : C_DIM " (chat-only)" C_RESET,
-           fmt_ctx(g_cfg.num_ctx), g_model_max_ctx > 0 ? " of " : "", g_model_max_ctx > 0 ? fmt_ctx(g_model_max_ctx) : "", eff ? " · effort " : "", eff ? eff : "");
+    box_add(0, C_DIM "model:" C_RESET " %s%s" C_DIM " · ctx %s%s%s%s%s" C_RESET, g_cfg.model ? g_cfg.model : "(none)", g_model_tools ? "" : C_DIM " (chat-only)" C_RESET,
+            fmt_ctx(g_cfg.num_ctx), g_model_max_ctx > 0 ? " of " : "", g_model_max_ctx > 0 ? fmt_ctx(g_model_max_ctx) : "", eff ? " · effort " : "", eff ? eff : "");
     if (g_cfg.advisor) {
         /* a hosted advisor without its key is one that will not answer: say so here, not at the first consultation */
         const provider_def *pv = provider_find(g_cfg.advisor, NULL);
         const char *key = pv ? getenv(pv->key_env) : NULL;
-        printf(C_ORANGE "│" C_RESET " " C_DIM "advisor:" C_RESET " %s%s%s", g_cfg.advisor,
-               g_cfg.advisor_guidance != GUIDANCE_NORMAL ? C_DIM " · guidance " C_RESET : "", g_cfg.advisor_guidance != GUIDANCE_NORMAL ? advisor_guidance()->name : "");
-        if (pv && !(key && *key)) printf(C_YELLOW " · %s is not set" C_RESET, pv->key_env);
-        printf("\n");
+        if (pv && !(key && *key)) snprintf(g_advisor_note, sizeof g_advisor_note, C_YELLOW "%s is not set — export it before starting corbienest" C_RESET, pv->key_env);
+        box_add(0, C_DIM "advisor:" C_RESET " %s%s%s", g_cfg.advisor,
+                g_cfg.advisor_guidance != GUIDANCE_NORMAL ? C_DIM " · guidance " C_RESET : "", g_cfg.advisor_guidance != GUIDANCE_NORMAL ? advisor_guidance()->name : "");
     }
     if (model_hosted()) {
         const provider_def *pv = provider_find(g_cfg.model, NULL);
         const char *key = pv ? getenv(pv->key_env) : NULL;
-        printf(C_ORANGE "│" C_RESET " " C_DIM "api:  " C_RESET " %s · %s %s\n", pv ? provider_base_url(pv) : "", pv ? pv->key_env : "", key && *key ? C_GREEN "set" C_RESET : C_RED "not set" C_RESET);
-        if (need_ollama) printf(C_ORANGE "│" C_RESET " " C_DIM "host: " C_RESET " %s %s" C_DIM " (the advisor)" C_RESET "\n", g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);
+        box_add(0, C_DIM "api:  " C_RESET " %s · %s %s", pv ? provider_base_url(pv) : "", pv ? pv->key_env : "", key && *key ? C_GREEN "set" C_RESET : C_RED "not set" C_RESET);
+        if (need_ollama) box_add(0, C_DIM "host: " C_RESET " %s %s" C_DIM " (the advisor)" C_RESET, g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);
     } else {
-        printf(C_ORANGE "│" C_RESET " " C_DIM "host: " C_RESET " %s %s\n", g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);
-        host_warning(C_ORANGE "│" C_RESET " ");
+        box_add(0, C_DIM "host: " C_RESET " %s %s", g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);
+        host_warning_text(g_host_note, sizeof g_host_note);
     }
-    printf(C_ORANGE "│" C_RESET " " C_DIM "cwd:  " C_RESET " %s%s\n", g_cwd, g_project_instructions ? C_DIM " (project instructions loaded)" C_RESET : "");
-    if (g_cfg.mode != MODE_MANUAL) printf(C_ORANGE "│" C_RESET " " C_DIM "mode:  " C_RESET " %s%s" C_RESET "\n", g_cfg.mode == MODE_AUTO ? C_RED : g_cfg.mode == MODE_PLAN ? C_CYAN : C_ORANGE, mode_label(g_cfg.mode));
-    printf(C_ORANGE "╰"); for (int i = 0; i < w - 2; i++) printf("─"); printf("╯" C_RESET "\n");
+    box_add(0, C_DIM "cwd:  " C_RESET " %s%s", g_cwd, g_project_instructions ? C_DIM " (project instructions loaded)" C_RESET : "");
+    if (g_cfg.mode != MODE_MANUAL) box_add(0, C_DIM "mode:  " C_RESET " %s%s" C_RESET, g_cfg.mode == MODE_AUTO ? C_RED : g_cfg.mode == MODE_PLAN ? C_CYAN : C_ORANGE, mode_label(g_cfg.mode));
+    box_add(0, C_DIM "ui:   " C_RESET " %s" C_DIM " · /ui to switch" C_RESET, g_ui_nc ? "notcurses" : "ansi");
+}
+
+/* the box as a modal: animated while it is up, on a screen a person watches (the prompt's tick). Without a
+ * screen to put it on, its lines go to the transcript as they always did. */
+static void banner_modal(bool animate) {
+    int frame, spark;
+    box_state(0, !animate, &frame, &spark);
+    int H = box_lines(frame, spark);
+    const char *ls[BOX_ROWS];
+    for (int i = 0; i < H; i++) ls[i] = g_box_out[i].data ? g_box_out[i].data : "";
+    if (term_banner_show(ls, H, g_box.bw)) { if (animate) term_tick_set(banner_tick); return; }
+    for (int i = 0; i < H; i++) printf("%s\n", ls[i]);
+}
+
+static void banner(void) {
+    bool need_ollama = ollama_needed();
+    char ver[128] = "";
+    int ok = need_ollama ? ollama_ping(ver, sizeof ver) : 0;
+    banner_size();
+    banner_items(need_ollama, ok);
+    /* the transcript keeps one line for it; the box is the modal (/banner brings it back) */
+    printf(C_BOLD "Corbie Nest" C_RESET C_DIM " v%s · /banner shows the box again" C_RESET "\n", CORBIE_VERSION);
+    if (g_advisor_note[0]) printf("%s\n", g_advisor_note);
+    if (g_host_note[0]) printf("%s\n", g_host_note);
     if (need_ollama && ok != 0) {
         if (model_hosted()) printf(C_YELLOW "cannot reach ollama at %s: %s — the advisor's consultations need it" C_RESET "\n" C_DIM "start it with `ollama serve`, or set the host with /host or OLLAMA_HOST" C_RESET "\n", g_cfg.host, ver);
         else printf(C_RED "cannot reach ollama at %s: %s" C_RESET "\n" C_DIM "start it with `ollama serve`, or set the host with /host or OLLAMA_HOST" C_RESET "\n", g_cfg.host, ver);
     }
+    bool animate = g_cfg.interactive && (g_ui_nc || term_is_fullscreen());
+    banner_modal(animate);
     printf(C_DIM "/help for commands · @file to attach · !cmd for shell · shift+tab to switch mode · Ctrl-D to quit" C_RESET "\n\n");
+}
+
+/* /banner: the box again, as the modal (its animation with it) */
+static void cmd_banner(void) {
+    bool need_ollama = ollama_needed();
+    char ver[128] = "";
+    int ok = need_ollama ? ollama_ping(ver, sizeof ver) : 0;
+    banner_size();
+    banner_items(need_ollama, ok);
+    bool animate = g_cfg.interactive && (g_ui_nc || term_is_fullscreen());
+    banner_modal(animate);
 }
 
 /* ---------- suggestions under the input field (term_suggest) ----------
@@ -3797,6 +4146,22 @@ static void suggest_advisor(const char *word, term_sug **items, int *n, bool wor
         const char *key = getenv(p->key_env);
         snprintf(desc, sizeof desc, working ? "%s (%s) — the model that does the work · %s %s" : "%s (%s), a hosted API · %s %s", p->label, p->known_as, p->key_env, key && *key ? "set" : "not set");
         sug_add(items, n, pre, desc, true);
+    }
+    if (working) for (int i = 0; (p = provider_at(i)); i++) {   /* the hosted models that do the work: "anthropic:ID", found by what is typed of it */
+        if (p->style != PROVIDER_MESSAGES) continue;
+        const char *why;
+        cJSON *hl = model_list_get(provider_slot_of(p), p, &why);
+        for (int pass = 0; pass < 2; pass++) cJSON_ArrayForEach(m, hl) {
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(m, "id"), *name = cJSON_GetObjectItemCaseSensitive(m, "name");
+            if (!cJSON_IsString(id)) continue;
+            sbuf t; sb_init(&t); sb_printf(&t, "%s:%s", p->name, id->valuestring);
+            bool starts = !strncasecmp(t.data, word, wl);
+            if (*n < MODEL_SUG_MAX && (pass == 0 ? starts : !starts && wl >= 2 && strcasestr(t.data, word))) {
+                char desc[160]; snprintf(desc, sizeof desc, "%s%s%s", p->label, cJSON_IsString(name) ? " · " : "", cJSON_IsString(name) ? name->valuestring : "");
+                sug_add(items, n, t.data, desc, false);
+            }
+            sb_free(&t);
+        }
     }
     cJSON *list = model_list_get(0, NULL, NULL);
     for (int pass = 0; pass < 2; pass++) cJSON_ArrayForEach(m, list) {
@@ -3957,15 +4322,18 @@ static char *options_choose(void) {
     }
     char *chosen = NULL;
     if (n >= 2) {
-        const char *items[12], *shown[12]; char *dbuf[12];
+        /* the last row is always "chat about this": it sends nothing, and the editor is left to the user's own words */
+        const char *items[13], *shown[13]; char *dbuf[13];
         for (int i = 0; i < n; i++) {
             items[i] = labels[i];
             sbuf d; sb_init(&d); sb_puts(&d, descs[i]);
             if (i == rec) sb_puts(&d, *descs[i] ? " · recommended" : "recommended");
             dbuf[i] = sb_detach(&d); shown[i] = dbuf[i];
         }
-        int r = term_select("Implementation options", items, shown, n, rec >= 0 ? rec : 0);
-        if (r >= 0) {
+        items[n] = "chat about this"; shown[n] = "talk it over with the model before choosing"; dbuf[n] = NULL;
+        int r = term_select("Implementation options", items, shown, n + 1, rec >= 0 ? rec : 0);
+        if (r == n) printf(C_DIM "  type your question or message below" C_RESET "\n");
+        else if (r >= 0) {
             sbuf c; sb_init(&c); sb_printf(&c, "Go with this: %s", labels[r]);
             if (*descs[r]) sb_printf(&c, " — %s", descs[r]);
             chosen = sb_detach(&c);
@@ -3982,6 +4350,7 @@ static int process_input(char *line) {
     size_t n = strlen(s); while (n && (s[n-1] == ' ' || s[n-1] == '\n' || s[n-1] == '\t')) s[--n] = 0;
     if (!*s) return 0;
     if (strcmp(s, "/rewind")) { hist_add(s); hist_save(); }   /* persist as we go, so a crash or kill loses nothing */
+    if (!strcasecmp(s, "exit")) return 1;   /* a typed "exit" leaves, as /quit does */
     if (*s == '/') { int q = handle_slash(s); if (q == 1) return 1; printf("\n"); term_status_refresh(); return q; }
     if (*s == '!') { handle_bang(s + 1); printf("\n"); return 0; }
     if (*s == '#' && s[1] && s[1] != '#') {   /* "# fact" -> memory (a lone "#" or "##…" is sent as text) */
@@ -3992,10 +4361,14 @@ static int process_input(char *line) {
     int first = begin_request();
     add_message("user", msg);
     free(msg);
+    tools_exit_clear();
     bool aborted = run_turn();
     session_save();
     memory_note(first, aborted);
+    bool leave = tools_exit_asked() && !aborted;   /* the model judged the user is leaving: the turn is over, so go */
+    tools_exit_clear();
     apply_pending();
+    if (leave) return 1;
     printf("\n");
     fflush(stdout);
     return aborted ? -1 : 0;
@@ -4168,12 +4541,14 @@ static void usage(void) {
            "      --advisor-guidance LEVEL   how much the agent leans on it: light, normal (default), strong, max (see /advisor guidance)\n"
            "      --advisor-window MINUTES   a request that runs long gets its consultations again after that long (default 15; off = never)\n"
            "      --draft N        draft_num_predict: speculative-decoding/MTP draft tokens per step (0 = off; default: the model's own)\n"
+           "      --ui ansi|notcurses  the screen for this run (default: ui= in the config, else ansi); notcurses needs a build made with notcurses installed\n"
            "      --benchmark [N]  measure tokens per second at each context size the model supports (or just -c N):\n"
            "                       N timed runs (default 3) of a fixed prompt (or -p PROMPT) per size, then exit\n"
            "  -h, --help           this help\n");
 }
 
 int main(int argc, char **argv) {
+    g_argc = argc; g_argv = argv;
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -4187,7 +4562,7 @@ int main(int argc, char **argv) {
     const char *env_model = getenv("CORBIENEST_MODEL");
     if (env_model && *env_model) { free(g_cfg.model); g_cfg.model = xstrdup(env_model); }
 
-    const char *oneshot = NULL, *resume_id = NULL, *cli_effort = NULL; bool resume_latest = false, json_out = false, ctx_given = false; int bench_runs = 0;
+    const char *oneshot = NULL, *resume_id = NULL, *cli_effort = NULL, *ui_arg = NULL; bool resume_latest = false, json_out = false, ctx_given = false; int bench_runs = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         #define NEEDARG() (i + 1 < argc ? argv[++i] : (usage(), exit(2), (char*)NULL))
@@ -4215,11 +4590,19 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--draft")) { const char *dv = NEEDARG(); if (strspn(dv, "0123456789") != strlen(dv) || !*dv) { fprintf(stderr, "bad draft count %s (a number of tokens, 0 = off)\n", dv); return 2; } g_cfg.draft = atoi(dv); }
         else if (!strcmp(a, "--benchmark")) { bench_runs = 3; if (i + 1 < argc && argv[i+1][0] >= '1' && argv[i+1][0] <= '9' && strspn(argv[i+1], "0123456789") == strlen(argv[i+1])) bench_runs = atoi(argv[++i]); }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
-        else if (!strcmp(a, "-v") || !strcmp(a, "--version")) { printf("corbienest %s\n", CORBIE_VERSION); return 0; }
+        else if (!strcmp(a, "-v") || !strcmp(a, "--version")) { printf("corbienest %s%s\n", CORBIE_VERSION, nc_compiled() ? " (notcurses screen)" : ""); return 0; }
+        else if (!strcmp(a, "--ui")) { ui_arg = NEEDARG(); if (strcmp(ui_arg, "ansi") && strcmp(ui_arg, "notcurses")) { fprintf(stderr, "unknown screen %s (ansi|notcurses)\n", ui_arg); return 2; } }
         else { fprintf(stderr, "unknown option %s\n", a); usage(); return 2; }
     }
     if (!getcwd(g_cwd, sizeof g_cwd)) snprintf(g_cwd, sizeof g_cwd, ".");
     g_session.started = time(NULL);
+    /* the screen: --ui, else ui= in the config. Only an interactive session gets it: a pipe, -p and
+     * --benchmark have no screen to draw, and the notcurses one would draw over their output */
+    const char *want_ui = ui_arg ? ui_arg : g_cfg.ui ? "notcurses" : "ansi";
+    if (!strcmp(want_ui, "notcurses") && g_cfg.interactive && !oneshot && !bench_runs && !json_out) {
+        if (nc_compiled()) g_ui_nc = true;
+        else fprintf(stderr, "corbienest: this build has no notcurses screen (notcurses was not installed when it was built); using the ANSI one\n");
+    }
     term_init();
     g_messages = cJSON_CreateArray();
     g_tools = tools_definitions();
@@ -4348,7 +4731,7 @@ int main(int argc, char **argv) {
     g_mem_exiting = true;
     memory_flush();   /* whatever the idle flush did not get to runs before we leave (Ctrl-C skips it) */
     session_save();
-    term_restore();   /* leaves the alternate screen: say goodbye on the normal one */
+    term_finish();    /* leaves the alternate screen: say goodbye on the normal one */
     printf(C_DIM "bye" C_RESET " · corbienest used %ld tokens this session (%ld in · %ld out) with %s\n",
            g_session.prompt_tokens + g_session.eval_tokens, g_session.prompt_tokens, g_session.eval_tokens, g_cfg.model);
     if (g_session_id[0]) printf(C_DIM "  continue it later with: corbienest --continue   (or --resume %s)" C_RESET "\n", g_session_id);

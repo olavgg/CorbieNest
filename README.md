@@ -10,10 +10,9 @@ is shown to you and confirmed before it runs.
 
 corbienest takes over the terminal (alternate screen) while it runs, like Claude Code: the
 conversation scrolls in the upper part, and the bottom of the screen is the app's: an input
-field — a rule, the `❯` prompt, a rule — so it is always visible that input is accepted,
-even while the model works, and under it a status bar showing the permission mode, the
-model, the tokens used this session (↑ prompt · ⟳ cache hits, when a hosted model had them · ↓ generated, ticking while the model
-streams) and context usage, and under the bar a location line: the working folder as an absolute path, and the git branch it is on when it is in a repository. The field grows with what you type (up to ten rows, then it
+field — a rounded box with the `❯` prompt inside it, green while it waits — so it is always visible that input is accepted,
+even while the model works. The permission mode sits on the lower rule of the field, right-aligned. Under the field is the status bar, on the last row, with the model (its provider prefix and `:latest` tag dropped), the tokens used this session (↑ prompt · ⟳ cache hits, when a hosted model had them · ↓ generated, ticking while the model
+streams) and context usage on the left, and the working folder as an absolute path with the git branch it is on, in a muted pink, on the right (a long path is cut from the left). The conversation shows what the model is doing and what a tool did; the bar shows no busy state. The field grows with what you type (up to ten rows, then it
 scrolls) and the conversation region shrinks to match; what you send moves up into the
 transcript as a `›` line. Whenever the app is waiting on something — the
 model loading or generating, a tool's shell command, an Ollama request — an animated
@@ -24,11 +23,16 @@ exit your shell is back exactly as it was (use `/save` to keep a transcript).
 ## Build
 
 Dependencies: a C11 compiler, `make`, [cJSON](https://github.com/DaveGamble/cJSON) and
-[libcurl](https://curl.se/libcurl/) (7.66 or newer) — that's all. No ncurses: the UI uses ANSI
+[libcurl](https://curl.se/libcurl/) (7.66 or newer) — that's all. The default UI uses ANSI
 escapes. libcurl is what speaks HTTPS, for an Ollama behind TLS and for the hosted APIs —
 an Anthropic model that does the work, or an [advisor](#the-advisor) on xAI, OpenAI or Anthropic.
 (`python3` is only needed to run the test suite, and
 `openssl` for its HTTPS tests.)
+
+The optional [notcurses](https://github.com/dankamongmen/notcurses) screen (`--ui notcurses`) is
+compiled in when pkg-config finds `notcurses` (`libnotcurses-dev` on Debian/Ubuntu, `notcurses-devel`
+on Fedora). Without it the build is the ANSI one, and `--ui notcurses` says it is not in this build.
+`make NOTCURSES=0` leaves it out even when installed; `make NOTCURSES=1` requires it.
 
 ```sh
 # Debian 13 (trixie) / Ubuntu 26.04 (resolute)
@@ -116,7 +120,7 @@ larger ones skipped.)
 
 | command | what it does |
 |---|---|
-| `/model` | interactive picker of the local models (↑/↓, type to filter, Enter). Typing `/model` completes a local name, or `anthropic:` / `claude:` and that key's models — `/model NAME` switches directly, and `anthropic:NAME` or `claude:NAME` makes that Claude model the one that does the work (`ANTHROPIC_API_KEY`) |
+| `/model` | interactive picker of the local models and the Anthropic models (↑/↓, type to filter, Enter; xAI and OpenAI are advisors only and are not listed). Typing `/model` completes a local name, an Anthropic model (`anthropic:ID`, found by what is typed), or `anthropic:` / `claude:` and that key's models — `/model NAME` switches directly, and `anthropic:NAME` or `claude:NAME` makes that Claude model the one that does the work (`ANTHROPIC_API_KEY`) |
 | `/models` | list installed models with tool/thinking capabilities |
 | `/clear` | new conversation |
 | `/compact` | have the model summarise the conversation to free context |
@@ -127,13 +131,14 @@ larger ones skipped.)
 | `/orchestrate REQUEST` | the advisor model in charge: it plans the request as tasks, the main model does them as workers — several at a time where the plan allows — and the advisor reviews each; see [Orchestrating](#orchestrating) |
 | `/workers [N]` | how many tasks of `/orchestrate` may run at the same time (default 3, `1` = one after another) |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
-| `/usage`, `/usage price MODEL IN OUT\|default` | tokens per model in this session — the main model, the advisor — and the **estimated cost** of the hosted ones. The providers' prompt-cache hits (`⟳ cache … read`) are priced at their cached-input rate — Anthropic's a tenth of the input price (5% or 2.5% on the newest models), OpenAI's and xAI's as their price lists give it for each model — and Anthropic's cache writes at 1.25×; they are shown on their own line, as `↑` is the input that was not from the cache. The list price per million tokens (built in, as of October 2026) or the one you set with `price`. The same estimate is on each consultation's result line (`⎿ advice · 4.2k tokens · 12s · ≈ $0.03`) and in `/cost`. An estimate: what was billed is on the provider's usage page |
+| `/usage`, `/usage price MODEL IN OUT\|default` | tokens per model in this session — the main model, the advisor — and the **estimated cost** of the hosted ones. The providers' prompt-cache hits (`⟳ cache … read`) are priced at their cached-input rate — Anthropic's a tenth of the input price (5% or 2.5% on the newest models), OpenAI's and xAI's as their price lists give it for each model — and Anthropic's cache writes at 1.25×; they are shown on their own line, as `↑` is the input that was not from the cache. The list price per million tokens (built in, as of October 2026) or the one you set with `price`. The same estimate is on each consultation's result line (`⎿ advice · 4.2k tokens · 12s · ≈ $0.03`) and in `/cost`. An estimate: what was billed is on the provider's usage page. On a full-screen conversation `/usage` comes up as a centred window and the running request goes on underneath its output is held back until the window closes (Esc or Ctrl-C closes it); Anthropic's last reply also reports its live rate limits (`limits at its last reply: input … of … a minute`, from the `anthropic-ratelimit-*` headers). The Admin Usage & Cost API (organization totals, needs an admin key) is not used |
+| `/banner` | the Corbie Nest box again: the crow, the model, host, advisor, mode and folder, as a window in the middle of the screen. It opens at startup and animates while it is up; close it with its **[×]** button (in the top border, two cells left of the corner) or Esc; sending a line closes it too. Its one line stays in the transcript |
 | `/system [text\|clear]` | extra system instructions |
 | `/think on\|off\|auto`, `/think show\|hide` | *when* a thinking-capable model thinks: `auto` (default) lets it think about each request once and turns thinking off for the tool rounds that follow, `on` thinks on every call, `off` never. *How hard* is `/effort` (`/think low\|medium\|high\|max` still works, as an alias for it) |
 | `/effort [LEVEL\|default]` | how hard **this model** thinks, in the levels it has — see [Effort](#effort). No argument opens a picker of them; `default` leaves it to the model. Kept per model, shown next to the model's name in the status bar. Given while the model works, it applies when the turn ends |
 | `/advisor [MODEL\|off]`, `/advisor guidance [LEVEL]`, `/advisor effort [LEVEL]`, `/advisor window MINUTES\|off`, `/advisor ctx N\|auto` (given while the model works: `ctx` applies at the next consultation, `guidance` and `window` when the turn ends) | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud or hosted model is set by name: `/advisor gpt-oss:120b-cloud`, `/advisor anthropic:claude-opus-5`). `guidance` says how much the agent leans on it (`light`, `normal`, `strong`, `max`), `effort` how hard it thinks |
 | `/subagent [MODEL\|default]`, `/subagent effort [LEVEL\|default]` | the model the sub-agents (`task`) run on. Default: the model doing the work. Another one is checked with its server first (a local model, Ollama's cloud, or a hosted `anthropic:`/`xai:`/`openai:` model) and then kept in the config as `subagent=`. `effort` sets how hard that model thinks, in its own levels (kept per model, as `/effort` does; the same model as the one doing the work shares its effort). Given with a model, it waits for the turn to end, like `/model`. See [Sub-agents](#sub-agents) |
-| `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (`.corbienest/permissions`) |
+| `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (kept in the config directory, `permissions/`, keyed by the project's path — a file in the project itself is never read) |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
 | `/init` | have the model explore the project and write an `AGENTS.md` (build/test commands, architecture, conventions); improves an existing one |
@@ -148,7 +153,7 @@ larger ones skipped.)
 | `/resume [ID\|all]` | pick an earlier session to continue (this directory; `all` for every directory), or load one by ID |
 | `/history [N]` | show the last N queries (default 20; the latest 100 are kept across sessions, ↑/↓ recalls them) |
 | `/cd DIR`, `/pwd` | change working directory |
-| `/quit` | exit (also Ctrl-D) |
+| `/quit` | exit (also Ctrl-D, and a typed `exit`). The model can end the program too: when you say you are leaving ("bye", "that's all"), it replies with a goodbye and calls its `exit` tool, and the program ends after that reply |
 
 ### Input tricks
 
@@ -178,12 +183,19 @@ larger ones skipped.)
   to (Project / User / Feedback / Reference) and the line is appended, no model call involved.
 - **Code is highlighted.** A fenced block in a reply is coloured by its language (`` ```python ``, `c`, `js`, `sh`, `json`, … — keywords, strings, comments and numbers, basic; a block without a language is plain), and so is the preview of a file the model writes, by the file's extension. The colours are escapes only, so the text and its wrapping are unchanged.
 - Enter sends; Alt+Enter, Ctrl+J or a trailing `\` inserts a newline. Bracketed paste works.
+- A paste of more than three lines (or 800 bytes) is shown as a token, `[Pasted text #1 +44 lines]`,
+  in reverse video. A click on it opens the text in a scrollable window (↑/↓, PgUp/PgDn, Home/End,
+  the wheel; Esc closes it). Backspace or Delete on the token removes all of it, and the whole text
+  is what is sent. A paste typed in while the model works is kept as plain text, not as a token.
 - Ctrl-C (or Esc) cancels a running generation / clears the line (twice on an empty line quits).
 - **Tool results are folded.** What `grep`, `cat` or a build prints is for the model; in the
   transcript a result of more than one line is a single line — `▸ 42 lines · how it begins` — and
   a **click on that line** shows the rest (`▾`), another click hides it again. It works at the
   prompt, scrolled back and while the model is working. Without the full-screen UI (`-p`, a pipe)
   the first lines are shown instead, as there is nothing to click.
+- **Multi-line shell commands are folded too.** A `bash` command of several lines shows as its first
+  line with `▸ (+N lines)`; a click shows the whole command (`▾`). A command that is about to be
+  asked about is never folded: the confirmation shows it in full.
 - The **mouse wheel** and PgUp/PgDn scroll back through the conversation (the alternate screen has
   no scrollback of its own, so corbienest keeps one) — at the prompt and while the model works:
   what arrives meanwhile is kept and shown when you scroll back down, and Esc returns to the
@@ -200,15 +212,13 @@ larger ones skipped.)
 - **You can keep typing while the model works.** What you type shows up in the input field as
   you go (`❯ …▏`); press Enter to queue it as a message — add details,
   narrow the request, change the spec — the status bar shows `N queued`.
-  **A queued message does not wait for the job in flight to end**, because it is usually about
-  that job: the running shell command is stopped, the tool calls of that round that had not
-  started are skipped (the model is told they did not run), a sub-agent reports what it has
-  found so far instead of finishing its research, and the message goes to the model on its very
-  next call. A message queued *before* the turn started — the ones sent one after another after
-  a turn ends — stops nothing; it is delivered between tool rounds as before. Queue as many as
-  you like; they are sent in order, and a `/command` waiting for the end of the turn does not
-  hold back the messages behind it. Ctrl-C hands queued text back to the editor instead of
-  sending it. Text without Enter simply reappears in the prompt afterwards.
+  **A queued message never stops the work in flight.** The running shell command, the tool calls
+  of the round, a sub-agent and an advisor consultation all run to their end. The message waits
+  and goes to the model at its next call: between tool rounds when the turn is still going, or as
+  the next request once it has ended. Esc and Ctrl-C are what stop work. Queue as many as you
+  like; they are sent in order, and a `/command` waiting for the end of the turn does not hold
+  back the messages behind it. Ctrl-C hands queued text back to the editor instead of sending it.
+  Text without Enter simply reappears in the prompt afterwards.
 - Tab completes slash commands, their options, skill names, `@files` and the words of a `!line`; ↑/↓ browse history — the latest 100 queries are
   kept in `~/.config/corbienest/history` (`/history` lists them). Ctrl-R searches it
   incrementally (`(reverse-i-search)`, like bash): type to refine, Ctrl-R again for an older
@@ -297,7 +307,7 @@ Each confirmation is a small menu:
 ![The confirmation menu: a yellow question, four numbered options with the selected one marked by an orange arrow, and a line of key hints underneath.](docs/confirm.svg)
 
 Move with ↑/↓ (or j/k) and press Enter, or hit `1`–`4` or the `y`/`a`/`p`/`n` shortcuts;
-Esc or Ctrl-C means no. `p` saves a rule to `.corbienest/permissions` (like Claude Code's
+Esc or Ctrl-C means no. `p` saves a rule to the config directory (`permissions/`, per project; like Claude Code's
 project allow-list): `edit` allows file writes/edits, `bash git status` allows shell commands
 that start with those words (`git status --short` yes, `git status; rm -rf /` no — commands
 with `; | & $ \` < >` never match a rule), `fetch www.postgresql.org` allows `web_fetch` to read
@@ -334,8 +344,9 @@ one line: the two tools' own descriptions carry the rest, and a system prompt is
 every single call. Naming the doc sites you care about in `AGENTS.md` makes it concrete —
 see [Project instructions](#project-instructions).
 
-Pages come in through the `curl` (or `wget`) program, which already brings redirects, size caps
-and a fallback for machines without it. Every
+Pages come in through the `curl` (or `wget`) program, which already brings size caps and a
+fallback for machines without it. Redirects are **not** followed: the page says where it moved,
+and the new address is a `web_fetch` of its own, checked and confirmed like any other. Every
 search and fetch is confirmed like a shell command — a search shows the query, which is what
 leaves your machine — `http(s)` only, and cloud-metadata addresses (`169.254.169.254`,
 `metadata.google.internal`) are refused outright. Approving a host once (`p`) covers the rest of
@@ -587,8 +598,8 @@ can also just say so: *"ask the advisor before you continue"*.
   model; `/think` does not apply to it). Lower it if consultations run out of tokens while
   thinking. `/advisor MODEL` with the model already doing the work is allowed — a second opinion
   from a fresh context, not a stronger one.
-- Enter with a message while it is consulted stops the consultation (your message goes first);
-  Esc skips it. Either way the turn carries on. Plan mode keeps the advisor — it changes
+- Enter with a message while it is consulted does not stop the consultation: the message waits
+  for the next call. Esc skips it. Either way the turn carries on. Plan mode keeps the advisor — it changes
   nothing; sub-agents do not get it. Its tokens are part of the session totals, and `/cost`
   shows them on a line of their own.
 
@@ -670,7 +681,7 @@ hosted, cloud or a bigger local one) is in charge, and the model doing the work 
   lines in the transcript are tagged `[2]` with the task they belong to. A plan that marks
   nothing runs in order. Whether it is faster is up to the server: Ollama answers parallel
   calls to one model only with `OLLAMA_NUM_PARALLEL` above 1 (and the memory for it), and
-  queues them otherwise. A queued message or Esc stops every worker.
+  queues them otherwise. Esc stops every worker; a queued message does not.
 - The expensive model never reads a worker's transcript — only plans, reports and diffs — so
   its tokens stay few; `/usage` shows what they came to.
 
@@ -729,7 +740,7 @@ scheduler load a separate runner for each rather than sharing one.
 Give each session its own directory (a `git worktree` is the natural fit): two agents editing
 one tree fight over the files themselves, and `/rewind` only knows about the writes its own
 process made. Then nothing per-project collides — `.corbienest/memory.md` and
-`.corbienest/permissions` are per directory, session files are named after the start time and
+the rules are per directory (in the config directory, not the project: a cloned repo cannot grant them), session files are named after the start time and
 pid, and `--continue` resumes the latest session *from this directory*.
 
 What is shared is `~/.config/corbienest`, and it is written to survive that:
@@ -743,7 +754,7 @@ What is shared is `~/.config/corbienest`, and it is written to survive that:
   session saved last is what the *next* one starts with. Give the sessions separate settings
   with `XDG_CONFIG_HOME=~/.config/crow-a corbienest` if that matters.
 
-The same atomic swap is used for `.corbienest/memory.md`, `.corbienest/permissions` and the
+The same atomic swap is used for `.corbienest/memory.md`, the permission rules and the
 session files, so a crash or a kill mid-write cannot truncate any of them either.
 
 ## Tests
@@ -775,9 +786,8 @@ by hand and tick *integration*, or run `make test-integration` locally). Run `ma
   with results fed back, `--yolo`, XML tool-call recovery, `@file`, errors, and — through a
   pseudo-terminal — the editor (cursor keys, history, multi-line, paste, type-ahead),
   the confirmation menu (arrow keys, deny with reason, always, stray keys ignored),
-  messages queued with Enter while the model streams or a tool runs (they stop the command,
-  the round and the sub-agent in flight, step past a queued `/command`, and are handed back on
-  Ctrl-C), the mouse wheel and the scrollback (at the prompt, while a reply streams, over the
+  messages queued with Enter while the model streams or a tool runs (they wait for the work in
+  flight, step past a queued `/command`, and are handed back on Ctrl-C), the mouse wheel and the scrollback (at the prompt, while a reply streams, over the
   input field), the suggestions for `/commands`, their options, `@files` and `!lines` (at the
   prompt and while the model works), a resize at an idle
   prompt, the same wheel and resize through a real tmux when one is installed (its `mouse`
@@ -785,7 +795,7 @@ by hand and tick *integration*, or run `make test-integration` locally). Run `ma
   Shift+Tab mode cycling (plan / accept-edits behaviour), `/skills`, Ctrl-C interruption,
   slash commands, the `/model` picker, `!cmd`, `/save`, config/history persistence, `/effort`
   (per-model levels, the picker, the status bar), `/advisor` (the consultation, its limit,
-  a missing or signed-out advisor, Esc and a queued message during one; xAI, OpenAI and
+  a missing or signed-out advisor, Esc during one, and a message queued during one (it waits for the advice); xAI, OpenAI and
   Anthropic through the fake's stand-ins for them — keys, effort, refusals, a missing or wrong
   key, and that the key is written nowhere), `/advisor guidance` (the review before a request
   ends, the check of its first change) and HTTPS (an Ollama and a hosted API behind TLS, and a
@@ -845,7 +855,7 @@ sends your query text to the engine. In the
 default `manual` mode every mutating action, command and page fetch is shown and confirmed
 first, and `plan` mode is read-only (a fetch is still allowed there: reading the docs is how a
 plan gets the API right) — but `--yolo` / `/mode auto` approves everything, and rules saved to
-`.corbienest/permissions` stay approved for that project. Run it on code you can restore
+the rules saved for that project stay approved. Run it on code you can restore
 (a git working tree), and remember that a local model is still a model: it can be talked into
 things by the content of the files it reads. An advisor that is not on your machine (an Ollama
 cloud model, or `xai:`/`openai:`/`anthropic:`) is sent the conversation — file contents and

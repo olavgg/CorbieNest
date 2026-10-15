@@ -6,6 +6,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -39,19 +40,32 @@ const char *tools_summary_line(void) {
 }
 
 /* ---------- persistent project permissions ----------
- * .corbienest/permissions holds one rule per line: "edit" (file writes/edits are fine in
+ * The config directory's permissions/ file for this project (perm_path()) holds one rule per line: "edit" (file writes/edits are fine in
  * this project), "bash <words>" (shell commands whose leading words match, e.g. "bash git
  * status", "bash make") or "fetch <host>" (web_fetch may read pages from that host, e.g.
  * "fetch www.postgresql.org"). Commands with shell metacharacters (; | & $ ` > < newline)
  * never match a rule — a chained command is not "just git status". */
-#define PERM_PATH ".corbienest/permissions"
 #define PERM_MAX  200
 static char *g_perm[PERM_MAX]; static int g_perm_n = 0;
+
+/* Where this project's rules are kept: in the user's config directory, under a name made from the
+ * project's path. A file in the project itself cannot grant anything — a cloned repository could
+ * carry one that says "edit" or "bash git" — so the rules are never read from the working tree. */
+static const char *perm_path(void) {
+    static char path[1200];
+    char cwd[1024]; if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, "?");
+    unsigned long long h = 1469598103934665603ULL;   /* FNV-1a, 64 bit */
+    for (const char *p = cwd; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+    snprintf(path, sizeof path, "%s/permissions/%016llx.rules", config_dir(), h);
+    return path;
+}
 
 void tools_permissions_load(void) {
     for (int i = 0; i < g_perm_n; i++) free(g_perm[i]);
     g_perm_n = 0;
-    size_t n; char *d = read_whole_file(PERM_PATH, &n, 64 * 1024);
+    if (access(".corbienest/permissions", F_OK) == 0)
+        printf(C_DIM "  ⚠ .corbienest/permissions in this project is not read: a project cannot grant permissions (a cloned one could). Add its rules again with /permissions." C_RESET "\n");
+    size_t n; char *d = read_whole_file(perm_path(), &n, 64 * 1024);
     if (!d) return;
     char *save = NULL;
     for (char *l = strtok_r(d, "\n", &save); l && g_perm_n < PERM_MAX; l = strtok_r(NULL, "\n", &save)) {
@@ -63,12 +77,14 @@ void tools_permissions_load(void) {
     free(d);
 }
 static void perm_save(void) {
-    if (!g_perm_n) { unlink(PERM_PATH); return; }
+    if (!g_perm_n) { unlink(perm_path()); return; }
     sbuf b; sb_init(&b);
-    sb_puts(&b, "# corbienest project permissions — one rule per line: \"edit\", \"bash <leading words>\" or \"fetch <host>\" (see /permissions)\n");
+    char cwd[1024]; if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, "?");
+    sb_printf(&b, "# corbienest project permissions for %s — one rule per line: \"edit\", \"bash <leading words>\" or \"fetch <host>\" (see /permissions)\n", cwd);
     for (int i = 0; i < g_perm_n; i++) sb_printf(&b, "%s\n", g_perm[i]);
-    mkdir_p(".corbienest");
-    write_whole_file_atomic(PERM_PATH, b.data, b.len);
+    char dir[1100]; snprintf(dir, sizeof dir, "%s/permissions", config_dir());
+    mkdir_p(dir);
+    write_whole_file_atomic(perm_path(), b.data, b.len);
     sb_free(&b);
 }
 int tools_permissions_count(void) { return g_perm_n; }
@@ -86,7 +102,7 @@ bool tools_permissions_remove(int i) {
     perm_save();
     return true;
 }
-void tools_permissions_clear(void) { for (int i = 0; i < g_perm_n; i++) free(g_perm[i]); g_perm_n = 0; unlink(PERM_PATH); }
+void tools_permissions_clear(void) { for (int i = 0; i < g_perm_n; i++) free(g_perm[i]); g_perm_n = 0; unlink(perm_path()); }
 
 /* Rule text a command would be remembered under: its first word, plus the subcommand for
  * tools that have them (git, npm, cargo, docker …). Empty if the command is not "simple". */
@@ -161,11 +177,50 @@ static ckpt_t *g_ckpt; static int g_ckpt_n, g_ckpt_cap; static size_t g_ckpt_byt
 static int g_ckpt_step = 0;   /* a part of the request that is looked at by itself (a task of /orchestrate); 0 = none */
 
 void tools_checkpoint_turn(int turn) { g_ckpt_turn = turn; g_ckpt_step = 0; }
+/* /goal: while a candidate's tool call runs, the working directory is its worktree and writes must stay in it */
+static const char *g_tool_root = NULL;
+static int g_tool_saved = -1;
+bool tools_enter(const char *root) {
+    if (g_tool_saved >= 0 || !root) return false;
+    int fd = open(".", O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return false;
+    if (chdir(root) != 0) { close(fd); return false; }
+    g_tool_saved = fd; g_tool_root = root;
+    return true;
+}
+void tools_leave(void) {
+    if (g_tool_saved < 0) return;
+    if (fchdir(g_tool_saved) != 0) fprintf(stderr, "corbienest: cannot return to the working directory: %s\n", strerror(errno));
+    close(g_tool_saved); g_tool_saved = -1; g_tool_root = NULL;
+}
+/* p is as a tool was given it, ~ expanded, and is taken from the current directory: inside the root? A path that does
+ * not exist yet is checked by its folder. Symlinks are resolved, so one out of the worktree does not pass. */
+static bool path_in_root(const char *p) {
+    if (!g_tool_root) return true;
+    char root[PATH_MAX], full[PATH_MAX];
+    if (!realpath(g_tool_root, root)) return false;
+    if (!realpath(p, full)) {
+        const char *slash = strrchr(p, '/'), *name = slash ? slash + 1 : p;
+        if (!*name || !strcmp(name, ".") || !strcmp(name, "..")) return false;
+        char dir[PATH_MAX];
+        if (!slash) snprintf(dir, sizeof dir, ".");
+        else if (slash == p) snprintf(dir, sizeof dir, "/");
+        else if ((size_t)(slash - p) < sizeof dir) snprintf(dir, sizeof dir, "%.*s", (int)(slash - p), p);
+        else return false;
+        char real[PATH_MAX];
+        if (!realpath(dir, real)) return false;
+        size_t rl = strlen(real), nl = strlen(name);
+        if (rl + nl + 2 > sizeof full) return false;
+        memcpy(full, real, rl); full[rl] = '/'; memcpy(full + rl + 1, name, nl + 1);
+    }
+    size_t n = strlen(root);
+    return !strncmp(full, root, n) && (full[n] == '/' || full[n] == 0);
+}
 void tools_checkpoint_step(int step) { g_ckpt_step = step; }
 static void ckpt_free(ckpt_t *c) { free(c->path); free(c->content); g_ckpt_bytes -= c->len; }
 void tools_checkpoint_clear(void) { for (int i = 0; i < g_ckpt_n; i++) ckpt_free(&g_ckpt[i]); g_ckpt_n = 0; }
 static void ckpt_save(const char *path) {
-    if (g_ckpt_turn < 0) return;
+    if (g_ckpt_turn < 0 || g_tool_root) return;   /* a candidate's files are not the user's (see tools_enter) */
     for (int i = 0; i < g_ckpt_n; i++) if (g_ckpt[i].turn == g_ckpt_turn && g_ckpt[i].step == g_ckpt_step && !strcmp(g_ckpt[i].path, path)) return;   /* first state in this turn (and step) wins */
     ckpt_t c = { g_ckpt_turn, xstrdup(path), NULL, 0, false, g_ckpt_step };
     if (is_file(path)) { c.content = read_whole_file(path, &c.len, CKPT_MAX_BYTES); if (!c.content) { free(c.path); return; } c.existed = true; }
@@ -173,6 +228,7 @@ static void ckpt_save(const char *path) {
     if (g_ckpt_n == g_ckpt_cap) { g_ckpt_cap = g_ckpt_cap ? g_ckpt_cap * 2 : 32; g_ckpt = xrealloc(g_ckpt, sizeof *g_ckpt * (size_t)g_ckpt_cap); }
     g_ckpt[g_ckpt_n++] = c; g_ckpt_bytes += c.len;
 }
+void tools_checkpoint_path(const char *path) { ckpt_save(path); }
 /* files changed in `turn` or later: distinct paths, appended comma-separated to `names` (may be NULL); returns the count */
 int tools_checkpoint_files(int turn, sbuf *names) {
     int n = 0;
@@ -316,6 +372,11 @@ cJSON *tools_definitions(void) {
     }
 
     p = cJSON_CreateObject();
+    cJSON_AddItemToArray(arr, mk_tool("exit",
+        "End the program once you have replied. Call it only when the user has said they are finished and want to leave (\"exit\", \"bye\", \"that's all\"): reply with a short goodbye first, in the same turn. Never call it to end a task.",
+        p, (const char*[]){NULL}));
+
+    p = cJSON_CreateObject();
     prop(p, "description", "string", "A short (3-6 word) label for what the sub-agent does, shown to the user.");
     prop(p, "prompt", "string", "The complete task for the sub-agent. It starts with a fresh context and sees nothing of this conversation, so include every relevant detail: what to look for, where, and exactly what to report back.");
     cJSON_AddItemToArray(arr, mk_tool("task",
@@ -358,11 +419,13 @@ static bool jbool(cJSON *o, const char *k, bool dflt) {
 /* Truncate a big output keeping head and tail. */
 static void cap_output(sbuf *b, size_t cap) {
     if (b->len <= cap) return;
-    size_t head = cap * 2 / 3, tail = cap - head;
+    size_t head = utf8_cut(b->data, b->len, cap * 2 / 3), tail = cap - cap * 2 / 3;
+    const char *t = b->data + b->len - tail;   /* the tail starts on a character too */
+    while (tail && ((unsigned char)*t & 0xC0) == 0x80) { t++; tail--; }
     sbuf n; sb_init(&n);
     sb_append(&n, b->data, head);
     sb_printf(&n, "\n\n[... output truncated: %zu bytes omitted ...]\n\n", b->len - head - tail);
-    sb_append(&n, b->data + b->len - tail, tail);
+    sb_append(&n, t, tail);
     sb_free(b);
     *b = n;
 }
@@ -391,16 +454,26 @@ static void preview_lines(const char *text, int max_lines, const char *color, co
     if (total > lines) printf("  " C_DIM "… (%d more lines)" C_RESET "\n", total - lines);
 }
 
+enum { CONF_EDIT = CONF_EDIT_K, CONF_BASH = CONF_BASH_K, CONF_FETCH = CONF_FETCH_K };
+/* Would confirm() ask? The same early returns, without the output: a command that will be asked
+ * about is never folded away (the user approves what they can see). Keep in step with confirm(). */
+static bool confirm_will_ask(int kind, bool *always_flag, const char *cmd) {
+    if (always_flag && *always_flag) return false;
+    if (tools_no_confirm) return false;
+    if (YOLO() || (kind == CONF_EDIT && g_cfg.mode == MODE_ACCEPT_EDITS)) return false;
+    if (kind == CONF_EDIT && g_cfg.mode == MODE_PLAN) return false;
+    if (perm_match(kind, cmd)) return false;
+    return g_cfg.interactive;
+}
 /* Confirmation prompt. Returns 1 allow, 0 deny. On deny, *reason may be set (malloc'd).
  * kind: CONF_EDIT for write/edit, CONF_BASH for shell commands, CONF_FETCH for web_fetch;
  * `cmd` is the shell command or the URL (for the project rules), NULL for edits. */
-enum { CONF_EDIT = CONF_EDIT_K, CONF_BASH = CONF_BASH_K, CONF_FETCH = CONF_FETCH_K };
 static int confirm(const char *what, int kind, bool *always_flag, const char *cmd, char **reason) {
     *reason = NULL;
     if (always_flag && *always_flag) return 1;
     if (tools_no_confirm) return 1;
     if (YOLO() || (kind == CONF_EDIT && g_cfg.mode == MODE_ACCEPT_EDITS)) {
-        if (g_cfg.interactive) printf("  " C_YELLOW "%s" C_RESET "  " C_DIM "auto-approved (%s mode)" C_RESET "\n", what, mode_name(g_cfg.mode));
+        if (g_cfg.interactive && kind != CONF_BASH) printf("  " C_YELLOW "%s" C_RESET "  " C_DIM "auto-approved (%s mode)" C_RESET "\n", what, mode_name(g_cfg.mode));
         return 1;
     }
     if (kind == CONF_EDIT && g_cfg.mode == MODE_PLAN) {
@@ -410,7 +483,7 @@ static int confirm(const char *what, int kind, bool *always_flag, const char *cm
     }
     const char *rule = perm_match(kind, cmd);
     if (rule) {
-        printf("  " C_YELLOW "%s" C_RESET "  " C_DIM "auto-approved (project rule: %s)" C_RESET "\n", what, rule);
+        if (kind != CONF_BASH) printf("  " C_YELLOW "%s" C_RESET "  " C_DIM "auto-approved (project rule: %s)" C_RESET "\n", what, rule);
         return 1;
     }
     if (!g_cfg.interactive) {
@@ -425,9 +498,11 @@ static int confirm(const char *what, int kind, bool *always_flag, const char *cm
     if (kind == CONF_BASH) { bash_rule_for(cmd, newrule, sizeof newrule); if (newrule[0]) snprintf(plabel, sizeof plabel, "Yes, and always allow `%s …` in this project", newrule + 5); }
     else if (kind == CONF_FETCH) { fetch_rule_for(cmd, newrule, sizeof newrule); if (newrule[0]) snprintf(plabel, sizeof plabel, "Yes, and always allow fetching from %s in this project", newrule + 6); }
     else { snprintf(newrule, sizeof newrule, "edit"); snprintf(plabel, sizeof plabel, "Yes, and always allow file edits in this project"); }
+    term_confirm_quiet = kind == CONF_BASH;
     int r = term_confirm(what, always, newrule[0] ? plabel : NULL, reason);
+    term_confirm_quiet = false;
     if (r == 2 && always_flag) *always_flag = true;
-    if (r == 3 && newrule[0]) { tools_permissions_add(newrule); printf("  " C_DIM "saved to " PERM_PATH ": %s" C_RESET "\n", newrule); }
+    if (r == 3 && newrule[0]) { tools_permissions_add(newrule); printf("  " C_DIM "saved to %s: %s" C_RESET "\n", perm_path(), newrule); }
     return r > 0;
 }
 
@@ -478,6 +553,7 @@ static tool_status t_write_file(cJSON *args, sbuf *out) {
     const char *content = jstr(args, "content", NULL);
     if (!path || !content) { sb_puts(out, "error: need 'path' and 'content'"); return TOOL_ERROR; }
     char *p = expand_home(path);
+    if (!path_in_root(p)) { sb_printf(out, "error: %s is outside this candidate's worktree; write inside the working directory", path); free(p); return TOOL_ERROR; }
     bool exists = is_file(p);
     printf("  " C_DIM "%s %s (%zu bytes)" C_RESET "\n", exists ? "overwrite" : "create", path, strlen(content));
     const char *dot = strrchr(path, '.'), *slash = strrchr(path, '/');
@@ -514,6 +590,7 @@ static tool_status t_edit_file(cJSON *args, sbuf *out) {
     if (!path || !olds || !news) { sb_puts(out, "error: need 'path', 'old_string' and 'new_string'"); return TOOL_ERROR; }
     if (!*olds) { sb_puts(out, "error: old_string must not be empty (use write_file to create files)"); return TOOL_ERROR; }
     char *p = expand_home(path);
+    if (!path_in_root(p)) { sb_printf(out, "error: %s is outside this candidate's worktree; edit inside the working directory", path); free(p); return TOOL_ERROR; }
     size_t len; char *d = read_whole_file(p, &len, 0);
     if (!d) { sb_printf(out, "error: cannot read %s: %s", path, strerror(errno)); free(p); return TOOL_ERROR; }
     int occ = count_occ(d, olds);
@@ -582,7 +659,7 @@ static tool_status t_list_dir(cJSON *args, sbuf *out) {
 
 /* ---------- shell runner ---------- */
 /* Runs cmd via /bin/sh -c, capturing stdout+stderr. Returns exit code (or -1 on failure,
- * 124 on timeout, 125 if a message the user queued stopped it, 130 if interrupted by user).
+ * 124 on timeout, 130 if interrupted by user). A message queued meanwhile does not stop it.
  * `cap` bounds what is kept while it streams (a runaway command cannot eat the heap);
  * `busy`/`verb` label the status bar and the inline spinner while it runs. */
 static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupted,
@@ -608,9 +685,9 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
     }
     close(pfd[1]);
     setpgid(pid, pid);
-    struct pollfd fds[2] = { { pfd[0], POLLIN, 0 }, { g_cfg.interactive ? STDIN_FILENO : -1, POLLIN, 0 } };
+    struct pollfd fds[2] = { { pfd[0], POLLIN, 0 }, { g_cfg.interactive ? term_interrupt_fd() : -1, POLLIN, 0 } };
     long remaining_ms = (long)timeout_s * 1000;
-    bool timed_out = false, by_msg = false;
+    bool timed_out = false;
     term_raw(true);
     term_busy(busy);
     struct timeval t0; gettimeofday(&t0, NULL);
@@ -626,16 +703,13 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
                 double el = (double)(t.tv_sec - t0.tv_sec) + (double)(t.tv_usec - t0.tv_usec) / 1e6;
                 static const char *SP[] = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
                 spin = (spin + 1) % 10;
-                printf("\r\x1b[2K  " C_ORANGE "%s" C_RESET C_DIM " %s… (%.0fs)  " C_GRAY "ctrl-c to interrupt" C_RESET, SP[spin], verb, el);
+                printf("\r\x1b[2K  " C_ORANGE "%s" C_RESET C_DIM " %s… (%.0fs)  " C_RESET "ctrl-c to interrupt", SP[spin], verb, el);
                 fflush(stdout); spin_shown = true;
             }
             continue;
         }
         if (fds[1].revents & POLLIN) {
-            if (term_poll_interrupt()) { *interrupted = true; break; }
-            /* A message queued while this runs is almost always about the job in flight: stop
-             * the command so it reaches the model now, not when a ten-minute build is done. */
-            if (term_queue_new()) { by_msg = true; break; }
+            if (term_poll_interrupt()) { *interrupted = true; break; }   /* (a queued message waits for the command to finish) */
         }
         if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             char buf[8192]; ssize_t n = read(pfd[0], buf, sizeof buf);
@@ -645,17 +719,53 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
     }
     if (spin_shown) { fputs("\r\x1b[2K", stdout); fflush(stdout); }
     term_busy(NULL);
-    if (timed_out || *interrupted || by_msg) { kill(-pid, SIGTERM); usleep(200 * 1000); kill(-pid, SIGKILL); }
+    if (timed_out || *interrupted) { kill(-pid, SIGTERM); usleep(200 * 1000); kill(-pid, SIGKILL); }
     /* drain */
     close(pfd[0]);
     int status = 0;
     waitpid(pid, &status, 0);
     if (timed_out) return 124;
-    if (by_msg) return 125;
     if (*interrupted) return 130;
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return -1;
+}
+
+/* The command as the transcript shows it. A command of several lines is folded to its first line,
+ * with a mark that opens the rest (term_fold_begin); not when the user is about to be asked about
+ * it (they approve what they can see), and off full-screen mode it is printed whole, as before. */
+/* A one-line command short enough to sit in the question: the approval shows it in full, so no "$" line. */
+int tools_shell_in(const char *dir, const char *cmd, int timeout_s, sbuf *out, bool *interrupted, const char *busy, const char *verb) {
+    bool entered = dir ? tools_enter(dir) : false;
+    if (dir && !entered) { *interrupted = false; sb_printf(out, "cannot enter %s", dir); return -1; }
+    int rc = run_shell(cmd, timeout_s, out, interrupted, OUT_CAP * 2, busy, verb);
+    if (entered) tools_leave();
+    return rc;
+}
+
+static bool cmd_in_question(const char *cmd) { return !strchr(cmd, '\n') && strlen(cmd) <= 160; }
+static void print_command(const char *cmd, bool will_ask) {
+    char first[320];
+    int w = term_width() - 6 - 16; if (w < 12) w = 12;   /* "  ▸ $ " and "  (+NNNN lines)" */
+    int more = cmd_head(cmd, w, first, sizeof first);
+    if (will_ask && cmd_in_question(cmd)) return;
+    if (!will_ask && more == 0) return;   /* not asked, one line: the result's line shows it */
+    if (more > 0 && !will_ask) {
+        char head[512];
+        snprintf(head, sizeof head, "  " C_DIM TERM_FOLD_CLOSED " $ " C_RESET C_BOLD "%s" C_RESET C_DIM "  (+%d lines)" C_RESET, first, more);
+        if (term_fold_begin(head)) {
+            for (const char *p = cmd; *p; ) {
+                size_t len = strcspn(p, "\n");
+                fputs("     " C_DIM, stdout);
+                for (size_t i = 0; i < len; i++) { unsigned char c = (unsigned char)p[i]; if (c == '\t') fputs("    ", stdout); else fputc(c < 32 || c == 127 ? ' ' : c, stdout); }   /* no carriage returns, no escapes: they would move the model's cursor (cmd_head maps the same) */
+                fputs(C_RESET "\n", stdout);
+                p += len; if (*p == '\n') p++;
+            }
+            term_fold_end();
+            return;
+        }
+    }
+    printf("  " C_DIM "$ " C_RESET C_BOLD "%s" C_RESET "\n", cmd);
 }
 
 static tool_status t_bash(cJSON *args, sbuf *out) {
@@ -664,9 +774,13 @@ static tool_status t_bash(cJSON *args, sbuf *out) {
     int timeout = jint(args, "timeout", 120);
     if (timeout <= 0) timeout = 120;
     if (timeout > 600) timeout = 600;
-    printf("  " C_DIM "$ " C_RESET C_BOLD "%s" C_RESET "\n", cmd);
+    bool asked = confirm_will_ask(CONF_BASH, &g_always_bash, cmd);
+    print_command(cmd, asked);
+    char q[256];   /* the question carries a short command in full: the approval is of what is shown */
+    if (asked && cmd_in_question(cmd)) snprintf(q, sizeof q, "Run this command?  %s", cmd);
+    else snprintf(q, sizeof q, "Run this command?");
     char *reason = NULL;
-    if (!confirm("Run this command?", CONF_BASH, &g_always_bash, cmd, &reason)) {
+    if (!confirm(q, CONF_BASH, &g_always_bash, cmd, &reason)) {
         sb_printf(out, "User denied running the command.%s%s", reason ? " Reason: " : "", reason ? reason : "");
         free(reason); return TOOL_DENIED;
     }
@@ -676,10 +790,6 @@ static tool_status t_bash(cJSON *args, sbuf *out) {
     cap_output(&o, OUT_CAP);
     if (rc == 124) sb_printf(out, "(command timed out after %ds and was killed)\n", timeout);
     if (intr) sb_puts(out, "(command interrupted by user with Ctrl-C)\n");
-    if (rc == 125) {
-        printf("  " C_YELLOW "⚠ stopped: your message goes to the model first" C_RESET "\n");
-        sb_puts(out, "(the command did not finish: the user sent a message while it ran and it was stopped so they could be answered. Its output up to that point follows.)\n");
-    }
     if (o.len) { sb_append(out, o.data, o.len); if (o.data[o.len-1] != '\n') sb_putc(out, '\n'); }
     else sb_puts(out, "(no output)\n");
     sb_printf(out, "exit code: %d", rc);
@@ -706,11 +816,10 @@ static tool_status t_grep(cJSON *args, sbuf *out) {
     char *p = expand_home(path); sh_quote(&cmd, p); free(p);
     sb_puts(&cmd, " 2>/dev/null | head -n 300");
     sbuf o; sb_init(&o); bool intr;
-    int rc = run_shell(cmd.data, 60, &o, &intr, OUT_CAP * 2, "running command", "running");
+    run_shell(cmd.data, 60, &o, &intr, OUT_CAP * 2, "running command", "running");
     cap_output(&o, OUT_CAP);
     if (!o.len) sb_printf(out, "No matches for /%s/ in %s", pat, path);
     else { sb_append(out, o.data, o.len); }
-    if (rc == 125) sb_puts(out, "\n(the search was stopped before it finished: the user sent a message while it ran)");
     sb_free(&o); sb_free(&cmd);
     return TOOL_OK;
 }
@@ -753,8 +862,8 @@ static bool looks_like_html(const char *d, size_t len) {
  * status (0 with wget, which does not report one) and `ctype` its content type. On failure
  * `err` gets a line the model can act on. */
 static bool web_get(const char *url, int timeout, const char *busy, const char *verb,
-                    sbuf *body, int *status, char *ctype, size_t ctype_n, sbuf *err) {
-    sb_init(body); *status = 0; if (ctype_n) ctype[0] = 0;
+                    sbuf *body, int *status, char *ctype, size_t ctype_n, char *loc, size_t loc_n, sbuf *err) {
+    sb_init(body); *status = 0; if (ctype_n) ctype[0] = 0; if (loc_n) loc[0] = 0;
     bool curl = have_bin("curl");
     if (!curl && !have_bin("wget")) {
         sb_puts(err, "error: neither curl nor wget is installed, so corbienest cannot reach the network. Tell the user; do not guess what the page says.");
@@ -762,11 +871,12 @@ static bool web_get(const char *url, int timeout, const char *busy, const char *
     }
     sbuf cmd; sb_init(&cmd);
     if (curl) {
-        sb_printf(&cmd, "curl -sSL --max-time %d --max-filesize %u --compressed -A 'corbienest/%s' "
+        /* no -L: a redirect is not followed here, the new address is reported and fetched as a call of its own */
+        sb_printf(&cmd, "curl -sS --proto =http,https --max-time %d --max-filesize %u --compressed -A 'corbienest/%s' "
                         "-H 'Accept: text/html,text/plain,text/markdown,application/json;q=0.9,*/*;q=0.8' "
-                        "-w '\n" WEB_MARK "%%{http_code} %%{content_type}>>>' -- ", timeout, WEB_MAX, CORBIE_VERSION);
+                        "-w '\n" WEB_MARK "%%{http_code} %%{content_type}\n%%{redirect_url}>>>' -- ", timeout, WEB_MAX, CORBIE_VERSION);
     } else {
-        sb_printf(&cmd, "wget -q -O - --timeout=%d --tries=2 -U 'corbienest/%s' -- ", timeout, CORBIE_VERSION);
+        sb_printf(&cmd, "wget -q -O - --max-redirect=0 --timeout=%d --tries=2 -U 'corbienest/%s' -- ", timeout, CORBIE_VERSION);
     }
     sh_quote(&cmd, url);
 
@@ -779,7 +889,16 @@ static bool web_get(const char *url, int timeout, const char *busy, const char *
         char *mark = NULL;
         for (char *q = strstr(body->data, WEB_MARK); q; q = strstr(q + 1, WEB_MARK)) mark = q;
         if (mark) {
-            sscanf(mark + strlen(WEB_MARK), "%d %127[^>]", status, ctype);
+            /* "CODE CONTENT-TYPE\nREDIRECT>>>": the type and the address are each on their own line */
+            const char *q = mark + strlen(WEB_MARK), *nl = strchr(q, '\n'), *end = strstr(q, ">>>");
+            sscanf(q, "%d", status);
+            const char *sp = strchr(q, ' ');
+            if (ctype_n && sp && nl && sp < nl) snprintf(ctype, ctype_n, "%.*s", (int)(nl - sp - 1), sp + 1);
+            if (loc_n && nl && end && nl < end) {
+                bool clean = true;   /* a server's address goes to the model and the screen: printable, no spaces */
+                for (const char *c = nl + 1; c < end; c++) if ((unsigned char)*c <= 0x20 || (unsigned char)*c >= 0x7f) clean = false;
+                if (clean) snprintf(loc, loc_n, "%.*s", (int)(end - nl - 1), nl + 1);
+            }
             size_t at = (size_t)(mark - body->data);
             if (at && body->data[at-1] == '\n') at--;
             body->data[at] = 0; body->len = at;
@@ -789,9 +908,9 @@ static bool web_get(const char *url, int timeout, const char *busy, const char *
     bool ok = true;
     if (rc == 124) { sb_printf(err, "error: fetching %s timed out after %ds", url, timeout); ok = false; }
     else if (intr) { sb_puts(err, "(the fetch was interrupted by the user with Ctrl-C)"); ok = false; }
-    else if (rc == 125) {
-        printf("  " C_YELLOW "⚠ stopped: your message goes to the model first" C_RESET "\n");
-        sb_puts(err, "(nothing was fetched: the user sent a message while it was downloading and it was stopped so they could be answered)");
+    else if (*status >= 300 && *status < 400) {
+        sb_printf(err, "error: %s redirects to %s. Redirects are not followed: if that page is wanted, call web_fetch with the new address (it is checked and confirmed like any other).",
+                  url, loc[0] ? loc : "another address");
         ok = false;
     }
     else if (*status && (*status < 200 || *status >= 300))
@@ -832,8 +951,8 @@ static tool_status t_web_fetch(cJSON *args, sbuf *out) {
         free(reason); return TOOL_DENIED;
     }
 
-    sbuf o; int status; char ctype[128];
-    if (!web_get(url, timeout, "fetching page", "fetching", &o, &status, ctype, sizeof ctype, out)) return TOOL_ERROR;
+    sbuf o; int status; char ctype[128], loc[1024];
+    if (!web_get(url, timeout, "fetching page", "fetching", &o, &status, ctype, sizeof ctype, loc, sizeof loc, out)) return TOOL_ERROR;
 
     bool html = ctype[0] ? (strcasestr(ctype, "html") != NULL || strcasestr(ctype, "xml") != NULL)
                          : looks_like_html(o.data, o.len);
@@ -904,8 +1023,8 @@ static tool_status t_web_search(cJSON *args, sbuf *out) {
         free(reason); free(url); return TOOL_DENIED;
     }
 
-    sbuf o; int status; char ctype[128];
-    if (!web_get(url, 30, "searching the web", "searching", &o, &status, ctype, sizeof ctype, out)) { free(url); return TOOL_ERROR; }
+    sbuf o; int status; char ctype[128], loc[1024];
+    if (!web_get(url, 30, "searching the web", "searching", &o, &status, ctype, sizeof ctype, loc, sizeof loc, out)) { free(url); return TOOL_ERROR; }
 
     int n = 0;
     char *list = search_results_text(o.data, o.len, url, max, &n);
@@ -939,6 +1058,19 @@ static tool_status t_task(cJSON *args, sbuf *out) {
     return rc == 0 ? TOOL_OK : TOOL_ERROR;
 }
 
+/* ---------- exit (the model sees the user is leaving) ----------
+ * The call only sets a flag: main.c ends the program when the turn is over, so the reply that says
+ * goodbye is still written and the session is saved as on /quit. */
+static bool g_exit_asked = false;
+bool tools_exit_asked(void) { return g_exit_asked; }
+void tools_exit_clear(void) { g_exit_asked = false; }
+static tool_status t_exit(sbuf *out) {
+    if (g_in_subagent) { sb_puts(out, "error: a sub-agent cannot end the program"); return TOOL_ERROR; }
+    g_exit_asked = true;
+    sb_puts(out, "ok: the program ends after this reply. Say goodbye in one short line.");
+    return TOOL_OK;
+}
+
 /* ---------- advisor (a stronger model, consulted) ---------- */
 tools_advisor_fn tools_advisor = NULL;
 static tool_status t_advisor(cJSON *args, sbuf *out) {
@@ -965,7 +1097,10 @@ tool_status tools_execute(const char *name, cJSON *args, sbuf *out) {
     else if (!strcmp(name, "web_search") || !strcmp(name, "search_web") || !strcmp(name, "search")) st = t_web_search(args, out);
     else if (!strcmp(name, "task")) st = t_task(args, out);
     else if (!strcmp(name, "advisor")) st = t_advisor(args, out);
+    else if (!strcmp(name, "exit")) st = t_exit(out);
     else { sb_printf(out, "error: unknown tool '%s'. Available tools: %s", name, tools_summary_line()); st = TOOL_ERROR; }
     if (tmp) cJSON_Delete(tmp);
+    /* what a tool returned goes to the terminal and into the request: a binary file's bytes are not UTF-8 */
+    if (out->data && !utf8_ok(out->data, out->len)) { char *fx = utf8_fix(out->data); sb_clear(out); sb_puts(out, fx); free(fx); }
     return st;
 }

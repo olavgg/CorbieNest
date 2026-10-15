@@ -8,7 +8,7 @@
 #include <stddef.h>
 #include <cjson/cJSON.h>
 
-#define CORBIE_VERSION "0.2.0"
+#define CORBIE_VERSION "0.3.0"
 
 /* ---------- ANSI colours ---------- */
 #define C_RESET   "\x1b[0m"
@@ -86,6 +86,13 @@ long  shell_word(const char *buf, size_t cur, bool *command);
 int   command_complete(const char *typed, int max, file_match **out);
 char *shell_escape(const char *s);
 
+/* A pasted block the editor shows as a token, "[Pasted text #K +N lines]" (term.c): K numbers the
+ * paste within the prompt, N is its line count. paste_tokens() finds the tokens in a line of
+ * input (sp: start and end bytes, ks: K, ns: N, each optional), paste_expand() puts the texts
+ * back for the ones that are still whole: K in 1..n and N equal to lines[K-1]. */
+size_t paste_tokens(const char *s, size_t len, size_t (*sp)[2], int *ks, int *ns, size_t max);
+char  *paste_expand(const char *s, size_t len, const char *const *texts, const int *lines, int n);
+
 /* A sub-agent's log (main.c keeps one per run, shown by ← at the prompt): plain text appended to
  * `log`, which is cut from its front, at a line, once it is past `cap` bytes. */
 void  agent_log_add(sbuf *log, const char *text, size_t cap);
@@ -107,6 +114,16 @@ char *search_results_text(const char *html, size_t len, const char *engine_url, 
  * were left out, and message `keep` (the request being worked on; -1 = none) always stays. malloc'd. */
 char *transcript_text(cJSON *msgs, int keep, size_t budget);
 void  sb_put_cut(sbuf *b, const char *s, size_t cap);   /* s, without its middle when longer than cap bytes (UTF-8 safe; says how much went) */
+/* UTF-8 for a request body (the server refuses a body that is not valid JSON): */
+bool   utf8_ok(const char *s, size_t len);
+bool   tail_incomplete(const char *buf, size_t n);   /* ends inside an escape sequence or a UTF-8 character */
+char  *utf8_fix(const char *s);                  /* malloc'd copy, each invalid byte as U+FFFD */
+size_t utf8_cut(const char *s, size_t len, size_t cap);   /* the longest prefix of s up to cap bytes that ends on a character */
+int    cmd_head(const char *cmd, int width, char *out, size_t n);   /* a shell command's first line for a fold's head; returns the lines after it */
+/* Every tool call of an assistant message gets its tool result right after it (a stopped request leaves
+ * calls without one, and the server refuses the next request); invalid UTF-8 in content is fixed. Returns
+ * how many were fixed. The conversation's own repair, run when a request starts. */
+int    messages_repair(cJSON *msgs);
 
 /* The advisor (/advisor): where a consultation runs and what it is shown — see util.c. */
 #define ADVISOR_CTX_AUTO     16384        /* its window unless /advisor ctx says otherwise (and never more than the main one) */
@@ -192,6 +209,7 @@ typedef struct {
     int   memory_every;  /* run the memory-extraction call after this many requests (also at exit, /clear, /compact, /cd) */
     int   memory_idle;   /* seconds idle at the prompt after which a pending extraction runs anyway (0 = only at memory_every / exit) */
     char *keep_alive;    /* ollama keep_alive for the model ("30m", "-1" = forever, "0" = unload); NULL = server default */
+    char *ui;            /* "ansi" (default) or "notcurses" (needs a build made with notcurses installed); NULL = ansi */
 } config_t;
 
 extern config_t g_cfg;
@@ -234,10 +252,19 @@ void config_save(void);
 typedef int (*http_line_cb)(const char *line, size_t len, void *ud);
 typedef void (*http_idle_cb)(void *ud);   /* called ~every 100ms while waiting */
 
+/* The rate limits an Anthropic response reports for itself (anthropic-ratelimit-* headers): what
+ * is left of the limit at the moment of the response. Counts are per minute, as the API gives them. */
+typedef struct {
+    bool      have;       /* the response carried any of them */
+    long long req_lim, req_rem, in_lim, in_rem, out_lim, out_rem;
+    char      reset[40];  /* when the input-token limit is back in full (RFC 3339, as sent) */
+} ratelimit_info;
+
 typedef struct {
     int   status;         /* HTTP status, 0 if none */
     bool  aborted;        /* aborted by callback / interrupt key */
     char  err[512];       /* error text if return < 0 */
+    ratelimit_info rl;    /* the response's rate-limit headers, when it had them */
 } http_result;
 
 extern int http_interrupt_fd;   /* fd to watch for user input while waiting; -1 to disable */
@@ -266,6 +293,7 @@ char *http_url(const char *base, const char *path);   /* base + path; "host" and
 /* ---------- term.h ---------- */
 void term_init(void);
 void term_restore(void);
+void term_finish(void);       /* the program is ending: restores the terminal, and output after it is not the screen's */
 void term_raw(bool on);
 int  term_width(void);
 void term_size(int *rows, int *cols);
@@ -279,6 +307,7 @@ void term_clear_screen(void);
  * term_status_refresh() redraws the bar; call it after mode/model/token changes.
  * term_status_live() shows output tokens of an in-flight generation (0 = none). */
 void term_fullscreen(bool on);
+bool term_is_fullscreen(void);                        /* the alternate screen with its bottom chrome is up (ANSI) */
 void term_status_refresh(void);
 void term_status_live(long out_tokens);
 void fmt_tokens(long n, char *out, size_t sz);   /* 950, 1.2k, 45k, 1.1M */
@@ -302,6 +331,7 @@ int term_getkey(void);
 /* Non-blocking: drain pending stdin into the type-ahead buffer; returns 1 if Ctrl-C/Esc was pressed.
  * Enter while busy turns the pending text into a queued message (see below). */
 int term_poll_interrupt(void);
+int term_interrupt_fd(void);                /* the fd a busy wait watches for keys: stdin, or notcurses' readiness pipe */
 /* Background work at an idle prompt. When term_idle_ms > 0, the editor runs term_idle_hook()
  * once per prompt after that many milliseconds without a keystroke on an empty line, with the
  * terminal put back the way it is during a turn (input field released, cursor where the
@@ -324,13 +354,6 @@ void        term_queue_push(const char *msg);
 void        term_queue_clear(void);
 void        term_queue_to_editor(void);   /* after an interrupt: hand queued text back to the editor */
 char       *term_queue_pop_plain(void);   /* oldest plain message, stepping over queued /commands and !lines */
-/* "The user said something since main.c last looked." A message queued after term_queue_mark()
- * stops the work in flight so it reaches the model at once instead of after the task: the tool
- * calls of a round still to run, a shell command, a sub-agent. A message that was already
- * waiting when that work started does not — it is delivered at the normal point. Queued
- * /commands and !lines belong to the REPL and stop nothing. */
-int         term_queue_new(void);
-void        term_queue_mark(void);        /* everything queued so far is accounted for */
 /* Slash commands that only look at state or flip a setting do not have to wait for the turn
  * to end: when Enter is pressed while busy, term.c offers the line to this hook first and
  * only queues it as a message when the hook returns 0. Set by main.c. */
@@ -341,7 +364,16 @@ extern int (*term_run_while_busy)(const char *line);
 #define TERM_FOLD_CLOSED "▸"
 #define TERM_FOLD_OPEN   "▾"
 bool        term_fold_begin(const char *head);
+/* rate limits: the anthropic-ratelimit-* headers of a response (util.c); per model, the last seen */
+void        ratelimit_header(ratelimit_info *rl, const char *line, size_t n);
+void        ratelimit_set(const char *model, const ratelimit_info *rl);
+bool        ratelimit_get(const char *model, ratelimit_info *out);
+/* a text in a centred window over the conversation, while the model may keep working underneath
+ * (Esc closes it). false when there is no full-screen conversation to draw it on: print it instead */
+bool        term_overlay_show(const char *text);
+void        term_overlay_close(void);
 void        term_fold_end(void);
+int         term_fold_toggle(int line);   /* the fold whose head is scrollback line `line`: shown or hidden; the body lines flipped, -1 if no head there */
 void        term_line_break(void);        /* start a fresh line if output is mid-line (the model may be mid-sentence) */
 void        term_editor_prefill(const char *text);   /* text appears in the editor at the next prompt (e.g. after /rewind) */
 char       *term_keys_to_text(const unsigned char *keys, size_t n);   /* raw keystrokes -> trimmed text (malloc'd) */
@@ -366,6 +398,68 @@ extern int (*term_suggest)(const char *buf, size_t cur, size_t *from, term_sug *
 /* Interactive list picker: returns chosen index or -1 if cancelled. */
 int term_select(const char *title, const char **items, const char **descs, int n, int current);
 
+/* What term_nc.c draws from, and what term.c exports for it (the ANSI UI uses none of this) */
+extern bool g_ui_nc;                                  /* the notcurses frontend is the screen */
+extern bool term_confirm_quiet;                        /* the next term_confirm does not echo its answer (a bash call's line says it) */
+void        term_status_text(sbuf *o, int cols);      /* the bar, as the ANSI UI draws it (escapes included) */
+void        term_wrap(const char *s, size_t len, int width, int col0, size_t target, int want, size_t *start_out, int *row_out, int *col_out);   /* the field's text wrapped at word boundaries (term.c) */
+bool        term_is_ready(void);                      /* the top-level prompt is waiting: the field says [ready] in green */
+int         term_mode_text(sbuf *o, int cols);        /* the mode for the field's lower rule within cols (its hint dropped when it does not fit); returns its width, 0 if none */
+int         term_sb_nlines(void);                     /* the conversation: the scrollback model's lines */
+void        term_tick_set(void (*fn)(bool still));     /* the banner: called every TICK_MS while the top-level prompt waits; still=true once, when it returns */
+bool        term_banner_show(const char **lines, int n, int bw);   /* the banner's modal (its lines, the box's width): up; false when there is no screen for it */
+void        term_banner_draw(const char **lines, int n, int bw);   /* the modal's lines again (a tick) */
+void        term_banner_hide(void);
+bool        term_banner_open(void);
+#define BANNER_X_FROM_RIGHT 3   /* the close button's centre: this many cells in from the box's right edge (the corner is 1): 2 cells left of the corner */
+#define BANNER_X_W 3            /* the close button is "[×]": its three cells are the click target */
+int         term_tick_wait(void);                      /* ms until the next tick (-1: no tick is running) */
+void        term_tick_run(void);                       /* runs the tick if it is due (notcurses' loop calls it) */
+int         term_sb_epoch(void);                      /* changes whenever the lines are renumbered (dropped, cleared): a row map made before is stale */
+const char *term_sb_line(int i);
+bool        term_sb_hidden(int i);                    /* a closed fold's body */
+void        term_sgr_track(sbuf *st, const char *d, size_t len);   /* the colours in effect after d: what a wrapped row continues in */
+int         term_sb_col(void);                        /* column the output is at (0 = a fresh line) */
+
+/* ---------- term_nc.c: the notcurses frontend ----------
+ * Always compiled; with WITH_NOTCURSES (notcurses found by make) they drive notcurses, without it they are
+ * stubs and g_ui_nc stays false. nc_sgr_parse() is pure and works in both builds (test_unit). */
+typedef struct { unsigned fg, bg; unsigned styles; } nc_style;   /* fg/bg: 0xRRGGBB or NC_DEFAULT; styles: NC_ST_* */
+#define NC_DEFAULT 0xFFFFFFFFu
+#define NC_ST_BOLD    1u
+#define NC_ST_DIM     2u
+#define NC_ST_ITALIC  4u
+#define NC_ST_UNDER   8u
+#define NC_ST_REVERSE 16u
+typedef struct { char egc[8]; unsigned char w; nc_style st; } nc_cell;   /* one character as drawn: UTF-8, columns, style */
+/* Parses the escape sequence at s (length n): a CSI is consumed whole (its SGR applied to st when it
+ * is one); returns the bytes consumed, or 0 when s does not start a CSI. */
+size_t nc_sgr_parse(const char *s, size_t n, nc_style *st);
+unsigned nc_color256(int n);                           /* the xterm 256-colour palette, 0xRRGGBB */
+/* the characters of s (SGR applied on the way, carried in st when given), written to out up to max
+ * (out may be NULL to count); returns how many there are */
+int    nc_cells(const char *s, size_t n, nc_cell *out, int max, nc_style *st);
+int    nc_line_rows(const nc_cell *c, int n, int width);   /* the rows a line takes when wrapped at width */
+int    nc_text_width(const char *s);                       /* its width in columns */
+bool   nc_compiled(void);                             /* this build has the notcurses frontend */
+bool   nc_start(void);                                /* takes the screen; false (and a message on stderr) if it cannot */
+void   nc_stop(void);                                 /* gives it back; idempotent */
+bool   nc_size(int *rows, int *cols);                 /* the screen's size, when the frontend runs */
+void   nc_render(void);                               /* draws the pane, field, bar and location line now */
+void   nc_render_soon(void);                          /* the same, at most every few tens of ms */
+void   nc_output(void);                               /* a write reached the conversation */
+void   nc_clear(void);                                /* the conversation starts over at the top */
+void   nc_prefill(const char *text);                  /* text for the field at the next prompt */
+char  *nc_readline(const char *prompt, bool in_field);
+int    nc_poll_interrupt(void);                       /* keys read while the model works: 1 = stop */
+int    nc_input_fd(void);                             /* the fd that signals keys to read (-1: none) */
+int    nc_confirm(const char *question, const char *always_label, const char *project_label, char **reason);
+int    nc_select(const char *title, const char **items, const char **descs, int n, int current);
+void   nc_banner_set(const char **lines, int n, int bw, bool on);   /* the banner's modal: its lines and width, shown or not */
+bool   nc_banner_open(void);                          /* the banner's modal is up */
+void   nc_overlay_set(const char *text);              /* the overlay (/usage and the like) as a modal over the pane; NULL closes it */
+bool   nc_overlay_open(void);
+
 /* Basic syntax highlighting of one line of code, by the fence's language (or NULL/unknown: unchanged). Only
  * escapes are added; each token returns to `base`. Keywords, strings, comments, numbers. */
 void highlight_line(const char *lang, const char *line, sbuf *out, const char *base);
@@ -383,6 +477,8 @@ typedef struct {
     sbuf info;          /* that info string */
     sbuf line;          /* the code line being collected, printed highlighted when it ends */
     char lang[24];      /* the fence's language (first word of its info string, lower case) */
+    sbuf word;          /* the prose word being collected: printed when its end comes, so a word is never split across lines */
+    int  col;           /* the columns the prose has taken on this line (the word wrap's count) */
 } md_state;
 
 void md_init(md_state *m);
@@ -397,7 +493,9 @@ cJSON *tools_definitions(void);   /* array of tool defs (Ollama/OpenAI format), 
 /* Executes tool. Returns status; writes result text into out. */
 tool_status tools_execute(const char *name, cJSON *args, sbuf *out);
 void tools_reset_permissions(void);       /* forget the "always this session" answers */
-/* Persistent per-project permission rules (.corbienest/permissions, one per line:
+bool tools_exit_asked(void);              /* the model called the exit tool: end the program after this turn */
+void tools_exit_clear(void);
+/* Persistent per-project permission rules (kept in the config directory, one per line:
  * "bash <prefix words>" or "edit"), like Claude Code's project allow-list. */
 void        tools_permissions_load(void);          /* (re)read the file for the current directory */
 int         tools_permissions_count(void);
@@ -409,6 +507,10 @@ void        tools_permissions_clear(void);                /* removes the file */
  * ("turn" = index into the conversation) they happened in. */
 void tools_checkpoint_turn(int turn);              /* main.c: a request starts */
 void tools_checkpoint_step(int step);              /* a part of it that is looked at by itself (a task of /orchestrate); 0 = none */
+void tools_checkpoint_path(const char *path);       /* records a file's state before the program changes it outside a tool (/goal's apply) */
+bool tools_enter(const char *root);                /* a tool call runs in root (a /goal candidate's worktree): chdir, writes stay inside it; false if it cannot */
+void tools_leave(void);                            /* back to the directory tools_enter() left */
+int  tools_shell_in(const char *dir, const char *cmd, int timeout_s, sbuf *out, bool *interrupted, const char *busy, const char *verb);   /* a shell command in dir (NULL = here), its exit code; -1 if it could not run */
 int  tools_checkpoint_diff(int turn, int step, sbuf *out);   /* what that step did to the files it wrote, as unified diffs; returns files that differ */
 int  tools_checkpoint_files(int turn, sbuf *names);/* files changed in that request or later */
 int  tools_checkpoint_restore(int turn);           /* put them back; returns files restored */
@@ -500,6 +602,25 @@ typedef struct {
 int  orch_parse_plan(const char *text, orch_task **tasks);
 void orch_tasks_free(orch_task *t, int n);
 
+/* ---------- /goal: the pure half ----------
+ * `/goal "METRIC" [min|max] [-n ROUNDS] [-k CANDIDATES] TASK`. The metric is a shell command whose
+ * last output line is a number; higher is better unless "min" says otherwise. A candidate ends its
+ * report with a line "GOAL: REACHED" or "GOAL: IMPOSSIBLE <why>" (goal_verdict()). */
+typedef struct {
+    char *metric;      /* the command that prints the score (malloc'd) */
+    bool  lower;       /* min: a lower score is better */
+    int   rounds;      /* rounds of candidates, at most GOAL_ROUNDS_MAX */
+    int   cands;       /* candidates per round, at most ORCH_WORKERS_MAX */
+    char *task;        /* what the goal is (malloc'd) */
+} goal_spec;
+#define GOAL_ROUNDS_MAX 10
+enum { GOAL_NONE, GOAL_REACHED, GOAL_IMPOSSIBLE };
+bool goal_parse(const char *arg, goal_spec *g, char *err, size_t errn);   /* on false, err says why; g is then empty */
+void goal_spec_free(goal_spec *g);
+bool goal_number(const char *out, double *v);                              /* the last non-empty line, as a number */
+bool goal_better(double v, double best, bool lower);
+int  goal_verdict(const char *report, char *why, size_t n);                /* the last "GOAL:" line of a report */
+
 /* The git branch of a directory: 1 when it is in a repository, with the branch name (or the commit of a
  * detached HEAD) in out; 0 when it is not. Reads the .git of it or of the nearest directory above. */
 int   git_branch(const char *dir, char *out, size_t n);
@@ -543,7 +664,6 @@ typedef struct {
     int         num_predict;  /* >0 = cap on generated tokens */
     const char *busy;         /* status-bar label while generating (default "generating") */
     bool        followup;     /* continues the prompt of the call before it (see think_decide) */
-    bool        stop_on_message; /* give up when the user queues a message (*aborted, ollama_stopped_for_message) */
     /* a call to another model than g_cfg.model — the advisor — brings what goes with it: */
     const char *model;        /* NULL = g_cfg.model */
     const model_info *info;   /* that model's /api/show (NULL with model = it cannot think, as far as we know) */
@@ -559,8 +679,6 @@ void ollama_call_reset(void);
  * On error/abort returns NULL and sets *aborted / prints error. */
 cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted);
 extern bool ollama_quiet;   /* when set, ollama_chat() does not print the streamed reply (background calls) */
-extern bool ollama_stopped_for_message;   /* the last call was given up for a queued message, not by Esc/Ctrl-C */
-int ollama_poll_or_message(void);         /* http_interrupt_check for such a call: Esc/Ctrl-C, or a newly queued message */
 /* Error text of the most recent ollama_chat() ("" when it succeeded or was interrupted), so the
  * caller can react to a specific server error instead of only seeing a NULL reply. */
 extern char ollama_error[512];
@@ -613,7 +731,7 @@ typedef struct {
  * usable (no key, key refused, no such model). err says why for 1 and -1. */
 int   provider_model_info(const char *advisor, model_info *mi, char *err, size_t n);
 /* One consultation. The answer (malloc'd, "" when there is none) or NULL: *aborted when the user
- * stopped it (ollama_stopped_for_message: by queuing a message), otherwise err says why. */
+ * stopped it (Esc or Ctrl-C), otherwise err says why. */
 char *provider_chat(const char *advisor, const model_info *mi, const provider_request *rq, chat_stats *st, bool *aborted, char *err, size_t n);
 /* the pieces of it, exposed for tests */
 char *provider_request_body(const char *advisor, const model_info *mi, const provider_request *rq);

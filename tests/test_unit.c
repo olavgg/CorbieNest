@@ -222,6 +222,21 @@ static void test_tools_body(void *ud) {
     CHECK(tools_execute("grep", a, &out) == TOOL_OK); cJSON_Delete(a);
     CHECK(strstr(out.data, "No matches") != NULL); sb_clear(&out);
 
+    /* exit: the program is ended after the turn, and only the main agent may ask */
+    tools_exit_clear();
+    CHECK(tools_execute("exit", NULL, &out) == TOOL_OK && tools_exit_asked()); sb_clear(&out);
+    tools_exit_clear();
+    CHECK(!tools_exit_asked());
+    {
+        cJSON *defs = tools_definitions(); bool found = false; cJSON *t;
+        cJSON_ArrayForEach(t, defs) {
+            cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
+            cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+            if (cJSON_IsString(nm) && !strcmp(nm->valuestring, "exit")) found = true;
+        }
+        CHECK(found); cJSON_Delete(defs);
+    }
+
     /* bash: output + exit code, stderr merged, timeout */
     a = cJSON_CreateObject(); cJSON_AddStringToObject(a, "command", "echo out; echo err 1>&2; exit 3");
     CHECK(tools_execute("bash", a, &out) == TOOL_OK); cJSON_Delete(a);
@@ -253,7 +268,7 @@ static void test_tools_body(void *ud) {
 
     /* tool definitions are well-formed */
     cJSON *defs = tools_definitions();
-    CHECK(cJSON_GetArraySize(defs) == 7);
+    CHECK(cJSON_GetArraySize(defs) == 8);   /* the seven, and exit */
     cJSON *t; cJSON_ArrayForEach(t, defs) {
         cJSON *f = cJSON_GetObjectItem(t, "function");
         CHECK(cJSON_IsString(cJSON_GetObjectItem(f, "name")));
@@ -418,6 +433,24 @@ static void test_util(void) {
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
 }
 
+/* ---------- a shell command's fold head ---------- */
+static void test_cmd_head(void) {
+    char out[64]; int more;
+    more = cmd_head("ls -la", 40, out, sizeof out); CHECK(more == 0); CHECK_STR(out, "ls -la");
+    more = cmd_head("ls\n", 40, out, sizeof out); CHECK(more == 0); CHECK_STR(out, "ls");          /* a trailing newline is no line */
+    more = cmd_head("a\nb", 40, out, sizeof out); CHECK(more == 1); CHECK_STR(out, "a");
+    more = cmd_head("a\nb\n", 40, out, sizeof out); CHECK(more == 1);
+    more = cmd_head("a\n\nb", 40, out, sizeof out); CHECK(more == 2);                        /* a blank line in the middle counts */
+    more = cmd_head("a\n\n\n", 40, out, sizeof out); CHECK(more == 0);                       /* trailing blank lines do not */
+    more = cmd_head("\n\n  set -e\n  make", 40, out, sizeof out); CHECK(more == 1); CHECK_STR(out, "set -e");   /* leading blanks go */
+    more = cmd_head("cat <<EOF\r\nx\r\nEOF", 40, out, sizeof out); CHECK(more == 2); CHECK_STR(out, "cat <<EOF");   /* no \r left */
+    more = cmd_head("echo\tx\x01y\nz", 40, out, sizeof out); CHECK_STR(out, "echo x y");   /* tab and controls become spaces */
+    more = cmd_head("abcdefghijklmnop\nz", 10, out, sizeof out); CHECK(more == 1); CHECK_STR(out, "abcdefghi\xe2\x80\xa6");   /* cut, with an ellipsis */
+    more = cmd_head("äöüäöüäöü\nz", 4, out, sizeof out); CHECK(more == 1); CHECK_STR(out, "äöü\xe2\x80\xa6");   /* cut on a character, counted in columns */
+    more = cmd_head("abc\nz", 3, out, sizeof out); CHECK_STR(out, "abc");                     /* exactly fits: no ellipsis */
+    char small[4]; more = cmd_head("abcdef\nz", 10, small, sizeof small); CHECK(more == 1); CHECK(strlen(small) < sizeof small);   /* a small buffer is never overrun */
+}
+
 /* ---------- URLs and HTML (web_fetch) ---------- */
 static void test_web(void) {
     CHECK(url_ok("https://www.postgresql.org/docs/17/runtime-config-client.html"));
@@ -577,17 +610,39 @@ static void test_queue(void) {
     t = term_queue_pop_plain(); CHECK_STR(t, "behind it"); free(t);
     CHECK(term_queue_count() == 2 && term_queue_pop_plain() == NULL);
     CHECK_STR(term_queue_peek(), "/save f.md");
+    /* a queued message waits; it is only taken out, never acted on in flight */
     term_queue_clear();
-    /* "new since the mark": what stops the work in flight. Only plain messages count, and
-       only ones queued after main.c last marked the queue seen. */
-    term_queue_mark(); CHECK(!term_queue_new());
-    term_queue_push("/status"); CHECK(!term_queue_new());
-    term_queue_push("look at this too"); CHECK(term_queue_new());
-    term_queue_mark(); CHECK(!term_queue_new());          /* still queued, but no longer new */
-    t = term_queue_pop_plain(); free(t);
-    CHECK(!term_queue_new());
-    term_queue_clear();
+    term_queue_push("look at this too"); CHECK(term_queue_count() == 1);
+    t = term_queue_pop_plain(); CHECK_STR(t, "look at this too"); free(t);
+    CHECK(term_queue_count() == 0);
     #undef KT
+    /* a wrapped row continues in the colours its line opened: the repaint re-sends them (term_sgr_track) */
+    { sbuf st; sb_init(&st);
+      term_sgr_track(&st, "\x1b[2mone two\x1b[0m", strlen("\x1b[2mone two\x1b[0m")); CHECK(st.len == 0);
+      term_sgr_track(&st, "\x1b[2mfirst", strlen("\x1b[2mfirst")); CHECK_STR(st.data, "\x1b[2m");
+      term_sgr_track(&st, "\x1b[38;5;132mx\x1b[m", strlen("\x1b[38;5;132mx\x1b[m")); CHECK(st.len == 0);
+      term_sgr_track(&st, "\x1b[1m\x1b[32mok", strlen("\x1b[1m\x1b[32mok")); CHECK_STR(st.data, "\x1b[1m\x1b[32m");
+      sb_free(&st); }
+    /* the rate limits of a response: its anthropic-ratelimit-* headers, per model (util.c) */
+    { ratelimit_info rl; memset(&rl, 0, sizeof rl);
+      const char *h1 = "anthropic-ratelimit-input-tokens-remaining: 1999000\r\n";
+      ratelimit_header(&rl, h1, strlen(h1)); CHECK(rl.have && rl.in_rem == 1999000 && rl.in_lim == 0);
+      const char *h2 = "Anthropic-RateLimit-Requests-Limit:  1000 \r\n";
+      ratelimit_header(&rl, h2, strlen(h2)); CHECK(rl.req_lim == 1000);
+      const char *h3 = "anthropic-ratelimit-output-tokens-limit: 400000\r\n";
+      ratelimit_header(&rl, h3, strlen(h3)); CHECK(rl.out_lim == 400000);
+      const char *h4 = "anthropic-ratelimit-input-tokens-reset: 2026-10-15T10:00:00Z\r\n";
+      ratelimit_header(&rl, h4, strlen(h4)); CHECK_STR(rl.reset, "2026-10-15T10:00:00Z");
+      const char *h5 = "anthropic-ratelimit-tokens-remaining: 5\r\n";   /* the aggregate is not one of the three */
+      ratelimit_header(&rl, h5, strlen(h5)); CHECK(rl.in_rem == 1999000);
+      const char *h6 = "content-type: application/json\r\n";
+      ratelimit_header(&rl, h6, strlen(h6)); CHECK(rl.out_rem == 0);
+      const char *h7 = "anthropic-ratelimit-requests-remaining: many\r\n";   /* not a number: ignored */
+      ratelimit_header(&rl, h7, strlen(h7)); CHECK(rl.req_rem == 0);
+      ratelimit_info none; memset(&none, 0, sizeof none);
+      ratelimit_set("claude-test-a", &none); CHECK(!ratelimit_get("claude-test-a", &rl));   /* nothing to keep */
+      ratelimit_set("claude-test-a", &rl); ratelimit_info back; CHECK(ratelimit_get("claude-test-a", &back) && back.in_rem == 1999000);
+      CHECK(!ratelimit_get("claude-test-b", &back)); }
     /* prompt history keeps the latest 100 queries */
     for (int i = 0; i < 150; i++) { char l[32]; snprintf(l, sizeof l, "query %d", i); hist_add(l); }
     CHECK(hist_count() == 100);
@@ -1087,6 +1142,73 @@ static void test_agent_log(void) {
     sb_free(&b);
 }
 
+/* a pasted block in the prompt is a token; the text goes back in on submit, whole tokens only */
+static void test_paste(void) {
+    const char *in = "look [Pasted text #1 +3 lines] and [Pasted text #2 +2 lines]!";
+    size_t sp[4][2]; int ks[4], ns[4];
+    size_t n = paste_tokens(in, strlen(in), sp, ks, ns, 4);
+    CHECK(n == 2);
+    CHECK(n == 2 && sp[0][0] == 5 && sp[0][1] == 30 && ks[0] == 1 && ns[0] == 3);
+    CHECK(n == 2 && ks[1] == 2 && ns[1] == 2);
+    CHECK(paste_tokens("[Pasted text #1 +3 lines", 24, NULL, NULL, NULL, 4) == 0);   /* not finished */
+    CHECK(paste_tokens("[Pasted text #0 +3 lines]", 25, NULL, NULL, NULL, 4) == 0);  /* no paste 0 */
+    const char *texts[2] = { "a\nb\nc", "d\ne" }; int lines[2] = { 3, 2 };
+    char *o = paste_expand(in, strlen(in), texts, lines, 2);
+    CHECK(!strcmp(o, "look a\nb\nc and d\ne!"));
+    free(o);
+    o = paste_expand("[Pasted text #1 +4 lines] x", 27, texts, lines, 2);   /* a token whose count was edited: literal */
+    CHECK(!strcmp(o, "[Pasted text #1 +4 lines] x"));
+    free(o);
+    o = paste_expand("[Pasted text #9 +3 lines]", 25, texts, lines, 2);      /* a number with no paste: literal */
+    CHECK(!strcmp(o, "[Pasted text #9 +3 lines]"));
+    free(o);
+    const char *ten = "[Pasted text #1 +3 lines]";                       /* a token that ends the input */
+    o = paste_expand(ten, strlen(ten), texts, lines, 2);
+    CHECK(!strcmp(o, "a\nb\nc"));
+    free(o);
+    CHECK(paste_tokens(ten, strlen(ten), NULL, NULL, NULL, 4) == 1);
+    o = paste_expand("", 0, texts, lines, 2);
+    CHECK(o && !*o);
+    free(o);
+}
+
+static void test_goal(void) {
+    char err[160], why[200];
+    goal_spec g;
+    CHECK(goal_parse("\"./bench.sh\" ", &g, err, sizeof err) == false);   /* no goal after the metric */
+    CHECK(strstr(err, "no goal") != NULL);
+    CHECK(goal_parse("\"./bench.sh --fast\" min -n 2 -k 4 make it run in 10 ms", &g, err, sizeof err));
+    CHECK_STR(g.metric, "./bench.sh --fast"); CHECK(g.lower && g.rounds == 2 && g.cands == 4); CHECK_STR(g.task, "make it run in 10 ms");
+    goal_spec_free(&g);
+    CHECK(goal_parse("\"cat score\" -k 3 -n 5 max faster", &g, err, sizeof err));   /* options in any order, after the metric */
+    CHECK_STR(g.metric, "cat score"); CHECK(!g.lower && g.rounds == 5 && g.cands == 3); CHECK_STR(g.task, "faster");
+    goal_spec_free(&g);
+    CHECK(goal_parse("'wc -l x' do it", &g, err, sizeof err));   /* defaults: 3 rounds, 3 candidates, higher is better */
+    CHECK(g.rounds == 3 && g.cands == ORCH_WORKERS_DEFAULT && !g.lower); CHECK_STR(g.task, "do it");
+    goal_spec_free(&g);
+    CHECK(!goal_parse("\"unclosed", &g, err, sizeof err) && strstr(err, "closing"));
+    CHECK(!goal_parse("\"cat score\" -n 0 x", &g, err, sizeof err) && strstr(err, "-n"));
+    CHECK(!goal_parse("\"cat score\" -n 11 x", &g, err, sizeof err) && strstr(err, "-n"));
+    CHECK(!goal_parse("\"cat score\" -k 1 x", &g, err, sizeof err) && strstr(err, "-k"));
+    CHECK(!goal_parse("\"cat score\" -k many x", &g, err, sizeof err) && strstr(err, "number"));
+    CHECK(!goal_parse("   ", &g, err, sizeof err) && strstr(err, "metric"));
+    CHECK(!goal_parse("\"cat score\"   \n", &g, err, sizeof err) && strstr(err, "no goal"));
+    double v;
+    CHECK(goal_number("warming up\n1.5 s\n  42.25  \n\n", &v) && v == 42.25);
+    CHECK(goal_number("12", &v) && v == 12);
+    CHECK(goal_number("-3e2\r\n", &v) && v == -300);
+    CHECK(!goal_number("42 ms", &v));          /* a unit after the number is not a score */
+    CHECK(!goal_number("42\nno number here", &v));
+    CHECK(!goal_number("nan", &v) && !goal_number("inf", &v) && !goal_number("", &v) && !goal_number(NULL, &v));
+    CHECK(goal_better(2.0, 1.0, false) && !goal_better(1.0, 1.0, false) && goal_better(0.5, 1.0, true) && !goal_better(2.0, 1.0, true));
+    CHECK(goal_verdict("I made it faster.\n\nGOAL: REACHED\n", why, sizeof why) == GOAL_REACHED);
+    CHECK(goal_verdict("**GOAL: IMPOSSIBLE** faster than light is not a thing.", why, sizeof why) == GOAL_IMPOSSIBLE);
+    CHECK_STR(why, "faster than light is not a thing.");
+    CHECK(goal_verdict("GOAL: IMPOSSIBLE: the disk is full\nGOAL: REACHED", why, sizeof why) == GOAL_REACHED && why[0] == 0);   /* the last line wins */
+    CHECK(goal_verdict("the goal is not reached yet, GOAL: REACHED mentioned mid-line", why, sizeof why) == GOAL_NONE);
+    CHECK(goal_verdict("nothing about it", why, sizeof why) == GOAL_NONE && goal_verdict(NULL, NULL, 0) == GOAL_NONE);
+}
+
 static void test_orchestrate(void) {
     orch_task *t = NULL;
     int n = orch_parse_plan("Here is the plan.\n\nTASK 1: add the flag\nEdit src/a.c: add --dry.\nDONE WHEN: make passes\n\n"
@@ -1395,16 +1517,155 @@ static void test_provider(void) {
     cJSON_Delete(msgs); cJSON_Delete(tools);
 }
 
+/* ---------- what a request body must satisfy: valid UTF-8, every call answered ---------- */
+static void test_wellformed(void) {
+    /* tail_incomplete: a chunk that ends inside an escape sequence or a UTF-8 character */
+    CHECK(!tail_incomplete("abc", 3));
+    CHECK(tail_incomplete("x\x1b[38;5", 7));                              /* CSI cut in the parameters */
+    CHECK(!tail_incomplete("x\x1b[0m", 6));                               /* CSI complete */
+    CHECK(tail_incomplete("\xe2\x94", 2));                                /* a 3-byte character cut short */
+    CHECK(!tail_incomplete("\xe2\x94\x80", 3));                          /* … complete */
+    CHECK(tail_incomplete("\x1b]8;;u", 6));                                /* OSC without its end */
+    CHECK(!tail_incomplete("\x1b]8;;u\x07", 7));                          /* … ended by BEL */
+    CHECK(tail_incomplete("a\x1b", 2));                                   /* a lone ESC */
+    CHECK(!tail_incomplete("a\x1b" "7", 3));                                 /* ESC 7 is two bytes */
+    CHECK(tail_incomplete("a\x1b(", 3));                                  /* ESC ( wants its final byte */
+    CHECK(!tail_incomplete("a\x1b(B", 4));
+    /* utf8_ok: good sequences pass, every kind of bad byte fails */
+    CHECK(utf8_ok("plain ascii", 11));
+    CHECK(utf8_ok("æøå €  𝄞", strlen("æøå €  𝄞")));                      /* 2-, 3- and 4-byte characters */
+    CHECK(!utf8_ok("a\xC3", 2));                                       /* a character cut short */
+    CHECK(!utf8_ok("\x80rest", 5));                                    /* a bare continuation byte */
+    CHECK(!utf8_ok("\xC0\xAF", 2));                                   /* overlong */
+    CHECK(!utf8_ok("\xED\xA0\x80", 3));                              /* UTF-16 surrogate */
+    CHECK(!utf8_ok("\xF4\x90\x80\x80", 4));                         /* above U+10FFFF */
+    CHECK(!utf8_ok("\xFF", 1));
+
+    /* utf8_fix: invalid bytes become U+FFFD, valid text is untouched */
+    char *f = utf8_fix("ok \xC3 mid \xE2\x82\xAC end \xFF");
+    CHECK_STR(f, "ok \xEF\xBF\xBD mid \xE2\x82\xAC end \xEF\xBF\xBD");
+    CHECK(utf8_ok(f, strlen(f)));
+    free(f);
+
+    /* utf8_cut: never splits a character, never longer than asked */
+    const char *u = "ab\xC3\xA6\xC3\xA6";                               /* ab, æ, æ: 6 bytes */
+    CHECK(utf8_cut(u, 6, 3) == 2);                                         /* 3 would end inside the first æ */
+    CHECK(utf8_cut(u, 6, 4) == 4);
+    CHECK(utf8_cut(u, 6, 9) == 6);
+
+    /* messages_repair: a stopped request's calls get their results */
+    const char *orphan =
+        "[{\"role\":\"user\",\"content\":\"go\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":["
+            "{\"id\":\"t1\",\"function\":{\"name\":\"bash\",\"arguments\":{}}},"
+            "{\"id\":\"t2\",\"function\":{\"name\":\"read_file\",\"arguments\":{}}}]},"
+        "{\"role\":\"tool\",\"tool_name\":\"bash\",\"tool_call_id\":\"t1\",\"content\":\"done\"},"
+        "{\"role\":\"user\",\"content\":\"continue\"}]";
+    cJSON *msgs = cJSON_Parse(orphan);
+    CHECK(msgs != NULL);
+    CHECK(messages_repair(msgs) == 1);                                     /* t2 only: t1 was answered */
+    CHECK(cJSON_GetArraySize(msgs) == 5);
+    cJSON *r = cJSON_GetArrayItem(msgs, 3);                                /* t2's result sits after the existing result */
+    CHECK_STR(jstr_at(r, "tool_call_id"), "t2");
+    CHECK_STR(jstr_at(r, "tool_name"), "read_file");
+    CHECK_STR(jstr_at(cJSON_GetArrayItem(msgs, 4), "role"), "user");          /* the user's message stays last */
+    CHECK(messages_repair(msgs) == 0);                                     /* a second pass finds nothing to mend */
+
+    /* a call answered by a later result of a *different* reply is not answered for this one */
+    cJSON *twice = cJSON_Parse(
+        "[{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"x\",\"function\":{\"name\":\"bash\"}}]},"
+        "{\"role\":\"user\",\"content\":\"hi\"},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"x\",\"content\":\"late\"}]");
+    CHECK(messages_repair(twice) == 1);
+    CHECK(cJSON_GetArraySize(twice) == 4);
+    CHECK(messages_repair(twice) == 0);                                    /* a conversation with every call answered: nothing added */
+    CHECK(cJSON_GetArraySize(twice) == 4);
+    CHECK_STR(jstr_at(cJSON_GetArrayItem(twice, 1), "tool_call_id"), "x");
+    cJSON_Delete(twice);
+
+    /* invalid UTF-8 already in the conversation (a saved session, an old cut) is mended in place */
+    cJSON *bad = cJSON_CreateArray();
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddStringToObject(m, "role", "tool");
+    cJSON_AddStringToObject(m, "content", "output \xE2\x82 cut");
+    cJSON_AddItemToArray(bad, m);
+    CHECK(messages_repair(bad) == 1);
+    CHECK(utf8_ok(jstr_at(m, "content"), strlen(jstr_at(m, "content"))));
+    CHECK_STR(jstr_at(m, "content"), "output \xEF\xBF\xBD\xEF\xBF\xBD cut");   /* E2 and 82: two bad bytes */
+    CHECK(messages_repair(bad) == 0);
+    cJSON_Delete(bad);
+    cJSON_Delete(msgs);
+}
+
+/* ---------- the notcurses frontend's pure half: SGR, the palette, the cells ---------- */
+static void test_nc_pure(void) {
+    nc_style st = { NC_DEFAULT, NC_DEFAULT, 0 };
+    /* SGR: colours, styles, resets */
+    CHECK(nc_sgr_parse("\x1b[31m", 5, &st) == 5 && st.fg == 0xbf616au);
+    CHECK(nc_sgr_parse("\x1b[1;3m", 6, &st) == 6 && (st.styles & NC_ST_BOLD) && (st.styles & NC_ST_ITALIC));
+    CHECK(nc_sgr_parse("\x1b[22m", 5, &st) == 5 && !(st.styles & NC_ST_BOLD));
+    CHECK(nc_sgr_parse("\x1b[38;5;208m", strlen("\x1b[38;5;208m"), &st) == strlen("\x1b[38;5;208m") && st.fg == nc_color256(208));
+    CHECK(nc_sgr_parse("\x1b[48;2;1;2;3m", strlen("\x1b[48;2;1;2;3m"), &st) == strlen("\x1b[48;2;1;2;3m") && st.bg == 0x010203u);
+    /* the location line's rose (256-colour 132, LOC_ROSE in term.c): the index maps to #af5f87, and no style comes with it */
+    st = (nc_style){ NC_DEFAULT, NC_DEFAULT, 0 };
+    CHECK(nc_sgr_parse("\x1b[38;5;132m", strlen("\x1b[38;5;132m"), &st) == strlen("\x1b[38;5;132m") && st.fg == 0xaf5f87u && st.styles == 0);
+    CHECK(nc_sgr_parse("\x1b[m", 3, &st) == 3 && st.fg == NC_DEFAULT && st.styles == 0);   /* ESC[m is a reset */
+    CHECK(nc_sgr_parse("\x1b[97m", 5, &st) == 5 && st.fg == 0xeceff4u);
+    /* a CSI that is not SGR is consumed and changes nothing; a private mode too */
+    st.fg = 0x123456;
+    CHECK(nc_sgr_parse("\x1b[2K", 4, &st) == 4 && st.fg == 0x123456);
+    CHECK(nc_sgr_parse("\x1b[?25h", 6, &st) == 6 && st.fg == 0x123456);
+    CHECK(nc_sgr_parse("abc", 3, &st) == 0);                                     /* not an escape at all */
+    CHECK(nc_sgr_parse("\x1b[31", 4, &st) == 4);                                  /* unterminated: the rest is the escape */
+    /* the palette: the 6x6x6 cube and the grey ramp */
+    CHECK(nc_color256(16) == 0x000000u && nc_color256(231) == 0xffffffu && nc_color256(232) == 0x080808u);
+    /* cells: text, a tab to the next stop, a multi-byte character, a combining mark, colours carried */
+    nc_cell cells[64];
+    nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 };
+    int n = nc_cells("\x1b[1mab\x1b[0m\tc", strlen("\x1b[1mab\x1b[0m\tc"), cells, 64, &carry);
+    CHECK(n == 2 + 6 + 1);                                                        /* a, b, six spaces to column 8, c */
+    CHECK(cells[0].st.styles & NC_ST_BOLD && strcmp(cells[0].egc, "a") == 0);
+    CHECK(!(cells[2].st.styles & NC_ST_BOLD) && cells[2].egc[0] == ' ');
+    CHECK(strcmp(cells[n - 1].egc, "c") == 0);
+    n = nc_cells("\xc3\xa6x", strlen("\xc3\xa6x"), cells, 64, NULL);                              /* æ then x */
+    CHECK(n == 2 && strcmp(cells[0].egc, "\xc3\xa6") == 0 && cells[0].w == 1 && strcmp(cells[1].egc, "x") == 0);
+    n = nc_cells("e\xcc\x81x", strlen("e\xcc\x81x"), cells, 64, NULL);                             /* e + combining acute: one cell */
+    CHECK(n == 2 && strlen(cells[0].egc) == 3);
+    n = nc_cells("\xe4\xb8\x80", strlen("\xe4\xb8\x80"), cells, 64, NULL);                          /* a wide character: two columns */
+    CHECK(n == 1 && cells[0].w == 2);
+    CHECK(nc_text_width("\xe4\xb8\x80x") == 3);
+    /* wrapping: a line rows at width, a wide character is not split */
+    n = nc_cells("abcdef", 6, cells, 64, NULL);
+    CHECK(nc_line_rows(cells, n, 4) == 2 && nc_line_rows(cells, n, 6) == 1 && nc_line_rows(cells, 0, 4) == 1);
+    n = nc_cells("abc\xe4\xb8\x80", strlen("abc\xe4\xb8\x80"), cells, 64, NULL);
+    CHECK(nc_line_rows(cells, n, 4) == 2);                                        /* abc then the wide one on row 2 */
+}
+
+static void test_wrap(void) {
+    /* word wrap: a row breaks after its last space; a word longer than a row is cut */
+    size_t st = 0; int r = 0, c = 0;
+    term_wrap("hello world foo", 15, 8, 0, 15, 1, &st, &r, &c);
+    CHECK(st == 6);
+    term_wrap("hello world foo", 15, 8, 0, 15, 2, &st, &r, &c);
+    CHECK(st == 12 && r == 2 && c == 3);
+    term_wrap("abcdefghijkl", 12, 5, 0, 12, 1, &st, &r, &c);
+    CHECK(st == 5 && r == 2 && c == 2);
+    term_wrap("ab cd", 5, 5, 0, 5, -1, NULL, &r, &c);
+    CHECK(r == 0 && c == 5);
+    term_wrap("x\ny", 3, 9, 0, 3, 1, &st, &r, &c);
+    CHECK(st == 2);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
     g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 10; g_cfg.interactive = false;
     struct { const char *name; void (*fn)(void); } tests[] = {
-        { "sbuf", test_sbuf }, { "util", test_util }, { "markdown", test_md }, { "highlight", test_highlight }, { "git branch", test_gitbranch },
+        { "sbuf", test_sbuf }, { "util", test_util }, { "cmd head", test_cmd_head }, { "markdown", test_md }, { "highlight", test_highlight }, { "git branch", test_gitbranch },
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "orchestrate", test_orchestrate }, { "agent log", test_agent_log },
+        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

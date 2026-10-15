@@ -662,9 +662,8 @@ char *provider_chat(const char *advisor, const model_info *mi, const provider_re
     const char *hdrs[4]; sbuf keep; auth_headers(p, advisor, key, hdrs, &keep);
     struct timeval t0, t1; gettimeofday(&t0, NULL);
     term_raw(true);
-    ollama_stopped_for_message = false;
-    http_interrupt_fd = g_cfg.interactive ? STDIN_FILENO : -1;
-    http_interrupt_check = ollama_poll_or_message;
+    http_interrupt_fd = g_cfg.interactive ? term_interrupt_fd() : -1;
+    http_interrupt_check = term_poll_interrupt;
     http_idle = idle_tick; http_idle_ud = NULL;
     http_headers = hdrs;
     int idle_was = http_idle_timeout_ms;
@@ -678,6 +677,7 @@ char *provider_chat(const char *advisor, const model_info *mi, const provider_re
     gettimeofday(&t1, NULL);
     st->total_seconds = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_usec - t0.tv_usec) / 1e6;
     char *text = NULL;
+    ratelimit_set(advisor, &res.rl);
     if (res.aborted) *aborted = true;
     else if (rc != 0) snprintf(err, n, "%s", res.err);
     else text = provider_parse_reply(advisor, out.data, res.status, st, err, n);
@@ -759,9 +759,9 @@ static void turn_idle(void *ud) {
     if (c->thinking_header && g_cfg.show_thinking) return;
     c->spin_i = (c->spin_i + 1) % 10;
     if (c->think_tokens > 0)
-        printf("\r\x1b[2K" C_MAGENTA "%s" C_RESET C_DIM " thinking… (%d tokens, %.0fs)  " C_GRAY "esc to interrupt" C_RESET, TURN_SPIN[c->spin_i], c->think_tokens, turn_elapsed(&c->t0));
+        printf("\r\x1b[2K" C_MAGENTA "%s" C_RESET C_DIM " thinking… (%d tokens, %.0fs)  " C_RESET "esc to interrupt", TURN_SPIN[c->spin_i], c->think_tokens, turn_elapsed(&c->t0));
     else
-        printf("\r\x1b[2K" C_ORANGE "%s" C_RESET C_DIM " %s… (%.0fs)  " C_GRAY "esc to interrupt" C_RESET, TURN_SPIN[c->spin_i],
+        printf("\r\x1b[2K" C_ORANGE "%s" C_RESET C_DIM " %s… (%.0fs)  " C_RESET "esc to interrupt", TURN_SPIN[c->spin_i],
                turn_elapsed(&c->t0) > 8 ? "waiting" : "thinking", turn_elapsed(&c->t0));
     fflush(stdout);
     c->spinner_shown = true;
@@ -939,9 +939,8 @@ cJSON *provider_turn(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abo
     md_init(&c.md); sb_init(&c.data); c.blocks = cJSON_CreateArray(); c.stats = stats; c.index = -1;
     gettimeofday(&c.t0, NULL);
     term_raw(true);
-    ollama_stopped_for_message = false;
-    http_interrupt_fd = g_cfg.interactive ? STDIN_FILENO : -1;
-    http_interrupt_check = ollama_call.stop_on_message ? ollama_poll_or_message : term_poll_interrupt;
+    http_interrupt_fd = g_cfg.interactive ? term_interrupt_fd() : -1;
+    http_interrupt_check = term_poll_interrupt;
     http_idle = turn_idle; http_idle_ud = &c;
     http_headers = hdrs;
     term_busy(turn_busy("waiting for model"));
@@ -953,6 +952,7 @@ cJSON *provider_turn(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abo
     http_idle_timeout_ms = idle_was;
     http_headers = NULL; http_idle = NULL; http_interrupt_fd = -1;
     term_busy(NULL);
+    ratelimit_set(model, &res.rl);
     free(body); sb_free(&keep);
     if (c.data.len) turn_dispatch(&c);
     term_status_live(0);
@@ -968,7 +968,7 @@ cJSON *provider_turn(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abo
     bool failed = false;
     if (res.aborted) {
         *aborted = true;
-        if (!ollama_stopped_for_message && !ollama_quiet) printf("\n" C_YELLOW "⏹ interrupted" C_RESET "\n");
+        if (!ollama_quiet) printf("\n" C_YELLOW "⏹ interrupted" C_RESET "\n");
     } else if (rc != 0) {
         failed = true;
         snprintf(ollama_error, sizeof ollama_error, "%s", res.err);
