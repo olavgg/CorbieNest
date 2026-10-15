@@ -3238,6 +3238,12 @@ int term_select(const char *title, const char **items, const char **descs, int n
     park_hold(); int r = select_impl(title, items, descs, n, current); park_free();
     return r;
 }
+/* s cut to `width` cells into r, the cut ended by … */
+static void cells_cut(sbuf *r, const char *s, int width) {
+    if (vis_width(s) <= width) { sb_puts(r, s); return; }
+    sb_append(r, s, vis_offset(s, strlen(s), width > 1 ? width - 1 : 0));
+    sb_puts(r, "…");
+}
 static int select_impl(const char *title, const char **items, const char **descs, int n, int current) {
     if (n <= 0) return -1;
     term_raw(true);
@@ -3279,10 +3285,18 @@ static int select_impl(const char *title, const char **items, const char **descs
         for (int i = top; i < nvis && i < top + max_show; i++) {
             int idx = vis[i];
             bool is_sel = (i == selpos);
-            char line[512];
-            snprintf(line, sizeof line, "%s%-44s %s", idx == current ? "* " : "  ", items[idx], descs && descs[idx] ? descs[idx] : "");
-            if ((int)strlen(line) > w - 4) line[w - 4] = 0;
-            sb_printf(&o, "%s%s %s" C_RESET "\n", is_sel ? C_ORANGE "❯" : " ", is_sel ? C_BOLD : "", line); lines++;
+            /* the label column is 44 cells, or half the row when the row is narrow; the description takes the rest. The row
+             * is cut by display width (a byte cut garbles a UTF-8 letter), with the … the cut shows. */
+            int room = w - 4, namew = room >= 88 ? 44 : room / 2;
+            sbuf txt; sb_init(&txt); sb_puts(&txt, idx == current ? "* " : "  ");
+            sbuf nm; sb_init(&nm); cells_cut(&nm, items[idx], namew);
+            sb_puts(&txt, nm.data ? nm.data : "");
+            for (int c = vis_width(nm.data ? nm.data : ""); c < namew; c++) sb_putc(&txt, ' ');
+            sb_putc(&txt, ' ');
+            if (descs && descs[idx]) sb_puts(&txt, descs[idx]);
+            sbuf row; sb_init(&row); cells_cut(&row, txt.data ? txt.data : "", room);
+            sb_printf(&o, "%s%s %s" C_RESET "\n", is_sel ? C_ORANGE "❯" : " ", is_sel ? C_BOLD : "", row.data ? row.data : ""); lines++;
+            sb_free(&row); sb_free(&nm); sb_free(&txt);
         }
         if (nvis == 0) { sb_puts(&o, C_DIM "  (no matches)" C_RESET "\n"); lines++; }
         if (nvis > max_show) { sb_printf(&o, C_DIM "  … %d of %d shown" C_RESET "\n", max_show < nvis ? max_show : nvis, nvis); lines++; }
