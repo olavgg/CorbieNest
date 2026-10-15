@@ -1101,6 +1101,35 @@ static bool sug_key(int k) {
     return false;
 }
 
+/* ↑/↓ on the line: the history, as at the prompt; while busy the queued messages come back into the field first
+ * (queue true), as the ANSI screen does. The line typed before a browse is kept in g_draft for ↓. */
+static void nc_hist(int k, bool queue) {
+    if (k == NK_UP && queue && term_queue_count()) {
+        sbuf b; sb_init(&b);
+        while (term_queue_count()) {
+            char *m = term_queue_pop();
+            if (b.len) sb_putc(&b, '\n');
+            sb_append(&b, m, strlen(m));
+            free(m);
+        }
+        if (g_len) { sb_putc(&b, '\n'); sb_append(&b, g_ed, g_len); }
+        ed_set(b.data ? b.data : "");
+        sb_free(&b);
+        return;
+    }
+    if (k == NK_UP) {
+        if (g_hist_pos > 0) {
+            if (g_hist_pos == hist_count()) { free(g_draft); g_draft = xstrdup(g_ed ? g_ed : ""); }
+            g_hist_pos--;
+            ed_set(hist_get(g_hist_pos));
+        }
+    } else if (g_hist_pos < hist_count()) {
+        g_hist_pos++;
+        if (g_hist_pos == hist_count()) ed_set(g_draft ? g_draft : "");
+        else ed_set(hist_get(g_hist_pos));
+    }
+}
+
 int nc_poll_interrupt(void) {
     fflush(stdout);   /* output a command printed here (stdout is fully buffered) reaches the pane now */
     for (;;) {
@@ -1110,6 +1139,7 @@ int nc_poll_interrupt(void) {
         sug_sync();                                      /* the list is for the line as it is before this key */
         if (term_strip_key(strip_code(k), g_len == 0 && !g_sug_n)) continue;   /* the agents strip: ↓ from an empty line, ↑/↓, Enter opens the log, Esc returns */
         if (sug_key(k)) continue;                        /* the list's keys: Tab, ↓/↑, Enter on a row, Esc closes it */
+        if (k == NK_UP || k == NK_DOWN) { nc_hist(k, true); continue; }   /* the queue first, then the history */
         if (k == 3 || k == 27) return 1;                 /* Ctrl-C and Esc stop the work, as in the ANSI UI */
         if (k == 13) {                                   /* Enter while busy: the line is queued for the model */
             if (g_len) {
@@ -1170,22 +1200,7 @@ static char *readline_loop(void) {
         }
         ctrl_c = 0;
         if (k == 27) { ed_set(""); g_hist_pos = hist_count(); continue; }
-        if (k == NK_UP) {
-            if (g_hist_pos > 0) {
-                if (g_hist_pos == hist_count()) { free(g_draft); g_draft = xstrdup(g_ed ? g_ed : ""); }
-                g_hist_pos--;
-                ed_set(hist_get(g_hist_pos));
-            }
-            continue;
-        }
-        if (k == NK_DOWN) {
-            if (g_hist_pos < hist_count()) {
-                g_hist_pos++;
-                if (g_hist_pos == hist_count()) ed_set(g_draft ? g_draft : "");
-                else ed_set(hist_get(g_hist_pos));
-            }
-            continue;
-        }
+        if (k == NK_UP || k == NK_DOWN) { nc_hist(k, false); continue; }
         edit_key(k);
     }
 }

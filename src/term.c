@@ -1791,12 +1791,15 @@ static char *ta_pending_text(void) {
     return t;
 }
 
+static int g_ta_hist = -1;   /* ↑/↓ while busy: the history entry shown (g_hist_n: none, -1: not browsing) */
+static char *g_ta_draft;     /* what was typed before the history browse (↓ to the end brings it back) */
 /* Enter pressed while busy: the pending type-ahead becomes a queued message — unless it
  * is a slash command main.c can run right there and then (/status, /mode, …). */
 static void ta_submit(void) {
     size_t n = g_ta_len - g_ta_pos;
     char *text = term_keys_to_text(g_ta + g_ta_pos, n);
     g_ta_pos = g_ta_len = 0;
+    g_ta_hist = -1; free(g_ta_draft); g_ta_draft = NULL;   /* the history browse ends with the line */
     if (*text) {
         view_leave();   /* sending is the end of reading back: what the line does shows on the live screen */
         if (!(*text == '/' && term_run_while_busy && term_run_while_busy(text))) term_queue_push(text);
@@ -1839,6 +1842,7 @@ static size_t ta_csi(void) {
     while (st > g_ta_pos && g_ta[st - 1] >= 0x30 && g_ta[st - 1] <= 0x3F) st--;
     return st >= g_ta_pos + 2 && g_ta[st - 1] == '[' && g_ta[st - 2] == 27 ? st : 0;
 }
+static void ta_hist(int k);   /* ↑/↓ while busy: the queue first, then the history (below) */
 static void ta_type(unsigned char c) {
     if (g_ta_x10) {   /* button, column, row — each offset by 32 */
         static unsigned char rep[3];
@@ -1871,11 +1875,15 @@ static void ta_type(unsigned char c) {
                 return;
             }
             if ((k == K_UP || k == K_DOWN) && ta_sug_arrow(k, st - 2)) return;
+            if (k == K_UP || k == K_DOWN) { g_ta_len = st - 2; ta_hist(k); return; }   /* the arrow is taken here */
         }
-        if ((c == 'A' || c == 'B') && g_ta_len - g_ta_pos >= 2 && g_ta[g_ta_len - 1] == 'O' && g_ta[g_ta_len - 2] == 27
-            && ta_sug_arrow(c == 'A' ? K_UP : K_DOWN, g_ta_len - 2)) return;   /* (ESC O A: a terminal in application-cursor mode) */
+        if ((c == 'A' || c == 'B') && g_ta_len - g_ta_pos >= 2 && g_ta[g_ta_len - 1] == 'O' && g_ta[g_ta_len - 2] == 27) {
+            if (ta_sug_arrow(c == 'A' ? K_UP : K_DOWN, g_ta_len - 2)) return;   /* (ESC O A: a terminal in application-cursor mode) */
+            g_ta_len -= 2; ta_hist(c == 'A' ? K_UP : K_DOWN); return;
+        }
     }
     if (!g_ta_paste && (c == 14 || c == 16) && ta_sug_key(c == 14 ? K_DOWN : K_UP)) return;
+    if (!g_ta_paste && (c == 14 || c == 16)) { ta_hist(c == 14 ? K_DOWN : K_UP); return; }   /* Ctrl-N / Ctrl-P: as ↓ / ↑ */
     if (!g_ta_paste && c == '\t' && g_fs) { ta_sug_key(c); return; }   /* Tab completes, or does nothing: it is not text */
     ta_put(c);
     /* show it in the field — unless it is a byte of a key sequence still arriving (a wheel
@@ -2196,6 +2204,21 @@ int term_getkey(void) {
 #define HIST_FILE_MAX (64 * 1024)   /* bytes; ~1000 queries, so folding is rare */
 static char *g_hist[HIST_MAX];
 static int g_hist_n = 0;
+/* ↑/↓ while busy: the history the type-ahead shows (g_ta_hist = g_hist_n: none, -1: not browsing since the
+ * last line), and what was typed before browsing (g_ta_draft), which ↓ back to the end brings back. */
+static void ta_hist(int k) {
+    if (k == K_UP && term_queue_count()) { term_queue_to_editor(); term_status_refresh(); return; }   /* the queue comes back first */
+    if (g_ta_hist < 0) g_ta_hist = g_hist_n;
+    if (k == K_UP) {
+        if (g_ta_hist == 0) return;
+        if (g_ta_hist == g_hist_n) { free(g_ta_draft); g_ta_draft = ta_text(); }
+        ta_set_text(g_hist[--g_ta_hist]);
+    } else if (g_ta_hist < g_hist_n) {
+        if (++g_ta_hist == g_hist_n) ta_set_text(g_ta_draft ? g_ta_draft : "");
+        else ta_set_text(g_hist[g_ta_hist]);
+    }
+    term_status_refresh();
+}
 static int g_hist_pending = 0;   /* entries added since the last save: the tail of g_hist */
 
 int hist_count(void) { return g_hist_n; }
