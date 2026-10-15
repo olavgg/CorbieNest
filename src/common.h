@@ -86,6 +86,10 @@ long  shell_word(const char *buf, size_t cur, bool *command);
 int   command_complete(const char *typed, int max, file_match **out);
 char *shell_escape(const char *s);
 
+/* A sub-agent's log (main.c keeps one per run, shown by ← at the prompt): plain text appended to
+ * `log`, which is cut from its front, at a line, once it is past `cap` bytes. */
+void  agent_log_add(sbuf *log, const char *text, size_t cap);
+
 /* URLs and HTML, for the web_fetch tool (in util.c so the unit tests can reach them) */
 bool  url_ok(const char *url);                                  /* http(s), sane, not cloud metadata */
 bool  url_host(const char *url, char *out, size_t n);           /* "host[:port]", lowercased */
@@ -306,6 +310,11 @@ int term_poll_interrupt(void);
  * term_idle_ms before each term_readline(); typing anything cancels it for that prompt. */
 extern void (*term_idle_hook)(void);
 extern int term_idle_ms;
+/* ← on an empty prompt line calls term_agents_menu() with the terminal as the idle hook gets it
+ * (main.c: the sub-agents of this session). term_show_block() shows a text as an open fold and
+ * moves the view to its head, for the hook to show what it chose: the rest of the block is plain. */
+extern void (*term_agents_menu)(void);
+void term_show_block(const char *head, const char *body);
 /* Messages queued with Enter while the model was generating or a tool was running
  * (like Claude Code). main.c delivers them between tool rounds / after the turn. */
 int         term_queue_count(void);

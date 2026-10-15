@@ -1526,3 +1526,34 @@ int git_branch(const char *dir, char *out, size_t n) {
     else snprintf(out, n, "%s", "HEAD");
     return 1;
 }
+
+/* The text goes on the end of a sub-agent's log, as plain text: escape sequences and control
+ * bytes other than tab and newline are dropped (a fold body is written into the model, where a
+ * CR or an ESC would move the cursor). Past `cap` bytes the front goes, cut after a line break,
+ * with a note that lines were dropped. */
+void agent_log_add(sbuf *log, const char *text, size_t cap) {
+    static const char NOTE[] = "… earlier lines dropped\n";
+    size_t nl = strlen(NOTE);
+    sbuf plain; sb_init(&plain);
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if (*p == 27) {   /* ESC [ params final, or ESC x */
+            if (!p[1]) break;
+            if (p[1] == '[') { p += 2; while (*p && (*p < 0x40 || *p > 0x7e)) p++; if (!*p) break; }
+            else p++;
+            continue;
+        }
+        if (*p == '\r' || *p == 0x7f || (*p < 0x20 && *p != '\n' && *p != '\t')) continue;
+        sb_append(&plain, (const char *)p, 1);
+    }
+    sb_append(log, plain.data ? plain.data : "", plain.len);
+    sb_free(&plain);
+    if (log->len <= cap) return;
+    size_t keep = cap > nl ? cap - nl : 0;   /* what stays, the note included, is at most cap */
+    size_t cut = log->len - keep;            /* at least one byte goes */
+    while (cut < log->len && log->data[cut - 1] != '\n') cut++;
+    memmove(log->data, log->data + cut, log->len - cut);
+    log->len -= cut;
+    sbuf b; sb_init(&b);
+    sb_append(&b, NOTE, nl); sb_append(&b, log->data, log->len);
+    sb_free(log); *log = b;
+}

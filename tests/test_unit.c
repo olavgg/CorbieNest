@@ -1066,6 +1066,27 @@ static cJSON *jget(cJSON *o, const char *path) {   /* "a.b.0.c" */
 }
 static const char *jstr_at(cJSON *o, const char *path) { cJSON *v = jget(o, path); return cJSON_IsString(v) ? v->valuestring : NULL; }
 
+/* a sub-agent's log: appended in order, and past the cap the front goes, whole lines only */
+static void test_agent_log(void) {
+    sbuf b; sb_init(&b);
+    agent_log_add(&b, "one\n", 100); agent_log_add(&b, "two\n", 100);
+    CHECK(!strcmp(b.data, "one\ntwo\n"));
+    sb_free(&b); sb_init(&b);
+    for (int i = 0; i < 50; i++) { char l[32]; snprintf(l, sizeof l, "line %02d\n", i); agent_log_add(&b, l, 120); }
+    CHECK(b.len <= 120);
+    CHECK(!strncmp(b.data, "… earlier lines dropped\n", 25));
+    CHECK(strstr(b.data, "line 49\n") != NULL && strstr(b.data, "line 00") == NULL);
+    CHECK(b.data[b.len - 1] == '\n');
+    const char *p = strchr(b.data, '\n') + 1;                     /* after the note: a whole line starts */
+    CHECK(!strncmp(p, "line ", 5));
+    sb_free(&b);
+    /* what a tool prints is plain text in the log: colour codes and carriage returns go */
+    sb_init(&b);
+    agent_log_add(&b, "\x1b[31mred\x1b[0m ok\r\n\tdone\x1b", 100);
+    CHECK(!strcmp(b.data, "red ok\n\tdone"));
+    sb_free(&b);
+}
+
 static void test_orchestrate(void) {
     orch_task *t = NULL;
     int n = orch_parse_plan("Here is the plan.\n\nTASK 1: add the flag\nEdit src/a.c: add --dry.\nDONE WHEN: make passes\n\n"
@@ -1383,7 +1404,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "orchestrate", test_orchestrate },
+        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "orchestrate", test_orchestrate }, { "agent log", test_agent_log },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

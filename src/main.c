@@ -1530,11 +1530,105 @@ static bool subagent_info(void) {
     return true;
 }
 
+/* ---------- sub-agents: the log of each run (← on an empty prompt line) ----------
+ * Every run keeps what it did as plain text: its task, each tool call and the head of its
+ * result, the report. The live transcript shows the same lines as they come; this is what is
+ * left when the turn is over, or to read a run that is still going. */
+#define AGENTS_KEEP   16              /* runs the list keeps; a running one is never dropped */
+#define AGENT_LOG_MAX (96 * 1024)     /* bytes of log kept per run (util.c agent_log_add) */
+#define AGENT_RESULT_LINES 8          /* lines of a tool result the log keeps */
+enum { AG_RUNNING, AG_DONE, AG_STOPPED, AG_FAILED };
+typedef struct {
+    int id;
+    char *desc;
+    char *model;          /* the model the run was on, NULL = the model doing the work */
+    int state, rounds;
+    char activity[200];   /* what it is doing now, or did last */
+    sbuf log;
+} subagent_rec;
+static subagent_rec *g_agents[AGENTS_KEEP];   /* oldest first */
+static int g_agent_n = 0, g_agent_seq = 0;
+
+static void agent_free(subagent_rec *r) { free(r->desc); free(r->model); sb_free(&r->log); free(r); }
+static subagent_rec *agent_begin(const char *desc, const char *model) {
+    if (g_agent_n == AGENTS_KEEP) {
+        int i = 0; while (i < g_agent_n && g_agents[i]->state == AG_RUNNING) i++;
+        if (i == g_agent_n) return NULL;   /* (every one running: cannot happen, runs do not nest) */
+        agent_free(g_agents[i]);
+        memmove(g_agents + i, g_agents + i + 1, sizeof *g_agents * (size_t)(g_agent_n - i - 1));
+        g_agent_n--;
+    }
+    subagent_rec *r = xmalloc(sizeof *r);
+    memset(r, 0, sizeof *r);
+    r->id = ++g_agent_seq; r->desc = xstrdup(desc); r->model = model ? xstrdup(model) : NULL;
+    r->state = AG_RUNNING; sb_init(&r->log);
+    g_agents[g_agent_n++] = r;
+    return r;
+}
+static void agent_say(subagent_rec *r, const char *text) { if (r && text) agent_log_add(&r->log, text, AGENT_LOG_MAX); }
+static void agent_act(subagent_rec *r, const char *what) { if (r) snprintf(r->activity, sizeof r->activity, "%s", what); }
+/* the head of a tool result, the way the transcript previews it, into the log */
+static void agent_say_result(subagent_rec *r, const char *res) {
+    if (!r || !res) return;
+    int lines = 0; const char *p = res;
+    while (*p) {
+        const char *nl = strchr(p, '\n'); size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (lines == AGENT_RESULT_LINES) { agent_say(r, "    …\n"); break; }
+        char line[204]; size_t cut = len < 200 ? len : 200;
+        while (cut && cut < len && ((unsigned char)p[cut] & 0xC0) == 0x80) cut--;   /* not in the middle of a character */
+        memcpy(line, p, cut); line[cut] = 0;
+        agent_say(r, "    "); agent_say(r, line); agent_say(r, len > cut ? "…\n" : "\n");
+        lines++;
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
+static const char *agent_state_word(const subagent_rec *r) {
+    switch (r->state) {
+    case AG_RUNNING: return "running";
+    case AG_DONE:    return "done";
+    case AG_STOPPED: return "stopped";
+    default:         return "failed";
+    }
+}
+/* ← on an empty prompt line: the sub-agents of this session, newest first, and the log of the one picked */
+static void agents_menu(void) {
+    if (!g_agent_n) { printf(C_DIM "no sub-agents have run in this session yet" C_RESET "\n"); return; }
+    int n = g_agent_n;
+    const char **items = xmalloc(sizeof *items * (size_t)(n + 1)), **descs = xmalloc(sizeof *descs * (size_t)(n + 1));
+    items[0] = "main agent"; descs[0] = "the conversation";
+    for (int k = 1; k <= n; k++) {
+        const subagent_rec *r = g_agents[n - k];
+        char *label = xmalloc(64), *desc = xmalloc(320);
+        snprintf(label, 64, "#%d %s", r->id, r->desc);
+        if (r->state == AG_RUNNING) snprintf(desc, 320, "running · round %d · %s", r->rounds, r->activity);
+        else snprintf(desc, 320, "%s · %d round%s", agent_state_word(r), r->rounds, r->rounds == 1 ? "" : "s");
+        items[k] = label; descs[k] = desc;
+    }
+    int pick = term_select("sub-agents", items, descs, n + 1, -1);
+    if (pick > 0) {
+        const subagent_rec *r = g_agents[n - pick];
+        char head[400];
+        snprintf(head, sizeof head, "▾ sub-agent #%d %s · %s%s%s", r->id, r->desc, agent_state_word(r),
+                 r->model ? " · on " : "", r->model ? r->model : "");
+        term_show_block(head, r->log.len ? r->log.data : "(nothing logged yet)\n");
+    }
+    for (int k = 1; k <= n; k++) { free((char *)items[k]); free((char *)descs[k]); }
+    free(items); free(descs);
+}
+
 static int run_subagent(const char *description, const char *prompt, sbuf *out) {
     printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", description);
     const char *sm = subagent_model();
+    subagent_rec *rec = agent_begin(description, sm);
+    agent_say(rec, "task: "); agent_say(rec, prompt); agent_say(rec, "\n");
     if (sm) {
-        if (!subagent_info()) { sb_printf(out, "error: the sub-agents' model %s cannot be used: %s. Do the task with the tools yourself, or say what is missing.", sm, g_subagent_err); return 1; }
+        if (!subagent_info()) {
+            sb_printf(out, "error: the sub-agents' model %s cannot be used: %s. Do the task with the tools yourself, or say what is missing.", sm, g_subagent_err);
+            agent_say(rec, out->data); if (rec) rec->state = AG_FAILED;
+            printf("    " C_RED "⎿ %s" C_RESET "\n", out->data);
+            return 1;
+        }
         printf(C_DIM "    on %s (/subagent)" C_RESET "\n", sm);
     }
     cJSON *msgs = cJSON_CreateArray();
@@ -1563,6 +1657,7 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
     }
     int rc = 1, tool_rounds = 0, round_first = -1;
     bool stopped_early = false;   /* the user sent a message: report what it has and get out */
+    bool interrupted = false;     /* the user stopped it (Esc / Ctrl-C) */
     const char *final = NULL;
     for (int iter = 0; iter <= SUBAGENT_ITERS; iter++) {
         /* the sub-agent has its own conversation and up to SUBAGENT_ITERS rounds of results in
@@ -1571,6 +1666,8 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
             (double)(sp_bytes + tools_bytes() + conv_bytes(msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0))
             elide_tool_results(msgs, round_first);
         chat_stats st; bool aborted = false;
+        if (rec) rec->rounds = tool_rounds + 1;
+        agent_act(rec, "waiting for the model");
         char label[48]; snprintf(label, sizeof label, "sub-agent · round %d", tool_rounds + 1);
         ollama_quiet = true; ollama_call.busy = label;
         ollama_call.followup = iter > 0;   /* think=auto: think about the task once, not after every tool result */
@@ -1579,11 +1676,11 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         ollama_call_reset(); ollama_quiet = false;
         account_as(sm ? sm : g_cfg.model, &st);   /* its own model's tokens: /usage prices them as that model's */
         term_status_refresh();
-        if (!reply) { sb_puts(out, aborted ? "error: sub-agent interrupted by the user" : "error: sub-agent model call failed"); break; }
+        if (!reply) { sb_puts(out, aborted ? "error: sub-agent interrupted by the user" : "error: sub-agent model call failed"); interrupted = aborted; break; }
         cJSON_AddItemToArray(msgs, reply);
         cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
         cJSON *content = cJSON_GetObjectItemCaseSensitive(reply, "content");
-        if (aborted) { sb_puts(out, "error: sub-agent interrupted by the user"); break; }
+        if (aborted) { sb_puts(out, "error: sub-agent interrupted by the user"); interrupted = true; break; }
         if (!calls || cJSON_GetArraySize(calls) == 0) { final = cJSON_IsString(content) ? content->valuestring : ""; rc = 0; break; }
         if (iter == SUBAGENT_ITERS) { sb_printf(out, "error: sub-agent stopped after %d tool rounds without a report", SUBAGENT_ITERS); if (cJSON_IsString(content) && content->valuestring[0]) sb_printf(out, "\nIts last message:\n%s", content->valuestring); break; }
         cJSON *call;
@@ -1605,6 +1702,9 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
                 continue;
             }
             printf("    " C_DIM "⎿ %s%s%s%s" C_RESET "\n", name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
+            agent_say(rec, "› "); agent_say(rec, name); agent_say(rec, summ[0] ? "(" : ""); agent_say(rec, summ); agent_say(rec, summ[0] ? ")\n" : "\n");
+            char act[200]; snprintf(act, sizeof act, "%s%s%s%s", name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
+            agent_act(rec, act);
             sbuf o; sb_init(&o);
             g_session.tool_calls++;
             tool_status ts;
@@ -1612,12 +1712,13 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
             else if (!strcmp(name, "advisor")) { sb_puts(&o, "error: the advisor is not available to a sub-agent (it would be shown the wrong conversation); report what you found"); ts = TOOL_ERROR; }
             else ts = tools_execute(name, args, &o);
             (void)ts;
+            agent_say_result(rec, o.data);
             cJSON_AddItemToArray(msgs, tool_result_message(name, tool_call_id(call), o.data ? o.data : ""));
             sb_free(&o);
             if (parsed) cJSON_Delete(parsed);
         }
         tool_rounds++;
-        if (term_poll_interrupt()) { sb_puts(out, "error: sub-agent interrupted by the user"); break; }
+        if (term_poll_interrupt()) { sb_puts(out, "error: sub-agent interrupted by the user"); interrupted = true; break; }
         /* The user is talking to the main agent: half a report now beats a whole one after
          * another twenty rounds of research it may no longer want. */
         if (term_queue_new()) {
@@ -1635,6 +1736,13 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         printf("    " C_DIM "⎿ report after %d tool round%s:" C_RESET "\n", tool_rounds, tool_rounds == 1 ? "" : "s");
         print_result_preview(final && *final ? final : "(empty)", 8);
     } else printf("    " C_RED "⎿ %s" C_RESET "\n", out->data ? out->data : "sub-agent failed");
+    if (rec) {
+        rec->state = stopped_early || interrupted ? AG_STOPPED : rc == 0 ? AG_DONE : AG_FAILED;
+        agent_say(rec, rc == 0 ? "report:\n" : "result:\n");
+        agent_say(rec, out->data ? out->data : "");
+        agent_say(rec, "\n");
+        rec->activity[0] = 0;
+    }
     cJSON_Delete(tools);
     cJSON_Delete(msgs);
     return rc;
@@ -2960,6 +3068,7 @@ static void cmd_help(void) {
            "                        scroll too; Esc/Enter return); a line under it says where you are, the status bar stays as it is.\n"
            "                        The wheel does nothing over the input field: there ↑/↓ are the keys.\n"
            "                        Selecting text with the mouse needs Shift held down (in tmux too)\n"
+           "  ←  on an empty line    the sub-agents of this session and what each did (the main agent is the list's first line)\n"
            "  status bar            bottom row shows the permission mode, model, session tokens and context usage\n"
            "  / @ and !             the commands (and their options), files, or programs and paths matching what you typed are listed\n"
            "                        under the input field, also while the model works: Tab completes, ↓ steps into the list, Enter\n"
@@ -4209,6 +4318,7 @@ int main(int argc, char **argv) {
     hist_load();
     term_suggest = suggest;
     term_idle_hook = memory_idle_hook;
+    term_agents_menu = agents_menu;
     for (;;) {
         memory_arm_idle();   /* a finished request folds itself into memory while the prompt sits idle */
         char *line = term_readline(C_BOLD C_ORANGE "› " C_RESET);

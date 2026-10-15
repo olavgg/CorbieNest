@@ -382,6 +382,12 @@ work. `/subagent` changes that, separately from the main model:
 - The setting is saved (`subagent=` in the config), so it holds for the next session as well.
 - Sub-agents still have no edit tools and cannot start sub-agents or ask the advisor, whatever
   model they run on.
+- **← on an empty prompt line** opens the list of this session's sub-agents (newest first, each
+  with its state and rounds, or what a running one is doing now) and the main agent. Picking one
+  shows its log as an open block at the top of the scrollback: its task, each tool call and the
+  head of what it returned, and the report. Esc returns to the prompt. The log is kept for the
+  last 16 runs, 96 KB each, in memory only; while a sub-agent runs, its tool calls are also
+  echoed live, and PgUp/the wheel scroll back to them.
 
 ### Choosing between options
 

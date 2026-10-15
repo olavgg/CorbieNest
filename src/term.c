@@ -214,7 +214,7 @@ static void bar_build(sbuf *o, int cols) {
     /* segments in priority order: mode, model, tokens, ctx, hint */
     char seg_tok[96], seg_tok_long[192];
     snprintf(seg_tok, sizeof seg_tok, "%s tokens", ttot);
-    if (cached) { char tc[32]; fmt_tokens(cached, tc, sizeof tc); snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens (↑%s ⟳%s ↓%s)", ttot, tin, tc, tout); }
+    if (cached) { char tc[32]; fmt_tokens(cached, tc, sizeof tc); snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens (↑%s ⟳ %s ↓%s)", ttot, tin, tc, tout); }
     else snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens (↑%s ↓%s)", ttot, tin, tout);
     const char *hint = "(shift+tab to cycle)";
     int room = cols - 1;
@@ -1043,6 +1043,35 @@ void term_fold_end(void) {
     sb_ensure_line();
     g_sb_meta[g_sb_line] = (sb_meta){ 0, SB_PLAIN, false };   /* the line output continues on is no part of the body */
 }
+/* A block of plain text shown as an open fold, and the view moved to its head: what ← at the
+ * prompt shows a sub-agent's log with. The lines go into the model as the fold's body without
+ * being painted (the view is painted from the model below). Off full-screen mode: printed. */
+void term_show_block(const char *head, const char *body) {
+    size_t blen = strlen(body);
+    if (!g_fs || !g_sb_active) { printf("%s\n%s%s", head, body, blen && body[blen - 1] != '\n' ? "\n" : ""); fflush(stdout); return; }
+    fflush(stdout);
+    if (g_sb_col > 0) sb_feed("\n", 1);
+    int id = ++g_fold_seq;
+    sb_ensure_line();
+    g_fold_rec = id;
+    g_sb_meta[g_sb_line] = (sb_meta){ id, SB_FOLD_HEAD, false };
+    sb_feed(head, strlen(head)); sb_feed("\n", 1);
+    sb_feed(body, blen);
+    if (blen && body[blen - 1] != '\n') sb_feed("\n", 1);
+    g_fold_rec = 0;
+    sb_ensure_line();
+    g_sb_meta[g_sb_line] = (sb_meta){ 0, SB_PLAIN, false };   /* the prompt's line is no part of the block */
+    for (int i = 0; i < g_sb_n; i++) if (g_sb_meta[i].fold == id) g_sb_meta[i].hidden = false;   /* open */
+    int n, top = -1; sb_row *r = sb_rows(g_fs_cols, &n);
+    int head_line = -1;
+    for (int i = 0; i < g_sb_n && head_line < 0; i++) if (g_sb_meta[i].fold == id && g_sb_meta[i].kind == SB_FOLD_HEAD) head_line = i;
+    for (int i = 0; i < n && top < 0 && head_line >= 0; i++) if (r[i].line == head_line) top = i;
+    free(r);
+    if (top < 0) return;
+    g_view_top = top;
+    view_paint();
+}
+
 static void fold_click(void) {
     int row = g_click_row; g_click_row = 0;
     if (!row || !g_fs || !g_sb_active || g_fold_rec || row > fs_region()) return;
@@ -1358,6 +1387,7 @@ int term_poll_interrupt(void) {
 
 /* Idle work at the prompt (see common.h): main.c sets these before each term_readline(). */
 void (*term_idle_hook)(void) = NULL;
+void (*term_agents_menu)(void) = NULL;
 int term_idle_ms = 0;
 
 static int read_byte_timeout(int ms) {
@@ -1671,9 +1701,7 @@ static void ed_refresh(editor *e);
 /* Run term_idle_hook() with the terminal in the state a turn runs in: the field released and
  * the cursor back where the transcript ended, so the hook's own output (and the status bar it
  * refreshes) lands like any other conversation output. The prompt is redrawn afterwards. */
-static void ed_idle_run(editor *e) {
-    void (*hook)(void) = term_idle_hook;
-    if (!hook) return;
+static void ed_hook_run(editor *e, void (*hook)(void)) {
     if (e->in_field) {
         g_field_focus = false;
         g_field_text = ""; g_field_len = g_field_cur = 0; g_field_view = 0;
@@ -1693,6 +1721,9 @@ static void ed_idle_run(editor *e) {
         hook();
     }
     ed_refresh(e);
+}
+static void ed_idle_run(editor *e) {
+    if (term_idle_hook) ed_hook_run(e, term_idle_hook);
 }
 
 static void ed_refresh(editor *e) {
@@ -2059,7 +2090,9 @@ static char *readline_impl(const char *prompt, bool in_field) {
                 if (e.cur > 0) { size_t p = u8_prev(e.buf.data, e.cur); ed_delete_range(&e, p, e.cur); e.cur = p; }
                 break;
             case K_DEL: ed_delete_range(&e, e.cur, u8_next(e.buf.data, e.cur, e.buf.len)); break;
-            case K_LEFT: case 2: e.cur = u8_prev(e.buf.data, e.cur); break;
+            case K_LEFT: case 2:
+                if (k == K_LEFT && e.buf.len == 0 && term_agents_menu) { ed_hook_run(&e, term_agents_menu); break; }   /* ← on an empty line: the sub-agents */
+                e.cur = u8_prev(e.buf.data, e.cur); break;
             case K_RIGHT: case 6: e.cur = u8_next(e.buf.data, e.cur, e.buf.len); break;
             case K_HOME: case 1: {
                 size_t p = e.cur; while (p > 0 && e.buf.data[p-1] != '\n') p--; e.cur = p; break; }
