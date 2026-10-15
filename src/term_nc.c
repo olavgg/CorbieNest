@@ -222,6 +222,7 @@ bool nc_compiled(void) { return true; }
 #define NK_PGUP  (-17)
 #define NK_PGDN  (-18)
 #define NK_RESIZE (-19)
+#define NK_PASTE (-20)         /* a bracketed paste, its text taken from the paste FIFO (edit_key inserts it) */
 
 static struct notcurses *g_nc = NULL;
 static FILE *g_nc_out = NULL;          /* notcurses' own stream: a dup of fd 1, never the captured stdout */
@@ -408,6 +409,79 @@ static void nc_mouse(const ncinput *ni) {
     nc_render_soon();
 }
 
+/* ---------- bracketed paste ----------
+ * notcurses has no paste API: the terminal's bracketed paste (ESC [200~ … ESC [201~) comes as key events,
+ * ESC then '[', '2', … . They are taken here: the text between the markers is one NK_PASTE, which edit_key
+ * inserts as text (a pasted newline is a line break, not Enter). Keys that start like a marker are held
+ * until they are told apart; a lone Esc is passed on at the end of the drain. */
+static const int PM_START[6] = { 27, '[', '2', '0', '0', '~' };
+static const int PM_END[6]   = { 27, '[', '2', '0', '1', '~' };
+#define PM_MAX 16
+static bool g_pm_in;                   /* inside the pasted text */
+static int g_pm_held[6], g_pm_nheld;   /* keys that may be a marker, not yet told apart */
+static sbuf g_pm_text;                 /* the text of the paste being read */
+static char *g_pq[PM_MAX];             /* the pastes, in the order their NK_PASTE keys were queued */
+static int g_pq_head, g_pq_n;
+
+static char *paste_take(void) {
+    if (!g_pq_n) return NULL;
+    char *t = g_pq[g_pq_head];
+    g_pq_head = (g_pq_head + 1) % PM_MAX; g_pq_n--;
+    return t;
+}
+
+/* a key out of the stream: Esc closes the overlay or the banner first, else it is queued */
+static void key_out(int k) {
+    if (k == NK_SKIP) return;
+    if (k == 27 && g_ov_on) { nc_overlay_set(NULL); return; }   /* Esc closes the overlay */
+    if (k == 27 && g_bn_on) { nc_banner_close(); return; }      /* Esc closes the banner's modal before anything else */
+    if (g_kq_n < KQ_MAX) g_kq[(g_kq_head + g_kq_n++) % KQ_MAX] = k;
+}
+
+/* a key of the pasted text: a newline or a return is a line break, a tab a space, other controls are dropped */
+static void pm_text(int k) {
+    if (k == 13 || k == 10) { sb_putc(&g_pm_text, '\n'); return; }
+    if (k == 9) { sb_putc(&g_pm_text, ' '); return; }
+    if (k < 32 || k == 127 || k >= 0x110000) return;
+    char b[4]; int n = utf8_put((unsigned)k, b);
+    sb_append(&g_pm_text, b, (size_t)n);
+}
+
+static void pm_queue_paste(void) {
+    if (g_pq_n >= PM_MAX || g_kq_n >= KQ_MAX) return;   /* no room: the paste is dropped */
+    g_pq[(g_pq_head + g_pq_n++) % PM_MAX] = xstrdup(g_pm_text.data ? g_pm_text.data : "");
+    g_kq[(g_kq_head + g_kq_n++) % KQ_MAX] = NK_PASTE;
+}
+
+/* takes key k if the paste markers claim it (true); otherwise the caller queues it */
+static bool pm_feed(int k) {
+    for (;;) {
+        if (!g_pm_in) {
+            if (g_pm_nheld < 6 && k == PM_START[g_pm_nheld]) {
+                g_pm_held[g_pm_nheld++] = k;
+                if (g_pm_nheld == 6) { g_pm_nheld = 0; g_pm_in = true; sb_free(&g_pm_text); sb_init(&g_pm_text); }
+                return true;
+            }
+            if (!g_pm_nheld) return false;
+            for (int i = 0; i < g_pm_nheld; i++) key_out(g_pm_held[i]);   /* not a marker after all: keys */
+            g_pm_nheld = 0;
+            continue;                                   /* k again, from the start of the marker */
+        }
+        if (g_pm_nheld < 6 && k == PM_END[g_pm_nheld]) {
+            g_pm_held[g_pm_nheld++] = k;
+            if (g_pm_nheld == 6) { g_pm_nheld = 0; g_pm_in = false; pm_queue_paste(); }
+            return true;
+        }
+        if (g_pm_nheld) {                               /* a part of the end marker that was text after all */
+            for (int i = 0; i < g_pm_nheld; i++) pm_text(g_pm_held[i]);
+            g_pm_nheld = 0;
+            continue;
+        }
+        pm_text(k);
+        return true;
+    }
+}
+
 static int nc_getkey(int ms) {
     if (!g_nc) return NK_NONE;
     if (g_kq_n) return kq_take();
@@ -429,9 +503,12 @@ static int nc_getkey(int ms) {
             continue;
         }
         int k = nc_key_code(&ni);
-        if (k == 27 && g_ov_on) { nc_overlay_set(NULL); continue; }   /* Esc closes the overlay */
-        if (k == 27 && g_bn_on) { nc_banner_close(); continue; }   /* Esc closes the banner's modal before anything else */
-        if (k != NK_SKIP && g_kq_n < KQ_MAX) g_kq[(g_kq_head + g_kq_n++) % KQ_MAX] = k;
+        if (k == NK_SKIP || pm_feed(k)) continue;   /* a paste's markers and text are taken by pm_feed */
+        key_out(k);
+    }
+    if (!g_pm_in && g_pm_nheld) {                   /* an Esc on its own, held for a marker: it is a key after all */
+        for (int i = 0; i < g_pm_nheld; i++) key_out(g_pm_held[i]);
+        g_pm_nheld = 0;
     }
     return g_kq_n ? kq_take() : NK_SKIP;
 }
@@ -967,6 +1044,7 @@ static void edit_key(int k) {
         case 11: { size_t e = ed_line_end(g_cur); if (e > g_cur) ed_delete(g_cur, e); break; }   /* Ctrl-K */
         case 21: { size_t s = ed_line_start(g_cur); if (s < g_cur) ed_delete(s, g_cur); break; } /* Ctrl-U */
         case 10:       ed_insert("\n", 1); break;                            /* Ctrl-J: a newline in the line */
+        case NK_PASTE: { char *t = paste_take(); if (t) { ed_insert(t, strlen(t)); free(t); } break; }   /* a bracketed paste: its text, newlines kept */
         case NK_PGUP:  g_top += pane_rows() / 2; nc_render(); break;
         case NK_PGDN:  g_top -= pane_rows() / 2; if (g_top < 0) g_top = 0; nc_render(); break;
         default:
