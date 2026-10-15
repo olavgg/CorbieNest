@@ -4437,7 +4437,7 @@ static bool box_title(void) {
 static void banner_items(bool need_ollama, int ok) {
     g_host_note[0] = g_advisor_note[0] = 0;
     box_title();   /* the block letters, when the box is wide enough (the name is on the line below either way) */
-    box_add(1, C_BOLD "Corbie Nest" C_RESET " v%s — local coding agent for Ollama", CORBIE_VERSION);
+    box_add(1, C_BOLD "Corbie Nest" C_RESET " v%s — a coding agent for local and hosted models", CORBIE_VERSION);
     for (int r = 0; r < CROW_ROWS; r++) { box_add(2, ""); g_box.it[g_box.n - 1].crow = r; }
     box_add(0, "");   /* a gap between the crow and the lines below it */
     const char *eff = g_cfg.model ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
