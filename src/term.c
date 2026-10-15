@@ -2620,6 +2620,25 @@ static void paste_insert(editor *e, const char *t, size_t n) {
     }
     ed_insert(e, t, n);
 }
+/* Ctrl-O unfolds the paste token the caret is on (or just after): its text goes into the field in its place,
+ * where it can be read and edited, and is sent as it stands. The token's record stays unreferenced:
+ * paste_result() only substitutes tokens still in the field. */
+static bool paste_unfold(editor *e) {
+    size_t sp[PASTE_MAX][2]; int ks[PASTE_MAX], ns[PASTE_MAX];
+    size_t nt = paste_tokens(e->buf.data, e->buf.len, sp, ks, ns, PASTE_MAX);
+    for (size_t i = 0; i < nt; i++) {
+        if (e->cur < sp[i][0] || e->cur > sp[i][1]) continue;
+        int k = ks[i] - 1;
+        if (k < 0 || k >= g_paste_n || !g_paste[k].text) return false;
+        const char *t = g_paste[k].text; size_t n = strlen(t);
+        /* take the token out, then put the text in its place: the caret ends after the text */
+        e->cur = sp[i][0];
+        ed_delete_range(e, sp[i][0], sp[i][1]);
+        ed_insert(e, t, n);
+        return true;
+    }
+    return false;
+}
 /* Backspace (before the cursor) or Delete (after it) on a whole token takes the whole token. */
 static bool paste_del(editor *e, bool before) {
     size_t sp[PASTE_MAX][2];
@@ -2843,6 +2862,7 @@ static char *readline_impl(const char *prompt, bool in_field) {
             case K_RIGHT: case 6: e.cur = u8_next(e.buf.data, e.cur, e.buf.len); break;
             case K_HOME: case 1: {
                 size_t p = e.cur; while (p > 0 && e.buf.data[p-1] != '\n') p--; e.cur = p; break; }
+            case 15: paste_unfold(&e); break;   /* Ctrl-O: unfold the paste token at the caret */
             case K_END: case 5: {
                 size_t p = e.cur; while (p < e.buf.len && e.buf.data[p] != '\n') p++; e.cur = p; break; }
             case K_ALT_B: case K_CTRL_LEFT: e.cur = word_left(&e); break;
