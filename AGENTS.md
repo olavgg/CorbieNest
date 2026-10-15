@@ -1,7 +1,8 @@
 # AGENTS.md — working on Corbie Nest (corbienest)
 
-corbienest is a Claude-Code-style terminal coding agent for local Ollama models, written in
-plain C11 with no dependencies beyond libc, POSIX, cJSON and libcurl. No readline, no ncurses,
+corbienest is a Claude-Code-style terminal coding agent for local and hosted models (Ollama,
+Anthropic, xAI, OpenAI, DeepSeek, Kimi), written in plain C11 with no dependencies beyond libc,
+POSIX, cJSON and libcurl. No readline, no ncurses,
 nothing more — with one exception, optional: a notcurses frontend, built when pkg-config finds
 notcurses (`NOTCURSES=auto`, the default) and left out otherwise (see "The notcurses frontend" below).
 The build needs nothing new to compile: without notcurses installed it is the dependency-free build,

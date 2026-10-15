@@ -1,4 +1,4 @@
-/* corbienest — a Claude-Code-style terminal coding agent for local Ollama models. */
+/* corbienest — a Claude-Code-style terminal coding agent for local and hosted models. */
 #define _GNU_SOURCE
 #include "common.h"
 #include <ctype.h>
