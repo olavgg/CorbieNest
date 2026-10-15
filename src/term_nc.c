@@ -197,6 +197,7 @@ bool nc_compiled(void) { return true; }
 
 /* the frame's colours (0xRRGGBB) */
 #define C_TEXT    0xE5E9F0u
+#define C_MENTION 0x56B6C2u   /* a @file that is there, in the field: the cyan the ANSI screen uses */
 #define C_ACCENT  0xF0883Eu   /* the orange of the prompt, the menus and the busy mark */
 #define C_MUTED   0x7C8799u
 #define C_RULE    0x3B4252u
@@ -582,6 +583,9 @@ static void draw_field(int top) {
     int rows, cr, cc;
     field_layout(width, &rows, &cr, &cc);
     int nrows = 0; size_t *starts = field_starts(width, &nrows);
+    /* the @files in the text that are there: the same spans the ANSI field colours (a / or ! line has none) */
+    size_t ms[16][2];
+    int nm = g_len && g_ed[0] != '/' && g_ed[0] != '!' ? mention_spans(g_ed, g_len, ms, 16) : 0;
     int shown = rows > FIELD_MAX ? FIELD_MAX : rows;
     int first = cr - shown + 1 > 0 ? cr - shown + 1 : 0;      /* keep the cursor's row in view */
     if (first > rows - shown) first = rows - shown > 0 ? rows - shown : 0;
@@ -628,9 +632,11 @@ static void draw_field(int top) {
         size_t len = utf8_len(ch);
         if (at + len > g_len) len = g_len - at;
         nc_cell cell; int w = nc_cells(g_ed + at, len, &cell, 1, NULL) ? cell.w : 1;
+        bool inmention = false;
+        for (int q = 0; q < nm; q++) if (at >= ms[q][0] && at < ms[q][1]) { inmention = true; break; }
         if (shows) {
             /* the caret is a light cell with a dark letter (reverse video does not show here, and the hardware cursor is not moved: see nc_render) */
-            nc_style st = here ? (nc_style){ C_BAR_A, C_TEXT, 0 } : (nc_style){ C_TEXT, NC_DEFAULT, 0 };
+            nc_style st = here ? (nc_style){ C_BAR_A, C_TEXT, 0 } : (nc_style){ inmention ? C_MENTION : C_TEXT, NC_DEFAULT, 0 };
             paint(g_std, &st, C_TEXT, NC_DEFAULT);
             ncplane_putstr_yx(g_std, y, x, cell.egc);
         }
