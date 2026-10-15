@@ -4102,7 +4102,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/workers")) {
         int now = g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT, n = arg ? atoi(arg) : 0;
         if (!arg) printf("workers: %d" C_DIM " — tasks of /orchestrate that may run at the same time, where the plan lets them (1 = one after another)" C_RESET "\n", now);
-        else if (n < 1 || n > ORCH_WORKERS_MAX) printf("usage: /workers N   (1 to %d: tasks of /orchestrate that may run at the same time)\n", ORCH_WORKERS_MAX);
+        else if (n < 1 || n > ORCH_PARALLEL_MAX) printf("usage: /workers N   (1 to %d: tasks of /orchestrate that may run at the same time)\n", ORCH_PARALLEL_MAX);
         else {
             g_cfg.workers = n; config_save();
             printf(C_GREEN "✓ workers = %d" C_RESET C_DIM "%s" C_RESET "\n", n, n > 1 ? " — whether they overlap is the server's to say too: an Ollama with one slot (OLLAMA_NUM_PARALLEL) answers them in turn" : " — one task after another");

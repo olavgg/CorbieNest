@@ -1268,7 +1268,8 @@ static void test_orchestrate(void) {
     sbuf many; sb_init(&many);
     for (int i = 1; i <= ORCH_MAX_TASKS + 3; i++) sb_printf(&many, "TASK %d: step %d\ndo %d\n", i, i, i);
     n = orch_parse_plan(many.data, &t);
-    CHECK(n == ORCH_MAX_TASKS); CHECK_STR(t[n - 1].body, "do 12");   /* no more than that, and the last one kept whole */
+    char last[32]; snprintf(last, sizeof last, "do %d", ORCH_MAX_TASKS);
+    CHECK(n == ORCH_MAX_TASKS); CHECK_STR(t[n - 1].body, last);   /* no more than that, and the last one kept whole */
     orch_tasks_free(t, n); sb_free(&many);
 }
 

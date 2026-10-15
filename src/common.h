@@ -599,9 +599,10 @@ extern model_info g_model_info;   /* the model in use (set by main.c) */
  * the next "TASK 2: …" — because that is what every model can write, markdown around it or not.
  * orch_parse_plan() reads it: the tasks in order (at most ORCH_MAX_TASKS, numbered as they come,
  * whatever numbers the model gave them), malloc'd; 0 when the text holds no task. */
-#define ORCH_MAX_TASKS 12
+#define ORCH_MAX_TASKS 24   /* the "after" set is a 32-bit mask: at most 32 */
 #define ORCH_WORKERS_DEFAULT 3   /* tasks that may run at the same time, unless /workers says otherwise */
-#define ORCH_WORKERS_MAX 8
+#define ORCH_WORKERS_MAX 8     /* /goal: candidates, and models for them */
+#define ORCH_PARALLEL_MAX 20   /* /orchestrate: tasks that may run at the same time (/workers, workers= in the config) */
 typedef struct {
     char *title, *body;
     unsigned after;   /* the tasks (bit i = task i, earlier ones only) that must be accepted before this one starts: an
