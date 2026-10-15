@@ -1,8 +1,8 @@
 # Corbie Nest
 
-A Claude-Code-style terminal coding agent written in plain C. It runs **local Ollama models**,
-or **Anthropic's API** directly. It streams responses, reads, writes and edits files, searches
-the codebase, and runs shell and git commands. Every mutating action is shown to you and
+A Claude-Code-style terminal coding agent written in plain C. It runs **local models** through
+Ollama, and **hosted models** from Anthropic, xAI, OpenAI, DeepSeek and Kimi. It streams responses,
+reads, writes and edits files, searches the codebase, and runs shell and git commands. Every mutating action is shown to you and
 confirmed before it runs.
 
 ![corbienest on the notcurses screen: the banner with the block-letter title, the input field pinned to the bottom, and the status bar with the model, the tokens, and the folder and git branch.](docs/demo.svg)
