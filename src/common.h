@@ -344,6 +344,9 @@ extern int term_idle_ms;
  * (main.c: the sub-agents of this session). term_show_block() shows a text as an open fold and
  * moves the view to its head, for the hook to show what it chose: the rest of the block is plain. */
 extern void (*term_agents_menu)(void);
+/* the agents strip (term.c's strip_draw): the running sub-agents' lines, and the open of the one picked (main.c) */
+extern int  (*term_agents_strip)(sbuf *o, int cols, int max);
+extern void (*term_agents_open)(int idx);
 void term_show_block(const char *head, const char *body);
 /* Messages queued with Enter while the model was generating or a tool was running
  * (like Claude Code). main.c delivers them between tool rounds / after the turn. */

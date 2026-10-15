@@ -376,6 +376,13 @@ static int    g_sug_sel = -1;          /* the highlighted one; -1 = none, the li
 static int    g_sug_top = 0;           /* first one shown, when there are more than fit */
 static size_t g_sug_from = 0;          /* where the word they would replace starts */
 static int    g_sug_rows = 0;          /* rows of the chrome the list holds */
+/* the agents strip: the running sub-agents, one row each, between the field and the status bar (main.c
+ * supplies the lines through term_agents_strip). g_strip_sel is the row the keys are on (-1: the field). */
+#define STRIP_MAX 4
+static sbuf g_strip;
+static int  g_strip_rows = 0, g_strip_sel = -1;
+int  (*term_agents_strip)(sbuf *o, int cols, int max) = NULL;
+void (*term_agents_open)(int idx) = NULL;
 static char  *g_ta_sug_for = NULL;     /* the list is the type-ahead's (the model is working): the text it is for */
 static void sug_draw(sbuf *o, int row);
 static void sug_clear(void);
@@ -388,7 +395,7 @@ static bool ta_sug_key(int k);
  * (view_note). On a terminal too short to spare them, only the bar is kept. */
 #define FIELD_MIN_ROWS 6
 static bool field_shown(void) { return g_fs && g_fs_rows >= FIELD_MIN_ROWS; }
-static int fs_reserved_for(int rows) { return g_fs && rows >= FIELD_MIN_ROWS ? g_field_rows + 3 + g_sug_rows + (g_view_top >= 0) : 1; }
+static int fs_reserved_for(int rows) { return g_fs && rows >= FIELD_MIN_ROWS ? g_field_rows + 3 + g_sug_rows + g_strip_rows + (g_view_top >= 0) : 1; }
 static int fs_reserved(void) { return fs_reserved_for(g_fs_rows); }
 /* last row of the scrolling region (the conversation) */
 static int fs_region(void) { int r = g_fs_rows - fs_reserved(); return r < 1 ? 1 : r; }
@@ -505,7 +512,7 @@ static void view_note(sbuf *o, int row) {
     sb_puts(o, C_RESET "\x1b[K");
 }
 
-static int field_top(void) { return g_fs_rows - g_field_rows - 2 - g_sug_rows; }   /* row of the upper rule (the bar is the last row, below the field's lower rule and the suggestions) */
+static int field_top(void) { return g_fs_rows - g_field_rows - 2 - g_sug_rows - g_strip_rows; }   /* row of the upper rule (the bar is the last row, below the field's lower rule and the suggestions) */
 
 /* Append text[from, from + n) with the "@path" mentions that name something that is there in
  * colour: a mention that took is one the message will carry, and one that did not is a typo
@@ -540,6 +547,32 @@ static void field_edge(sbuf *o, int row, bool top) {
     for (int i = 0; i < g_fs_cols - 2; i++) sb_puts(o, "─");
     sb_puts(o, top ? "╮" : "╯");
     sb_puts(o, C_RESET);
+}
+/* the strip's lines, from the running sub-agents; the selected row is highlighted */
+static void strip_refresh(void) {
+    sb_clear(&g_strip);
+    int rows = g_fs && term_agents_strip ? term_agents_strip(&g_strip, term_width(), STRIP_MAX) : 0;
+    g_strip_rows = rows;
+    if (g_strip_sel >= rows) g_strip_sel = rows - 1;
+    if (rows == 0) g_strip_sel = -1;
+}
+static void strip_draw(sbuf *o, int top) {
+    if (!g_strip_rows) return;
+    const char *p = g_strip.data ? g_strip.data : "";
+    int cols = g_fs_cols > 1 ? g_fs_cols : 1;
+    for (int i = 0; i < g_strip_rows; i++) {
+        const char *e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        sbuf line; sb_init(&line);
+        sb_append(&line, p, len);
+        sb_printf(o, "\x1b[%d;1H", top + i);
+        if (i == g_strip_sel) sb_puts(o, "\x1b[48;5;236m");   /* the row the keys are on: a dark band, padded with spaces */
+        sb_append(o, line.data ? line.data : "", line.len);
+        for (int w = vis_width(line.data ? line.data : ""); w < cols; w++) sb_putc(o, ' ');
+        sb_puts(o, C_RESET);
+        sb_free(&line);
+        p = e ? e + 1 : p + len;
+    }
 }
 static void field_draw(sbuf *o, const char *typed) {
     if (!g_fs || g_fs_rows < FIELD_MIN_ROWS) return;
@@ -729,12 +762,16 @@ void term_status_refresh(void) {
     if (!g_fs) return;
     layout_sync();
     ta_sug_sync();
-    if (field_sync_rows()) layout_sync();   /* the field changed height: re-cut the region */
+    bool fchanged = field_sync_rows();   /* the field changed height: re-cut the region */
+    int strip_before = g_strip_rows;
+    strip_refresh();
+    if (fchanged || strip_before != g_strip_rows) layout_sync();
     if (g_view_top >= 0 && g_view_stale) view_paint();
     char *typed = g_busy && !g_field_focus ? ta_pending_text() : NULL;
     sbuf o; sb_init(&o);
     if (!g_field_focus) sb_puts(&o, "\x1b" "7");
     field_draw(&o, typed);
+    strip_draw(&o, field_top() + g_field_rows + 2 + g_sug_rows);
     bar_draw(&o);
     if (g_field_focus) field_cursor(&o); else { sb_puts(&o, "\x1b" "8"); chrome_park(&o); }
     chrome_send(&o);
@@ -1863,6 +1900,26 @@ void term_editor_prefill(const char *text) {
 
 int term_interrupt_fd(void) { return g_ui_nc ? nc_input_fd() : STDIN_FILENO; }
 
+/* While a turn runs, the agents strip takes the keys that are on it: ↓ from an empty type-ahead goes into it,
+ * ↑/↓ move, Enter opens the log picked, Esc returns to the field. Returns the bytes it took (0: none). */
+static ssize_t busy_strip_key(const unsigned char *kb, ssize_t k, ssize_t i) {
+    if (!g_strip_rows) return 0;
+    int code = 0; ssize_t used = 0;
+    if (kb[i] == 27 && i + 2 < k && (kb[i + 1] == '[' || kb[i + 1] == 'O') && (kb[i + 2] == 'A' || kb[i + 2] == 'B')) { code = kb[i + 2] == 'A' ? K_UP : K_DOWN; used = 3; }
+    else if (kb[i] == 27 && i == k - 1) { code = K_ESC; used = 1; }
+    else if (kb[i] == '\r' || kb[i] == '\n') { code = '\r'; used = 1; }
+    if (!code) return 0;
+    if (g_strip_sel < 0) {
+        if (code == K_DOWN && g_ta_len == 0) { g_strip_sel = 0; term_status_refresh(); return used; }
+        return 0;
+    }
+    if (code == K_DOWN) { if (g_strip_sel < g_strip_rows - 1) g_strip_sel++; term_status_refresh(); return used; }
+    if (code == K_UP) { g_strip_sel--; term_status_refresh(); return used; }
+    if (code == K_ESC) { g_strip_sel = -1; term_status_refresh(); return used; }
+    if (code == '\r') { if (term_agents_open) term_agents_open(g_strip_sel); term_status_refresh(); return used; }
+    return 0;
+}
+
 int term_poll_interrupt(void) {
     if (g_ui_nc) return nc_poll_interrupt();
     unsigned char kb[256];
@@ -1874,6 +1931,7 @@ int term_poll_interrupt(void) {
         if (k <= 0) return 0;
         for (ssize_t i = 0; i < k; i++) {
             if (kb[i] == 3) { term_overlay_close(); view_leave(); return 1; }     /* Ctrl-C */
+            { ssize_t took = busy_strip_key(kb, k, i); if (took) { i += took - 1; continue; } }
             if (kb[i] == 27 && i == k - 1 && !g_ta_x10) {   /* bare Esc, or a split escape sequence? */
                 fd_set rf2; FD_ZERO(&rf2); FD_SET(STDIN_FILENO, &rf2);
                 struct timeval tv2 = { 0, 40 * 1000 };
@@ -1882,6 +1940,7 @@ int term_poll_interrupt(void) {
                      * prompt — it takes a second one to stop the model. */
                     if (g_ov_text) { term_overlay_close(); continue; }   /* the overlay goes first, like the viewer */
                     if (g_view_top >= 0) { view_leave(); continue; }
+                    if (g_strip_sel >= 0) { g_strip_sel = -1; term_status_refresh(); continue; }   /* the strip first: Esc back to the field */
                     if (ta_sug_key(K_ESC)) continue;   /* and with the suggestions up, it closes those */
                     return 1;
                 }
@@ -2696,6 +2755,16 @@ static char *readline_impl(const char *prompt, bool in_field) {
     while (!done) {
         if (g_view_top >= 0) { scroll_view(0); e.prev_cursor_row = 0; ed_refresh(&e); continue; }
         int k = read_key_prompt(idle_armed && e.buf.len == 0);
+        if (g_strip_rows) {   /* the agents strip: ↓ on an empty line goes into it; in it ↑/↓ move, Enter opens the log, Esc or a typed key returns to the field */
+            if (g_strip_sel < 0 && k == K_DOWN && e.buf.len == 0 && !g_sug_rows) { g_strip_sel = 0; term_status_refresh(); continue; }
+            if (g_strip_sel >= 0) {
+                if (k == K_DOWN) { if (g_strip_sel < g_strip_rows - 1) g_strip_sel++; term_status_refresh(); continue; }
+                if (k == K_UP) { g_strip_sel--; term_status_refresh(); continue; }
+                if (k == K_ESC) { g_strip_sel = -1; term_status_refresh(); continue; }
+                if (k == '\r' || k == '\n') { if (term_agents_open) term_agents_open(g_strip_sel); term_status_refresh(); continue; }
+                g_strip_sel = -1; term_status_refresh();   /* any other key: back to the field, and that key is handled as usual */
+            }
+        }
         if (k == K_MOUSE) { if (!paste_click(&e)) fold_click(); continue; }   /* a click: a paste token opens it; on the head of a fold it opens or closes the fold */
         if (k == K_WHEEL_DOWN) continue;                   /* the wheel with nothing below to scroll to */
         if (k == K_IDLE) {

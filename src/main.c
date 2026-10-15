@@ -1671,6 +1671,43 @@ static const char *agent_state_word(const subagent_rec *r) {
     }
 }
 /* ← on an empty prompt line: the sub-agents of this session, newest first, and the log of the one picked */
+/* ---------- the strip: the running sub-agents, between the message box and the status bar ----------
+ * One line each, newest first, as far as the strip has rows. term.c keeps the selection and draws it;
+ * strip_open shows the log of the one picked (the same view as the agents menu). */
+static int running_count(void) { int k = 0; for (int i = 0; i < g_agent_n; i++) if (g_agents[i]->state == AG_RUNNING) k++; return k; }
+static const subagent_rec *running_at(int idx) {
+    int k = 0;
+    for (int i = g_agent_n - 1; i >= 0; i--) if (g_agents[i]->state == AG_RUNNING && k++ == idx) return g_agents[i];
+    return NULL;
+}
+static int strip_lines(sbuf *o, int cols, int max) {
+    int total = running_count();
+    int rows = total < max ? total : max;
+    for (int i = 0; i < rows; i++) {
+        const subagent_rec *r = running_at(i);
+        char line[480];
+        snprintf(line, sizeof line, "◆ #%d %s · round %d · %s", r->id, r->desc, r->rounds, r->activity);
+        /* cut to the width, on a character boundary, with an ellipsis */
+        int room = cols - 4 > 1 ? cols - 4 : 1;
+        if (plain_width(line) > room) {
+            size_t cut = 0; int w = 0;
+            while (line[cut] && w < room - 1) { cut++; while ((unsigned char)line[cut] & 0x80 && ((unsigned char)line[cut] & 0xC0) == 0x80) cut++; w++; }
+            line[cut] = 0; strcat(line, "…");
+        }
+        if (i) sb_putc(o, '\n');
+        sb_printf(o, "  " C_ORANGE "%s" C_RESET, line);
+    }
+    return rows;
+}
+static void strip_open(int idx) {
+    const subagent_rec *r = running_at(idx);
+    if (!r) return;
+    char head[400];
+    snprintf(head, sizeof head, "▾ sub-agent #%d %s · %s%s%s", r->id, r->desc, agent_state_word(r),
+             r->model ? " · on " : "", r->model ? r->model : "");
+    term_show_block(head, r->log.len ? r->log.data : "(nothing logged yet)\n");
+}
+
 static void agents_menu(void) {
     if (!g_agent_n) { printf(C_DIM "no sub-agents have run in this session yet" C_RESET "\n"); return; }
     int n = g_agent_n;
@@ -4703,6 +4740,8 @@ int main(int argc, char **argv) {
     term_suggest = suggest;
     term_idle_hook = memory_idle_hook;
     term_agents_menu = agents_menu;
+    term_agents_strip = strip_lines;
+    term_agents_open = strip_open;
     for (;;) {
         memory_arm_idle();   /* a finished request folds itself into memory while the prompt sits idle */
         char *line = term_readline(C_BOLD C_ORANGE "› " C_RESET);
