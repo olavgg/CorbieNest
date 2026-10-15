@@ -52,6 +52,8 @@ BUDGET = {"thinking": {"supported": True, "types": {"enabled": {"supported": Tru
 PROVIDER_MODELS = {
     "xai": {"grok-fake": {}},
     "openai": {"gpt-fake": {}},   # takes reasoning_effort up to high, like the gpt-5 family
+    "deepseek": {"deepseek-flash": {}, "deepseek-v4-pro": {}},   # the DeepSeek API, OpenAI-compatible at the root
+    "kimi": {"kimi-k2.6": {}, "kimi-k3": {}},                    # the Kimi API, OpenAI-compatible under /v1
     "anthropic": {"claude-fake-opus": {"max_input_tokens": 1_000_000, "max_tokens": 128_000, "capabilities": ADAPTIVE},
                   "claude-opus-5": {"max_input_tokens": 1_000_000, "max_tokens": 128_000, "capabilities": ADAPTIVE},   # has refusal fallbacks
                   "claude-fake-haiku": {"max_input_tokens": 200_000, "max_tokens": 64_000, "capabilities": BUDGET}},
@@ -410,7 +412,7 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass   # the client gave up waiting (Esc, a queued message)
     def _provider(self):
-        m = re.match(r"^/(xai|openai|anthropic)/v1(/.*)$", self.path)
+        m = re.match(r"^/(xai|openai|anthropic|kimi)/v1(/.*)$", self.path) or re.match(r"^/(deepseek)(/chat/completions)$", self.path)
         return (m.group(1), m.group(2)) if m else (None, None)
     def _provider_auth(self, prov):
         """None if the request may go on, else the error already sent"""

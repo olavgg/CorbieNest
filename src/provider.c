@@ -1,5 +1,5 @@
 /* Hosted model APIs, named PROVIDER:MODEL — "xai:grok-4.7", "openai:gpt-5.2",
- * "anthropic:claude-opus-5". xAI and OpenAI speak Chat Completions and are advisors only.
+ * "anthropic:claude-opus-5". xAI, OpenAI, DeepSeek and Kimi speak Chat Completions: advisors, and the workers of /goal.
  * Anthropic speaks the Messages API: a consultation (provider_chat) is one toolless question,
  * and a turn (provider_turn) is the model that does the work — tools, streaming, the same
  * conversation ollama_chat() speaks, translated at the wire.
@@ -24,6 +24,9 @@ static const provider_def PROVIDERS[] = {
     { "openai",    "chatgpt","OpenAI",    "OPENAI_API_KEY",    "OPENAI_BASE_URL",    "https://api.openai.com/v1", PROVIDER_CHAT_COMPLETIONS, "gpt-5.2", "ChatGPT" },
     /* no /v1 in the base: ANTHROPIC_BASE_URL is written that way for the SDKs (and Claude Code) */
     { "anthropic", "claude", "Anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "https://api.anthropic.com", PROVIDER_MESSAGES,         "claude-opus-5", "Claude" },
+    /* verified against the vendors' docs (2026-10): DeepSeek's API is OpenAI-compatible at the root, Kimi's at /v1 */
+    { "deepseek",  "deepseek","DeepSeek","DEEPSEEK_API_KEY",  "DEEPSEEK_BASE_URL",  "https://api.deepseek.com",  PROVIDER_CHAT_COMPLETIONS, "deepseek-flash", "DeepSeek" },
+    { "kimi",      "moonshot","Kimi",    "MOONSHOT_API_KEY",  "MOONSHOT_BASE_URL",  "https://api.moonshot.ai/v1", PROVIDER_CHAT_COMPLETIONS, "kimi-k2.6", "Kimi" },
 };
 
 const provider_def *provider_at(int i) {
@@ -527,11 +530,154 @@ static void take_usage(cJSON *u, chat_stats *st, bool inputs) {
     if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(u, "output_tokens"))) st->eval_tokens = (int)v->valuedouble;
 }
 
+/* ---------- Chat Completions turns (the workers of /goal on xAI, OpenAI, DeepSeek, Kimi) ----------
+ * The conversation is the one ollama_chat() speaks, and so is the reply: an assistant message with its
+ * tool_calls (arguments as an object) and its content. Chat Completions wants the arguments as a JSON
+ * string, every result after the id of its call, and max_completion_tokens from OpenAI; that is
+ * translated here, at the wire. Calls that arrive without an id get one, and the results that follow
+ * them without one are matched to those ids in order. */
+static bool cc_openai(const provider_def *p) { return !strcmp(p->name, "openai"); }
+
+static cJSON *cc_messages(cJSON *messages) {
+    cJSON *out = cJSON_CreateArray();
+    cJSON *pending = cJSON_CreateArray();   /* the ids of the last assistant message's calls */
+    int seq = 0, next = 0;
+    cJSON *m;
+    cJSON_ArrayForEach(m, messages) {
+        cJSON *role = cJSON_GetObjectItemCaseSensitive(m, "role");
+        if (!cJSON_IsString(role)) continue;
+        cJSON *content = cJSON_GetObjectItemCaseSensitive(m, "content");
+        const char *text = cJSON_IsString(content) ? content->valuestring : "";
+        cJSON *o = cJSON_CreateObject();
+        if (!strcmp(role->valuestring, "tool")) {
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(m, "tool_call_id");
+            const char *cid = cJSON_IsString(id) && id->valuestring[0] ? id->valuestring : NULL;
+            if (!cid && next < cJSON_GetArraySize(pending)) cid = cJSON_GetArrayItem(pending, next++)->valuestring;
+            cJSON_AddStringToObject(o, "role", "tool");
+            if (cid) cJSON_AddStringToObject(o, "tool_call_id", cid);
+            cJSON_AddStringToObject(o, "content", text);
+        } else if (!strcmp(role->valuestring, "assistant")) {
+            cJSON_AddStringToObject(o, "role", "assistant");
+            cJSON_AddStringToObject(o, "content", text);
+            cJSON *calls = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+            if (cJSON_IsArray(calls) && cJSON_GetArraySize(calls)) {
+                cJSON *tc = cJSON_AddArrayToObject(o, "tool_calls");
+                cJSON_Delete(pending); pending = cJSON_CreateArray(); next = 0;
+                cJSON *call;
+                cJSON_ArrayForEach(call, calls) {
+                    cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
+                    cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+                    cJSON *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+                    cJSON *id = cJSON_GetObjectItemCaseSensitive(call, "id");
+                    char idbuf[48];
+                    if (cJSON_IsString(id) && id->valuestring[0]) snprintf(idbuf, sizeof idbuf, "%s", id->valuestring);
+                    else snprintf(idbuf, sizeof idbuf, "call_%d", ++seq);
+                    cJSON *t = cJSON_CreateObject();
+                    cJSON_AddStringToObject(t, "id", idbuf);
+                    cJSON_AddStringToObject(t, "type", "function");
+                    cJSON *f = cJSON_AddObjectToObject(t, "function");
+                    cJSON_AddStringToObject(f, "name", cJSON_IsString(nm) ? nm->valuestring : "");
+                    char *as = cJSON_IsString(args) ? xstrdup(args->valuestring) : args ? cJSON_PrintUnformatted(args) : xstrdup("{}");
+                    cJSON_AddStringToObject(f, "arguments", as);
+                    free(as);
+                    cJSON_AddItemToArray(tc, t);
+                    cJSON_AddItemToArray(pending, cJSON_CreateString(idbuf));
+                }
+            }
+        } else {
+            cJSON_AddStringToObject(o, "role", role->valuestring);
+            cJSON_AddStringToObject(o, "content", text);
+            cJSON_Delete(pending); pending = cJSON_CreateArray(); next = 0;
+        }
+        cJSON_AddItemToArray(out, o);
+    }
+    cJSON_Delete(pending);
+    return out;
+}
+
+/* the body of one turn for a Chat Completions provider; mid is the model's own name (no prefix) */
+static char *cc_turn_body(const provider_def *p, const char *mid, cJSON *messages, cJSON *tools, int max_tokens, double temperature) {
+    cJSON *b = cJSON_CreateObject();
+    cJSON_AddStringToObject(b, "model", mid);
+    cJSON_AddItemToObject(b, "messages", cc_messages(messages));
+    if (tools && cJSON_GetArraySize(tools)) { cJSON_AddItemToObject(b, "tools", cJSON_Duplicate(tools, 1)); cJSON_AddStringToObject(b, "tool_choice", "auto"); }
+    cJSON_AddBoolToObject(b, "stream", false);
+    if (max_tokens > 0) cJSON_AddNumberToObject(b, cc_openai(p) ? "max_completion_tokens" : "max_tokens", max_tokens);
+    if (temperature >= 0) cJSON_AddNumberToObject(b, "temperature", temperature);
+    /* Kimi's K2 thinking models keep their reasoning between turns only when asked to; corbienest does not
+     * carry it, so thinking is off for them. kimi-k3 always reasons (reasoning_effort) and is left alone. */
+    if (!strcmp(p->name, "kimi") && !strncmp(mid, "kimi-k2", 7)) {
+        cJSON *th = cJSON_AddObjectToObject(b, "thinking");
+        cJSON_AddStringToObject(th, "type", "disabled");
+    }
+    char *s = cJSON_PrintUnformatted(b);
+    cJSON_Delete(b);
+    return s;
+}
+
+/* the reply, in the shape ollama_chat() returns: role, content and tool_calls (id, function.name, function.arguments as an object) */
+static cJSON *cc_turn_reply(const provider_def *p, const char *mid, const char *json, int status, chat_stats *st, char *err, size_t n) {
+    (void)mid;
+    if (status >= 400 || status == 0) { status_error(p, mid, status, json, err, n); return NULL; }
+    cJSON *j = cJSON_Parse(json ? json : "");
+    if (!j) { snprintf(err, n, "%s sent an answer that is not JSON: %.120s", p->label, json ? json : ""); return NULL; }
+    cJSON *ch = cJSON_GetObjectItemCaseSensitive(j, "choices");
+    cJSON *c0 = cJSON_IsArray(ch) ? cJSON_GetArrayItem(ch, 0) : NULL;
+    cJSON *msg = c0 ? cJSON_GetObjectItemCaseSensitive(c0, "message") : NULL;
+    if (!msg) { snprintf(err, n, "%s sent an answer with no message", p->label); cJSON_Delete(j); return NULL; }
+    cJSON *reply = cJSON_CreateObject();
+    cJSON_AddStringToObject(reply, "role", "assistant");
+    cJSON *content = cJSON_GetObjectItemCaseSensitive(msg, "content");
+    cJSON_AddStringToObject(reply, "content", cJSON_IsString(content) ? content->valuestring : "");
+    cJSON *tcs = cJSON_GetObjectItemCaseSensitive(msg, "tool_calls");
+    if (cJSON_IsArray(tcs) && cJSON_GetArraySize(tcs)) {
+        cJSON *calls = cJSON_AddArrayToObject(reply, "tool_calls");
+        cJSON *t; int k = 0;
+        cJSON_ArrayForEach(t, tcs) {
+            cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
+            cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+            cJSON *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(t, "id");
+            char idbuf[48];
+            if (cJSON_IsString(id) && id->valuestring[0]) snprintf(idbuf, sizeof idbuf, "%s", id->valuestring);
+            else snprintf(idbuf, sizeof idbuf, "call_%d", ++k);
+            cJSON *c = cJSON_CreateObject();
+            cJSON_AddStringToObject(c, "id", idbuf);
+            cJSON *f = cJSON_AddObjectToObject(c, "function");
+            cJSON_AddStringToObject(f, "name", cJSON_IsString(nm) ? nm->valuestring : "");
+            cJSON *parsed = cJSON_IsString(args) ? cJSON_Parse(args->valuestring) : NULL;
+            if (parsed) cJSON_AddItemToObject(f, "arguments", parsed);
+            else cJSON_AddStringToObject(f, "arguments", cJSON_IsString(args) ? args->valuestring : "{}");
+            cJSON_AddItemToArray(calls, c);
+        }
+    }
+    if (st) {
+        memset(st, 0, sizeof *st);
+        cJSON *u = cJSON_GetObjectItemCaseSensitive(j, "usage");
+        if (u) {
+            cJSON *pt = cJSON_GetObjectItemCaseSensitive(u, "prompt_tokens"), *ct = cJSON_GetObjectItemCaseSensitive(u, "completion_tokens");
+            cJSON *pd = cJSON_GetObjectItemCaseSensitive(u, "prompt_tokens_details");
+            cJSON *cached = pd ? cJSON_GetObjectItemCaseSensitive(pd, "cached_tokens") : NULL;
+            cJSON *cw = pd ? cJSON_GetObjectItemCaseSensitive(pd, "cache_write_tokens") : NULL;
+            if (cJSON_IsNumber(pt)) st->prompt_tokens = pt->valueint;
+            if (cJSON_IsNumber(ct)) st->eval_tokens = ct->valueint;
+            if (cJSON_IsNumber(cached)) st->cache_read = cached->valueint;
+            if (cJSON_IsNumber(cw)) st->cache_write = cw->valueint;
+        }
+        cJSON *fr = c0 ? cJSON_GetObjectItemCaseSensitive(c0, "finish_reason") : NULL;
+        if (cJSON_IsString(fr)) snprintf(st->done_reason, sizeof st->done_reason, "%s", !strcmp(fr->valuestring, "length") ? "length" : "stop");
+    }
+    cJSON_Delete(j);
+    err[0] = 0;
+    return reply;
+}
+
 cJSON *provider_turn_reply(const char *model, const char *json, int status, chat_stats *st, char *err, size_t n) {
     const char *mid = ""; const provider_def *p = provider_find(model, &mid);
     err[0] = 0;
     if (st) memset(st, 0, sizeof *st);
     if (!p) { snprintf(err, n, "'%s' is not a hosted model", model ? model : ""); return NULL; }
+    if (p->style == PROVIDER_CHAT_COMPLETIONS) return cc_turn_reply(p, mid, json, status, st, err, n);
     if (status >= 400 || status == 0) { status_error(p, mid, status, json, err, n); return NULL; }
     cJSON *j = cJSON_Parse(json ? json : "");
     if (!j) { snprintf(err, n, "%s sent an answer that is not JSON: %.120s", p->label, json ? json : ""); return NULL; }
@@ -720,6 +866,8 @@ char *provider_turn_request(cJSON *messages, cJSON *tools) {
     const model_info *mi = ollama_call.model ? (ollama_call.info ? ollama_call.info : &no_info) : &g_model_info;
     int max_tokens; const char *effort; bool thinking; double temperature;
     turn_ask(model, mi, &max_tokens, &effort, &thinking, &temperature);
+    const char *mid = ""; const provider_def *p = provider_find(model, &mid);
+    if (p && p->style == PROVIDER_CHAT_COMPLETIONS) return cc_turn_body(p, mid, messages, tools, max_tokens, temperature);
     return provider_turn_body(model, mi, messages, tools, max_tokens, effort, thinking, temperature, false);
 }
 
