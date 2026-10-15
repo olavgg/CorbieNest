@@ -347,6 +347,10 @@ extern void (*term_agents_menu)(void);
 /* the agents strip (term.c's strip_draw): the running sub-agents' lines, and the open of the one picked (main.c) */
 extern int  (*term_agents_strip)(sbuf *o, int cols, int max);
 extern void (*term_agents_open)(int idx);
+int  term_strip_update(const char **text);   /* the strip's rows, refreshed (notcurses draws it) */
+enum { STRIP_OTHER = 0, STRIP_UP, STRIP_DOWN, STRIP_ESC, STRIP_ENTER };
+int  term_strip_sel(void);                    /* the row the keys are on (-1: the field) */
+bool term_strip_key(int key, bool may_enter);   /* a key on the strip (STRIP_*); true when the strip took it */
 void term_show_block(const char *head, const char *body);
 /* Messages queued with Enter while the model was generating or a tool was running
  * (like Claude Code). main.c delivers them between tool rounds / after the turn. */

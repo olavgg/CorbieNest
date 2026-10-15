@@ -342,6 +342,14 @@ static int nc_key_code(const ncinput *ni) {
 
 /* One key, or NK_NONE after `ms` milliseconds without one. Input comes through notcurses
  * (its own thread fills the pipe that notcurses_inputready_fd() reports). */
+/* the strip's key for a notcurses key (term.c's STRIP_*) */
+static int strip_code(int k) {
+    if (k == NK_UP) return STRIP_UP;
+    if (k == NK_DOWN) return STRIP_DOWN;
+    if (k == 27) return STRIP_ESC;
+    if (k == 13 || k == 10) return STRIP_ENTER;
+    return STRIP_OTHER;
+}
 static int nc_getkey(int ms);
 static void nc_flush_due(void);
 
@@ -735,6 +743,23 @@ static void draw_overlay(void) {
     put_text(top + H - 1, left, edge, W, C_RULE, C_BAR_A, false, &carry);
 }
 
+/* the agents strip: one row per running sub-agent, the selected one on a dark band */
+static void draw_strip(int first, int rows, const char *text) {
+    const char *p = text ? text : "";
+    int sel = term_strip_sel();
+    for (int i = 0; i < rows && *p; i++) {
+        const char *e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        sbuf line; sb_init(&line); sb_append(&line, p, len);
+        unsigned bg = i == sel ? 0x2A2F3Au : NC_DEFAULT;
+        fill_row(first + i, 0, g_cols, bg, false);
+        nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 };
+        put_text(first + i, 0, line.data ? line.data : "", g_cols, NC_DEFAULT, bg, false, &carry);
+        sb_free(&line);
+        p = e ? e + 1 : p + len;
+    }
+}
+
 static void draw_menu(void) {
     int widest = nc_text_width(g_menu_title) + 2, hint_w = nc_text_width(g_menu_hint);
     if (hint_w > widest) widest = hint_w;
@@ -837,11 +862,14 @@ void nc_render(void) {
     if (g_rows >= 6 && g_cols >= 10) {
         int fh = field_height();
         int bar = g_rows - 1;   /* the bar is the last row: the folder and branch are in it */
-        int top = bar - fh; if (top < 1) top = 1;
+        const char *strip_text = NULL;
+        int srows = term_strip_update(&strip_text);   /* the agents strip: between the field and the bar */
+        int top = bar - fh - srows; if (top < 1) top = 1;
         g_field_top = top;
         draw_pane(top);
         draw_field(top);
         draw_suggest();
+        draw_strip(bar - srows, srows, strip_text);
         draw_bar(bar);
         if (g_ov_on) draw_overlay();
         if (g_bn_on) draw_banner();
@@ -999,6 +1027,7 @@ int nc_poll_interrupt(void) {
         if (k == NK_NONE) break;
         if (k == NK_SKIP) break;                         /* drained, nothing usable: never spin on the readiness fd */
         sug_sync();                                      /* the list is for the line as it is before this key */
+        if (term_strip_key(strip_code(k), g_len == 0 && !g_sug_n)) continue;   /* the agents strip: ↓ from an empty line, ↑/↓, Enter opens the log, Esc returns */
         if (sug_key(k)) continue;                        /* the list's keys: Tab, ↓/↑, Enter on a row, Esc closes it */
         if (k == 3 || k == 27) return 1;                 /* Ctrl-C and Esc stop the work, as in the ANSI UI */
         if (k == 13) {                                   /* Enter while busy: the line is queued for the model */
@@ -1044,6 +1073,7 @@ static char *readline_loop(void) {
         term_tick_run();
         if (k == NK_NONE || k == NK_SKIP) continue;
         idle_at = -1;                                  /* typing cancels the idle work for this prompt */
+        if (term_strip_key(strip_code(k), g_len == 0 && !g_sug_n)) continue;   /* the agents strip: ↓ from an empty line, ↑/↓, Enter opens the log, Esc returns */
         if (sug_key(k)) continue;                      /* the list's keys come first (see sug_key) */
         if (k == 13) {
             char *line = xstrdup(g_ed ? g_ed : "");

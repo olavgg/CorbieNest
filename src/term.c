@@ -551,7 +551,7 @@ static void field_edge(sbuf *o, int row, bool top) {
 /* the strip's lines, from the running sub-agents; the selected row is highlighted */
 static void strip_refresh(void) {
     sb_clear(&g_strip);
-    int rows = g_fs && term_agents_strip ? term_agents_strip(&g_strip, term_width(), STRIP_MAX) : 0;
+    int rows = (g_fs || g_ui_nc) && term_agents_strip ? term_agents_strip(&g_strip, term_width(), STRIP_MAX) : 0;
     g_strip_rows = rows;
     if (g_strip_sel >= rows) g_strip_sel = rows - 1;
     if (rows == 0) g_strip_sel = -1;
@@ -1899,6 +1899,26 @@ void term_editor_prefill(const char *text) {
 }
 
 int term_interrupt_fd(void) { return g_ui_nc ? nc_input_fd() : STDIN_FILENO; }
+
+int term_strip_sel(void) { return g_strip_sel; }
+/* The strip for the notcurses screen (which draws it itself): refreshes it, and gives its lines and rows. */
+int term_strip_update(const char **text) {
+    strip_refresh();
+    if (text) *text = g_strip.data ? g_strip.data : "";
+    return g_strip_rows;
+}
+/* A key on the strip (STRIP_*; STRIP_OTHER returns to the field and is not taken).
+ * may_enter: the field is empty, so ↓ goes into the strip. Returns whether the strip took the key. */
+bool term_strip_key(int key, bool may_enter) {
+    if (!g_strip_rows) return false;
+    if (g_strip_sel < 0) { if (key == STRIP_DOWN && may_enter) { g_strip_sel = 0; return true; } return false; }
+    if (key == STRIP_DOWN) { if (g_strip_sel < g_strip_rows - 1) g_strip_sel++; return true; }
+    if (key == STRIP_UP) { g_strip_sel--; return true; }
+    if (key == STRIP_ESC) { g_strip_sel = -1; return true; }
+    if (key == STRIP_ENTER) { if (term_agents_open) term_agents_open(g_strip_sel); return true; }
+    g_strip_sel = -1;
+    return false;
+}
 
 /* While a turn runs, the agents strip takes the keys that are on it: ↓ from an empty type-ahead goes into it,
  * ↑/↓ move, Enter opens the log picked, Esc returns to the field. Returns the bytes it took (0: none). */
