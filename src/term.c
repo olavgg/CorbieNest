@@ -1043,7 +1043,8 @@ void term_fold_end(void) {
     sb_ensure_line();
     g_sb_meta[g_sb_line] = (sb_meta){ 0, SB_PLAIN, false };   /* the line output continues on is no part of the body */
 }
-/* A block of plain text shown as an open fold, and the view moved to its head: what ← at the
+/* The block stays up in the viewer, as after PgUp: Esc, Enter or End return to the prompt. A block
+ * of plain text shown as an open fold, and the view moved to its head: what ← at the
  * prompt shows a sub-agent's log with. The lines go into the model as the fold's body without
  * being painted (the view is painted from the model below). Off full-screen mode: printed. */
 void term_show_block(const char *head, const char *body) {
