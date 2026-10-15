@@ -3,6 +3,7 @@
  * an interactive list picker, and a streaming markdown-ish printer. */
 #define _GNU_SOURCE
 #include "common.h"
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -202,16 +203,19 @@ static void bar_build(sbuf *o, int cols) {
     if (eff) { snprintf(mbuf, sizeof mbuf, "%s · %s", model, eff); model = mbuf; }
     char tin[32], tout[32], ttot[32];
     long out_now = g_session.eval_tokens + g_live_out;
-    fmt_tokens(g_session.prompt_tokens, tin, sizeof tin);
+    /* the input the model read is the total: the part it had from the prompt cache is shown on its own (⟳), so ↑ is what was billed as input */
+    long cached = g_session.cache_read > 0 ? g_session.cache_read : 0;
+    fmt_tokens(g_session.prompt_tokens - cached, tin, sizeof tin);
     fmt_tokens(out_now, tout, sizeof tout);
     fmt_tokens(g_session.prompt_tokens + out_now, ttot, sizeof ttot);
     char ctx[32] = "";
     if (g_cfg.num_ctx > 0 && g_session.last_prompt_tokens > 0)
         snprintf(ctx, sizeof ctx, "ctx %d%%", (int)(100.0 * g_session.last_prompt_tokens / g_cfg.num_ctx));
     /* segments in priority order: mode, model, tokens, ctx, hint */
-    char seg_tok[96], seg_tok_long[128];
+    char seg_tok[96], seg_tok_long[192];
     snprintf(seg_tok, sizeof seg_tok, "%s tokens", ttot);
-    snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens (↑%s ↓%s)", ttot, tin, tout);
+    if (cached) { char tc[32]; fmt_tokens(cached, tc, sizeof tc); snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens (↑%s ⟳%s ↓%s)", ttot, tin, tc, tout); }
+    else snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens (↑%s ↓%s)", ttot, tin, tout);
     const char *hint = "(shift+tab to cycle)";
     int room = cols - 1;
     int used = 0;
@@ -325,7 +329,7 @@ static bool ta_sug_key(int k);
  * (view_note). On a terminal too short to spare them, only the bar is kept. */
 #define FIELD_MIN_ROWS 6
 static bool field_shown(void) { return g_fs && g_fs_rows >= FIELD_MIN_ROWS; }
-static int fs_reserved_for(int rows) { return g_fs && rows >= FIELD_MIN_ROWS ? g_field_rows + 3 + g_sug_rows + (g_view_top >= 0) : 1; }
+static int fs_reserved_for(int rows) { return g_fs && rows >= FIELD_MIN_ROWS ? g_field_rows + 4 + g_sug_rows + (g_view_top >= 0) : 2; }
 static int fs_reserved(void) { return fs_reserved_for(g_fs_rows); }
 /* last row of the scrolling region (the conversation) */
 static int fs_region(void) { int r = g_fs_rows - fs_reserved(); return r < 1 ? 1 : r; }
@@ -415,7 +419,7 @@ static void view_note(sbuf *o, int row) {
     sb_puts(o, C_RESET "\x1b[K");
 }
 
-static int field_top(void) { return g_fs_rows - g_field_rows - 2 - g_sug_rows; }   /* row of the upper rule */
+static int field_top(void) { return g_fs_rows - g_field_rows - 3 - g_sug_rows; }   /* row of the upper rule (the bar and the location line are below) */
 
 /* Append text[from, from + n) with the "@path" mentions that name something that is there in
  * colour: a mention that took is one the message will carry, and one that did not is a typo
@@ -542,10 +546,37 @@ static bool layout_sync(void) {
     return g_view_top < 0;
 }
 
-/* Draw the status bar on the last row (absolute; the caller preserves the cursor). */
+/* The location line, on the last row: the working directory as an absolute path, and the git branch it is on
+ * when it is in a repository. Too long for the width, the path loses its start (…) and the branch stays. */
+static void loc_build(sbuf *o, int cols) {
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, "?");
+    char br[128] = "";
+    char tail[160] = "";
+    if (git_branch(cwd, br, sizeof br) == 1) snprintf(tail, sizeof tail, "  · branch %s", br);
+    size_t w = cols > 1 ? (size_t)cols - 1 : 1, pl = strlen(cwd), tl = strlen(tail);
+    if (tl > w) tail[w] = 0, tl = w;
+    char shown[4200];
+    if (pl + tl > w) {
+        size_t keep = w > tl + 1 ? w - tl - 1 : 0;   /* one column for the … */
+        if (keep > pl) keep = pl;
+        const char *q = cwd + (pl - keep);
+        while (*q && (*q & 0xC0) == 0x80) q++;   /* not in the middle of a character */
+        snprintf(shown, sizeof shown, "…%s", q);
+    } else snprintf(shown, sizeof shown, "%s", cwd);
+    sb_printf(o, C_DIM "%s%s" C_RESET, shown, tail);
+}
+
+/* Draw the status bar, and under it the location line, on the last rows (absolute; the caller preserves the
+ * cursor). On a terminal too short for the field only the bar and the location line are kept. */
 static void bar_draw(sbuf *o) {
-    sb_printf(o, "\x1b[%d;1H", g_fs_rows);
+    int bar_row = g_fs_rows >= 2 ? g_fs_rows - 1 : 1;
+    sb_printf(o, "\x1b[%d;1H", bar_row);
     bar_build(o, g_fs_cols);
+    sb_puts(o, "\x1b[K");
+    if (g_fs_rows < 2) return;
+    sb_printf(o, "\x1b[%d;1H", g_fs_rows);
+    loc_build(o, g_fs_cols);
     sb_puts(o, "\x1b[K");
 }
 
@@ -2236,6 +2267,15 @@ int term_confirm(const char *question, const char *always_label, const char *pro
 /* ---------- markdown streaming printer ---------- */
 void md_init(md_state *m) { memset(m, 0, sizeof *m); m->at_line_start = true; }
 
+/* a code line of a fence is printed when it ends, highlighted by the fence's language */
+static void md_code_line(md_state *m) {
+    sbuf out; sb_init(&out);
+    highlight_line(m->lang, m->line.data ? m->line.data : "", &out, C_CYAN);
+    fputs(out.data ? out.data : "", stdout);
+    sb_free(&out);
+    sb_clear(&m->line);
+}
+
 static void md_flush_ticks(md_state *m) {
     int t = m->pending_ticks;
     m->pending_ticks = 0;
@@ -2243,10 +2283,14 @@ static void md_flush_ticks(md_state *m) {
     if (t >= 3 && m->at_line_start) {
         m->in_fence = !m->in_fence;
         fputs(m->in_fence ? C_GRAY "```" : "```" C_RESET, stdout);
-        if (m->in_fence) fputs(C_RESET C_CYAN, stdout);
+        if (m->in_fence) {   /* the info string follows: it names the language */
+            fputs(C_RESET C_CYAN, stdout);
+            m->in_info = true; sb_clear(&m->info); sb_clear(&m->line); m->lang[0] = 0;
+        } else { m->in_info = false; }
         for (int i = 3; i < t; i++) fputc('`', stdout);
         return;
     }
+    if (m->in_fence && !m->in_info) { for (int i = 0; i < t; i++) sb_putc(&m->line, '`'); return; }
     if (m->in_fence) { for (int i = 0; i < t; i++) fputc('`', stdout); return; }
     if (t == 1) {
         m->in_code = !m->in_code;
@@ -2266,6 +2310,25 @@ void md_feed(md_state *m, const char *s, size_t n) {
         char c = s[i];
         if (c == '`') { md_flush_star(m); m->pending_ticks++; continue; }
         if (m->pending_ticks) { md_flush_ticks(m); m->at_line_start = false; }
+        if (m->in_fence && m->in_info) {   /* the info string: printed as it comes, and kept for the language */
+            fputc(c, stdout);
+            if (c != '\n') { sb_putc(&m->info, c); continue; }
+            m->in_info = false;
+            char *w = m->info.data ? m->info.data : "";
+            while (*w == ' ' || *w == '\t') w++;
+            size_t k = strcspn(w, " \t");
+            if (k >= sizeof m->lang) k = sizeof m->lang - 1;
+            for (size_t j = 0; j < k; j++) m->lang[j] = (char)tolower((unsigned char)w[j]);
+            m->lang[k] = 0;
+            m->at_line_start = true;
+            fputs(C_CYAN, stdout);
+            continue;
+        }
+        if (m->in_fence) {   /* the code: a line is printed when it ends, highlighted */
+            if (c == '\n') { md_code_line(m); fputc('\n', stdout); m->at_line_start = true; fputs(C_CYAN, stdout); }
+            else { sb_putc(&m->line, c); m->at_line_start = false; }
+            continue;
+        }
         if (!m->in_fence && !m->in_code) {
             if (c == '*') {
                 if (m->pending_star) { m->pending_star = false; m->in_bold = !m->in_bold; fputs(m->in_bold ? C_BOLD : C_RESET, stdout); continue; }
@@ -2287,8 +2350,10 @@ void md_feed(md_state *m, const char *s, size_t n) {
 void md_finish(md_state *m) {
     md_flush_star(m);
     if (m->pending_ticks) md_flush_ticks(m);
+    if (m->in_fence && m->line.len) md_code_line(m);   /* a last line that never ended */
     fputs(C_RESET, stdout);
-    m->in_fence = m->in_code = m->in_bold = false;
+    m->in_fence = m->in_code = m->in_bold = m->in_info = false;
+    sb_free(&m->line); sb_free(&m->info);
     fflush(stdout);
 }
 

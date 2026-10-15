@@ -84,6 +84,9 @@ WORK = tempfile.mkdtemp(prefix="crowtest_")
 CFG = tempfile.mkdtemp(prefix="crowcfg_")
 ENV = dict(os.environ, XDG_CONFIG_HOME=CFG, OLLAMA_HOST=HOST, TERM="xterm-256color", HOME=WORK)
 ENV.pop("CORBIENEST_MODEL", None)
+# A hosted key in the shell is the user's, not the test's: the tests that need one set it themselves (KEYS, TENV),
+# and the rest must not reach a hosted API (that costs money) because the shell happens to export one.
+for _k in ("XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"): ENV.pop(_k, None)
 # memory extraction adds a background model call after every request; keep it off for the
 # general tests (they assert on requests()[-1]) and exercise it explicitly at the end.
 # memory_idle=0 too, so a pending extraction never fires from a slow expect() mid-test.
@@ -325,6 +328,9 @@ class Session:
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(WORK)
+            # the child inherits the shell's environment: a hosted key the shell exports must not reach it unless the test gives one
+            for k in ("XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+                if k not in (env or ENV): os.environ.pop(k, None)
             for k, v in (env or ENV).items(): os.environ[k] = v
             os.execv(BIN, ["corbienest"] + list(args))
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -382,8 +388,9 @@ check(s.expect("Ctrl-D to quit"), "banner"); check("● connected" in s.text(), 
 check("plain http to" not in s.text(), "no unencrypted-host warning for an Ollama on this machine")
 raw = s.out.decode("utf-8", "replace")
 check("\x1b[?1049h" in raw, "alternate screen entered (full screen)")
-check(re.search(r"\x1b\[1;36r", raw) is not None, "scroll region reserves the input field and the status bar")
-check(re.search(r"\x1b\[40;1H[^\n]*manual mode[^\n]*fake-coder:latest[^\n]*0 tokens", raw) is not None, f"status bar on the last row: {raw[-300:]!r}")
+check(re.search(r"\x1b\[1;35r", raw) is not None, "scroll region reserves the input field, the status bar and the location line")
+check(re.search(r"\x1b\[39;1H[^\n]*manual mode[^\n]*fake-coder:latest[^\n]*0 tokens", raw) is not None, f"status bar on the row above the last: {raw[-300:]!r}")
+check(re.search(r"\x1b\[40;1H[^\n]*" + re.escape(WORK), raw) is not None, "the last row says the working folder, as an absolute path")
 check("manual mode (shift+tab to cycle)" in clean(raw), "mode-cycling hint sits next to the mode in the bar")
 check(re.search(r"\x1b\[37;1H[^\n]*─{20}", raw) is not None, "the input field is framed by a rule above the prompt")
 check(re.search(r"\x1b\[38;1H[^\n]*❯", raw) is not None, "the prompt sits between the rules, above the bar")
@@ -415,25 +422,25 @@ print("test interactive: the input field grows with the input and survives a res
 sf = Session(["-m", "fake-coder:latest"], cols=60, rows=20); sf.expect("Ctrl-D to quit")
 sf.send("one line")
 check(sf.expect("❯ one line"), "single-row field")
-check(re.search(r"\x1b\[1;16r", sf.out.decode("utf-8", "replace")) is not None, "region is rows minus field and bar")
+check(re.search(r"\x1b\[1;15r", sf.out.decode("utf-8", "replace")) is not None, "region is rows minus field, bar and location line")
 sf.send("\x1b\rtwo\x1b\rthree")   # alt+enter twice: three input rows
 check(sf.expect("three"), "multi-line input")
 raw = sf.out.decode("utf-8", "replace")
-check(re.search(r"\x1b\[1;14r", raw) is not None, f"the region shrank by the two extra input rows: {raw[-200:]!r}")
-check(re.search(r"\x1b\[16;1H[^\n]*three", raw) is not None, "the last input row sits just above the lower rule")
+check(re.search(r"\x1b\[1;13r", raw) is not None, f"the region shrank by the two extra input rows: {raw[-200:]!r}")
+check(re.search(r"\x1b\[17;1H[^\n]*three", raw) is not None, "the last input row sits just above the lower rule")
 sf.send("\x15")   # ctrl-u back to one row
 check(sf.expect("❯ "), "cleared")
 raw = sf.out.decode("utf-8", "replace")[-4000:]
-check(re.search(r"\x1b\[1;16r", raw) is not None, "the region grew back")
-check(re.search(r"\x1b\[15;1H\x1b\[2K", raw) and re.search(r"\x1b\[16;1H\x1b\[2K", raw),
+check(re.search(r"\x1b\[1;15r", raw) is not None, "the region grew back")
+check(re.search(r"\x1b\[14;1H\x1b\[2K", raw) and re.search(r"\x1b\[15;1H\x1b\[2K", raw),
       f"the rows the field gave back are painted again from the transcript, not left showing its old text: {raw[-300:]!r}")
 sf.mark = len(sf.out)
 fcntl.ioctl(sf.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
 os.kill(sf.pid, __import__("signal").SIGWINCH)
 check(sf.expect("manual mode", 3), "a resize at an idle prompt is drawn at once, not at the next key (a tmux pane is resized all the time)")
 raw = sf.out[sf.mark:].decode("utf-8", "replace")
-check(re.search(r"\x1b\[1;26r", raw) is not None, f"the region was re-cut for the new height: {raw[-300:]!r}")
-check(re.search(r"\x1b\[30;1H[^\n]*manual mode", raw) is not None, "the bar is on the new last row")
+check(re.search(r"\x1b\[1;25r", raw) is not None, f"the region was re-cut for the new height: {raw[-300:]!r}")
+check(re.search(r"\x1b\[29;1H[^\n]*manual mode", raw) is not None, "the bar is on the new row above the last")
 check("Corbie Nest" in clean(raw), "and the conversation is painted again for the new size, from the top of the transcript")
 sf.send("after resize")
 check(sf.expect("❯ after resize"), "the field follows a resize")
@@ -446,11 +453,11 @@ sp = Session(["-m", "fake-coder:latest"], cols=60, rows=20); sp.expect("Ctrl-D t
 sp.send("\x1b[200~" + "\n".join("pasted line %d" % i for i in range(1, 9)) + "\x1b[201~")
 check(sp.expect("pasted line 8"), "the paste lands in the field, newlines and all")
 raw = sp.out.decode("utf-8", "replace")
-check(re.search(r"\x1b\[1;9r", raw) is not None, f"the field grew to 8 rows and the region shrank: {raw[-300:]!r}")
+check(re.search(r"\x1b\[1;8r", raw) is not None, f"the field grew to 8 rows and the region shrank: {raw[-300:]!r}")
 sp.send("\r"); check(sp.expect("Echo: pasted line 1"), "the whole paste is sent as one message")
 check(requests()[-1]["messages"][-1]["content"].count("pasted line 8") == 1, "sent once, not twice")
 raw = sp.out.decode("utf-8", "replace")[-6000:]
-missing = [r for r in range(10, 17) if not re.search(r"\x1b\[%d;1H\x1b\[2K" % r, raw)]
+missing = [r for r in range(9, 16) if not re.search(r"\x1b\[%d;1H\x1b\[2K" % r, raw)]
 check(not missing, f"every row the field gave back is painted again from the transcript, so the paste does not stay below the reply: rows {missing} left dirty")
 sp.close()
 
@@ -762,6 +769,26 @@ check(sub and all(t["function"]["name"] in ("read_file", "list_dir", "grep", "ba
 check(sub and sum(t["function"]["name"] in ("web_fetch", "web_search") for t in sub[-1]["tools"]) == 2, "sub-agent can look documentation up")
 check("hay.txt" in sub[-1]["messages"][-1]["content"], "grep ran for real inside the sub-agent")
 os.remove(os.path.join(WORK, "hay.txt"))
+print("test interactive: /subagent sets the model and the effort sub-agents run on")
+open(os.path.join(WORK, "hay.txt"), "w").write("needle\n")
+s.send("/subagent fake-levels:latest\r"); check(s.expect("sub-agents run on fake-levels:latest"), "/subagent MODEL is checked and set")
+s.send("/subagent effort low\r"); check(s.expect("subagent effort: low"), "/subagent effort LEVEL goes to that model's effort")
+s.send("TOOL_TASK\r"); check(s.expect("on fake-levels:latest (/subagent)", 15), "the sub-agent says which model it runs on")
+check(s.expect("Tool said: REPORT", 15), "its report comes back to the main model")
+sub = [r for r in requests() if r["messages"][0]["role"] == "system" and "You are a sub-agent" in r["messages"][0]["content"]]
+check(sub and sub[-1]["model"] == "fake-levels:latest" and sub[-1].get("think") == "low", f"the sub-agent's call is to that model, at its effort: {sub[-1:]!r}")
+s.send("/subagent nosuchmodel:1b\r"); check(s.expect("does not know a model"), "an unknown model is refused there and then")
+s.send("/subagent xai:grok-fake\r"); check(s.expect("is an advisor only"), "an advisor-only provider is refused: it could not do the sub-agents' work")
+s.send("/subagent default\r"); check(s.expect("run on the model doing the work"), "/subagent default")
+os.remove(os.path.join(WORK, "hay.txt"))
+print("test interactive: the options the model offers come up as a picker; the choice is the next message")
+s.send("OPTIONS_REPLY please\r"); check(s.expect("Implementation options", 10), "the reply's options block is offered as a picker")
+check(s.expect("recommended", 3), f"with the recommended one marked: {s.text()[-400:]!r}")
+s.send("\x1b[A"); s.send("\r"); check(s.expect("Echo: Go with this: Lock file — simple, but a crash leaves it behind", 10), "arrow up and Enter: that option is the next message")
+s.send("OPTIONS_REPLY again\r"); check(s.expect("Implementation options", 10), "a second reply with options")
+time.sleep(0.6); s.send("\x1b"); time.sleep(0.6)   # a lone Esc is told from the start of a key sequence by its silence
+check("Go with this" not in since_send(s).split("OPTIONS_REPLY again")[-1], "Esc takes none of them: nothing is sent")
+s.send("/status\r"); check(s.expect("keep_alive", 5) and "Implementation options" not in since_send(s), "a slash command after them does not bring the picker back")
 s.send("/mode auto\r"); s.expect("mode: auto")
 s.send("TOOL_TASK_SLEEP\r"); check(s.expect("⤷ sub-agent slow research", 15), "sub-agent started")
 check(s.expect("running…", 10), "its shell command is running")
@@ -1047,7 +1074,7 @@ s.send("/m"); s.send("o"); check(s.expect("pick a model from a menu"), f"typing 
 view = listed()
 check("/models" in view and "permission mode: manual" in view and "/memory" in view and "/status" not in view, f"only the matching ones — a name that starts with it first, then one that contains it: {view!r}")
 check("tab complete · ↓ choose · esc close" in view, "and a line that says which keys work")
-check(re.search(r"\x1b\[1;27r", s.out.decode("utf-8", "replace")) is not None, "the list has rows of its own: the conversation region makes room")
+check(re.search(r"\x1b\[1;26r", s.out.decode("utf-8", "replace")) is not None, "the list has rows of its own: the conversation region makes room")
 s.send("d"); s.send("e"); view = listed(); check("/mode" in view and "/memory" not in view, f"every letter narrows it down: {view!r}")
 s.send("\x7f\x7f"); check("/memory" in listed(), "and deleting widens it again")
 s.send("\x1b[B"); view = listed(); check("enter take it" in view and re.search(r"❯ /model\s+pick a model", view), f"arrow down steps into the list: {view!r}")
@@ -1062,7 +1089,7 @@ s.send("/mode manual\r"); s.expect("✓ mode: ")
 s.send("/stat\r"); check(s.expect("unknown command /stat"), "with nothing highlighted Enter sends what was typed: the list is only a preview")
 s.send("/h"); s.send("e"); check("commands, keys and input tricks" in listed(), "the list for /he")
 s.send("\x1b"); check("commands, keys" not in listed(), "Esc closes the list")
-check(re.search(r"\x1b\[1;36r", s.out[s.mark:].decode("utf-8", "replace")) is not None, "and the conversation gets its rows back")
+check(re.search(r"\x1b\[1;35r", s.out[s.mark:].decode("utf-8", "replace")) is not None, "and the conversation gets its rows back")
 s.send("\x1b[A"); check(s.expect("❯ /stat"), "after which arrow up is the history again")
 check("model, context usage" not in listed(), "a recalled line brings no list up: the next arrow goes on through the history")
 s.send("\x1b[A"); check(s.expect("❯ /mode manual"), "as it does")
@@ -1156,7 +1183,7 @@ kinds = {l.split(" ", 2)[1] for l in lines if l.count(" ") >= 2}
 check(" # corbienest " in lines[0] and " rows x " in lines[0], f"the first line says what made it and for which size: {lines[0]!r}")
 check({"O", "I", "L", "B"} <= kinds, f"output, input, layout and activity are all in it: {sorted(kinds)}")
 check("traced words\\r" in "".join(l.split(" ", 2)[2] for l in lines if l.split(" ", 2)[1:2] == ["I"]), "what was typed, byte for byte")
-check(any(" L rows=40 cols=100 region=1-36 " in l for l in lines), "the layout it was drawn for")
+check(any(" L rows=40 cols=100 region=1-35 " in l for l in lines), "the layout it was drawn for")
 check(os.stat(TRACE).st_mode & 0o777 == 0o600, "it holds the conversation: readable by its owner alone")
 p = subprocess.run(REPLAY + ["--fast", "--no-hold"], capture_output=True, timeout=30)
 check(p.returncode == 0 and b"\x1b[?1049h" in p.stdout and "Echo: " in clean(p.stdout.decode("utf-8", "replace")) and "traced words" in clean(p.stdout.decode("utf-8", "replace")), "the replay writes what the session wrote, escapes and all")
@@ -1205,7 +1232,7 @@ else:
         check(pane_has(sock, "scrollback · rows"), f"mouse {mouse}: the wheel scrolls the conversation: {tmux(sock, 'capture-pane', '-p', '-t', 't')[-300:]!r}")
         check(tmux(sock, "display", "-p", "-t", "t", "#{pane_in_mode}").strip() == "0", f"mouse {mouse}: tmux did not keep it for its copy mode")
         check("❯ kept in the field" in tmux(sock, "capture-pane", "-p", "-t", "t"), f"mouse {mouse}: and it is not turned into arrow keys for the prompt history")
-        check("manual mode" in tmux(sock, "capture-pane", "-p", "-t", "t").rstrip("\n").split("\n")[-1], f"mouse {mouse}: the status bar is still on the last row")
+        check("manual mode" in tmux(sock, "capture-pane", "-p", "-t", "t").rstrip("\n").split("\n")[-2], f"mouse {mouse}: the status bar is still on the row above the location line")
         feed("\x1b[<65;10;5M" * 3)
         check(pane_has(sock, "scrollback · rows", want=False), f"mouse {mouse}: scrolling down returns to the prompt")
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 16, 60, 0, 0))
@@ -1213,9 +1240,9 @@ else:
         end = time.time() + 5; lines = []
         while time.time() < end:
             lines = tmux(sock, "capture-pane", "-p", "-t", "t").rstrip("\n").split("\n")
-            if len(lines) == 16 and "manual mode" in lines[-1] and lines[-4].startswith("─" * 60): break
+            if len(lines) == 16 and "manual mode" in lines[-2] and lines[-5].startswith("─" * 60): break
             time.sleep(0.1)
-        check(len(lines) == 16 and "manual mode" in lines[-1] and "❯ kept in the field" in lines[-3] and lines[-4].startswith("─" * 60),
+        check(len(lines) == 16 and "manual mode" in lines[-2] and "❯ kept in the field" in lines[-4] and lines[-5].startswith("─" * 60),
               f"mouse {mouse}: a resized pane is drawn for its new size without a key being pressed: {lines[-5:]!r}")
         tmux(sock, "kill-server")
         try: os.close(fd)
@@ -1360,11 +1387,32 @@ s.send("/think off\r"); check(s.expect("cannot stop thinking: it is sent its wea
 check(requests()[-1].get("think") == "low", "/think off: never think — for this model, as little as it can")
 s.send("/effort medium\r"); check(s.expect("/think was off: now auto"), "setting a level switches thinking back on")
 s.send("SLOW while busy\r"); s.expect("one ")
-s.send("/effort low\r"); check(s.expect("effort: low", 3), "/effort LEVEL runs while the model is working")
-check("queued" not in since_send(s) and "eight" not in since_send(s), "there and then: not queued for after the turn")
+s.send("/effort low\r"); check(s.expect("from the next request", 3), "/effort LEVEL is accepted while the model works, for the next request")
+check("queued" not in since_send(s) and "eight" not in since_send(s), "not queued for after the turn, and not applied under the request in flight")
 s.send("/effort\r"); check(s.expect("fake-levels:latest offers: low · medium · high", 3), "bare /effort prints the levels while busy")
 check("Effort for" not in since_send(s) and "eight" not in since_send(s), "instead of opening a picker inside a live request")
 check(s.expect("eight", 10), "generation carried on"); s.expect("tok/s")
+check(s.expect("effort: low", 5), "the setting is applied as the turn ends, not kept until the next message")
+s.send("after effort\r"); s.expect("Echo: after effort")
+check(requests()[-1].get("think") == "low", "the next request carries the level that was set while busy")
+print("test interactive: /ctx SIZE while busy is kept for the next request")
+s.send("/ctx 8k\r"); s.expect("tok/s"); s.send("/ctx 16k\r"); s.expect("tok/s")   # warm: sets the window for a request that has ended
+s.send("SLOW ctx busy\r"); s.expect("one ")
+s.send("/ctx 8k\r"); check(s.expect("context window: 8k", 3) and s.expect("from the next request", 3), "/ctx SIZE runs while the model works, and says when it applies")
+check("queued" not in since_send(s), "not queued for after the turn")
+check(s.expect("eight", 10), "the running turn carries on"); s.expect("tok/s")
+check(requests()[-1]["options"]["num_ctx"] == 16384, "the running turn kept the window it started with")
+s.send("after busy\r"); s.expect("Echo: after busy")
+check(requests()[-1]["options"]["num_ctx"] == 8192, "the next request uses the new window")
+print("test interactive: /advisor guidance while busy is kept for the next request")
+s.send("SLOW guidance busy\r"); s.expect("one ")
+s.send("/advisor guidance strong\r"); check(s.expect("from the next request", 3), "/advisor guidance runs while the model works, and says when it applies")
+check("queued" not in since_send(s), "not queued for after the turn")
+s.expect("eight", 10); s.expect("tok/s")
+s.send("after guidance\r"); s.expect("Echo: after guidance")
+check("advisor_guidance=strong" in open(CFG2_FILE).read(), "the next request applies it, and it is saved")
+s.send("/advisor guidance normal\r"); s.expect("advisor guidance: normal")
+s.send("/ctx 32k\r"); s.expect("context window: 32k")   # the config is shared with the advisor tests below: back to the default
 s.send("/model fake-thinker:latest\r"); s.expect("model set to fake-thinker")
 s.send("/effort off\r"); s.expect("effort: off"); s.send("/think on\r"); check(s.expect("/effort off for fake-thinker:latest is forgotten"), "/think on takes back an /effort off, or nothing would change")
 s.send("/think auto\r"); s.expect("think: auto"); s.send("/model fake-levels:latest\r"); s.expect("model set to fake-levels")
@@ -1549,6 +1597,39 @@ b = last_preq("anthropic")["body"]
 check(rc == 0 and b.get("thinking") == {"type": "enabled", "budget_tokens": 8000} and "output_config" not in b, f"a model with a thinking budget and no effort levels: {b.get('thinking')!r}")
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
 
+print("test the model that does the work on Anthropic: haiku works, opus advises")
+def anth_since(n0): return [r for r in preqs()[n0:] if r["provider"] == "anthropic"]
+def work_posts(posts): return [r for r in posts if "tools" in r["body"] or isinstance(r["body"].get("system"), list)]
+def consult_posts(posts):
+    return [r for r in posts if isinstance(r["body"].get("system"), str) and r["body"]["system"].startswith("You are the advisor")]
+def has_tool_result(r):
+    for m in r["body"].get("messages") or []:
+        c = m.get("content")
+        if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c): return True
+    return False
+n0 = len(preqs())
+out, rc = run(["-m", "anthropic:claude-fake-haiku", "--advisor", "anthropic:claude-fake-opus", "--yolo", "-p", "TOOL_BASH please"], env=ENVK)
+check(rc == 0 and "hello-from-tool" in out and "Tool said:" in out, f"the tool ran, and the model read its result: {out[-400:]!r}")
+posts = anth_since(n0)
+work = work_posts(posts)
+check(work and all(r["path"] == "/anthropic/v1/messages" and r["body"].get("stream") is True for r in work), f"streamed to the Messages API: {[(r['path'], r['body'].get('stream')) for r in work]!r}")
+if work:
+    first = work[0]["body"]
+    check(any(t.get("name") == "bash" for t in first.get("tools") or []) and "thinking" not in first and "fallbacks" not in first and "output_config" not in first and first.get("max_tokens") == 64000,
+          f"haiku, with tools, and no thinking (a budget model, left off): model={first.get('model')!r} max_tokens={first.get('max_tokens')!r} thinking={first.get('thinking')!r}")
+    check(any(has_tool_result(r) for r in work[1:]), "the next call carries the tool_result")
+check(not consult_posts(posts), "this request never consulted the advisor")
+n0 = len(preqs())
+out, rc = run(["-m", "anthropic:claude-fake-haiku", "--advisor", "anthropic:claude-opus-5", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+check(rc == 0 and "Tool said: ADVICE:" in out, f"the advice came back as the tool result: {out[-400:]!r}")
+posts = anth_since(n0)
+cons, work = consult_posts(posts), work_posts(posts)
+check(len(cons) == 1 and [m["role"] for m in cons[0]["body"]["messages"]] == ["user"] and "tools" not in cons[0]["body"]
+      and cons[0]["body"].get("fallbacks") == "default" and cons[0]["headers"].get("anthropic-beta") == "server-side-fallback-2026-07-01",
+      f"the consultation is still one user message, and Opus 5 asks for a fallback: {cons[0]['body'].get('fallbacks')!r} {cons[0]['headers'].get('anthropic-beta')!r}" if cons else f"no consultation in {len(posts)} posts")
+check(work and all(isinstance(r["body"].get("system"), list) and "tools" in r["body"] and "fallbacks" not in r["body"] for r in work),
+      "the model doing the work is a different request: tools, a system array, no fallbacks")
+
 print("test advisor on a hosted API: no key, a wrong key, no such model")
 noenv = {k: v for k, v in ENVK.items() if k != "XAI_API_KEY"}
 n0 = len(preqs())
@@ -1603,6 +1684,29 @@ s.send("/advisor anthropic:claude-fake-haiku\r"); check(s.expect("advisor: anthr
 s.send("/advisor effort on\r"); check(s.expect("advisor effort: on"), "a thinking budget, on")
 s.send("\x04"); s.close()
 check(key_nowhere() is None, f"still nowhere: {key_nowhere()!r}")
+
+print("test interactive: /model completes a local name and an Anthropic one")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
+s.send("/model fake-co"); s.send("d"); view = listed()
+check("fake-coder:latest" in view and "fake-chat" not in view and "xai:" not in view and "openai:" not in view,
+      f"a local name is completed as it is typed, and an advisor-only provider is not offered: {view!r}")
+s.send("\t\r"); check(s.expect("model set to fake-coder:latest"), "Tab completes the name, Enter sets it")
+s.send("/model "); view = listed()
+check("anthropic:" in view and "fake-coder:latest" in view and "the model that does the work" in view and "xai:" not in view and "openai:" not in view,
+      f"a bare argument offers Anthropic and the installed models: {view!r}")
+s.send("anthropic"); s.send(":"); view = listed()
+check("anthropic:claude-fake-opus" in view and "Claude Fake Haiku" in view and "grok-fake" not in view,
+      f"behind anthropic: its own models are listed: {view!r}")
+s.send("laude-fake-hai"); s.send("\t\r"); check(s.expect("model set to anthropic:claude-fake-haiku"), "Tab + Enter takes one")
+s.send("/model claude:"); s.send("c"); view = listed()
+check("claude:claude-fake-opus" in view and "claude:claude-fake-haiku" in view and "grok-fake" not in view,
+      f"claude: is the same list, under the name that was typed: {view!r}")
+s.send("\x03"); s.send("/model xai"); s.send(":"); view = listed()
+check("grok-fake" not in view and "xai:" not in view, f"xai: is not completed on /model: {view!r}")
+s.send("\x03"); s.send("/model\r"); check(s.expect("Select model"), "Enter with no name still opens the local picker")
+s.send("think"); time.sleep(0.2); s.send("\r"); check(s.expect("model set to fake-thinker:latest"), "and typing in it still filters")
+s.send("\x04"); s.close()
+check(key_nowhere() is None, f"completing the models wrote the key nowhere: {key_nowhere()!r}")
 
 # ---------- /advisor guidance: how much the agent leans on it ----------
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
@@ -1719,6 +1823,49 @@ check("fold-line-3" in view, "scrolled back it works the same")
 s.send("\x1b"); s.send("\x04"); s.close()
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_MANY"])
 check("fold-line-3" in out and "▸" not in out, "without a screen to click on, the first lines are shown as before")
+
+print("test location line: the working folder and its git branch, under the status bar")
+br = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=WORK, capture_output=True, text=True).stdout.strip()
+sl = Session(["-m", "fake-coder:latest"]); sl.expect("Ctrl-D to quit")
+check(sl.expect("· branch " + br, 10) if br else True, f"the location line names the branch: {br!r}")
+check(sl.expect(WORK, 5), "the location line gives the absolute path")
+sl.send("\x04"); sl.close()
+
+# ---------- code in the transcript: highlighting; the prompt cache: the bar and /usage ----------
+print("test highlight: code in a reply and a file's preview are coloured by their language")
+sh = Session(["-m", "fake-coder:latest"]); sh.expect("Ctrl-D to quit")
+m0 = sh.mark
+sh.send("CODE_REPLY\r"); check(sh.expect("Done.", 10), "the reply with a code block")
+check(b"\x1b[35mdef\x1b[0m" in sh.out[m0:], "a keyword is magenta")
+check(b"\x1b[90m# say hi\x1b[0m" in sh.out[m0:], "a comment is grey")
+check(b"\x1b[32m'hi '\x1b[0m" in sh.out[m0:], "a string is green")
+sh.send("/mode auto\r"); sh.expect("mode: auto")
+m1 = sh.mark
+sh.send("TOOL_WRITE_CODE\r"); check(sh.expect("create hello.py", 10), "a file is written")
+check(b"\x1b[35mdef\x1b[0m" in sh.out[m1:], "its preview shows the code coloured by the extension")
+check(sh.expect("Echo", 10) or True, "the turn ends")
+sh.send("/mode manual\r"); sh.expect("mode: manual")   # the shared config: back to the default
+sh.send("\x04"); sh.close()
+os.remove(os.path.join(WORK, "hello.py")) if os.path.exists(os.path.join(WORK, "hello.py")) else None
+
+print("test cache: the bar shows a hosted model's cache hits, /usage prices and shows them")
+sc = Session(["-m", "anthropic:claude-fake-haiku"], env=ENVK); sc.expect("Ctrl-D to quit")
+sc.send("/usage price anthropic:claude-fake-haiku 1 5\r"); sc.expect("price", 5)
+sc.send("CACHE hello\r"); check(sc.expect("⟳800", 10), f"the bar shows the cache hits: {sc.text()[-300:]!r}")
+sc.expect("tok/s", 10)
+sc.send("/usage\r")
+check(sc.expect("cache: 800 read at 10% of the input price", 10), "/usage: the cache reads, at the cache rate")
+check(sc.expect("40 written at 1.25×", 5), "/usage: the cache writes, at 1.25×")
+check(sc.expect("≈ $0.0003", 5), f"/usage: the cost is the cache-priced one (100 at 1, 800 at 0.10, 40 at 1.25, 20 out at 5 = $0.00033): {sc.text()[-400:]!r}")
+sc.send("\x04"); sc.close()
+
+so = Session(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo"], env=ENVK); so.expect("Ctrl-D to quit")
+so.send("TOOL_ADVISOR CACHE please\r"); check(so.expect("⎿  ", 15), "a consultation of an OpenAI advisor")
+so.expect("tok/s", 15)
+so.send("/usage\r")
+check(so.expect("openai:gpt-fake", 10) and so.expect("cache: 1.5k read", 5), f"the OpenAI cached prompt tokens are counted as cache reads: {so.text()[-400:]!r}")
+so.send("/mode manual\r"); so.expect("mode: manual")   # --yolo is saved to the shared config: back to the default for the tests after this
+so.send("\x04"); so.close()
 
 # ---------- /orchestrate: the advisor model plans and reviews, the main model does the tasks ----------
 print("test interactive: /orchestrate")

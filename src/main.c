@@ -18,6 +18,8 @@
 static cJSON *g_messages = NULL;    /* conversation, without system prompt */
 static cJSON *g_tools = NULL;       /* tool definitions */
 static bool   g_model_tools = true; /* current model supports tools */
+static bool   g_model_bad = false;  /* the working model cannot be used (a hosted one with no key, or an advisor-only provider) */
+static char   g_model_err[512];
 static bool   g_placement_checked = false; /* /api/ps warning about a partly-CPU model shown once per model */
 static bool   g_while_busy = false;        /* a slash command is running inside the turn (see run_slash_while_busy) */
 static int    g_model_max_ctx = 0;  /* context length the model was trained for (0 = unknown) */
@@ -38,7 +40,7 @@ static int    g_request_calls0 = 0;              /* g_session.tool_calls when th
 /* The commands, each with the line the suggestions under the input field show for it. */
 static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/help", "commands, keys and input tricks" },
-    { "/model", "pick a model from a menu, or /model NAME" },
+    { "/model", "pick a model from a menu, or anthropic:NAME" },
     { "/models", "list the models ollama has" },
     { "/clear", "start a new conversation" },
     { "/compact", "summarise the conversation to free context" },
@@ -47,6 +49,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/think", "when the model thinks: on, off, auto · show or hide it" },
     { "/effort", "how hard this model thinks" },
     { "/advisor", "a stronger model the agent may consult: a local one, or Claude, ChatGPT, Grok by API key" },
+    { "/subagent", "the model sub-agents (task) run on, and how hard it thinks" },
     { "/orchestrate", "the advisor model plans the request as tasks, this model does them, the advisor reviews each" },
     { "/workers", "how many tasks of /orchestrate may run at the same time" },
     { "/mode", "permission mode: manual, accept-edits, plan, auto" },
@@ -90,6 +93,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST|remove:remove rule N|clear:remove them all" },
     { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host" },
     { "/advisor", "off:no advisor|guidance:how much the agent leans on it|effort:how hard it thinks|window:minutes after which a long request gets its consultations again|ctx:its context window" },
+    { "/subagent", "default:the model doing the work|effort:how hard the sub-agents' model thinks" },
     { "/advisor guidance", "light:consulted rarely|normal:the default — and brought in when tool calls keep failing|strong:also reviews the work before a request ends|max:also checks the first change before it is made" },
     { "/advisor ctx", "auto:the main window, within the advisor's bounds" },
     { "/advisor window", "15:the default, a quarter of an hour|off:never: the limit holds for the whole request" },
@@ -102,18 +106,18 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
 };
 
 /* what each model was sent and gave in this session: /usage, and what it estimates the cost from */
-typedef struct { char *model; long in, out; int calls; } usage_row;
+typedef struct { char *model; long in, out; int calls; long cr, cw; } usage_row;   /* in = all input; cr/cw = its cache reads and writes */
 static usage_row *g_usage = NULL;
 static int g_n_usage = 0;
-static void usage_add(const char *model, long in, long out, int calls) {
+static void usage_add(const char *model, long in, long out, long cr, long cw, int calls) {
     if (!model || !*model) model = "(no model)";
     int i = 0;
     while (i < g_n_usage && strcmp(g_usage[i].model, model)) i++;
     if (i == g_n_usage) {
         g_usage = xrealloc(g_usage, sizeof *g_usage * (size_t)(g_n_usage + 1));
-        g_usage[g_n_usage++] = (usage_row){ xstrdup(model), 0, 0, 0 };
+        g_usage[g_n_usage++] = (usage_row){ xstrdup(model), 0, 0, 0, 0, 0 };
     }
-    g_usage[i].in += in; g_usage[i].out += out; g_usage[i].calls += calls;
+    g_usage[i].in += in; g_usage[i].out += out; g_usage[i].calls += calls; g_usage[i].cr += cr; g_usage[i].cw += cw;
 }
 static void usage_clear(void) {
     for (int i = 0; i < g_n_usage; i++) free(g_usage[i].model);
@@ -131,8 +135,9 @@ static const char *fmt_window(void) {
 /* one model call finished: fold its stats into the session totals — account() for the model
  * doing the work, account_as() for a call to another one (the advisor) */
 static void account_as(const char *model, const chat_stats *st) {
-    usage_add(model, st->prompt_tokens, st->eval_tokens, 1);
+    usage_add(model, st->prompt_tokens, st->eval_tokens, st->cache_read, st->cache_write, 1);
     g_session.prompt_tokens += st->prompt_tokens;
+    g_session.cache_read += st->cache_read;
     g_session.eval_tokens += st->eval_tokens;
     g_session.model_seconds += st->total_seconds;
     g_session.eval_seconds += st->eval_seconds;
@@ -241,8 +246,34 @@ static int elide_old_tool_results(int upto) {
     return elide_tool_results(g_messages, upto);
 }
 
+/* /ctx given while a request is in flight: the running turn keeps the window it started with (Ollama
+ * reloads the model for a new num_ctx, and the calls of this turn would each pay for it). begin_request()
+ * applies it when the next request starts. */
+static int g_pending_ctx = -1;
+/* /advisor guidance given while a request is in flight: the guidance is in the system prompt, so the
+ * change waits for the next request like the window does (see g_pending_ctx) */
+static int g_pending_guidance = -1;
+/* settings given while busy that change the prompt or the tool list (/think, /effort, /mode, /advisor window):
+ * the lines are run, in the order typed, when the next request starts (run_slash_while_busy) */
+static char **g_pending_lines = NULL;
+static int g_pending_n = 0;
+static int handle_slash(char *line);
+
+/* the settings given while a request was in flight take effect now, between two requests: when the turn
+ * ends (so they are not lost if the user quits first) and again when the next one starts (a no-op if none) */
+static void apply_pending(void) {
+    if (g_pending_ctx >= 0 || g_pending_guidance >= 0) {   /* /ctx and /advisor guidance given during the last request */
+        if (g_pending_ctx >= 0) { g_cfg.num_ctx = g_pending_ctx; g_pending_ctx = -1; }
+        if (g_pending_guidance >= 0) { g_cfg.advisor_guidance = g_pending_guidance; g_pending_guidance = -1; }
+        config_save();
+    }
+    for (int i = 0; i < g_pending_n; i++) { handle_slash(g_pending_lines[i]); free(g_pending_lines[i]); }
+    g_pending_n = 0;
+}
+
 /* a user request starts: remember where it begins in the conversation (for /rewind, memory) */
 static int begin_request(void) {
+    apply_pending();
     int first = cJSON_GetArraySize(g_messages);
     if (g_prev_request_first >= 0 && g_prev_request_first <= first) elide_old_tool_results(g_prev_request_first);
     g_prev_request_first = first;
@@ -314,6 +345,28 @@ static int g_mem_first = -1;      /* index of the first message not yet folded i
 static int g_mem_pending = 0;     /* finished requests since the last flush */
 static bool g_mem_exiting = false;/* the last flush, on the way out: say that Ctrl-C skips it */
 
+/* The model that does the work is a local one, or Anthropic (anthropic:MODEL / claude:MODEL).
+ * xAI and OpenAI stay advisors: a turn never sends their prefix to Ollama. */
+static bool model_messages(const char *name) {
+    const provider_def *p = name ? provider_find(name, NULL) : NULL;
+    return p && p->style == PROVIDER_MESSAGES;
+}
+static bool model_hosted(void) { return model_messages(g_cfg.model); }
+
+static cJSON *model_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted) {
+    const char *model = ollama_call.model ? ollama_call.model : g_cfg.model;
+    const provider_def *p = provider_find(model, NULL);
+    if (p && p->style == PROVIDER_MESSAGES) return provider_turn(messages, tools, stats, aborted);
+    if (p) {
+        *aborted = false;
+        if (stats) memset(stats, 0, sizeof *stats);
+        snprintf(ollama_error, sizeof ollama_error, "%s is an advisor — use /advisor %s", p->label, model);
+        printf(C_RED "✗ %s" C_RESET "\n", ollama_error);
+        return NULL;
+    }
+    return ollama_chat(messages, tools, stats, aborted);
+}
+
 static void memory_extract(int first) {
     if (!g_cfg.interactive && !is_dir(".corbienest")) return;
     int total = cJSON_GetArraySize(g_messages);
@@ -362,7 +415,7 @@ static void memory_extract(int first) {
      * runaway generation cannot hang the prompt, and an honest status-bar label */
     ollama_quiet = true;
     ollama_call.think = 0; ollama_call.num_predict = MEMORY_MAX_TOKENS; ollama_call.busy = "updating memory";
-    cJSON *reply = ollama_chat(msgs, NULL, &st, &ab);
+    cJSON *reply = model_chat(msgs, NULL, &st, &ab);
     ollama_call_reset();
     ollama_quiet = false;
     cJSON_Delete(msgs);
@@ -574,6 +627,7 @@ static void session_save(void) {
     cJSON_AddNumberToObject(o, "updated", (double)time(NULL));
     char *title = session_title_of(g_messages); cJSON_AddStringToObject(o, "title", title); free(title);
     cJSON_AddNumberToObject(o, "prompt_tokens", (double)g_session.prompt_tokens);
+    if (g_session.cache_read) cJSON_AddNumberToObject(o, "cache_read", (double)g_session.cache_read);
     cJSON_AddNumberToObject(o, "eval_tokens", (double)g_session.eval_tokens);
     cJSON *us = cJSON_AddArrayToObject(o, "usage");   /* per model, for /usage after a --resume */
     for (int i = 0; i < g_n_usage; i++) {
@@ -581,6 +635,8 @@ static void session_save(void) {
         cJSON_AddStringToObject(u, "model", g_usage[i].model);
         cJSON_AddNumberToObject(u, "in", (double)g_usage[i].in); cJSON_AddNumberToObject(u, "out", (double)g_usage[i].out);
         cJSON_AddNumberToObject(u, "calls", g_usage[i].calls);
+        if (g_usage[i].cr) cJSON_AddNumberToObject(u, "cr", (double)g_usage[i].cr);
+        if (g_usage[i].cw) cJSON_AddNumberToObject(u, "cw", (double)g_usage[i].cw);
         cJSON_AddItemToArray(us, u);
     }
     cJSON_AddItemReferenceToObject(o, "messages", g_messages);
@@ -647,11 +703,16 @@ static bool session_load(const char *id) {
     snprintf(g_session_id, sizeof g_session_id, "%s", id);
     cJSON *pt = cJSON_GetObjectItemCaseSensitive(o, "prompt_tokens"), *et = cJSON_GetObjectItemCaseSensitive(o, "eval_tokens");
     g_session.prompt_tokens = cJSON_IsNumber(pt) ? (long)pt->valuedouble : 0;
+    cJSON *cr = cJSON_GetObjectItemCaseSensitive(o, "cache_read");
+    g_session.cache_read = cJSON_IsNumber(cr) ? (long)cr->valuedouble : 0;
     g_session.eval_tokens = cJSON_IsNumber(et) ? (long)et->valuedouble : 0;
     usage_clear();   /* the totals are the resumed session's from here on, and so is what /usage lists */
     cJSON *u; cJSON_ArrayForEach(u, cJSON_GetObjectItemCaseSensitive(o, "usage")) {
         cJSON *um = cJSON_GetObjectItemCaseSensitive(u, "model"), *ui = cJSON_GetObjectItemCaseSensitive(u, "in"), *uo = cJSON_GetObjectItemCaseSensitive(u, "out"), *uc = cJSON_GetObjectItemCaseSensitive(u, "calls");
-        if (cJSON_IsString(um) && cJSON_IsNumber(ui) && cJSON_IsNumber(uo)) usage_add(um->valuestring, (long)ui->valuedouble, (long)uo->valuedouble, cJSON_IsNumber(uc) ? (int)uc->valuedouble : 0);
+        cJSON *ucr = cJSON_GetObjectItemCaseSensitive(u, "cr"), *ucw = cJSON_GetObjectItemCaseSensitive(u, "cw");
+        if (cJSON_IsString(um) && cJSON_IsNumber(ui) && cJSON_IsNumber(uo))
+            usage_add(um->valuestring, (long)ui->valuedouble, (long)uo->valuedouble, cJSON_IsNumber(ucr) ? (long)ucr->valuedouble : 0,
+                      cJSON_IsNumber(ucw) ? (long)ucw->valuedouble : 0, cJSON_IsNumber(uc) ? (int)uc->valuedouble : 0);
     }
     g_session.last_prompt_tokens = 0;
     cJSON *cwd = cJSON_GetObjectItemCaseSensitive(o, "cwd");
@@ -708,10 +769,12 @@ static void fmt_usd(double v, char *out, size_t n) { snprintf(out, n, v > 0 && v
 
 /* what the session's hosted calls come to at their prices; *priced says whether any had one */
 static double usage_cost_total(bool *priced) {
-    double total = 0, pi, po;
+    double total = 0;
     *priced = false;
-    for (int i = 0; i < g_n_usage; i++)
-        if (model_price(g_usage[i].model, &pi, &po)) { total += ((double)g_usage[i].in * pi + (double)g_usage[i].out * po) / 1e6; *priced = true; }
+    for (int i = 0; i < g_n_usage; i++) {
+        int known = 0; double cost = usage_cost_usd(g_usage[i].model, g_usage[i].in, g_usage[i].out, g_usage[i].cr, g_usage[i].cw, &known);
+        if (known) { total += cost; *priced = true; }
+    }
     return total;
 }
 
@@ -736,7 +799,7 @@ static void cmd_usage(const char *arg) {
     if (arg && !strncmp(arg, "price", 5) && (arg[5] == ' ' || !arg[5])) { usage_price(arg + 5); return; }
     if (arg) { printf("usage: /usage   ·   /usage price MODEL IN OUT   ·   /usage price MODEL default\n"); return; }
     if (!g_n_usage) { printf(C_DIM "no model has been called in this session yet" C_RESET "\n"); return; }
-    printf(C_BOLD "usage" C_RESET C_DIM " (this session: the tokens each API counted, input ↑ and output ↓)" C_RESET "\n");
+    printf(C_BOLD "usage" C_RESET C_DIM " (this session: the tokens each API counted, input ↑ (cached included) and output ↓)" C_RESET "\n");
     int w = 0;
     for (int i = 0; i < g_n_usage; i++) { int l = (int)strlen(g_usage[i].model); if (l > w) w = l; }
     if (w > 40) w = 40;
@@ -747,7 +810,7 @@ static void cmd_usage(const char *arg) {
         double pi = 0, po = 0; int known = model_price(u->model, &pi, &po);
         printf("  %-*s  %4d call%s  ↑%-6s ↓%-6s  ", w, u->model, u->calls, u->calls == 1 ? " " : "s", tin, tout);
         if (known) {
-            double cost = ((double)u->in * pi + (double)u->out * po) / 1e6;
+            int kn = 0; double cost = usage_cost_usd(u->model, u->in, u->out, u->cr, u->cw, &kn);
             total += cost; priced = true;
             fmt_usd(cost, usd, sizeof usd);
             printf("≈ %s" C_DIM "  ($%g in · $%g out per million, %s)" C_RESET "\n", usd, pi, po, known == 2 ? "set with /usage price" : "list price");
@@ -756,6 +819,11 @@ static void cmd_usage(const char *arg) {
             printf(C_YELLOW "no price known" C_RESET C_DIM " — /usage price %s IN OUT" C_RESET "\n", u->model);
         } else if (model_is_cloud(u->model)) printf(C_DIM "an Ollama cloud model: on your ollama.com plan" C_RESET "\n");
         else printf(C_DIM "local: no charge" C_RESET "\n");
+        if (u->cr || u->cw) {   /* the cache: its hits are billed at a fraction of the input, its writes above it */
+            char tr[32], tw[32]; fmt_tokens(u->cr, tr, sizeof tr); fmt_tokens(u->cw, tw, sizeof tw);
+            printf(C_DIM "      ⟳ cache: %s read at %.3g%% of the input price" C_RESET "\n", tr, 100 * model_cache_read_ratio(u->model));
+            if (u->cw) printf(C_DIM "      ⟳ cache: %s written at %.4g× the input price" C_RESET "\n", tw, model_cache_write_ratio(u->model));
+        }
     }
     if (priced) {
         char usd[32]; fmt_usd(total, usd, sizeof usd);
@@ -998,6 +1066,10 @@ static char *build_system_prompt(void) {
         "\n# Style\n- Be concise and direct. Do not pad answers with pleasantries.\n"
         "- Use markdown lightly (code blocks for code, short lists). Reference code as path:line.\n"
         "- When writing code, follow the existing conventions of the project and write complete, working code.\n");
+    sb_puts(&b, "\n# Options\nWhen there are two or more reasonable ways to do the work and the user should choose between them, end your reply "
+                "with one fenced block named options: one line per option, the one you recommend marked [recommended], and after a dash what it does and what it costs:\n"
+                "```options\n- [recommended] Advisory lock — survives a crash, needs flock\n- Lock file — simple, but a crash leaves it behind\n```\n"
+                "Only for a real choice between approaches; for anything you can decide yourself, just do it. The user picks one with the arrow keys, and the choice comes back as their next message.\n");
     if (g_model_tools && !g_cfg.no_tools && g_cfg.mode != MODE_PLAN)
         sb_puts(&b,
             "\n# Finishing a task\nA report closes work you have finished; it is not how every turn ends. Before you "
@@ -1048,8 +1120,38 @@ static void add_message(const char *role, const char *content) {
     cJSON_AddItemToArray(g_messages, m);
 }
 
+/* A hosted model's num_ctx is only the local budget (what is kept and sent). It is not a
+ * parameter of the API. Clamp in memory when it is unset or past the model's window; a later
+ * save is what persists it. */
+static void clamp_ctx_budget(void) {
+    if (model_hosted() && g_model_max_ctx > 0 && (g_cfg.num_ctx == 0 || g_cfg.num_ctx > g_model_max_ctx))
+        g_cfg.num_ctx = g_model_max_ctx;
+}
+
 /* ---------- model info ---------- */
 static void refresh_model_caps(bool quiet) {
+    g_model_bad = false; g_model_err[0] = 0;
+    const provider_def *hosted = g_cfg.model ? provider_find(g_cfg.model, NULL) : NULL;
+    if (hosted && hosted->style != PROVIDER_MESSAGES) {
+        g_model_bad = true;
+        snprintf(g_model_err, sizeof g_model_err, "%s is an advisor, not the model that does the work — use /advisor %s", hosted->label, g_cfg.model);
+        if (!quiet) printf(C_RED "✗ %s" C_RESET "\n", g_model_err);
+        return;
+    }
+    if (hosted) {
+        int rc = provider_model_info(g_cfg.model, &g_model_info, g_model_err, sizeof g_model_err);
+        g_model_info.tools = true;   /* the endpoint does not say; a Messages model does the work with the same tools */
+        g_model_tools = true;
+        g_model_max_ctx = g_model_info.context_length;
+        g_placement_checked = true;   /* nothing is loaded here for /api/ps to place */
+        if (rc < 0) { g_model_bad = true; if (!quiet) printf(C_RED "✗ %s" C_RESET "\n", g_model_err); return; }
+        if (rc > 0 && !quiet) printf(C_YELLOW "⚠ %s — using what this provider's models generally take" C_RESET "\n", g_model_err);
+        clamp_ctx_budget();
+        const char *saved = effort_get(g_cfg.model);
+        if (saved && !quiet && !effort_resolve(&g_model_info, saved, NULL))
+            printf(C_YELLOW "⚠ effort '%s' is saved for %s, which does not offer it (any more) — it is left to the model; /effort to pick one" C_RESET "\n", saved, g_cfg.model);
+        return;
+    }
     cJSON *list = ollama_list_models();
     if (!list) return;
     bool found = false;
@@ -1123,7 +1225,21 @@ static int parse_ctx_arg(const char *a) {
 }
 
 static void set_ctx(int n) {
+    if (model_hosted() && g_model_max_ctx > 0 && (n == 0 || n > g_model_max_ctx)) {
+        if (n > g_model_max_ctx) printf(C_YELLOW "clamped to %s, the model's window" C_RESET "\n", fmt_ctx(g_model_max_ctx));
+        n = g_model_max_ctx;
+    }
+    if (g_while_busy) {
+        g_pending_ctx = n;
+        printf(C_GREEN "✓ %s: %s" C_RESET C_DIM " — from the next request" C_RESET "\n", model_hosted() ? "context budget" : "context window", n ? fmt_ctx(n) : "server default");
+        return;
+    }
     g_cfg.num_ctx = n; config_save();
+    if (model_hosted()) {
+        printf(C_GREEN "✓ context budget: %s" C_RESET "\n" C_DIM "  what is kept and sent on each call; the API has no num_ctx, and this is not sent to it" C_RESET "\n", fmt_ctx(n));
+        term_status_refresh();
+        return;
+    }
     if (n > 0) {
         printf(C_GREEN "✓ context window: %s (num_ctx %d)" C_RESET, fmt_ctx(n), n);
         if (g_model_max_ctx > 0 && n > g_model_max_ctx) printf(C_YELLOW " — larger than the model's trained length (%s); quality may degrade" C_RESET, fmt_ctx(g_model_max_ctx));
@@ -1176,7 +1292,7 @@ static void cmd_ctx(const char *arg) {
     int current = -1;
     for (int i = 0; i < n; i++) {
         sbuf a; sb_init(&a); sbuf d; sb_init(&d);
-        if (sizes[i] == 0) { sb_puts(&a, "server default"); sb_puts(&d, "let ollama decide (usually 4k)"); }
+        if (sizes[i] == 0) { sb_puts(&a, model_hosted() ? "model window" : "server default"); sb_puts(&d, model_hosted() ? "keep and send up to the model's own window" : "let ollama decide (usually 4k)"); }
         else {
             sb_printf(&a, "%s", fmt_ctx(sizes[i]));
             sb_printf(&d, "%d tokens", sizes[i]);
@@ -1278,6 +1394,7 @@ static void print_stats(chat_stats *st) {
  * memory — the usual reason a local model crawls (too large a num_ctx or model for the GPU).
  * `verbose` also reports a fully-GPU model (for /status). */
 static void check_model_placement(bool verbose) {
+    if (model_hosted()) return;   /* a hosted model is not loaded here */
     if (!g_cfg.interactive || (g_placement_checked && !verbose)) return;
     /* a request is in flight and ollama.c's streaming callbacks are global: no second HTTP call */
     if (g_while_busy) { if (verbose) printf(C_BOLD "placement  " C_RESET C_DIM "(not checked while the model is working)" C_RESET "\n"); return; }
@@ -1333,10 +1450,16 @@ static const char *TOOL_NOT_RUN =
     "not started were skipped. Their message follows below — read it first, and call this tool "
     "again if it is still what you need.";
 
-static cJSON *tool_result_message(const char *name, const char *res) {
+static const char *tool_call_id(cJSON *call) {
+    cJSON *id = call ? cJSON_GetObjectItemCaseSensitive(call, "id") : NULL;
+    return cJSON_IsString(id) && id->valuestring[0] ? id->valuestring : NULL;
+}
+
+static cJSON *tool_result_message(const char *name, const char *id, const char *res) {
     cJSON *tm = cJSON_CreateObject();
     cJSON_AddStringToObject(tm, "role", "tool");
     cJSON_AddStringToObject(tm, "tool_name", name);
+    if (id && *id) cJSON_AddStringToObject(tm, "tool_call_id", id);   /* the Messages API matches a result to its call by this */
     size_t len = strlen(res);
     size_t cap = g_cfg.num_ctx > 0 ? (size_t)(g_cfg.num_ctx * (TOOL_RESULT_PCT / 100.0) * g_bytes_per_token) : 0;
     if (!cap || len <= cap) { cJSON_AddStringToObject(tm, "content", res); return tm; }
@@ -1377,8 +1500,43 @@ static cJSON *tools_for_mode(void) {
  * tool rounds. Its streaming output is not shown; each tool call is echoed as one line and
  * the final report is previewed and returned to the parent as the tool result. */
 #define SUBAGENT_ITERS 25
+/* ---------- sub-agents: the model they run on (/subagent) ----------
+ * A sub-agent (task) runs on the model doing the work unless /subagent names another. That model's
+ * capabilities are read once and kept, as the advisor's are; its effort is the one kept for that model. */
+static model_info g_subagent_info;
+static char *g_subagent_info_for = NULL;   /* the model g_subagent_info describes */
+static char g_subagent_err[400];           /* why subagent_info() said no */
+
+/* the model sub-agents run on when it is not the one doing the work, else NULL */
+static const char *subagent_model(void) {
+    return g_cfg.subagent && *g_cfg.subagent && !model_same(g_cfg.subagent, g_cfg.model) ? g_cfg.subagent : NULL;
+}
+/* what that model can be set to, asked of its server once. False: it cannot be used (g_subagent_err says why). */
+static bool subagent_info(void) {
+    const char *m = subagent_model();
+    if (!m) return true;
+    if (g_subagent_info_for && !strcmp(g_subagent_info_for, m)) return true;
+    free(g_subagent_info_for); g_subagent_info_for = NULL;
+    g_subagent_err[0] = 0;
+    if (provider_find(m, NULL)) {
+        int r = provider_model_info(m, &g_subagent_info, g_subagent_err, sizeof g_subagent_err);
+        if (r < 0) return false;
+        if (r > 0) return true;   /* not checked (unreachable): usable with what its provider's models take, and asked again next time */
+    } else if (ollama_model_show(m, &g_subagent_info) != 0) {
+        snprintf(g_subagent_err, sizeof g_subagent_err, "the server does not know a model '%s'", m);
+        return false;
+    }
+    g_subagent_info_for = xstrdup(m);
+    return true;
+}
+
 static int run_subagent(const char *description, const char *prompt, sbuf *out) {
     printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", description);
+    const char *sm = subagent_model();
+    if (sm) {
+        if (!subagent_info()) { sb_printf(out, "error: the sub-agents' model %s cannot be used: %s. Do the task with the tools yourself, or say what is missing.", sm, g_subagent_err); return 1; }
+        printf(C_DIM "    on %s (/subagent)" C_RESET "\n", sm);
+    }
     cJSON *msgs = cJSON_CreateArray();
     cJSON *sys = cJSON_CreateObject();
     cJSON_AddStringToObject(sys, "role", "system");
@@ -1416,9 +1574,10 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         char label[48]; snprintf(label, sizeof label, "sub-agent · round %d", tool_rounds + 1);
         ollama_quiet = true; ollama_call.busy = label;
         ollama_call.followup = iter > 0;   /* think=auto: think about the task once, not after every tool result */
-        cJSON *reply = ollama_chat(msgs, g_model_tools ? tools : NULL, &st, &aborted);
+        if (sm) { ollama_call.model = sm; ollama_call.info = &g_subagent_info; }
+        cJSON *reply = model_chat(msgs, g_model_tools ? tools : NULL, &st, &aborted);
         ollama_call_reset(); ollama_quiet = false;
-        account(&st);
+        account_as(sm ? sm : g_cfg.model, &st);   /* its own model's tokens: /usage prices them as that model's */
         term_status_refresh();
         if (!reply) { sb_puts(out, aborted ? "error: sub-agent interrupted by the user" : "error: sub-agent model call failed"); break; }
         cJSON_AddItemToArray(msgs, reply);
@@ -1441,7 +1600,7 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
             if (!cut && term_queue_new()) cut = true;
             if (cut) {
                 printf("    " C_DIM "⎿ %s — not run" C_RESET "\n", name);
-                cJSON_AddItemToArray(msgs, tool_result_message(name, TOOL_NOT_RUN));
+                cJSON_AddItemToArray(msgs, tool_result_message(name, tool_call_id(call), TOOL_NOT_RUN));
                 if (parsed) cJSON_Delete(parsed);
                 continue;
             }
@@ -1453,7 +1612,7 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
             else if (!strcmp(name, "advisor")) { sb_puts(&o, "error: the advisor is not available to a sub-agent (it would be shown the wrong conversation); report what you found"); ts = TOOL_ERROR; }
             else ts = tools_execute(name, args, &o);
             (void)ts;
-            cJSON_AddItemToArray(msgs, tool_result_message(name, o.data ? o.data : ""));
+            cJSON_AddItemToArray(msgs, tool_result_message(name, tool_call_id(call), o.data ? o.data : ""));
             sb_free(&o);
             if (parsed) cJSON_Delete(parsed);
         }
@@ -1724,13 +1883,28 @@ static int run_advisor(const char *question, sbuf *out) {
  * conversation of that shape is one every chat template renders, and the advice is a tool result
  * like any other advice — where a note from the "user" would be neither. */
 static void advisor_inject(cJSON *reply, const char *label, const char *result) {
+    static int seq;
+    char id[32]; snprintf(id, sizeof id, "call_adv_%d", ++seq);
     cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
     if (!calls) calls = cJSON_AddArrayToObject(reply, "tool_calls");
     cJSON *call = cJSON_CreateObject(), *fn = cJSON_AddObjectToObject(call, "function");
+    cJSON_AddStringToObject(call, "id", id);
     cJSON_AddStringToObject(fn, "name", "advisor");
     cJSON *a = cJSON_AddObjectToObject(fn, "arguments"); cJSON_AddStringToObject(a, "question", label);
     cJSON_AddItemToArray(calls, call);
-    cJSON_AddItemToArray(g_messages, tool_result_message("advisor", result));
+    /* a reply that already carries the blocks it must be sent back as needs this call in them
+     * too, or the result that follows has no tool_use to match */
+    cJSON *pc = cJSON_GetObjectItemCaseSensitive(reply, "provider_content");
+    if (cJSON_IsArray(pc)) {
+        cJSON *b = cJSON_CreateObject(), *in = cJSON_CreateObject();
+        cJSON_AddStringToObject(b, "type", "tool_use");
+        cJSON_AddStringToObject(b, "id", id);
+        cJSON_AddStringToObject(b, "name", "advisor");
+        cJSON_AddStringToObject(in, "question", label);
+        cJSON_AddItemToObject(b, "input", in);
+        cJSON_AddItemToArray(pc, b);
+    }
+    cJSON_AddItemToArray(g_messages, tool_result_message("advisor", id, result));
 }
 
 /* guidance strong and up: before a request that changed files ends, the advisor looks at it */
@@ -1893,6 +2067,11 @@ static void advisor_set(const char *model) {
 }
 
 static void guidance_set(int n) {
+    if (g_while_busy) {
+        g_pending_guidance = n;
+        printf(C_GREEN "✓ advisor guidance: %s" C_RESET C_DIM " — from the next request" C_RESET "\n", ADVISOR_GUIDANCE[n].name);
+        return;
+    }
     g_cfg.advisor_guidance = n; config_save();
     const advisor_guidance_def *g = advisor_guidance();
     printf(C_GREEN "✓ advisor guidance: %s" C_RESET C_DIM " — %s" C_RESET "\n", g->name, g->desc);
@@ -1933,6 +2112,9 @@ static void cmd_advisor(const char *arg) {
     if (arg && !strncmp(arg, "effort", 6) && (arg[6] == ' ' || !arg[6])) {
         const char *v = arg + 6; while (*v == ' ') v++;
         if (!g_cfg.advisor) { printf(C_DIM "no advisor is set — /advisor MODEL first" C_RESET "\n"); return; }
+        if (g_while_busy && !(g_advisor_info_for && !strcmp(g_advisor_info_for, g_cfg.advisor))) {
+            printf(C_DIM "the advisor's levels are not read while the model works — set them when it is idle" C_RESET "\n"); return;
+        }
         if (!advisor_info()) {
             if (provider_find(g_cfg.advisor, NULL)) printf(C_RED "✗ %s" C_RESET "\n", g_advisor_err);
             else printf(C_RED "✗ the server does not know the advisor model '%s'" C_RESET "\n", g_cfg.advisor);
@@ -2078,7 +2260,7 @@ static bool run_turn(void) {
          * tool result — that is where most of a task's wall time goes on local models
          * (think_decide() knows when that is not an option) */
         ollama_call.followup = iters > 0;
-        cJSON *reply = ollama_chat(msgs, tools, &st, &aborted);
+        cJSON *reply = model_chat(msgs, tools, &st, &aborted);
         ollama_call_reset();
         if (tools && tools != g_tools) cJSON_Delete(tools);
         cJSON_Delete(msgs);
@@ -2090,7 +2272,7 @@ static bool run_turn(void) {
              * own request was gone (see "how full the context is"): the estimate was too low, so
              * shrink for real and retry rather than losing the turn — first by eliding every tool
              * result, then, when there is nothing left to elide, by compacting. */
-            if (!aborted && shrinks < 2 && strstr(ollama_error, "no user query")) {
+            if (!aborted && shrinks < 2 && ollama_error[0] && (strstr(ollama_error, "no user query") || strstr(ollama_error, "prompt is too long") || strstr(ollama_error, "too many tokens") || strstr(ollama_error, "exceed context"))) {
                 shrinks++;
                 printf(C_YELLOW "⚠ the conversation no longer fits in %s of context — shrinking it and retrying" C_RESET "\n", fmt_ctx(g_cfg.num_ctx));
                 if (elide_tool_results(g_messages, cJSON_GetArraySize(g_messages))
@@ -2147,7 +2329,7 @@ static bool run_turn(void) {
                 printf(C_DIM "○" C_RESET " " C_BOLD "%s" C_RESET, name);
                 if (summ[0]) printf(C_DIM "(%s)" C_RESET, summ);
                 printf("\n  ⎿  " C_DIM "not run — your message goes to the model first" C_RESET "\n");
-                cJSON_AddItemToArray(g_messages, tool_result_message(name, TOOL_NOT_RUN));
+                cJSON_AddItemToArray(g_messages, tool_result_message(name, tool_call_id(call), TOOL_NOT_RUN));
                 if (parsed) cJSON_Delete(parsed);
                 continue;
             }
@@ -2160,7 +2342,7 @@ static bool run_turn(void) {
                 if (v != ADVICE_NONE) {
                     if (v == ADVICE_STOPPED) { cut = true; sb_clear(&out); sb_puts(&out, TOOL_NOT_RUN); }
                     else printf("  ⎿  " C_YELLOW "held back — the advisor sees a problem with it" C_RESET "\n");
-                    cJSON_AddItemToArray(g_messages, tool_result_message(name, out.data));
+                    cJSON_AddItemToArray(g_messages, tool_result_message(name, tool_call_id(call), out.data));
                     sb_free(&out);
                     if (parsed) cJSON_Delete(parsed);
                     continue;
@@ -2175,7 +2357,7 @@ static bool run_turn(void) {
             else if (ts == TOOL_ERROR) printf("  ⎿  " C_RED "%s" C_RESET "\n", res);
             else print_result_folded(res, (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8);
             if (tool_result_failed(name, res, ts == TOOL_ERROR)) failed = true;
-            cJSON_AddItemToArray(g_messages, tool_result_message(name, res));
+            cJSON_AddItemToArray(g_messages, tool_result_message(name, tool_call_id(call), res));
             sb_free(&out);
             if (parsed) cJSON_Delete(parsed);
         }
@@ -2348,12 +2530,22 @@ static void worker_call(orch_run *r, int i) {
         (double)(w->sp_bytes + tools_bytes() + conv_bytes(w->msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0))
         elide_tool_results(w->msgs, w->round_first);
     ollama_call.followup = w->rounds > 0 || w->attempt > 1;   /* think=auto: think about the task once, not after every tool result */
-    char *body = ollama_chat_request(w->msgs, r->tools);
+    char *body, why[512] = "";
+    if (model_hosted()) {
+        const char *hdrs[4]; sbuf keep;
+        const provider_def *p = provider_find(g_cfg.model, NULL);
+        body = provider_turn_request(w->msgs, r->tools);   /* reads ollama_call; the headers are built here, the thread reads nothing */
+        bool ok = body && p && provider_call_headers(g_cfg.model, hdrs, &keep, why, sizeof why);
+        w->job = ok ? http_job_start(provider_base_url(p), provider_chat_path(p), body, hdrs) : NULL;
+        if (ok) sb_free(&keep);
+    } else {
+        body = ollama_chat_request(w->msgs, r->tools);
+        w->job = http_job_start(g_cfg.host, "/api/chat", body, NULL);
+    }
     ollama_call_reset();
-    w->job = http_job_start(g_cfg.host, "/api/chat", body);
     free(body);
     if (w->job) w->state = T_RUNNING;
-    else { printf("    " C_RED "[%d] ⎿ the model call could not be started" C_RESET "\n", i + 1); task_end(w, T_FAILED, "failed: the model call could not be started"); }
+    else { printf("    " C_RED "[%d] ⎿ %s" C_RESET "\n", i + 1, why[0] ? why : "the model call could not be started"); task_end(w, T_FAILED, "failed: the model call could not be started"); }
 }
 
 static void worker_begin(orch_run *r, int i) {
@@ -2432,7 +2624,8 @@ static void worker_step(orch_run *r, int i) {
     int rc = http_job_finish(w->job, &body, &res);
     w->job = NULL;
     chat_stats st; char err[512] = "";
-    cJSON *reply = rc == 0 ? ollama_chat_reply(body.data, res.status, true, &st, err, sizeof err) : NULL;
+    cJSON *reply = rc == 0 ? (model_hosted() ? provider_turn_reply(g_cfg.model, body.data, res.status, &st, err, sizeof err)
+                                            : ollama_chat_reply(body.data, res.status, true, &st, err, sizeof err)) : NULL;
     if (rc != 0) snprintf(err, sizeof err, "%s", res.err);
     sb_free(&body);
     if (!reply) { printf("    " C_RED "[%d] ⎿ the model call failed: %s" C_RESET "\n", i + 1, err); task_end(w, T_FAILED, "failed: the model call did"); return; }
@@ -2465,14 +2658,14 @@ static void worker_step(orch_run *r, int i) {
         if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
         char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
         if (!cut && term_queue_new()) cut = true;
-        if (cut) cJSON_AddItemToArray(w->msgs, tool_result_message(name, TOOL_NOT_RUN));
+        if (cut) cJSON_AddItemToArray(w->msgs, tool_result_message(name, tool_call_id(call), TOOL_NOT_RUN));
         else {
             printf("    " C_DIM "[%d] ⎿ %s%s%s%s" C_RESET "\n", i + 1, name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
             sbuf o; sb_init(&o);
             g_session.tool_calls++;
             if (!strcmp(name, "task") || !strcmp(name, "advisor")) sb_printf(&o, "error: %s is not available to a worker; do the task with the other tools and report", name);
             else tools_execute(name, args, &o);
-            cJSON_AddItemToArray(w->msgs, tool_result_message(name, o.data ? o.data : ""));
+            cJSON_AddItemToArray(w->msgs, tool_result_message(name, tool_call_id(call), o.data ? o.data : ""));
             sb_free(&o);
         }
         if (parsed) cJSON_Delete(parsed);
@@ -2663,6 +2856,7 @@ static int cmd_init(void) {
     bool aborted = run_turn();
     session_save();
     memory_note(first, aborted);
+    apply_pending();
     load_project_instructions();   /* pick up the new file right away */
     if (!aborted && g_project_instructions) printf(C_GREEN "✓ project instructions loaded" C_RESET "\n");
     return aborted ? -1 : 0;
@@ -2700,10 +2894,11 @@ static void cmd_skills(const char *arg) {
 
 /* ---------- slash commands ---------- */
 static void cmd_help(void) {
-    printf(C_BOLD "corbienest %s" C_RESET " — chat with local Ollama models, with file & shell tools\n\n", CORBIE_VERSION);
+    printf(C_BOLD "corbienest %s" C_RESET " — chat with local Ollama models, or Anthropic (anthropic:MODEL), with file & shell tools\n\n", CORBIE_VERSION);
     printf(C_BOLD "Commands\n" C_RESET
            "  /help                 this help\n"
-           "  /model [name]         pick a model from a menu, or switch directly (saved as default)\n"
+           "  /model [name]         the model that does the work: a local one, or anthropic:MODEL / claude:MODEL (ANTHROPIC_API_KEY);\n"
+           "                        the name completes as you type; no argument opens the local-model menu (saved as the default)\n"
            "  /models               list models available in ollama\n"
            "  /clear                start a new conversation\n"
            "  /compact              summarise the conversation to free context\n"
@@ -2714,6 +2909,7 @@ static void cmd_help(void) {
            "                        /usage price MODEL IN OUT sets a price (USD per million tokens), /usage price MODEL default takes the built-in one\n"
            "  /diff [git args]      show the working-tree diff (stat + patch + untracked), without sending it to the model; e.g. /diff --staged\n"
            "  /rewind               (or Esc Esc at an empty prompt) go back to an earlier request: undo the file changes since, the conversation, or both\n"
+           "  /subagent [MODEL|default]  the model sub-agents (task) run on — the one doing the work, unless set here; /subagent effort LEVEL sets how hard it thinks\n"
            "  /system [text|clear]  show/set extra system instructions\n"
            "  /think on|off|auto    when a thinking-capable model thinks: on = every call, auto = only the first call of a request (default), off\n"
            "  /think show|hide      show or hide thinking tokens\n"
@@ -2927,12 +3123,52 @@ static void effort_command(const char *who, const char *model, const model_info 
     else effort_apply(who, model, mi, items[r]);
 }
 static void cmd_effort(const char *arg) { effort_command("", g_cfg.model, &g_model_info, arg); }
+
+/* /subagent [MODEL|default] and /subagent effort [LEVEL|default]: the model sub-agents (task) run on, and
+ * how hard it thinks. A model is asked of its server first, so a wrong name is refused there and then. */
+static void subagent_report(void) {
+    const char *m = subagent_model();
+    printf("sub-agents run on " C_BOLD "%s" C_RESET "%s\n", m ? m : g_cfg.model ? g_cfg.model : "(no model)",
+           m ? "" : C_DIM " — the model doing the work" C_RESET);
+    if (m && !(g_subagent_info_for && !strcmp(g_subagent_info_for, m)))
+        printf(C_DIM "  its levels are read when a sub-agent first runs on it, or with /subagent %s" C_RESET "\n", m);
+    else if (g_cfg.model)
+        printf(C_DIM "  effort: %s" C_RESET "\n", effort_label(m ? m : g_cfg.model, m ? &g_subagent_info : &g_model_info));
+}
+static void cmd_subagent(const char *arg) {
+    if (!arg) { subagent_report(); return; }
+    if (!strncmp(arg, "effort", 6) && (arg[6] == ' ' || !arg[6])) {
+        const char *v = arg + 6; while (*v == ' ') v++;
+        if (!*v) { subagent_report(); return; }
+        if (!g_cfg.model) { printf(C_DIM "no model is set" C_RESET "\n"); return; }
+        if (!subagent_model()) { effort_apply("subagent ", g_cfg.model, &g_model_info, v); return; }   /* the same model: its effort is the one it has */
+        if (!subagent_info()) { printf(C_RED "✗ %s" C_RESET "\n", g_subagent_err); return; }
+        effort_apply("subagent ", subagent_model(), &g_subagent_info, v);
+        return;
+    }
+    if (!strcmp(arg, "default")) {
+        free(g_cfg.subagent); g_cfg.subagent = NULL; free(g_subagent_info_for); g_subagent_info_for = NULL;
+        config_save();
+        printf(C_GREEN "✓ sub-agents run on the model doing the work" C_RESET "\n");
+        return;
+    }
+    const provider_def *pv = provider_find(arg, NULL);
+    if (pv && pv->style != PROVIDER_MESSAGES) { printf(C_RED "✗ %s is an advisor only: the sub-agents need a model that does the work (a local one, or anthropic:)" C_RESET "\n", pv->label); return; }
+    char *prev = g_cfg.subagent;
+    g_cfg.subagent = xstrdup(arg);
+    if (!subagent_info()) { free(g_cfg.subagent); g_cfg.subagent = prev; printf(C_RED "✗ %s" C_RESET "\n", g_subagent_err); return; }
+    free(prev); config_save();
+    printf(C_GREEN "✓ sub-agents run on %s" C_RESET "%s\n", arg, model_same(arg, g_cfg.model) ? C_DIM " — the model doing the work" C_RESET : "");
+}
 static void cmd_status(void) {
     printf(C_BOLD "model      " C_RESET "%s%s\n", g_cfg.model, g_model_tools ? "" : C_DIM " (no tool support)" C_RESET);
-    printf(C_BOLD "host       " C_RESET "%s\n", g_cfg.host);
+    if (model_hosted()) {
+        const provider_def *pv = provider_find(g_cfg.model, NULL);
+        printf(C_BOLD "api        " C_RESET "%s\n", pv ? provider_base_url(pv) : "");
+    } else printf(C_BOLD "host       " C_RESET "%s\n", g_cfg.host);
     printf(C_BOLD "cwd        " C_RESET "%s\n", g_cwd);
     printf(C_BOLD "messages   " C_RESET "%d\n", cJSON_GetArraySize(g_messages));
-    printf(C_BOLD "context    " C_RESET "last prompt %d tokens", g_session.last_prompt_tokens);
+    printf(C_BOLD "%s" C_RESET "last prompt %d tokens", model_hosted() ? "budget     " : "context    ", g_session.last_prompt_tokens);
     if (g_cfg.num_ctx > 0) printf(" of %d (%d%%)", g_cfg.num_ctx, (int)(100.0 * g_session.last_prompt_tokens / g_cfg.num_ctx)); else printf(" (num_ctx: server default)");
     if (g_model_max_ctx > 0) printf(" · model max %d%s", g_model_max_ctx, g_model_max_ctx > g_cfg.num_ctx ? " (/ctx to enlarge)" : "");
     printf("\n" C_BOLD "tokens     " C_RESET "%ld this session (%ld in · %ld generated)\n", g_session.prompt_tokens + g_session.eval_tokens, g_session.prompt_tokens, g_session.eval_tokens);
@@ -2945,9 +3181,14 @@ static void cmd_status(void) {
     if (g_cfg.advisor) printf(C_BOLD "advisor    " C_RESET "%s" C_DIM " · guidance %s · %d consultation%s this session%s" C_RESET "\n", g_cfg.advisor, advisor_guidance()->name,
                               g_session.advisor_calls, g_session.advisor_calls == 1 ? "" : "s", g_model_tools && !g_cfg.no_tools ? "" : " · idle: the agent has no tools to ask it with");
     printf(C_BOLD "temp       " C_RESET "%s", g_cfg.temperature < 0 ? "default\n" : ""); if (g_cfg.temperature >= 0) printf("%g\n", g_cfg.temperature);
-    printf(C_BOLD "keep_alive " C_RESET "%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "server default (5m)");
-    if (g_cfg.draft >= 0) printf(C_BOLD "draft      " C_RESET "%d (draft_num_predict, %s)\n", g_cfg.draft, g_cfg.draft ? "speculative decoding / MTP" : "speculative decoding off");
-    check_model_placement(true);
+    if (model_hosted()) {
+        printf(C_BOLD "keep_alive " C_RESET C_DIM "unused — a hosted model is not kept loaded" C_RESET "\n");
+        printf(C_BOLD "draft      " C_RESET C_DIM "unused — a hosted model has no draft model" C_RESET "\n");
+    } else {
+        printf(C_BOLD "keep_alive " C_RESET "%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "server default (5m)");
+        if (g_cfg.draft >= 0) printf(C_BOLD "draft      " C_RESET "%d (draft_num_predict, %s)\n", g_cfg.draft, g_cfg.draft ? "speculative decoding / MTP" : "speculative decoding off");
+        check_model_placement(true);
+    }
     if (g_project_instructions) printf(C_BOLD "project    " C_RESET "instructions file loaded\n");
     printf(C_BOLD "memory     " C_RESET "%s%s\n", g_cfg.memory ? "on" : "off", g_memory ? " · " MEMORY_PATH " loaded" : "");
     if (g_session_id[0]) printf(C_BOLD "session    " C_RESET "%s · resume later with: corbienest --resume %s\n", g_session_id, g_session_id);
@@ -2984,7 +3225,7 @@ static bool compact_conversation(bool resuming, const char *request) {
     cJSON_AddItemToArray(msgs, u);
     chat_stats st; bool aborted;
     ollama_call.think = 0; ollama_call.followup = true; ollama_call.busy = "compacting";   /* a summary needs no thinking; keep it quick — but it is the conversation's own prompt */
-    cJSON *reply = ollama_chat(msgs, NULL, &st, &aborted);
+    cJSON *reply = model_chat(msgs, NULL, &st, &aborted);
     ollama_call_reset();
     cJSON_Delete(msgs);
     account(&st);
@@ -3067,7 +3308,19 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/models")) cmd_models();
     else if (!strcmp(cmd, "/model")) {
         if (!arg) cmd_model_picker();
-        else { free(g_cfg.model); g_cfg.model = xstrdup(arg); refresh_model_caps(false); config_save(); printf(C_GREEN "✓ model set to %s" C_RESET "%s\n", g_cfg.model, model_effort_note()); }
+        else {
+            char *prev = g_cfg.model;
+            g_cfg.model = xstrdup(arg);
+            refresh_model_caps(false);
+            if (g_model_bad) {
+                printf(C_DIM "  model left as %s" C_RESET "\n", prev ? prev : "(none)");
+                free(g_cfg.model); g_cfg.model = prev;
+                refresh_model_caps(true);
+            } else {
+                free(prev); config_save();
+                printf(C_GREEN "✓ model set to %s" C_RESET "%s\n", g_cfg.model, model_effort_note());
+            }
+        }
     }
     else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { memory_flush(); cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); g_prev_request_first = -1; tools_reset_permissions(); tools_checkpoint_clear(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
     else if (!strcmp(cmd, "/compact")) { if (cmd_compact()) session_save(); }
@@ -3103,6 +3356,7 @@ static int handle_slash(char *line) {
     }
     else if (!strcmp(cmd, "/effort")) cmd_effort(arg);
     else if (!strcmp(cmd, "/advisor")) cmd_advisor(arg);
+    else if (!strcmp(cmd, "/subagent")) cmd_subagent(arg);
     else if (!strcmp(cmd, "/yolo")) {
         bool on = !arg ? !YOLO() : !strcmp(arg, "on");
         g_cfg.mode = on ? MODE_AUTO : MODE_MANUAL;
@@ -3199,6 +3453,7 @@ static int handle_slash(char *line) {
         bool aborted = run_turn();
         session_save();
         memory_note(first, aborted);
+        apply_pending();
         if (aborted) return -1;
     }
     return 0;
@@ -3213,18 +3468,38 @@ static int handle_slash(char *line) {
  * /init and skills do), start an HTTP request while one is streaming — ollama.c's
  * callbacks are global (/model, /models, /ctx, /host, /memory update), ask the user
  * anything (the pickers), or change the ground under the running turn (/cd). */
+/* A setting that changes the prompt or the tool list is not applied under a request in flight: it
+ * is run when the next request starts. /think show|hide only change the display, so they run now. */
+static bool slash_waits_for_next(const char *cmd, const char *arg) {
+    if (!arg) return false;
+    if (!strcmp(cmd, "/think")) return strcmp(arg, "show") && strcmp(arg, "hide");
+    if (!strcmp(cmd, "/effort")) return true;
+    if (!strcmp(cmd, "/advisor")) return !strncmp(arg, "window", 6) && (arg[6] == ' ' || !arg[6]);
+    return false;
+}
+
 static bool slash_runs_while_busy(const char *cmd, const char *arg) {
     static const char *ok[] = {
         "/help", "/?", "/status", "/cost", "/usage", "/diff", "/history", "/pwd", "/skills",
-        "/mode", "/yolo", "/permissions", "/tools", "/workers", "/max_iters", "/max-iters", "/think", "/effort", "/temp",
+        "/mode", "/yolo", "/permissions", "/tools", "/workers", "/max_iters", "/max-iters", "/temp",
         "/keepalive", "/keep-alive", "/memory", "/web", NULL };
     /* /web with an argument is not just a report: on|off rebuilds the tool list the running
      * turn is holding, and engine writes the config. Bare /web only prints. */
     if (!strcmp(cmd, "/web") && arg) return false;
+    /* /ctx with a size only sets the window for the next request; bare /ctx opens the picker */
+    if ((!strcmp(cmd, "/ctx") || !strcmp(cmd, "/context"))) return arg != NULL;
     /* /advisor with an argument asks the server about the model and rebuilds the tool list as
      * well; bare, it only reports. /effort never needs the server: what the model offers was
      * read when it was chosen, and while busy it prints the choices instead of asking. */
-    if (!strcmp(cmd, "/advisor")) return !arg;
+    /* /advisor guidance LEVEL and /advisor effort LEVEL run at once too (the first waits for the next request);
+     * the other forms of /advisor ask the server or change the advisor: not while busy */
+    if (!strcmp(cmd, "/advisor"))
+        return !arg || (!strncmp(arg, "guidance", 8) && (arg[8] == ' ' || !arg[8])) || (!strncmp(arg, "effort", 6) && (arg[6] == ' ' || !arg[6]))
+            || (!strncmp(arg, "ctx", 3) && (arg[3] == ' ' || !arg[3]));   /* the window of a consultation: read by the next one */
+    /* the bare forms report; with an argument /think, /effort and /advisor window wait (slash_waits_for_next) */
+    if (!strcmp(cmd, "/think")) return !arg || !strcmp(arg, "show") || !strcmp(arg, "hide");
+    if (!strcmp(cmd, "/effort")) return !arg;
+    if (!strcmp(cmd, "/subagent")) return !arg;   /* with a model: asked of its server, so it waits for the turn to end (like /model) */
     /* /memory update — and "every N" once N requests are pending — runs the extraction call;
      * "idle N" only sets the delay for the next prompt, so it is safe mid-turn */
     if (!strcmp(cmd, "/memory") && arg && strcmp(arg, "on") && strcmp(arg, "off") && strcmp(arg, "clear")
@@ -3238,12 +3513,20 @@ static bool slash_runs_while_busy(const char *cmd, const char *arg) {
 static int run_slash_while_busy(const char *line) {
     char *cmd = xstrndup(line, strcspn(line, " "));
     const char *arg = line + strlen(cmd); while (*arg == ' ') arg++;
-    bool ok = slash_runs_while_busy(cmd, *arg ? arg : NULL);
+    bool later = slash_waits_for_next(cmd, *arg ? arg : NULL);
+    bool ok = later || slash_runs_while_busy(cmd, *arg ? arg : NULL);
     free(cmd);
     if (!ok) return 0;
     hist_add(line); hist_save();
     term_line_break();   /* the model may be mid-sentence */
     echo_queued(line);
+    if (later) {
+        g_pending_lines = xrealloc(g_pending_lines, sizeof *g_pending_lines * (size_t)(g_pending_n + 1));
+        g_pending_lines[g_pending_n++] = xstrdup(line);
+        printf(C_GREEN "✓ %s" C_RESET C_DIM " — from the next request" C_RESET "\n", line);
+        term_status_refresh();
+        return 1;
+    }
     char *copy = xstrdup(line);
     g_while_busy = true;
     handle_slash(copy);
@@ -3278,9 +3561,14 @@ static void host_warning(const char *lead) {
     printf("%s" C_YELLOW "⚠ plain http to %s: the conversation crosses the network unencrypted" C_RESET C_DIM " (an https:// host keeps it private)" C_RESET "\n", lead, h);
 }
 
+static bool ollama_needed(void) {   /* the working model is local, or the advisor is a model on the Ollama server */
+    return !model_hosted() || (g_cfg.advisor && !provider_find(g_cfg.advisor, NULL));
+}
+
 static void banner(void) {
-    char ver[128];
-    int ok = ollama_ping(ver, sizeof ver);
+    bool need_ollama = ollama_needed();
+    char ver[128] = "";
+    int ok = need_ollama ? ollama_ping(ver, sizeof ver) : 0;
     int w = term_width(); if (w < 40) w = 40;
     printf(C_ORANGE "╭"); for (int i = 0; i < w - 2; i++) printf("─"); printf("╮" C_RESET "\n");
     printf(C_ORANGE "│" C_RESET " " C_BOLD "🐦‍⬛ Corbie Nest" C_RESET " v%s — local coding agent for Ollama\n", CORBIE_VERSION);
@@ -3296,12 +3584,22 @@ static void banner(void) {
         if (pv && !(key && *key)) printf(C_YELLOW " · %s is not set" C_RESET, pv->key_env);
         printf("\n");
     }
-    printf(C_ORANGE "│" C_RESET " " C_DIM "host: " C_RESET " %s %s\n", g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);
-    host_warning(C_ORANGE "│" C_RESET " ");
+    if (model_hosted()) {
+        const provider_def *pv = provider_find(g_cfg.model, NULL);
+        const char *key = pv ? getenv(pv->key_env) : NULL;
+        printf(C_ORANGE "│" C_RESET " " C_DIM "api:  " C_RESET " %s · %s %s\n", pv ? provider_base_url(pv) : "", pv ? pv->key_env : "", key && *key ? C_GREEN "set" C_RESET : C_RED "not set" C_RESET);
+        if (need_ollama) printf(C_ORANGE "│" C_RESET " " C_DIM "host: " C_RESET " %s %s" C_DIM " (the advisor)" C_RESET "\n", g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);
+    } else {
+        printf(C_ORANGE "│" C_RESET " " C_DIM "host: " C_RESET " %s %s\n", g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);
+        host_warning(C_ORANGE "│" C_RESET " ");
+    }
     printf(C_ORANGE "│" C_RESET " " C_DIM "cwd:  " C_RESET " %s%s\n", g_cwd, g_project_instructions ? C_DIM " (project instructions loaded)" C_RESET : "");
     if (g_cfg.mode != MODE_MANUAL) printf(C_ORANGE "│" C_RESET " " C_DIM "mode:  " C_RESET " %s%s" C_RESET "\n", g_cfg.mode == MODE_AUTO ? C_RED : g_cfg.mode == MODE_PLAN ? C_CYAN : C_ORANGE, mode_label(g_cfg.mode));
     printf(C_ORANGE "╰"); for (int i = 0; i < w - 2; i++) printf("─"); printf("╯" C_RESET "\n");
-    if (ok != 0) printf(C_RED "cannot reach ollama at %s: %s" C_RESET "\n" C_DIM "start it with `ollama serve`, or set the host with /host or OLLAMA_HOST" C_RESET "\n", g_cfg.host, ver);
+    if (need_ollama && ok != 0) {
+        if (model_hosted()) printf(C_YELLOW "cannot reach ollama at %s: %s — the advisor's consultations need it" C_RESET "\n" C_DIM "start it with `ollama serve`, or set the host with /host or OLLAMA_HOST" C_RESET "\n", g_cfg.host, ver);
+        else printf(C_RED "cannot reach ollama at %s: %s" C_RESET "\n" C_DIM "start it with `ollama serve`, or set the host with /host or OLLAMA_HOST" C_RESET "\n", g_cfg.host, ver);
+    }
     printf(C_DIM "/help for commands · @file to attach · !cmd for shell · shift+tab to switch mode · Ctrl-D to quit" C_RESET "\n\n");
 }
 
@@ -3346,11 +3644,12 @@ static cJSON *model_list_get(int slot, const provider_def *p, const char **why) 
 
 static void sug_add(term_sug **v, int *n, const char *text, const char *desc, bool open);
 
-/* What /advisor could be given besides its options: an installed model, or a hosted provider's
- * prefix — and behind the prefix, the models its key can use. The providers come before the
+/* What /advisor or /model could be given besides its options: an installed model, or a hosted
+ * provider's prefix — and behind the prefix, the models its key can use. /model only offers
+ * Anthropic (it can do the work; xAI and OpenAI stay advisors). The providers come before the
  * installed models (those can be many, and a hosted one is what nobody would guess is there);
  * of the models, names that start with what was typed come first, then those that contain it. */
-static void suggest_advisor(const char *word, term_sug **items, int *n) {
+static void suggest_advisor(const char *word, term_sug **items, int *n, bool working) {
     size_t wl = strlen(word);
     const char *colon = strchr(word, ':');
     const provider_def *pv = NULL, *p;
@@ -3358,6 +3657,7 @@ static void suggest_advisor(const char *word, term_sug **items, int *n) {
         sbuf probe; sb_init(&probe); sb_append(&probe, word, (size_t)(colon - word) + 1); sb_putc(&probe, 'x');
         pv = provider_find(probe.data, NULL);
         sb_free(&probe);
+        if (working && pv && pv->style != PROVIDER_MESSAGES) pv = NULL;   /* xAI and OpenAI are advisors; /model does not offer them */
     }
     cJSON *m;
     if (pv) {
@@ -3382,10 +3682,11 @@ static void suggest_advisor(const char *word, term_sug **items, int *n) {
         return;
     }
     for (int i = 0; (p = provider_at(i)); i++) {   /* by either name: "grok", "chatgpt" and "claude" are what people type */
-        char pre[48], desc[128]; snprintf(pre, sizeof pre, "%s:", p->name);
+        if (working && p->style != PROVIDER_MESSAGES) continue;
+        char pre[48], desc[160]; snprintf(pre, sizeof pre, "%s:", p->name);
         if (strncasecmp(pre, word, wl) && (!p->alias || strncasecmp(p->alias, word, wl))) continue;
         const char *key = getenv(p->key_env);
-        snprintf(desc, sizeof desc, "%s (%s), a hosted API · %s %s", p->label, p->known_as, p->key_env, key && *key ? "set" : "not set");
+        snprintf(desc, sizeof desc, working ? "%s (%s) — the model that does the work · %s %s" : "%s (%s), a hosted API · %s %s", p->label, p->known_as, p->key_env, key && *key ? "set" : "not set");
         sug_add(items, n, pre, desc, true);
     }
     cJSON *list = model_list_get(0, NULL, NULL);
@@ -3501,13 +3802,72 @@ static int suggest(const char *buf, size_t cur, size_t *from, term_sug **items) 
         }
         break;
     }
-    if (!strcmp(before, "/advisor")) suggest_advisor(word, items, &n);
+    if (!strcmp(before, "/advisor")) suggest_advisor(word, items, &n, false);
+    else if (!strcmp(before, "/model") || !strcmp(before, "/subagent")) suggest_advisor(word, items, &n, true);
     free(before); free(word);
     return n;
 }
 
 /* Handle one line of user input (from the editor or the message queue).
  * Returns 1 to quit, -1 if the model turn was interrupted, 0 otherwise. */
+/* The implementation options the model ended its last reply with: a fenced ```options block, one line per
+ * option ("- [recommended] Title — what it does"). They are offered as a picker, with the recommended one
+ * under the cursor, and the chosen one comes back as the next message: malloc'd, or NULL when there are none
+ * or the user chose none. */
+static char *options_choose(void) {
+    static int offered_at = -1;   /* the conversation's length when its last reply's options were offered: a slash command, which adds nothing, does not offer them again */
+    if (!g_cfg.interactive || !g_messages) return NULL;
+    if (cJSON_GetArraySize(g_messages) == offered_at) return NULL;
+    offered_at = cJSON_GetArraySize(g_messages);
+    cJSON *last = NULL;
+    for (int i = cJSON_GetArraySize(g_messages) - 1; i >= 0 && !last; i--) {
+        cJSON *role = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(g_messages, i), "role");
+        if (cJSON_IsString(role) && !strcmp(role->valuestring, "assistant")) last = cJSON_GetArrayItem(g_messages, i);
+    }
+    cJSON *content = last ? cJSON_GetObjectItemCaseSensitive(last, "content") : NULL;
+    if (!cJSON_IsString(content)) return NULL;
+    const char *head = strstr(content->valuestring, "```options");
+    const char *body = head ? strchr(head, '\n') : NULL;
+    if (!body) return NULL;
+    body++;
+    const char *end = strstr(body, "```");
+    size_t blen = end ? (size_t)(end - body) : strlen(body);
+    char *blk = xstrndup(body, blen);
+    char *labels[12], *descs[12]; int n = 0, rec = -1;
+    for (char *ln = strtok(blk, "\n"); ln && n < 12; ln = strtok(NULL, "\n")) {
+        while (*ln == ' ' || *ln == '\t') ln++;
+        if (!(ln[0] == '-' || ln[0] == '*') || ln[1] != ' ') continue;
+        ln += 2; while (*ln == ' ') ln++;
+        if (!strncmp(ln, "[recommended]", 13)) { rec = n; ln += 13; while (*ln == ' ') ln++; }
+        const char *dash = strstr(ln, " — ");   /* the dash between title and what it does (an em dash, or a hyphen) */
+        size_t sep = strlen(" — ");
+        if (!dash) { dash = strstr(ln, " - "); sep = 3; }
+        labels[n] = dash ? xstrndup(ln, (size_t)(dash - ln)) : xstrdup(ln);
+        descs[n] = dash ? xstrdup(dash + sep) : xstrdup("");
+        n++;
+    }
+    char *chosen = NULL;
+    if (n >= 2) {
+        const char *items[12], *shown[12]; char *dbuf[12];
+        for (int i = 0; i < n; i++) {
+            items[i] = labels[i];
+            sbuf d; sb_init(&d); sb_puts(&d, descs[i]);
+            if (i == rec) sb_puts(&d, *descs[i] ? " · recommended" : "recommended");
+            dbuf[i] = sb_detach(&d); shown[i] = dbuf[i];
+        }
+        int r = term_select("Implementation options", items, shown, n, rec >= 0 ? rec : 0);
+        if (r >= 0) {
+            sbuf c; sb_init(&c); sb_printf(&c, "Go with this: %s", labels[r]);
+            if (*descs[r]) sb_printf(&c, " — %s", descs[r]);
+            chosen = sb_detach(&c);
+        }
+        for (int i = 0; i < n; i++) free(dbuf[i]);
+    }
+    for (int i = 0; i < n; i++) { free(labels[i]); free(descs[i]); }
+    free(blk);
+    return chosen;
+}
+
 static int process_input(char *line) {
     char *s = line; while (*s == ' ' || *s == '\t' || *s == '\n') s++;
     size_t n = strlen(s); while (n && (s[n-1] == ' ' || s[n-1] == '\n' || s[n-1] == '\t')) s[--n] = 0;
@@ -3526,6 +3886,7 @@ static int process_input(char *line) {
     bool aborted = run_turn();
     session_save();
     memory_note(first, aborted);
+    apply_pending();
     printf("\n");
     fflush(stdout);
     return aborted ? -1 : 0;
@@ -3675,7 +4036,8 @@ static int run_benchmark(int runs, const char *prompt, bool ctx_given, bool json
 
 static void usage(void) {
     printf("usage: corbienest [options] [-p PROMPT]\n"
-           "  -m, --model NAME     model to use (default: saved / first tool-capable model)\n"
+           "  -m, --model NAME     model that does the work (default: saved / first tool-capable local model);\n"
+           "                       anthropic:MODEL or claude:MODEL uses the Anthropic API (ANTHROPIC_API_KEY)\n"
            "  -H, --host URL       ollama host (default $OLLAMA_HOST or http://127.0.0.1:11434)\n"
            "  -c, --ctx N          context window (num_ctx), e.g. 32768, 64k, 128k\n"
            "      --keep-alive DUR keep the model loaded between requests (default 30m; -1 forever, 0 unload, default = server's)\n"
@@ -3760,6 +4122,7 @@ int main(int argc, char **argv) {
     tools_permissions_load();
     skills_load();
     refresh_model_caps(oneshot != NULL || bench_runs);
+    if (g_model_bad) { fprintf(stderr, "corbienest: %s\n", g_model_err); term_restore(); return 1; }
     if (!g_cfg.model) { fprintf(stderr, "corbienest: no models found on %s (run `ollama pull <model>`)\n", g_cfg.host); return 1; }
     if (cli_effort) {   /* only now is it known what the model offers */
         if (!strcmp(cli_effort, "default")) effort_set(g_cfg.model, NULL);
@@ -3771,6 +4134,7 @@ int main(int argc, char **argv) {
         } else { effort_set(g_cfg.model, cli_effort); if (strcmp(cli_effort, "off") && g_cfg.think == 0) g_cfg.think = -1; }
     }
     if (bench_runs) {
+        if (provider_find(g_cfg.model, NULL)) { fprintf(stderr, "corbienest: --benchmark measures an Ollama model; %s is a hosted one\n", g_cfg.model); term_restore(); return 2; }
         int json_fd = -1;
         if (json_out) {   /* the report is dropped; only the JSON goes to the real stdout */
             fflush(stdout);
@@ -3859,6 +4223,13 @@ int main(int argc, char **argv) {
             echo_queued(q);
             rc = process_input(q);
             free(q);
+        }
+        /* the options the model offered at the end of its reply: the one chosen is the next message */
+        while (rc == 0 && !term_queue_count()) {
+            char *pick = options_choose();
+            if (!pick) break;
+            rc = process_input(pick);
+            free(pick);
         }
         if (rc == 1) break;
         if (rc == -1) term_queue_to_editor();

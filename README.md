@@ -1,7 +1,8 @@
 # Corbie Nest
 
 A Claude-Code-style terminal coding agent written in plain C that talks to
-**local Ollama models**. It streams responses, lets the model read/write/edit
+**local Ollama models**, or to **Anthropic's API** directly (`--model anthropic:claude-haiku-5.5`,
+with `--advisor anthropic:claude-opus-5.5` when a stronger model should be consulted). It streams responses, lets the model read/write/edit
 files, grep the codebase, and run shell and git commands — each mutating action
 is shown to you and confirmed before it runs.
 
@@ -11,8 +12,8 @@ corbienest takes over the terminal (alternate screen) while it runs, like Claude
 conversation scrolls in the upper part, and the bottom of the screen is the app's: an input
 field — a rule, the `❯` prompt, a rule — so it is always visible that input is accepted,
 even while the model works, and under it a status bar showing the permission mode, the
-model, the tokens used this session (↑ prompt · ↓ generated, ticking while the model
-streams) and context usage. The field grows with what you type (up to ten rows, then it
+model, the tokens used this session (↑ prompt · ⟳ cache hits, when a hosted model had them · ↓ generated, ticking while the model
+streams) and context usage, and under the bar a location line: the working folder as an absolute path, and the git branch it is on when it is in a repository. The field grows with what you type (up to ten rows, then it
 scrolls) and the conversation region shrinks to match; what you send moves up into the
 transcript as a `›` line. Whenever the app is waiting on something — the
 model loading or generating, a tool's shell command, an Ollama request — an animated
@@ -24,8 +25,9 @@ exit your shell is back exactly as it was (use `/save` to keep a transcript).
 
 Dependencies: a C11 compiler, `make`, [cJSON](https://github.com/DaveGamble/cJSON) and
 [libcurl](https://curl.se/libcurl/) (7.66 or newer) — that's all. No ncurses: the UI uses ANSI
-escapes. libcurl is what speaks HTTPS, for an Ollama behind TLS and for the hosted APIs the
-[advisor](#the-advisor) can consult. (`python3` is only needed to run the test suite, and
+escapes. libcurl is what speaks HTTPS, for an Ollama behind TLS and for the hosted APIs —
+an Anthropic model that does the work, or an [advisor](#the-advisor) on xAI, OpenAI or Anthropic.
+(`python3` is only needed to run the test suite, and
 `openssl` for its HTTPS tests.)
 
 ```sh
@@ -63,7 +65,8 @@ e.g. `ollama pull qwen3-coder:30b`, `qwen2.5-coder`, `devstral`, `llama3.1`, `gp
 
 ```
 corbienest [options] [-p PROMPT]
-  -m, --model NAME     model to use (default: saved / first tool-capable model)
+  -m, --model NAME     model that does the work (default: saved / first tool-capable Ollama model);
+                       anthropic:MODEL or claude:MODEL uses the Anthropic API (ANTHROPIC_API_KEY)
   -H, --host URL       ollama host (default $OLLAMA_HOST or http://127.0.0.1:11434)
   -c, --ctx N          context window (num_ctx, default 32768; accepts 64k, 128k, default)
   -s, --system TEXT    extra system instructions
@@ -113,7 +116,7 @@ larger ones skipped.)
 
 | command | what it does |
 |---|---|
-| `/model` | interactive model picker (↑/↓, type to filter, Enter) — `/model NAME` switches directly |
+| `/model` | interactive picker of the local models (↑/↓, type to filter, Enter). Typing `/model` completes a local name, or `anthropic:` / `claude:` and that key's models — `/model NAME` switches directly, and `anthropic:NAME` or `claude:NAME` makes that Claude model the one that does the work (`ANTHROPIC_API_KEY`) |
 | `/models` | list installed models with tool/thinking capabilities |
 | `/clear` | new conversation |
 | `/compact` | have the model summarise the conversation to free context |
@@ -124,11 +127,12 @@ larger ones skipped.)
 | `/orchestrate REQUEST` | the advisor model in charge: it plans the request as tasks, the main model does them as workers — several at a time where the plan allows — and the advisor reviews each; see [Orchestrating](#orchestrating) |
 | `/workers [N]` | how many tasks of `/orchestrate` may run at the same time (default 3, `1` = one after another) |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
-| `/usage`, `/usage price MODEL IN OUT\|default` | tokens per model in this session — the main model, the advisor — and the **estimated cost** of the hosted ones, at the provider's list price per million tokens (built in, as of October 2026) or the one you set with `price`. The same estimate is on each consultation's result line (`⎿ advice · 4.2k tokens · 12s · ≈ $0.03`) and in `/cost`. An estimate: what was billed is on the provider's usage page |
+| `/usage`, `/usage price MODEL IN OUT\|default` | tokens per model in this session — the main model, the advisor — and the **estimated cost** of the hosted ones. The providers' prompt-cache hits (`⟳ cache … read`) are priced at their cached-input rate — Anthropic's a tenth of the input price (5% or 2.5% on the newest models), OpenAI's and xAI's as their price lists give it for each model — and Anthropic's cache writes at 1.25×; they are shown on their own line, as `↑` is the input that was not from the cache. The list price per million tokens (built in, as of October 2026) or the one you set with `price`. The same estimate is on each consultation's result line (`⎿ advice · 4.2k tokens · 12s · ≈ $0.03`) and in `/cost`. An estimate: what was billed is on the provider's usage page |
 | `/system [text\|clear]` | extra system instructions |
 | `/think on\|off\|auto`, `/think show\|hide` | *when* a thinking-capable model thinks: `auto` (default) lets it think about each request once and turns thinking off for the tool rounds that follow, `on` thinks on every call, `off` never. *How hard* is `/effort` (`/think low\|medium\|high\|max` still works, as an alias for it) |
-| `/effort [LEVEL\|default]` | how hard **this model** thinks, in the levels it has — see [Effort](#effort). No argument opens a picker of them; `default` leaves it to the model. Kept per model, shown next to the model's name in the status bar |
-| `/advisor [MODEL\|off]`, `/advisor guidance [LEVEL]`, `/advisor effort [LEVEL]`, `/advisor window MINUTES\|off`, `/advisor ctx N\|auto` | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud or hosted model is set by name: `/advisor gpt-oss:120b-cloud`, `/advisor anthropic:claude-opus-5`). `guidance` says how much the agent leans on it (`light`, `normal`, `strong`, `max`), `effort` how hard it thinks |
+| `/effort [LEVEL\|default]` | how hard **this model** thinks, in the levels it has — see [Effort](#effort). No argument opens a picker of them; `default` leaves it to the model. Kept per model, shown next to the model's name in the status bar. Given while the model works, it applies when the turn ends |
+| `/advisor [MODEL\|off]`, `/advisor guidance [LEVEL]`, `/advisor effort [LEVEL]`, `/advisor window MINUTES\|off`, `/advisor ctx N\|auto` (given while the model works: `ctx` applies at the next consultation, `guidance` and `window` when the turn ends) | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud or hosted model is set by name: `/advisor gpt-oss:120b-cloud`, `/advisor anthropic:claude-opus-5`). `guidance` says how much the agent leans on it (`light`, `normal`, `strong`, `max`), `effort` how hard it thinks |
+| `/subagent [MODEL\|default]`, `/subagent effort [LEVEL\|default]` | the model the sub-agents (`task`) run on. Default: the model doing the work. Another one is checked with its server first (a local model, Ollama's cloud, or a hosted `anthropic:`/`xai:`/`openai:` model) and then kept in the config as `subagent=`. `effort` sets how hard that model thinks, in its own levels (kept per model, as `/effort` does; the same model as the one doing the work shares its effort). Given with a model, it waits for the turn to end, like `/model`. See [Sub-agents](#sub-agents) |
 | `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (`.corbienest/permissions`) |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
@@ -172,6 +176,7 @@ larger ones skipped.)
   Esc closes the list first; it is the Esc after that one which stops the model.
 - `# fact` — remember something: a menu asks which section of `.corbienest/memory.md` it belongs
   to (Project / User / Feedback / Reference) and the line is appended, no model call involved.
+- **Code is highlighted.** A fenced block in a reply is coloured by its language (`` ```python ``, `c`, `js`, `sh`, `json`, … — keywords, strings, comments and numbers, basic; a block without a language is plain), and so is the preview of a file the model writes, by the file's extension. The colours are escapes only, so the text and its wrapping are unchanged.
 - Enter sends; Alt+Enter, Ctrl+J or a trailing `\` inserts a newline. Bracketed paste works.
 - Ctrl-C (or Esc) cancels a running generation / clears the line (twice on an empty line quits).
 - **Tool results are folded.** What `grep`, `cat` or a build prints is for the model; in the
@@ -213,7 +218,11 @@ larger ones skipped.)
 - **Slash commands that only report or set something answer straight away while the model
   works** — they never become a queued message: `/help`, `/status`, `/cost`, `/diff`, `/history`,
   `/pwd`, `/skills`, `/memory`, `/mode`, `/yolo`, `/permissions`, `/tools`, `/max_iters`,
-  `/think`, `/effort` (it prints the levels instead of opening the picker), bare `/advisor`, `/temp`, `/keepalive`. A `/permissions add` or `/mode` typed mid-turn applies to the
+  `/think show|hide`, bare `/think`, `/effort` (bare: it prints the levels instead of opening the picker), `/advisor ctx`, bare `/advisor`, `/temp`, `/keepalive`.
+  `/mode` runs at once on purpose: it is the switch you want while the agent is editing. The settings that change the prompt
+  or the tool list — `/think LEVEL|on|off|auto`, `/effort LEVEL`, `/ctx N`, `/advisor guidance`, `/advisor window` — are accepted
+  while the model works and applied when the turn ends (at the latest, when the next request starts): the running turn keeps the
+  settings it started with, so the model's prompt cache is not rebuilt mid-turn. Each says "from the next request" when it is taken. A `/permissions add` or `/mode` typed mid-turn applies to the
   tool confirmations still to come, like Shift+Tab, and `/max_iters` to the rounds still to come. Everything that touches the conversation (`/clear`, `/compact`,
   `/rewind`, `/resume`, `/save`, `/system`, `/init`, skills), needs the server (`/model`,
   `/models`, `/ctx`, `/host`, `/memory update`) or asks a question stays queued until the turn ends.
@@ -280,7 +289,7 @@ Cycle with **Shift+Tab** at the prompt, or set one with `/mode NAME`, `--mode NA
 | `bash(command, timeout?)` | yes — shows the command; output/exit code returned to the model |
 | `web_search(query, max_results?)` | yes — shows the query and the engine; "always allow" saves the engine's **host** |
 | `web_fetch(url, offset?, timeout?)` | yes — shows the URL; "always allow" saves the **host** |
-| `task(description, prompt)` | none for the call itself — runs a **sub-agent**: a fresh, read-only agent loop (read_file, list_dir, grep, bash, web_search, web_fetch — with the usual confirmations) that investigates and returns a report as the tool result, keeping the noise out of the main context. Its tool calls are echoed as `⎿ grep(…)` lines and the report is previewed. Sub-agents cannot edit files or start further sub-agents |
+| `task(description, prompt)` | none for the call itself — runs a **sub-agent**: a fresh, read-only agent loop (read_file, list_dir, grep, bash, web_search, web_fetch — with the usual confirmations) that investigates and returns a report as the tool result, keeping the noise out of the main context. Its tool calls are echoed as `⎿ grep(…)` lines and the report is previewed. Sub-agents cannot edit files or start further sub-agents. It runs on the model `/subagent` names, at that model's effort, and its tokens are priced as that model's |
 | `advisor(question?)` | none — only on offer after `/advisor MODEL`. Puts the agent's question, and the conversation so far, to a **stronger model** (local, Ollama cloud, or a hosted API) and returns its advice as the tool result; see [The advisor](#the-advisor) |
 
 Each confirmation is a small menu:
@@ -351,6 +360,46 @@ partway — the model writes no report and says instead, in a line or two, what 
 not, and what comes next. There is no report in plan mode either (the plan is the answer), nor
 after a turn that only answered a question or stopped to ask you something. Small local models
 follow all of this more loosely than large ones.
+
+### Sub-agents
+
+A sub-agent is a fresh agent loop that the model starts with the `task` tool to investigate one
+self-contained question. It has read-only tools, works in its own context, and returns one
+report, so the main conversation only sees the answer. By default it runs on the model doing the
+work. `/subagent` changes that, separately from the main model:
+
+```
+/subagent qwen3-coder:30b          a local model, fast enough to read a lot
+/subagent anthropic:claude-haiku-5 a hosted one, for the reading (ANTHROPIC_API_KEY)
+/subagent effort low               how hard that model thinks, in the levels it has
+/subagent default                  back to the model doing the work
+```
+
+- A model is asked of its server when it is set (`/subagent` refuses a name the server does not
+  know), and its levels are read then, so `/subagent effort` can check them.
+- Its tokens go to `/usage` under its own name, so a cheap reading model shows up as one, with
+  its price.
+- The setting is saved (`subagent=` in the config), so it holds for the next session as well.
+- Sub-agents still have no edit tools and cannot start sub-agents or ask the advisor, whatever
+  model they run on.
+
+### Choosing between options
+
+When the model sees two or more reasonable ways to do the work, it ends its reply with the
+options as a short list, the one it recommends marked:
+
+```options
+- [recommended] Advisory lock — survives a crash, needs flock
+- Lock file — simple, but a crash leaves it behind
+```
+
+corbienest reads that block when the reply is finished and offers the options as a picker, with
+the recommended one under the cursor: ↑/↓ to choose, Enter to take it, Esc to take none. The
+choice goes back to the model as your next message (`Go with this: Advisory lock — …`), so the
+work carries on with the option you picked. The picker only comes up when no message is queued
+behind the reply, and in a plain pipe (`-p`) nothing is offered, as there is nothing to choose
+with. The model is told to use the block only for a real choice between approaches; for
+anything it can decide itself it just does the work.
 
 ### Skills
 
@@ -629,6 +678,14 @@ hosted, cloud or a bigger local one) is in charge, and the model doing the work 
 | OpenAI | `openai:gpt-5.2` (or `chatgpt:…`) | `OPENAI_API_KEY` | `https://api.openai.com/v1` (`OPENAI_BASE_URL`) | Chat Completions |
 | Anthropic (Claude) | `anthropic:claude-opus-5` (or `claude:…`) | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` (`ANTHROPIC_BASE_URL`) | Messages |
 
+Anthropic can also be **the model that does the work**, not only the advisor.
+`--model anthropic:claude-haiku-5.5` (or `claude:…`, or `/model` the same way) reads, edits and
+runs tools through the Messages API, and `--advisor anthropic:claude-opus-5.5` is still a separate
+consultation. xAI and OpenAI stay advisors: `/model xai:…` or `openai:…` is refused. The
+conversation is sent on every model call. `/ctx` is only the local budget for what is kept and
+sent — it is not a parameter of the API, and it is clamped to the model's input window.
+`keep_alive` and `--draft` apply to Ollama only, and `--benchmark` measures an Ollama model.
+
 - **Keys come from the environment only** — export one before starting corbienest. They are
   never written to the config, a session or the history. An API key from the provider's
   console is what is needed; a chat subscription (grok.com, ChatGPT, claude.ai) is not one.
@@ -652,8 +709,8 @@ hosted, cloud or a bigger local one) is in charge, and the model doing the work 
 
 ### Config
 
-Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N` are saved to
-`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, `CORBIENEST_TRACE` (a file to record the session's drawing into, see below), and for a hosted advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
+Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N`, `/subagent` are saved to
+`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`, the sub-agents' model as `subagent=`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, `CORBIENEST_TRACE` (a file to record the session's drawing into, see below), and for a hosted model or advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
 
 ### Running more than one session
 
@@ -686,15 +743,15 @@ session files, so a crash or a kill mid-write cannot truncate any of them either
 ## Tests
 
 ```sh
-make test               # both suites: what a change has to pass
-make test-unit          # the C unit tests alone
-make test-integration   # the pty (and tmux) tests alone
+make test               # the C unit tests: what a change has to pass
+make test-unit          # the same, by name
+make test-integration   # the pty (and tmux) tests, on request (some reach the hosted APIs: costs money)
 ```
 
 GitHub Actions builds with warnings as errors and runs the unit tests. The integration tests
 drive the program through a pty and assert on what arrives when — timing a shared runner does
-not keep — so there they run only on request (start the CI workflow by hand and tick
-*integration*). Run `make test` locally before pushing.
+not keep, and some reach the hosted APIs — so there they run only on request (start the CI workflow
+by hand and tick *integration*, or run `make test-integration` locally). Run `make test` before pushing.
 
 - `tests/test_unit.c` — C unit tests: string buffer, file helpers, the HTTP client
   (chunked/content-length/abort/extra headers against a forked local server, and what a host

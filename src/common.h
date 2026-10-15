@@ -172,6 +172,7 @@ typedef struct {
     int   n_prices;
     char *advisor;       /* the stronger model the agent may consult through the advisor tool (/advisor); NULL = none */
     int   advisor_ctx;   /* num_ctx of an advisor call; 0 = auto (see advisor_plan_for()) */
+    char *subagent;      /* the model sub-agents (task) run on; NULL or the main model = the model doing the work (/subagent) */
     int   advisor_guidance; /* how much the agent leans on it, GUIDANCE_* (/advisor guidance) */
     int   advisor_window;   /* seconds after which a request's count of consultations starts again (/advisor window, given in minutes); 0 = never */
     int   workers;       /* tasks of /orchestrate that may run at the same time (/workers); 0 = ORCH_WORKERS_DEFAULT */
@@ -193,7 +194,8 @@ extern config_t g_cfg;
 
 /* per-session token accounting (shown in the status bar and /status) */
 typedef struct {
-    long prompt_tokens;      /* sum of prompt (input) tokens over all calls */
+    long prompt_tokens;      /* sum of prompt (input) tokens over all calls, cached or not */
+    long cache_read;         /* the part of prompt_tokens a hosted provider read from its prompt cache (billed at a fraction) */
     long eval_tokens;        /* sum of generated (output) tokens over all calls */
     int  last_prompt_tokens; /* prompt size of the most recent call (context usage) */
     int  calls;              /* model calls made (turns, tool rounds, compaction, memory) */
@@ -250,7 +252,7 @@ int http_request(const char *base_url, const char *method, const char *path,
 /* A POST that a thread of its own performs — the model call of one of several workers. Started
  * and collected on the main thread; see http.c for what the thread may touch (its own handle). */
 typedef struct http_job http_job;
-http_job *http_job_start(const char *base_url, const char *path, const char *body);   /* NULL = it could not be started */
+http_job *http_job_start(const char *base_url, const char *path, const char *body, const char *const *headers);   /* headers NULL = none; NULL return = it could not be started */
 bool      http_job_done(http_job *j);
 void      http_job_cancel(http_job *j);                               /* it ends soon after, as aborted */
 int       http_job_finish(http_job *j, sbuf *out, http_result *res);  /* waits for it and frees it; returns as http_request() does */
@@ -355,6 +357,10 @@ extern int (*term_suggest)(const char *buf, size_t cur, size_t *from, term_sug *
 /* Interactive list picker: returns chosen index or -1 if cancelled. */
 int term_select(const char *title, const char **items, const char **descs, int n, int current);
 
+/* Basic syntax highlighting of one line of code, by the fence's language (or NULL/unknown: unchanged). Only
+ * escapes are added; each token returns to `base`. Keywords, strings, comments, numbers. */
+void highlight_line(const char *lang, const char *line, sbuf *out, const char *base);
+
 /* ---------- markdown-ish streaming printer ---------- */
 typedef struct {
     bool in_fence;
@@ -364,6 +370,10 @@ typedef struct {
     int  pending_ticks;
     bool pending_star;
     int  fence_ticks;   /* ticks in the run at line start */
+    bool in_info;       /* in a fence's info string (the language, after the opening ```) */
+    sbuf info;          /* that info string */
+    sbuf line;          /* the code line being collected, printed highlighted when it ends */
+    char lang[24];      /* the fence's language (first word of its info string, lower case) */
 } md_state;
 
 void md_init(md_state *m);
@@ -421,7 +431,9 @@ int   skill_scaffold(const char *name, char *path_out, size_t n);   /* 0 ok, 1 e
 
 /* ---------- ollama.h ---------- */
 typedef struct {
-    int    prompt_tokens;
+    int    prompt_tokens;    /* all input, cached or not: what the context holds */
+    int    cache_read;       /* the part of it the provider read from its prompt cache (a hit, billed at a fraction) */
+    int    cache_write;      /* the part it wrote to its cache (billed above the input price) */
     int    eval_tokens;
     double eval_seconds;
     double prompt_seconds;   /* prompt evaluation ("prefill") time; large = the KV cache missed */
@@ -456,6 +468,7 @@ typedef struct {
     bool think_declared;   /* the list came from the server rather than from model_think_profile() */
     bool think_off_top;    /* its "off" is written into the top of the prompt like a level (glimmer: "Reasoning strength: none."), so it may not flip mid-prompt either */
     bool think_adaptive, think_budget;   /* a hosted Anthropic model: takes thinking {type: adaptive} / {type: enabled, budget_tokens} (provider.c) */
+    int  max_output;       /* a hosted model's output cap (max_tokens), 0 if it did not say */
 } model_info;
 void   model_info_parse(const char *json, model_info *mi);      /* the /api/show body (exposed for tests) */
 void   model_think_profile(model_info *mi);   /* fill think_* from family/renderer unless the server declared them; call again after changing `thinking` */
@@ -478,11 +491,18 @@ typedef struct {
 int  orch_parse_plan(const char *text, orch_task **tasks);
 void orch_tasks_free(orch_task *t, int n);
 
+/* The git branch of a directory: 1 when it is in a repository, with the branch name (or the commit of a
+ * detached HEAD) in out; 0 when it is not. Reads the .git of it or of the nearest directory above. */
+int   git_branch(const char *dir, char *out, size_t n);
+
 /* ---------- prices: what /usage estimates the cost with ----------
  * USD per million input and output tokens. model_price() says what a model costs: 2 = a price
  * set with /usage price, 1 = the provider's list price as built in (hosted models only, by the
  * name or a dated snapshot of it), 0 = not known. */
 int  model_price(const char *model, double *in, double *out);
+double model_cache_read_ratio(const char *model);    /* a cache read costs this × the input price (Anthropic: 0.1, 0.05, 0.025; others 1) */
+double model_cache_write_ratio(const char *model);   /* a cache write costs this × the input price (Anthropic 1.25; others 1) */
+double usage_cost_usd(const char *model, long in, long out, long cache_read, long cache_write, int *known);   /* in = all input, cached included */
 void price_set(const char *model, double in, double out);   /* in < 0 = forget it (does not save the config) */
 
 /* ---------- effort: how hard a model thinks (/effort) ----------
@@ -552,10 +572,12 @@ int    ollama_model_placement(const char *model, double *size, double *size_vram
 /* Recover tool calls that a model emitted as text (exposed for tests). */
 cJSON *parse_text_tool_calls(const char *content);
 
-/* ---------- provider.c: hosted model APIs, for the advisor ----------
- * Besides a model on the Ollama server the advisor can be a hosted one, named PROVIDER:MODEL:
- * "xai:grok-4.7", "openai:gpt-5.2", "anthropic:claude-opus-5" (grok:, chatgpt: and claude: work too). The
- * key comes from the environment and is never saved. */
+/* ---------- provider.c: hosted model APIs ----------
+ * A hosted model, named PROVIDER:MODEL — "xai:grok-4.7", "openai:gpt-5.2", "anthropic:claude-opus-5"
+ * (grok:, chatgpt: and claude: work too) — can be the advisor, or the model that does the work.
+ * The key comes from the environment and is never saved. A turn (provider_turn) speaks the same
+ * conversation ollama_chat() does: the messages, the tools, a streamed reply, and an assistant
+ * message of the same shape back. A consultation (provider_chat) stays one toolless question. */
 typedef enum { PROVIDER_CHAT_COMPLETIONS, PROVIDER_MESSAGES } provider_style;
 typedef struct {
     const char *name, *alias, *label;      /* "xai", "grok", "xAI" */
@@ -566,6 +588,10 @@ typedef struct {
 const provider_def *provider_at(int i);   /* the providers in turn, NULL past the last */
 const provider_def *provider_find(const char *advisor, const char **model);   /* NULL = a model on the Ollama server */
 const char *provider_base_url(const provider_def *p);
+const char *provider_chat_path(const provider_def *p);   /* "/chat/completions" or "/v1/messages" */
+/* The headers of one call (the key). False when it cannot be made: not a hosted model, no key,
+ * or a base URL that would send the key in the clear. The strings live in *keep. */
+bool  provider_call_headers(const char *model, const char *hdrs[4], sbuf *keep, char *err, size_t n);
 typedef struct {
     const char *system, *user;   /* the two messages of a consultation */
     int         max_tokens;      /* the answer and its thinking together */
@@ -587,5 +613,15 @@ void  provider_parse_model(const char *advisor, const char *json, model_info *mi
 cJSON *provider_parse_models(const char *json);                    /* a model list as [{"id","name"}], NULL if it is not one */
 cJSON *provider_list_models(const provider_def *p, int wait_ms, char *err, size_t n);   /* what the key can use, asked silently; NULL without a key or an answer, and err says which */
 bool  provider_fallbacks(const char *advisor);   /* an Anthropic model with server-side refusal fallbacks (Opus 5, Fable 5.x) */
+/* A turn of the model that does the work, when that model is Anthropic. `messages` and `tools`
+ * are the conversation ollama_chat() speaks; the body is the Messages request (malloc'd).
+ * `effort` is a resolved level ("high") or NULL, `thinking` asks for it, temperature < 0 leaves
+ * it out. The reply is the assistant message ollama_chat() would have built — text in `content`,
+ * calls in `tool_calls`, and the raw blocks in `provider_content` so the next turn can send the
+ * thinking back. NULL + err on a failed request; a refusal is a message, not a failure. */
+char  *provider_turn_body(const char *model, const model_info *mi, cJSON *messages, cJSON *tools, int max_tokens, const char *effort, bool thinking, double temperature, bool stream);
+cJSON *provider_turn_reply(const char *model, const char *json, int status, chat_stats *st, char *err, size_t n);
+char  *provider_turn_request(cJSON *messages, cJSON *tools);   /* that body for the working model, from ollama_call / g_cfg, not streamed */
+cJSON *provider_turn(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted);   /* streamed; same contract as ollama_chat() */
 
 #endif

@@ -65,6 +65,86 @@ static void test_md(void) {
     free(o);
 }
 
+/* the text with its ANSI escapes taken out: what the reader sees, column for column */
+static char *plain_of(const char *s) {
+    sbuf b; sb_init(&b);
+    for (const char *p = s; *p; p++) {
+        if (*p == '\x1b' && p[1] == '[') { p += 2; while (*p && !((*p >= '@' && *p <= '~'))) p++; continue; }
+        sb_putc(&b, *p);
+    }
+    return sb_detach(&b);
+}
+static void test_highlight(void) {
+    /* the printer: a fence's language colours its keywords, strings, comments and numbers */
+    char *o = capture(md_run, "```python\ndef f(x):  # note\n    return 'a' + 10\n```\n");
+    CHECK(strstr(o, C_MAGENTA "def" C_RESET) != NULL && strstr(o, C_MAGENTA "return" C_RESET) != NULL);
+    CHECK(strstr(o, C_GRAY "# note" C_RESET) != NULL && strstr(o, C_GREEN "'a'" C_RESET) != NULL && strstr(o, C_YELLOW "10" C_RESET) != NULL);
+    char *pl = plain_of(o);
+    CHECK(strstr(pl, "def f(x):  # note") != NULL && strstr(pl, "    return 'a' + 10") != NULL);   /* the text is what it was */
+    free(pl); free(o);
+    o = capture(md_run, "```c\nint x");   /* a last line that never ends is still printed, highlighted */
+    CHECK(strstr(o, C_MAGENTA "int" C_RESET) != NULL && strstr(o, "x") != NULL);
+    free(o);
+    o = capture(md_run, "```\nx = 1  # plain\n```\n");   /* no language: no colour inside */
+    CHECK(strstr(o, C_MAGENTA) == NULL && strstr(o, C_GRAY "# plain") == NULL && strstr(o, "x = 1  # plain") != NULL);
+    free(o);
+    /* the function itself: each language's comments and strings, a string's escaped quote, an identifier in a word */
+    const char *cases[][3] = {
+        { "c", "int x = 10; // hi \"q\"", "int" },
+        { "js", "const s = \"a\\\"b\"; /* c */ let y = 2", "const" },
+        { "sh", "if [ -f x ]; then echo '#not' # yes", "if" },
+        { "json", "{\"k\": true, \"n\": null}", "true" },
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
+        sbuf h; sb_init(&h);
+        highlight_line(cases[i][0], cases[i][1], &h, C_CYAN);
+        CHECK(strstr(h.data, C_CYAN) != NULL && strstr(h.data, cases[i][2]) != NULL);
+        char *pl2 = plain_of(h.data);
+        CHECK(strcmp(pl2, cases[i][1]) == 0);
+        free(pl2); sb_free(&h);
+    }
+    sbuf h; sb_init(&h);
+    highlight_line("python", "value = 'it''s'  # end", &h, C_CYAN);
+    CHECK(strstr(h.data, C_GRAY "# end" C_RESET) != NULL && strstr(h.data, "'it'") != NULL);
+    sb_free(&h);
+    sbuf k; sb_init(&k);
+    highlight_line("c", "int classy = 2; defer_x = iffy", &k, C_CYAN);   /* keywords are whole words only */
+    CHECK(strstr(k.data, C_MAGENTA "int" C_RESET) != NULL && strstr(k.data, C_MAGENTA "classy") == NULL && strstr(k.data, C_MAGENTA "iffy") == NULL);
+    sb_free(&k);
+}
+
+/* ---------- the git branch of a directory (the status bar's location line) ---------- */
+static void write_text(const char *path, const char *text) {
+    FILE *f = fopen(path, "w"); if (f) { fputs(text, f); fclose(f); }
+}
+static void test_gitbranch(void) {
+    char root[] = "/tmp/crowtest_git_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char p[600], b[256];
+    /* a repository on a branch with a slash in its name, and a directory below it */
+    snprintf(p, sizeof p, "%s/repo", root); mkdir(p, 0700);
+    snprintf(p, sizeof p, "%s/repo/.git", root); mkdir(p, 0700);
+    snprintf(p, sizeof p, "%s/repo/.git/HEAD", root); write_text(p, "ref: refs/heads/feature/status\n");
+    snprintf(p, sizeof p, "%s/repo/src", root); mkdir(p, 0700);
+    snprintf(p, sizeof p, "%s/repo/src/deep", root); mkdir(p, 0700);
+    b[0] = 0;
+    CHECK(git_branch(p, b, sizeof b) == 1 && !strcmp(b, "feature/status"));   /* found above the directory itself */
+    snprintf(p, sizeof p, "%s/repo", root);
+    CHECK(git_branch(p, b, sizeof b) == 1 && !strcmp(b, "feature/status"));
+    /* a detached HEAD: the commit, seven digits */
+    snprintf(p, sizeof p, "%s/repo/.git/HEAD", root); write_text(p, "0123456789abcdef0123456789abcdef01234567\n");
+    snprintf(p, sizeof p, "%s/repo", root);
+    CHECK(git_branch(p, b, sizeof b) == 1 && !strcmp(b, "0123456"));
+    /* a linked worktree: .git is a file that names the git directory */
+    snprintf(p, sizeof p, "%s/wt", root); mkdir(p, 0700);
+    snprintf(p, sizeof p, "%s/wt/.git", root); write_text(p, "gitdir: /tmp/nonexistent-but-named\n");
+    CHECK(git_branch(p, b, sizeof b) == 0);   /* the directory named is not there: no branch, not a crash */
+    /* a directory outside any repository */
+    snprintf(p, sizeof p, "%s", root);
+    CHECK(git_branch(p, b, sizeof b) == 0);
+    CHECK(git_branch(NULL, b, sizeof b) == 0);
+}
+
 /* ---------- text tool call recovery ---------- */
 static void test_text_tool_calls(void) {
     cJSON *a = parse_text_tool_calls("blah\n<tool_call>\n<function=grep>\n<parameter=pattern>\nrange\n</parameter>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>");
@@ -1039,6 +1119,35 @@ static void test_provider(void) {
         CHECK(model_price("openai:gpt-5.9", &pi, &po) == 0 && model_price("openai:gpt-5-turbo", &pi, &po) == 0);   /* "gpt-5" says nothing about these */
         CHECK(model_price("xai:grok-4.7", &pi, &po) == 1 && pi == 2 && po == 6);
         CHECK(model_price("qwen3:32b", &pi, &po) == 0 && model_price("anthropic:claude-opus-5x", &pi, &po) == 0 && model_price(NULL, &pi, &po) == 0);
+        /* prompt caching: a read costs a fraction of the input, a write more; the reply's usage splits them out */
+        CHECK(model_cache_read_ratio("anthropic:claude-opus-5") == 0.10 && model_cache_read_ratio("claude:claude-sonnet-5-5") == 0.05);
+        CHECK(model_cache_read_ratio("claude:claude-fable-5-1-20260901") == 0.025 && model_cache_read_ratio("xai:grok-4.7") == 0.25);
+        /* OpenAI and xAI: their cached input at their own rate; a model with none is billed as input */
+        CHECK(model_cache_read_ratio("openai:gpt-5.5-2026-07-01") == 0.10 && model_cache_read_ratio("openai:gpt-4.1-mini") == 0.25);
+        CHECK(model_cache_read_ratio("openai:gpt-5.5-pro") == 1 && model_cache_read_ratio("xai:grok-4.5") == 0.15);
+        { int kn = 0; double c = usage_cost_usd("openai:gpt-5.5", 1000000, 1000000, 800000, 0, &kn);   /* 200k at $5 = 1.0, 800k cached at $0.50 = 0.4, 1M out at $30 = 30 */
+          CHECK(kn == 1 && c > 31.3999 && c < 31.4001); }
+        CHECK(model_cache_write_ratio("anthropic:claude-opus-5") == 1.25 && model_cache_write_ratio("openai:gpt-5") == 1);
+        { /* Opus 5 at $5 in / $25 out: 1M output, 100k plain input, 800k read, 100k written = 0.5 + 0.4 + 0.625 + 25 */
+            int kn = 0; double c = usage_cost_usd("anthropic:claude-opus-5", 1000000, 1000000, 800000, 100000, &kn);
+            CHECK(kn == 1 && c > 26.5249 && c < 26.5251);
+            CHECK(usage_cost_usd("qwen3:32b", 1000, 1000, 0, 0, &kn) == 0 && kn == 0);
+        }
+        {
+            chat_stats cst; char cerr[256];
+            cJSON *cr = provider_turn_reply("anthropic:claude-opus-5", "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"stop_reason\":\"end_turn\","
+                "\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":500,\"cache_creation_input_tokens\":40,\"output_tokens\":5}}", 200, &cst, cerr, sizeof cerr);
+            CHECK(cr != NULL && cst.prompt_tokens == 550 && cst.cache_read == 500 && cst.cache_write == 40 && cst.eval_tokens == 5);
+            cJSON_Delete(cr);
+        }
+        {
+            chat_stats ost; char oerr[256];
+            char *otxt = provider_parse_reply("openai:gpt-5.5", "{\"choices\":[{\"message\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],"
+                "\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":800}}}", 200, &ost, oerr, sizeof oerr);
+            CHECK(otxt && !strcmp(otxt, "hi"));
+            CHECK(ost.prompt_tokens == 1000 && ost.cache_read == 800 && ost.eval_tokens == 7);
+            free(otxt);
+        }
         price_set("grok:grok-4.7", 3, 9);
         CHECK(model_price("xai:grok-4.7", &pi, &po) == 2 && pi == 3 && po == 9);
         price_set("xai:grok-4.7", -1, -1);
@@ -1061,11 +1170,13 @@ static void test_provider(void) {
         "\"effort\":{\"supported\":true,\"low\":{\"supported\":true},\"medium\":{\"supported\":true},\"high\":{\"supported\":true},\"xhigh\":{\"supported\":true},\"max\":{\"supported\":true}}}}";
     provider_parse_model("anthropic:claude-opus-5", OPUS, &mi);
     CHECK(mi.context_length == 1000000 && mi.think_adaptive && !mi.think_budget && mi.n_think_levels == 5 && !mi.think_off && !strcmp(mi.think_default, "high"));
+    CHECK(mi.tools && mi.max_output == 128000);   /* the endpoint's max_tokens is the reply cap; tools are on for a Messages model */
     model_info opus = mi;
     const char *HAIKU = "{\"id\":\"claude-haiku-4-5\",\"max_input_tokens\":200000,\"capabilities\":{"
         "\"thinking\":{\"supported\":true,\"types\":{\"enabled\":{\"supported\":true},\"adaptive\":{\"supported\":false}}},\"effort\":{\"supported\":false}}}";
     provider_parse_model("anthropic:claude-haiku-4-5", HAIKU, &mi);
     CHECK(mi.think_budget && !mi.think_adaptive && mi.n_think_levels == 0 && mi.think_off && mi.think_on && !strcmp(mi.think_default, "off"));
+    CHECK(mi.tools && mi.max_output == 0);   /* this fixture names no max_tokens, so the cap stays the general one */
     model_info haiku = mi;
     provider_parse_model("anthropic:claude-x", "{\"id\":\"claude-x\"}", &mi);   /* a proxy that says nothing: nothing is sent that it might refuse */
     CHECK(!mi.thinking && !mi.think_adaptive);
@@ -1095,6 +1206,8 @@ static void test_provider(void) {
     CHECK(cJSON_GetNumberValue(jget(j, "max_tokens")) == 16000);
     CHECK_STR(jstr_at(j, "thinking.type"), "adaptive"); CHECK_STR(jstr_at(j, "output_config.effort"), "xhigh");
     CHECK_STR(jstr_at(j, "fallbacks"), "default"); CHECK(provider_fallbacks("anthropic:claude-opus-5"));
+    CHECK(provider_fallbacks("anthropic:claude-sonnet-5-5") && !provider_fallbacks("anthropic:claude-sonnet-5"));
+    CHECK(!provider_fallbacks("anthropic:claude-haiku-5-5") && !provider_fallbacks("ollama:qwen3:32b"));
     CHECK(!jget(j, "temperature") && !jget(j, "thinking.budget_tokens"));
     cJSON_Delete(j); free(body);
     rq.effort = NULL;
@@ -1172,6 +1285,93 @@ static void test_provider(void) {
     CHECK(provider_model_info("xai:grok-4.7", &mi, err, sizeof err) == -1 && strstr(err, "XAI_API_KEY is not set"));
     bool ab; t = provider_chat("xai:grok-4.7", &mi, &rq, &st, &ab, err, sizeof err);
     CHECK(!t && !ab && strstr(err, "XAI_API_KEY is not set"));
+
+    /* a working-model turn: the stored conversation stays user / assistant / tool; the wire is Messages */
+    cJSON *tools = cJSON_Parse("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"run\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}}},"
+                               "{\"type\":\"function\",\"function\":{\"name\":\"advisor\",\"description\":\"ask\",\"parameters\":{\"type\":\"object\"}}}]");
+    cJSON *msgs = cJSON_Parse("[{\"role\":\"system\",\"content\":\"SYS\"},{\"role\":\"user\",\"content\":\"do the thing\"},"
+                              "{\"role\":\"assistant\",\"content\":\"Running it.\",\"tool_calls\":[{\"id\":\"toolu_bash\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]},"
+                              "{\"role\":\"tool\",\"tool_name\":\"bash\",\"tool_call_id\":\"toolu_bash\",\"content\":\"hi\"},{\"role\":\"user\",\"content\":\"and now?\"}]");
+    body = provider_turn_body("anthropic:claude-haiku-4-5", &haiku, msgs, tools, 64000, NULL, false, -1, true);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "model"), "claude-haiku-4-5");
+    CHECK(cJSON_IsTrue(jget(j, "stream")) && cJSON_GetNumberValue(jget(j, "max_tokens")) == 64000);
+    CHECK(cJSON_IsArray(jget(j, "system")) && !jget(j, "thinking") && !jget(j, "output_config") && !jget(j, "fallbacks"));
+    CHECK_STR(jstr_at(j, "system.0.type"), "text"); CHECK_STR(jstr_at(j, "system.0.text"), "SYS");
+    CHECK_STR(jstr_at(j, "system.0.cache_control.type"), "ephemeral");
+    CHECK_STR(jstr_at(j, "tools.0.name"), "bash"); CHECK(jget(j, "tools.0.input_schema.properties.command") && !jget(j, "tools.0.function"));
+    CHECK(cJSON_GetArraySize(jget(j, "messages")) == 3);   /* the tool result and the next user line are one user message */
+    CHECK_STR(jstr_at(j, "messages.0.content.0.text"), "do the thing");
+    CHECK_STR(jstr_at(j, "messages.1.content.0.text"), "Running it.");
+    CHECK_STR(jstr_at(j, "messages.1.content.1.type"), "tool_use"); CHECK_STR(jstr_at(j, "messages.1.content.1.id"), "toolu_bash");
+    CHECK_STR(jstr_at(j, "messages.1.content.1.input.command"), "echo hi");
+    CHECK_STR(jstr_at(j, "messages.2.content.0.type"), "tool_result"); CHECK_STR(jstr_at(j, "messages.2.content.0.tool_use_id"), "toolu_bash");
+    CHECK_STR(jstr_at(j, "messages.2.content.0.content"), "hi"); CHECK_STR(jstr_at(j, "messages.2.content.1.text"), "and now?");
+    CHECK_STR(jstr_at(j, "messages.2.content.1.cache_control.type"), "ephemeral");
+    cJSON_Delete(j); free(body);
+
+    /* a reply with thinking is stored as blocks and sent back unchanged, cache breakpoint on the copy */
+    memset(&st, 0, sizeof st);
+    cJSON *msg = provider_turn_reply("anthropic:claude-haiku-4-5",
+        "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"weighing\",\"signature\":\"sig\"},{\"type\":\"text\",\"text\":\"Running it.\"},"
+        "{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"bash\",\"input\":{\"command\":\"echo hi\"}}],\"stop_reason\":\"tool_use\","
+        "\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":7,\"output_tokens\":4}}",
+        200, &st, err, sizeof err);
+    CHECK_STR(jstr_at(msg, "role"), "assistant"); CHECK_STR(jstr_at(msg, "content"), "Running it.");
+    CHECK_STR(jstr_at(msg, "tool_calls.0.id"), "toolu_1"); CHECK_STR(jstr_at(msg, "tool_calls.0.function.name"), "bash");
+    CHECK_STR(jstr_at(msg, "tool_calls.0.function.arguments"), "{\"command\":\"echo hi\"}");
+    CHECK_STR(jstr_at(msg, "provider_content.0.type"), "thinking"); CHECK_STR(jstr_at(msg, "provider_content.0.thinking"), "weighing");
+    CHECK_STR(jstr_at(msg, "provider_content.0.signature"), "sig"); CHECK_STR(jstr_at(msg, "provider_content.2.id"), "toolu_1");
+    CHECK(st.prompt_tokens == 20 && st.eval_tokens == 4); CHECK_STR(st.done_reason, "stop");
+    cJSON *follow = cJSON_Parse("[{\"role\":\"user\",\"content\":\"go\"}]");
+    cJSON_AddItemToArray(follow, msg);
+    body = provider_turn_body("anthropic:claude-haiku-4-5", &haiku, follow, tools, 64000, NULL, false, -1, false);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "messages.1.content.0.type"), "thinking"); CHECK_STR(jstr_at(j, "messages.1.content.0.thinking"), "weighing");
+    CHECK_STR(jstr_at(j, "messages.1.content.0.signature"), "sig"); CHECK_STR(jstr_at(j, "messages.1.content.2.id"), "toolu_1");
+    CHECK_STR(jstr_at(j, "messages.1.content.2.cache_control.type"), "ephemeral");
+    CHECK(!jget(msg, "provider_content.0.cache_control") && !jget(msg, "provider_content.2.cache_control"));   /* the stored blocks are not the copy */
+    cJSON_Delete(j); free(body); cJSON_Delete(follow);
+
+    /* quiet: no thinking and no effort, even on a model that would otherwise send both. A real level still goes out when asked */
+    body = provider_turn_body("anthropic:claude-opus-5", &opus, msgs, NULL, 256, NULL, false, -1, false);
+    j = cJSON_Parse(body);
+    CHECK(cJSON_IsFalse(jget(j, "stream")) && !jget(j, "thinking") && !jget(j, "output_config"));
+    CHECK_STR(jstr_at(j, "fallbacks"), "default");   /* opus still asks for a fallback model; that is not thinking */
+    cJSON_Delete(j); free(body);
+    body = provider_turn_body("anthropic:claude-opus-5", &opus, msgs, NULL, 32000, "xhigh", true, -1, false);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "thinking.type"), "adaptive"); CHECK_STR(jstr_at(j, "output_config.effort"), "xhigh");
+    cJSON_Delete(j); free(body);
+    body = provider_turn_body("anthropic:claude-haiku-4-5", &haiku, msgs, NULL, 64000, NULL, true, -1, false);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "thinking.type"), "enabled"); CHECK(cJSON_GetNumberValue(jget(j, "thinking.budget_tokens")) == 32000);
+    CHECK(!jget(j, "output_config") && !jget(j, "fallbacks"));
+    cJSON_Delete(j); free(body);
+
+    /* a call the request is not offering (the advisor, once it was turned off) goes out as text, or the next call is a 400 */
+    cJSON *bash_only = cJSON_Parse("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"run\",\"parameters\":{\"type\":\"object\"}}}]");
+    cJSON *dem = cJSON_Parse("[{\"role\":\"user\",\"content\":\"ask\"},"
+                             "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_adv_1\",\"function\":{\"name\":\"advisor\",\"arguments\":{\"question\":\"why\"}}}]},"
+                             "{\"role\":\"tool\",\"tool_name\":\"advisor\",\"tool_call_id\":\"call_adv_1\",\"content\":\"advice text\"}]");
+    body = provider_turn_body("anthropic:claude-haiku-4-5", &haiku, dem, bash_only, 64000, NULL, false, -1, false);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "messages.1.content.0.type"), "text");
+    CHECK(jstr_at(j, "messages.1.content.0.text") && strstr(jstr_at(j, "messages.1.content.0.text"), "[called advisor]") && !jget(j, "messages.1.content.1"));
+    CHECK_STR(jstr_at(j, "messages.2.content.0.type"), "text");
+    CHECK(jstr_at(j, "messages.2.content.0.text") && strstr(jstr_at(j, "messages.2.content.0.text"), "[advisor result]\nadvice text"));
+    cJSON_Delete(j); free(body); cJSON_Delete(dem); cJSON_Delete(bash_only);
+
+    /* a refusal is the turn's answer. The advisor's parser still reports it as a failure and returns nothing */
+    memset(&st, 0, sizeof st);
+    const char *REF = "{\"content\":[],\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\"}}";
+    msg = provider_turn_reply("anthropic:claude-fable-5", REF, 200, &st, err, sizeof err);
+    CHECK(msg && strstr(jstr_at(msg, "content"), "claude-fable-5 declined to answer (refusal: cyber)") && !jget(msg, "tool_calls"));
+    CHECK_STR(st.done_reason, "stop");
+    cJSON_Delete(msg);
+    t = provider_parse_reply("anthropic:claude-fable-5", REF, 200, &st, err, sizeof err);
+    CHECK(!t && strstr(err, "declined") && strstr(err, "cyber"));
+    cJSON_Delete(msgs); cJSON_Delete(tools);
 }
 
 int main(void) {
@@ -1179,7 +1379,7 @@ int main(void) {
     memset(&g_cfg, 0, sizeof g_cfg);
     g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 10; g_cfg.interactive = false;
     struct { const char *name; void (*fn)(void); } tests[] = {
-        { "sbuf", test_sbuf }, { "util", test_util }, { "markdown", test_md },
+        { "sbuf", test_sbuf }, { "util", test_util }, { "markdown", test_md }, { "highlight", test_highlight }, { "git branch", test_gitbranch },
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },

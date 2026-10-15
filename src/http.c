@@ -279,14 +279,14 @@ static void *job_run(void *ud) {
     return NULL;
 }
 
-http_job *http_job_start(const char *base_url, const char *path, const char *body) {
+http_job *http_job_start(const char *base_url, const char *path, const char *body, const char *const *headers) {
     if (!curl_ready()) return NULL;
     http_job *j = calloc(1, sizeof *j);
     if (!j) return NULL;
     j->h = curl_easy_init();
     if (!j->h) { free(j); return NULL; }
     j->url = http_url(base_url, path); j->body = xstrdup(body ? body : "");
-    j->hdrs = easy_setup(j->h, j->url, "POST", j->body, NULL, j->errbuf);
+    j->hdrs = easy_setup(j->h, j->url, "POST", j->body, headers, j->errbuf);
     curl_easy_setopt(j->h, CURLOPT_WRITEFUNCTION, job_body);
     curl_easy_setopt(j->h, CURLOPT_WRITEDATA, j);
     curl_easy_setopt(j->h, CURLOPT_XFERINFOFUNCTION, job_progress);

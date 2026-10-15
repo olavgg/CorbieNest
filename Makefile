@@ -28,10 +28,11 @@ LIBOBJ := $(filter-out src/main.o,$(OBJ))
 tests/test_unit: tests/test_unit.c $(LIBOBJ) src/common.h
 	$(CC) $(CFLAGS) -o $@ tests/test_unit.c $(LIBOBJ) $(LDLIBS)
 
-# `make test` is both suites, and what a change has to pass. The two halves by themselves: the unit
-# tests need nothing but the build; the integration tests drive the program through a pty (and tmux),
-# which is timing a hosted CI runner does not keep — CI runs test-unit, and test-integration on request.
-test: test-unit test-integration
+# `make test` is the unit tests: what a change has to pass, and what needs nothing but the build.
+# The integration tests drive the program through a pty (and tmux), which is timing a hosted CI
+# runner does not keep, and some checks reach the hosted APIs, which costs money: they run only
+# on request, with `make test-integration`.
+test: test-unit
 
 test-unit: tests/test_unit
 	./tests/test_unit

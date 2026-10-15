@@ -413,6 +413,7 @@ void config_load(void) {
         else if (!strncmp(k, "price.", 6)) { double pi, po; if (k[6] && sscanf(v, "%lf/%lf", &pi, &po) == 2 && pi >= 0 && po >= 0) price_set(k + 6, pi, po); }
         else if (!strcmp(k, "advisor")) { free(g_cfg.advisor); g_cfg.advisor = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "advisor_ctx")) { int n = atoi(v); if (n == 0 || n >= ADVISOR_CTX_MIN) g_cfg.advisor_ctx = n; }
+        else if (!strcmp(k, "subagent")) { free(g_cfg.subagent); g_cfg.subagent = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "workers")) { int n = atoi(v); if (n >= 1 && n <= ORCH_WORKERS_MAX) g_cfg.workers = n; }
         else if (!strcmp(k, "advisor_window")) { double m = atof(v); if (m >= 0 && m <= 24 * 60) g_cfg.advisor_window = (int)(m * 60 + 0.5); }
         else if (!strcmp(k, "advisor_guidance")) { int n = advisor_guidance_parse(v); if (n >= 0) g_cfg.advisor_guidance = n; }
@@ -451,6 +452,7 @@ void config_save(void) {
     for (int i = 0; i < g_cfg.n_prices; i++) sb_printf(&b, "price.%s=%g/%g\n", g_cfg.prices[i].model, g_cfg.prices[i].in, g_cfg.prices[i].out);
     if (g_cfg.advisor) sb_printf(&b, "advisor=%s\n", g_cfg.advisor);
     if (g_cfg.advisor_ctx > 0) sb_printf(&b, "advisor_ctx=%d\n", g_cfg.advisor_ctx);
+    if (g_cfg.subagent && *g_cfg.subagent) sb_printf(&b, "subagent=%s\n", g_cfg.subagent);
     if (g_cfg.workers > 0) sb_printf(&b, "workers=%d\n", g_cfg.workers);
     if (g_cfg.advisor_window != ADVISOR_WINDOW_DEFAULT) sb_printf(&b, "advisor_window=%g\n", g_cfg.advisor_window / 60.0);   /* in minutes, as it is typed */
     if (g_cfg.advisor_guidance != GUIDANCE_NORMAL) sb_printf(&b, "advisor_guidance=%s\n", advisor_guidance()->name);
@@ -588,23 +590,27 @@ void orch_tasks_free(orch_task *t, int n) {
  * /usage price sets another. The higher rates some charge for a very long prompt (xAI from 200k
  * tokens, OpenAI from 272k, Haiku 5.5 from 100k) are left out: the one hosted call corbienest
  * makes is a consultation, whose brief is capped far below that. */
-static const struct { const char *name; double in, out; } LIST_PRICES[] = {
-    { "anthropic:claude-fable-5", 10, 50 },   { "anthropic:claude-mythos-5", 10, 50 },
-    { "anthropic:claude-opus-5-5", 4, 20 },   { "anthropic:claude-opus-5", 5, 25 },
-    { "anthropic:claude-opus-4", 5, 25 },     { "anthropic:claude-opus-4-1", 15, 75 },
-    { "anthropic:claude-sonnet-5", 2, 10 },   { "anthropic:claude-sonnet-4", 3, 15 },
-    { "anthropic:claude-haiku-5", 0.10, 0.50 }, { "anthropic:claude-haiku-4-5", 1, 5 },
-    { "openai:gpt-6-astra", 10, 50 },   { "openai:gpt-6.1-sol", 2, 10 },    { "openai:gpt-6-sol", 2, 10 },      { "openai:gpt-6-luna", 0.10, 0.50 },
-    { "openai:gpt-5.6-sol", 4, 20 },    { "openai:gpt-5.6-terra", 2, 12 },  { "openai:gpt-5.6-luna", 0.20, 1.20 },
-    { "openai:gpt-5.5", 5, 30 },        { "openai:gpt-5.5-pro", 30, 180 },
-    { "openai:gpt-5.4", 2.50, 15 },     { "openai:gpt-5.4-mini", 0.75, 4.50 }, { "openai:gpt-5.4-nano", 0.20, 1.25 }, { "openai:gpt-5.4-pro", 30, 180 },
-    { "openai:gpt-5.2", 1.75, 14 },     { "openai:gpt-5.2-pro", 21, 168 },  { "openai:gpt-5.1", 1.25, 10 },
-    { "openai:gpt-5", 1.25, 10 },       { "openai:gpt-5-mini", 0.25, 2 },   { "openai:gpt-5-nano", 0.05, 0.40 }, { "openai:gpt-5-pro", 15, 120 },
-    { "openai:gpt-4.1", 2, 8 },         { "openai:gpt-4.1-mini", 0.40, 1.60 }, { "openai:gpt-4.1-nano", 0.10, 0.40 },
-    { "openai:gpt-4o", 2.50, 10 },      { "openai:gpt-4o-mini", 0.15, 0.60 },
-    { "openai:o3", 2, 8 },              { "openai:o3-pro", 20, 80 },        { "openai:o3-mini", 1.10, 4.40 },   { "openai:o4-mini", 1.10, 4.40 },
-    { "xai:grok-4.7", 2, 6 },           { "xai:grok-4.6", 2, 6 },           { "xai:grok-4.5", 2, 6 },
-    { "xai:grok-4.3", 1.25, 2.50 },     { "xai:grok-4.20", 1.25, 2.50 },    { "xai:grok-4.20-multi-agent", 1.25, 2.50 }, { "xai:grok-build-0.1", 1, 2 },
+static const struct { const char *name; double in, out, cache; } LIST_PRICES[] = {
+    /* cache: what a cached input token costs, × the input price (the providers' cached-input column; the
+     * newest Anthropic models read at 5% or 2.5%). A model with no cached price is 1: no discount assumed. */
+    { "anthropic:claude-fable-5", 10, 50, 0.10 },     { "anthropic:claude-fable-5-1", 10, 50, 0.025 },
+    { "anthropic:claude-mythos-5", 10, 50, 0.10 },    { "anthropic:claude-mythos-5-1", 10, 50, 0.025 },
+    { "anthropic:claude-opus-5-5", 4, 20, 0.05 },     { "anthropic:claude-opus-5", 5, 25, 0.10 },
+    { "anthropic:claude-opus-4", 5, 25, 0.10 },       { "anthropic:claude-opus-4-1", 15, 75, 0.10 },
+    { "anthropic:claude-sonnet-5-5", 2, 10, 0.05 },   { "anthropic:claude-sonnet-5", 2, 10, 0.10 },
+    { "anthropic:claude-sonnet-4", 3, 15, 0.10 },
+    { "anthropic:claude-haiku-5", 0.10, 0.50, 0.10 }, { "anthropic:claude-haiku-4-5", 1, 5, 0.10 },
+    { "openai:gpt-6-astra", 10, 50, 0.10 },   { "openai:gpt-6.1-sol", 2, 10, 0.05 },   { "openai:gpt-6-sol", 2, 10, 0.10 },   { "openai:gpt-6-luna", 0.10, 0.50, 0.10 },
+    { "openai:gpt-5.6-sol", 4, 20, 0.10 },    { "openai:gpt-5.6-terra", 2, 12, 0.10 }, { "openai:gpt-5.6-luna", 0.20, 1.20, 0.10 },
+    { "openai:gpt-5.5", 5, 30, 0.10 },        { "openai:gpt-5.5-pro", 30, 180, 1 },
+    { "openai:gpt-5.4", 2.50, 15, 0.10 },     { "openai:gpt-5.4-mini", 0.75, 4.50, 0.10 }, { "openai:gpt-5.4-nano", 0.20, 1.25, 0.10 }, { "openai:gpt-5.4-pro", 30, 180, 1 },
+    { "openai:gpt-5.2", 1.75, 14, 0.10 },     { "openai:gpt-5.2-pro", 21, 168, 1 },  { "openai:gpt-5.1", 1.25, 10, 0.10 },
+    { "openai:gpt-5", 1.25, 10, 0.10 },       { "openai:gpt-5-mini", 0.25, 2, 0.10 },   { "openai:gpt-5-nano", 0.05, 0.40, 0.10 }, { "openai:gpt-5-pro", 15, 120, 1 },
+    { "openai:gpt-4.1", 2, 8, 0.25 },         { "openai:gpt-4.1-mini", 0.40, 1.60, 0.25 }, { "openai:gpt-4.1-nano", 0.10, 0.40, 0.25 },
+    { "openai:gpt-4o", 2.50, 10, 0.50 },      { "openai:gpt-4o-mini", 0.15, 0.60, 0.50 },
+    { "openai:o3", 2, 8, 0.25 },              { "openai:o3-pro", 20, 80, 1 },        { "openai:o3-mini", 1.10, 4.40, 0.50 },   { "openai:o4-mini", 1.10, 4.40, 0.25 },
+    { "xai:grok-4.7", 2, 6, 0.25 },           { "xai:grok-4.6", 2, 6, 0.25 },           { "xai:grok-4.5", 2, 6, 0.15 },
+    { "xai:grok-4.3", 1.25, 2.50, 0.16 },     { "xai:grok-4.20", 1.25, 2.50, 0.16 },    { "xai:grok-4.20-multi-agent", 1.25, 2.50, 0.16 }, { "xai:grok-build-0.1", 1, 2, 0.20 },
 };
 
 /* a hosted model under its provider's own name ("claude:x" is "anthropic:x"); any other as it is. malloc'd */
@@ -615,21 +621,57 @@ static char *price_key(const char *model) {
     return sb_detach(&b);
 }
 
+/* the built-in price for a key ("provider:model"): the longest name it is, or a dated snapshot of, -1 if none.
+ * "gpt-5" says nothing about "gpt-5.9" or "gpt-5-mini" */
+static int list_match(const char *key) {
+    int best = -1; size_t bl = 0;
+    for (size_t i = 0; i < sizeof LIST_PRICES / sizeof *LIST_PRICES; i++) {
+        size_t l = strlen(LIST_PRICES[i].name);
+        if (l <= bl || strncmp(key, LIST_PRICES[i].name, l)) continue;
+        if (key[l] && !(key[l] == '-' && isdigit((unsigned char)key[l + 1]))) continue;
+        best = (int)i; bl = l;
+    }
+    return best;
+}
+
 int model_price(const char *model, double *in, double *out) {
     if (!model || !*model) return 0;
     char *key = price_key(model);
-    int found = 0; size_t best = 0;
+    int found = 0;
     for (int i = 0; !found && i < g_cfg.n_prices; i++)
         if (!strcmp(g_cfg.prices[i].model, key)) { *in = g_cfg.prices[i].in; *out = g_cfg.prices[i].out; found = 2; }
-    /* the name itself, or a dated snapshot of it ("-2026…") — "gpt-5" says nothing about "gpt-5.9" or "gpt-5-mini" */
-    for (size_t i = 0; !found && i < sizeof LIST_PRICES / sizeof *LIST_PRICES; i++) {
-        size_t l = strlen(LIST_PRICES[i].name);
-        if (l <= best || strncmp(key, LIST_PRICES[i].name, l)) continue;
-        if (key[l] && !(key[l] == '-' && isdigit((unsigned char)key[l + 1]))) continue;
-        *in = LIST_PRICES[i].in; *out = LIST_PRICES[i].out; best = l;
-    }
+    if (!found) { int m = list_match(key); if (m >= 0) { *in = LIST_PRICES[m].in; *out = LIST_PRICES[m].out; found = 1; } }
     free(key);
-    return found ? found : best ? 1 : 0;
+    return found;
+}
+
+/* Prompt caching, as Anthropic bills it (its prompt-caching and models pages): a read costs a tenth of
+ * the base input price — 2.5% on Fable 5.1 and Mythos 5.1, 5% on Opus 5.5 and Sonnet 5.5 — and a write to
+ * the 5-minute cache 1.25 times it. OpenAI and xAI bill cached input at the rate in LIST_PRICES (their
+ * usage reports it as a part of the prompt; they bill no separate write). */
+static bool anthropic_model(const char *model, const char **name) {
+    const provider_def *p = model ? provider_find(model, name) : NULL;
+    return p && p->style == PROVIDER_MESSAGES;
+}
+double model_cache_write_ratio(const char *model) { return anthropic_model(model, NULL) ? 1.25 : 1; }
+/* a cached input token costs this × the input price: the list's figure, else Anthropic's tenth and 1 for the rest */
+double model_cache_read_ratio(const char *model) {
+    if (!model || !*model) return 1;
+    char *key = price_key(model);
+    int m = list_match(key);
+    double r = m >= 0 ? LIST_PRICES[m].cache : anthropic_model(model, NULL) ? 0.10 : 1;
+    free(key);
+    return r;
+}
+/* what a model's tokens cost in USD: the uncached input at the input price, the cache reads and writes
+ * at their ratios, the output at the output price. known = model_price()'s answer (0 = no price: cost 0). */
+double usage_cost_usd(const char *model, long in, long out, long cache_read, long cache_write, int *known) {
+    double pi = 0, po = 0;
+    *known = model_price(model, &pi, &po);
+    if (!*known) return 0;
+    long plain = in - cache_read - cache_write; if (plain < 0) plain = 0;
+    return ((double)plain * pi + (double)cache_read * pi * model_cache_read_ratio(model)
+            + (double)cache_write * pi * model_cache_write_ratio(model) + (double)out * po) / 1e6;
 }
 
 void price_set(const char *model, double in, double out) {
@@ -1367,4 +1409,120 @@ const char *strip_think_block(const char *s) {
     e += 8;
     while (*e == ' ' || *e == '\n' || *e == '\r' || *e == '\t') e++;
     return e;
+}
+
+/* ---------- syntax highlighting for code in a fenced block ----------
+ * Basic and by the fence's name: keywords, strings, comments and numbers, for the usual languages. The
+ * escapes are the only thing added — the text, and so its columns, is what it was. `base` is the colour the
+ * code is printed in: each token ends by going back to it. A language not known is left as it is. */
+typedef enum { HL_NONE, HL_C, HL_PY, HL_SH, HL_JSON } hl_lang;
+static hl_lang hl_language(const char *name) {
+    static const struct { const char *n; hl_lang l; } NAMES[] = {
+        { "c", HL_C }, { "h", HL_C }, { "cpp", HL_C }, { "c++", HL_C }, { "cc", HL_C }, { "hpp", HL_C }, { "java", HL_C },
+        { "js", HL_C }, { "javascript", HL_C }, { "ts", HL_C }, { "typescript", HL_C }, { "go", HL_C }, { "rust", HL_C },
+        { "rs", HL_C }, { "cs", HL_C }, { "csharp", HL_C }, { "swift", HL_C }, { "kotlin", HL_C }, { "php", HL_C }, { "scala", HL_C },
+        { "py", HL_PY }, { "python", HL_PY }, { "python3", HL_PY },
+        { "sh", HL_SH }, { "bash", HL_SH }, { "shell", HL_SH }, { "zsh", HL_SH }, { "console", HL_SH },
+        { "json", HL_JSON }, { "jsonc", HL_JSON },
+    };
+    for (size_t i = 0; i < sizeof NAMES / sizeof *NAMES; i++)
+        if (!strcasecmp(name, NAMES[i].n)) return NAMES[i].l;
+    return HL_NONE;
+}
+static bool hl_keyword(hl_lang l, const char *w, size_t n) {
+    static const char *const C_KW[] = { "auto", "break", "case", "catch", "char", "class", "const", "continue", "default", "do", "double",
+        "else", "enum", "extern", "false", "final", "finally", "float", "for", "func", "fn", "function", "go", "if", "impl", "import",
+        "in", "int", "interface", "let", "long", "match", "mut", "new", "nil", "null", "package", "private", "protected", "public",
+        "return", "short", "signed", "sizeof", "static", "struct", "super", "switch", "this", "throw", "true", "try", "type", "typedef",
+        "union", "unsigned", "use", "var", "void", "volatile", "while", "const", "export", "from", "async", "await", "yield", "self",
+        "bool", "string", "undefined", "pub", "mod", "where", "trait", "defer", "select", "chan", "range", "readonly", NULL };
+    static const char *const PY_KW[] = { "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif",
+        "else", "except", "False", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "None", "nonlocal", "not",
+        "or", "pass", "raise", "return", "True", "try", "while", "with", "yield", "self", NULL };
+    static const char *const SH_KW[] = { "case", "do", "done", "elif", "else", "esac", "export", "fi", "for", "function", "if", "in",
+        "local", "return", "select", "then", "until", "while", "readonly", "unset", "declare", NULL };
+    static const char *const JSON_KW[] = { "true", "false", "null", NULL };
+    const char *const *list = l == HL_C ? C_KW : l == HL_PY ? PY_KW : l == HL_SH ? SH_KW : JSON_KW;
+    for (int i = 0; list[i]; i++) if (strlen(list[i]) == n && !strncmp(list[i], w, n)) return true;
+    return false;
+}
+
+void highlight_line(const char *lang, const char *line, sbuf *out, const char *base) {
+    hl_lang l = hl_language(lang ? lang : "");
+    if (l == HL_NONE || !line) { sb_puts(out, line ? line : ""); return; }
+    bool hash = l == HL_PY || l == HL_SH;          /* comments: '#' … the end of the line */
+    bool slash = l == HL_C;                        /* comments: '//' to the end, and a block comment within the line */
+    const char *p = line;
+    while (*p) {
+        if ((hash && *p == '#') || (slash && p[0] == '/' && p[1] == '/')) {
+            sb_puts(out, C_GRAY); sb_puts(out, p); sb_puts(out, C_RESET); sb_puts(out, base); return;
+        }
+        if (slash && p[0] == '/' && p[1] == '*') {
+            const char *e = strstr(p + 2, "*/"); size_t n = e ? (size_t)(e + 2 - p) : strlen(p);
+            sb_puts(out, C_GRAY); sb_append(out, p, n); sb_puts(out, C_RESET); sb_puts(out, base);
+            p += n; continue;
+        }
+        if (*p == '"' || *p == '\'') {
+            char q = *p; const char *s = p++;
+            while (*p && *p != q) { if (*p == '\\' && p[1]) p++; p++; }
+            if (*p) p++;
+            sb_puts(out, C_GREEN); sb_append(out, s, (size_t)(p - s)); sb_puts(out, C_RESET); sb_puts(out, base);
+            continue;
+        }
+        if (isdigit((unsigned char)*p) && !(p > line && (isalnum((unsigned char)p[-1]) || p[-1] == '_'))) {
+            const char *s = p;
+            while (isalnum((unsigned char)*p) || *p == '.' || *p == '_') p++;
+            sb_puts(out, C_YELLOW); sb_append(out, s, (size_t)(p - s)); sb_puts(out, C_RESET); sb_puts(out, base);
+            continue;
+        }
+        if (isalpha((unsigned char)*p) || *p == '_') {
+            const char *s = p;
+            while (isalnum((unsigned char)*p) || *p == '_') p++;
+            if (hl_keyword(l, s, (size_t)(p - s))) { sb_puts(out, C_MAGENTA); sb_append(out, s, (size_t)(p - s)); sb_puts(out, C_RESET); sb_puts(out, base); }
+            else sb_append(out, s, (size_t)(p - s));
+            continue;
+        }
+        sb_putc(out, *p++);
+    }
+}
+
+/* ---------- the git branch of a directory (the status bar's location line) ----------
+ * The .git of dir or of the nearest directory above it (a file there, as a linked worktree has, points to
+ * its git directory). Writes the branch name, or the first seven digits of the commit a detached HEAD is on,
+ * into out. 1 when dir is in a repository, else 0. Reads only: a few small files, so it can run at every redraw. */
+int git_branch(const char *dir, char *out, size_t n) {
+    char cur[4096], gitp[4200], head[4300];
+    if (!dir || !*dir || strlen(dir) >= sizeof cur) return 0;
+    snprintf(cur, sizeof cur, "%s", dir);
+    for (;;) {
+        snprintf(gitp, sizeof gitp, "%s/.git", cur);
+        struct stat st;
+        if (stat(gitp, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) snprintf(head, sizeof head, "%s/HEAD", gitp);
+            else {   /* "gitdir: PATH": a linked worktree */
+                FILE *f = fopen(gitp, "r"); char line[1024] = "";
+                if (!f) return 0;
+                if (!fgets(line, sizeof line, f)) line[0] = 0;
+                fclose(f);
+                size_t l = strlen(line); while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
+                if (strncmp(line, "gitdir: ", 8)) return 0;
+                if (line[8] == '/') snprintf(head, sizeof head, "%s/HEAD", line + 8);
+                else snprintf(head, sizeof head, "%s/%s/HEAD", cur, line + 8);
+            }
+            break;
+        }
+        if (!strcmp(cur, "/")) return 0;   /* the root: no repository */
+        char *slash = strrchr(cur, '/');
+        if (slash == cur) strcpy(cur, "/"); else *slash = 0;
+    }
+    FILE *f = fopen(head, "r");
+    if (!f) return 0;
+    char line[512] = "";
+    if (!fgets(line, sizeof line, f)) line[0] = 0;
+    fclose(f);
+    size_t l = strlen(line); while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
+    if (!strncmp(line, "ref: refs/heads/", 16)) snprintf(out, n, "%s", line + 16);
+    else if (strlen(line) >= 7) snprintf(out, n, "%.7s", line);   /* detached: the commit */
+    else snprintf(out, n, "%s", "HEAD");
+    return 1;
 }

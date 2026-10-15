@@ -367,8 +367,9 @@ static void cap_output(sbuf *b, size_t cap) {
     *b = n;
 }
 
-/* Print a few lines of text with a prefix, coloured, for previews. */
-static void preview_lines(const char *text, int max_lines, const char *color) {
+/* Print a few lines of text with a prefix, coloured, for previews. `lang` (a file's extension, or NULL) colours
+ * the code in it, as the replies' code blocks are; a line too long to fit is shown plain, as it always was. */
+static void preview_lines(const char *text, int max_lines, const char *color, const char *lang) {
     int lines = 0, total = 0;
     for (const char *p = text; *p; p++) if (*p == '\n') total++;
     if (*text && text[strlen(text)-1] != '\n') total++;
@@ -377,7 +378,12 @@ static void preview_lines(const char *text, int max_lines, const char *color) {
     while (*p && lines < max_lines) {
         const char *e = strchr(p, '\n');
         size_t n = e ? (size_t)(e - p) : strlen(p);
-        printf("  %s%.*s%s" C_RESET "\n", color, (int)(n > w ? w : n), p, n > w ? "…" : "");
+        if (lang && n <= w) {
+            sbuf h; sb_init(&h);
+            highlight_line(lang, p, &h, color);   /* the line as it is, with the code's colours */
+            printf("  %s%s" C_RESET "\n", color, h.data ? h.data : "");
+            sb_free(&h);
+        } else printf("  %s%.*s%s" C_RESET "\n", color, (int)(n > w ? w : n), p, n > w ? "…" : "");
         lines++;
         if (!e) break;
         p = e + 1;
@@ -474,7 +480,8 @@ static tool_status t_write_file(cJSON *args, sbuf *out) {
     char *p = expand_home(path);
     bool exists = is_file(p);
     printf("  " C_DIM "%s %s (%zu bytes)" C_RESET "\n", exists ? "overwrite" : "create", path, strlen(content));
-    preview_lines(content, 12, C_GREEN);
+    const char *dot = strrchr(path, '.'), *slash = strrchr(path, '/');
+    preview_lines(content, 12, C_GREEN, dot && (!slash || dot > slash) ? dot + 1 : NULL);
     char *reason = NULL;
     if (!confirm(exists ? "Overwrite this file?" : "Create this file?", CONF_EDIT, &g_always_write, NULL, &reason)) {
         sb_printf(out, "User denied writing %s.%s%s", path, reason ? " Reason: " : "", reason ? reason : "");
@@ -526,8 +533,8 @@ static tool_status t_edit_file(cJSON *args, sbuf *out) {
     }
     printf("  " C_DIM "edit %s (%d replacement%s)" C_RESET "\n", path, occ, occ == 1 ? "" : "s");
     /* diff-ish preview */
-    { sbuf t; sb_init(&t); const char *q = olds; while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "- %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_RED); sb_free(&t); }
-    { sbuf t; sb_init(&t); const char *q = news; if (!*q) sb_puts(&t, "+ (deleted)\n"); while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "+ %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_GREEN); sb_free(&t); }
+    { sbuf t; sb_init(&t); const char *q = olds; while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "- %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_RED, NULL); sb_free(&t); }
+    { sbuf t; sb_init(&t); const char *q = news; if (!*q) sb_puts(&t, "+ (deleted)\n"); while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "+ %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_GREEN, NULL); sb_free(&t); }
     char *reason = NULL;
     if (!confirm("Apply this edit?", CONF_EDIT, &g_always_edit, NULL, &reason)) {
         sb_printf(out, "User denied editing %s.%s%s", path, reason ? " Reason: " : "", reason ? reason : "");
