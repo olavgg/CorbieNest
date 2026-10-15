@@ -535,37 +535,94 @@ static bool plan_after(const char *line, size_t len, int *nums, int *n, bool *no
     return true;
 }
 
+/* "KEY: value" among a plan's lines (a task's, or the plan's): the value's span. KEY is a whole word, matched
+ * without case and past the markers a model puts in front of it (bullets, bold); false for any other line. */
+static bool plan_field(const char *line, size_t len, const char *key, const char **val, size_t *vlen) {
+    const char *p = line, *end = line + len;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '*' || *p == '_' || *p == '-' || *p == '>' || *p == '#')) p++;
+    size_t kl = strlen(key);
+    if ((size_t)(end - p) < kl || strncasecmp(p, key, kl)) return false;
+    p += kl;
+    while (p < end && (*p == ' ' || *p == '*' || *p == '_')) p++;
+    if (p == end || *p != ':') return false;
+    p++;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '`' || *p == '*' || *p == '_')) p++;
+    while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '`' || end[-1] == '*' || end[-1] == '_')) end--;
+    *val = p; *vlen = (size_t)(end - p);
+    return true;
+}
+
+/* "OWNS: a, b": the paths a task may write, appended to its list (a literal file, or a directory prefix) */
+static void plan_owns(orch_task *t, const char *v, size_t vl) {
+    for (size_t i = 0; i < vl; ) {
+        size_t j = i; while (j < vl && v[j] != ',') j++;
+        size_t a = i, b = j;
+        while (a < b && (v[a] == ' ' || v[a] == '\t')) a++;
+        while (b > a && (v[b - 1] == ' ' || v[b - 1] == '\t')) b--;
+        if (b > a && t->nowns < ORCH_OWNS_MAX) {
+            t->owns = xrealloc(t->owns, sizeof *t->owns * (size_t)(t->nowns + 1));
+            t->owns[t->nowns++] = xstrndup(v + a, b - a);
+        }
+        i = j + 1;
+    }
+}
+
 int orch_parse_plan(const char *text, orch_task **tasks) {
+    return orch_parse_plan_ex(text, tasks, NULL);
+}
+
+int orch_parse_plan_ex(const char *text, orch_task **tasks, char **contract) {
     *tasks = NULL;
-    int n = 0;
+    if (contract) *contract = NULL;
+    int n = 0; bool in_contract = false;   /* in_contract: the CONTRACT: block before the first task */
     int num[ORCH_MAX_TASKS + 1] = { 0 };                 /* the number the plan gave each task */
     int dep[ORCH_MAX_TASKS + 1][ORCH_MAX_TASKS], ndep[ORCH_MAX_TASKS + 1]; bool said[ORCH_MAX_TASKS + 1];
     memset(ndep, 0, sizeof ndep); memset(said, 0, sizeof said);
-    sbuf body; sb_init(&body);
+    sbuf body, csb; sb_init(&body); sb_init(&csb);
     for (const char *p = text ? text : ""; *p; ) {
         size_t len = strcspn(p, "\n"), tl = 0;
         const char *title = plan_header(p, len, &tl);
-        bool none;
+        bool none; const char *v = NULL; size_t vl = 0;
         if (title) {
+            in_contract = false;
             if (n) { (*tasks)[n - 1].body = xstrdup(body.data ? body.data : ""); trim((*tasks)[n - 1].body); }
             body.len = 0; if (body.data) body.data[0] = 0;
             if (n == ORCH_MAX_TASKS) { n++; break; }   /* (counted to say so, never stored) */
             *tasks = xrealloc(*tasks, sizeof **tasks * (size_t)(n + 1));
             const char *d = p; while (d < title && !isdigit((unsigned char)*d)) d++;
             num[n] = atoi(d);
-            (*tasks)[n++] = (orch_task){ xstrndup(title, tl), NULL, 0 };
+            (*tasks)[n++] = (orch_task){ .title = xstrndup(title, tl) };
         } else if (n && plan_after(p, len, dep[n - 1], &ndep[n - 1], &none)) said[n - 1] = true;   /* (not part of the instructions) */
+        else if (n && plan_field(p, len, "role", &v, &vl)) {
+            free((*tasks)[n - 1].role);
+            (*tasks)[n - 1].role = vl ? xstrndup(v, vl) : NULL;
+        } else if (n && plan_field(p, len, "owns", &v, &vl)) plan_owns(&(*tasks)[n - 1], v, vl);
+        else if (!n && plan_field(p, len, "contract", &v, &vl)) {
+            in_contract = true;
+            if (vl) { sb_append(&csb, v, vl); sb_putc(&csb, '\n'); }
+        } else if (!n && in_contract) { sb_append(&csb, p, len); sb_putc(&csb, '\n'); }
         else if (n) { sb_append(&body, p, len); sb_putc(&body, '\n'); }
         p += len; if (*p == '\n') p++;
     }
     if (n > ORCH_MAX_TASKS) n = ORCH_MAX_TASKS;
     else if (n) { (*tasks)[n - 1].body = xstrdup(body.data ? body.data : ""); trim((*tasks)[n - 1].body); }
     sb_free(&body);
+    if (contract && csb.len) {
+        *contract = xstrdup(csb.data);
+        trim(*contract);
+        if (!(*contract)[0]) { free(*contract); *contract = NULL; }
+    }
+    sb_free(&csb);
     /* a header with nothing to it — no title and no instructions — is not a task */
     int keep = 0, at[ORCH_MAX_TASKS];   /* at[i]: where task i ended up, -1 = dropped */
     for (int i = 0; i < n; i++) {
         if (!(*tasks)[i].body) (*tasks)[i].body = xstrdup("");
-        if (!(*tasks)[i].title[0] && !(*tasks)[i].body[0]) { free((*tasks)[i].title); free((*tasks)[i].body); at[i] = -1; continue; }
+        if (!(*tasks)[i].title[0] && !(*tasks)[i].body[0]) {
+            free((*tasks)[i].title); free((*tasks)[i].body); free((*tasks)[i].role);
+            for (int k = 0; k < (*tasks)[i].nowns; k++) free((*tasks)[i].owns[k]);
+            free((*tasks)[i].owns);
+            at[i] = -1; continue;
+        }
         at[i] = keep; (*tasks)[keep++] = (*tasks)[i];
     }
     /* what each waits for: the tasks its AFTER line names — earlier ones only, so nothing can wait
@@ -582,7 +639,11 @@ int orch_parse_plan(const char *text, orch_task **tasks) {
 }
 
 void orch_tasks_free(orch_task *t, int n) {
-    for (int i = 0; i < n; i++) { free(t[i].title); free(t[i].body); }
+    for (int i = 0; i < n; i++) {
+        free(t[i].title); free(t[i].body); free(t[i].role);
+        for (int k = 0; k < t[i].nowns; k++) free(t[i].owns[k]);
+        free(t[i].owns);
+    }
     free(t);
 }
 

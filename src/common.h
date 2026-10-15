@@ -605,8 +605,12 @@ typedef struct {
     char *title, *body;
     unsigned after;   /* the tasks (bit i = task i, earlier ones only) that must be accepted before this one starts: an
                        * "AFTER: 1, 3" or "AFTER: none" line of the plan — and without one, the task before it */
+    char *role;       /* "ROLE: name" of the plan: the skill that does this task (malloc'd; NULL = the default worker) */
+    char **owns; int nowns;   /* "OWNS: a, b": the paths it may write, literal files or directory prefixes (malloc'd) */
 } orch_task;
+#define ORCH_OWNS_MAX 16
 int  orch_parse_plan(const char *text, orch_task **tasks);
+int  orch_parse_plan_ex(const char *text, orch_task **tasks, char **contract);   /* contract: the "CONTRACT:" block before the first task, malloc'd or NULL */
 void orch_tasks_free(orch_task *t, int n);
 
 /* ---------- /goal: the pure half ----------

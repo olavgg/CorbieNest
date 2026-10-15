@@ -1234,6 +1234,21 @@ static void test_orchestrate(void) {
     n = orch_parse_plan("TASK 1\nJust the instructions.\n\nTASK 2: —\n", &t);
     CHECK(n == 2); CHECK_STR(t[0].title, ""); CHECK_STR(t[0].body, "Just the instructions.");
     orch_tasks_free(t, n);
+    /* ROLE: and OWNS: belong to their task, not its instructions; CONTRACT: is the plan's, read before the first task */
+    char *contract = NULL;
+    n = orch_parse_plan_ex("Plan.\nCONTRACT: package com.x; entity Hours(id, project, hours)\n- Repo: HoursRepo with findByWeek\n\n"
+                           "TASK 1: entities\nROLE: entity\nOWNS: src/main/java/com/x/model/, src/test/java/com/x/model\ndo the entities\n\n"
+                           "TASK 2: service\nROLE: service\nOWNS: `src/main/java/com/x/service/HoursService.java`\nAFTER: 1\ndo the service\n\n"
+                           "TASK 3: plain\nROLE:\ndo it\n", &t, &contract);
+    CHECK(n == 3 && contract && strstr(contract, "entity Hours") && strstr(contract, "Repo: HoursRepo") && !strstr(contract, "TASK 1"));
+    CHECK_STR(t[0].role, "entity"); CHECK(t[0].nowns == 2 && !strcmp(t[0].owns[0], "src/main/java/com/x/model/") && !strcmp(t[0].owns[1], "src/test/java/com/x/model"));
+    CHECK_STR(t[1].role, "service"); CHECK(t[1].nowns == 1 && !strcmp(t[1].owns[0], "src/main/java/com/x/service/HoursService.java"));
+    CHECK(t[1].after == 1u && t[2].after == 2u && t[2].role == NULL && t[2].nowns == 0);   /* an empty ROLE: is no role */
+    CHECK_STR(t[1].body, "do the service");
+    free(contract); orch_tasks_free(t, n);
+    n = orch_parse_plan_ex("TASK 1: a\ndo a\n", &t, &contract);
+    CHECK(n == 1 && contract == NULL && t[0].role == NULL && t[0].owns == NULL);   /* a plan without the new lines parses as before */
+    orch_tasks_free(t, n);
     CHECK(orch_parse_plan("I would rather talk first.\nThe task is unclear.", &t) == 0 && t == NULL);
     CHECK(orch_parse_plan("", &t) == 0 && orch_parse_plan(NULL, &t) == 0);
     sbuf many; sb_init(&many);
