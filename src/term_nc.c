@@ -204,6 +204,8 @@ bool nc_compiled(void) { return true; }
 #define C_MENU    0x1E2330u   /* a menu's background */
 #define C_BAR_A   0x161A24u   /* the status bar: a gradient from here … */
 #define C_BAR_B   0x2A1F3Du   /* … to here */
+#define C_FIELD_TEXT 0xFFF1B8u /* what is typed in the field: a light yellow on a darker ground (the ANSI field uses the same) */
+#define C_FIELD_BG   0x151922u
 #define C_OK      0xA3BE8Cu
 #define C_BAD     0xBF616Au
 #define C_WARN    0xEBCB8Bu
@@ -683,7 +685,8 @@ static void draw_field(int top) {
     put_text(top, g_cols - 1, "╮", 1, rc, NC_DEFAULT, false, NULL);
     put_text(top + shown + 1, 0, "╰", 1, rc, NC_DEFAULT, false, NULL);
     put_text(top + shown + 1, g_cols - 1, "╯", 1, rc, NC_DEFAULT, false, NULL);
-    for (int r = 0; r < shown; r++) {                        /* the side borders of the text rows */
+    for (int r = 0; r < shown; r++) {                        /* the side borders of the text rows; the rows between them are the field's ground */
+        fill_row(top + 1 + r, 2, g_cols - 2, C_FIELD_BG, false);
         put_text(top + 1 + r, 0, "│", 1, rc, NC_DEFAULT, false, NULL);
         put_text(top + 1 + r, g_cols - 1, "│", 1, rc, NC_DEFAULT, false, NULL);
     }
@@ -691,7 +694,7 @@ static void draw_field(int top) {
         nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 };
         put_text(top, g_cols - 8, "[ready]", 7, 0x5FD75Fu, NC_DEFAULT, false, &carry);
     }
-    if (first == 0) put_text(top + 1, 2, "❯", 1, C_ACCENT, NC_DEFAULT, false, NULL);   /* the prompt, inside the border */
+    if (first == 0) put_text(top + 1, 2, "❯", 1, C_ACCENT, C_FIELD_BG, false, NULL);   /* the prompt, inside the border */
     {   /* the mode, on the lower rule, its last cell two columns in from the edge (as the ANSI screen puts it) */
         sbuf m; sb_init(&m);
         int mw = term_mode_text(&m, g_cols), x0 = g_cols - mw - 1;
@@ -721,8 +724,8 @@ static void draw_field(int top) {
         for (int q = 0; q < nm; q++) if (at >= ms[q][0] && at < ms[q][1]) { inmention = true; break; }
         if (shows) {
             /* the caret is a light cell with a dark letter (reverse video does not show here, and the hardware cursor is not moved: see nc_render) */
-            nc_style st = here ? (nc_style){ C_BAR_A, C_TEXT, 0 } : (nc_style){ inmention ? C_MENTION : C_TEXT, NC_DEFAULT, 0 };
-            paint(g_std, &st, C_TEXT, NC_DEFAULT);
+            nc_style st = here ? (nc_style){ C_BAR_A, C_TEXT, 0 } : (nc_style){ inmention ? C_MENTION : C_FIELD_TEXT, NC_DEFAULT, 0 };
+            paint(g_std, &st, C_FIELD_TEXT, C_FIELD_BG);
             ncplane_putstr_yx(g_std, y, x, cell.egc);
         }
         col += w; at += len;

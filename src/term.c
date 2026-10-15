@@ -522,6 +522,10 @@ static int field_top(void) { return g_fs_rows - g_field_rows - 2 - g_sug_rows - 
 static int field_mentions(const char *text, size_t len, size_t (*sp)[2]) {
     return len && text[0] != '/' && text[0] != '!' ? mention_spans(text, len, sp, MENTION_MAX) : 0;
 }
+/* what is typed in the field: a light yellow on a darker ground (notcurses uses the same colours) */
+#define FIELD_FG "\x1b[38;2;255;241;184m"
+#define FIELD_BG "\x1b[48;2;21;25;34m"
+#define FIELD_ON FIELD_BG FIELD_FG
 /* kind[i] 1 = a paste token (reverse video), anything else a mention (cyan); kind may be NULL */
 static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_t (*sp)[2], const int *kind, int ns) {
     size_t at = from, end = from + n;
@@ -531,7 +535,7 @@ static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_
         size_t a = sp[i][0] > at ? sp[i][0] : at, b = sp[i][1] < end ? sp[i][1] : end;
         sb_append(o, text + at, a - at);
         if (kind && kind[i] == 1) { sb_puts(o, "\x1b[7m"); sb_append(o, text + a, b - a); sb_puts(o, "\x1b[27m"); }
-        else { sb_puts(o, C_CYAN); sb_append(o, text + a, b - a); sb_puts(o, "\x1b[39m"); }
+        else { sb_puts(o, C_CYAN); sb_append(o, text + a, b - a); sb_puts(o, FIELD_FG); }
         at = b;
     }
     if (at < end) sb_append(o, text + at, end - at);
@@ -586,9 +590,10 @@ static void field_draw(sbuf *o, const char *typed) {
         int c = g_fs_cols - 7 - 1;
         if (c >= 1) sb_printf(o, "\x1b[%d;%dH" C_GREEN "[ready]" C_RESET, top, c);
     }
-    for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;1H\x1b[K", top + 1 + i);
+    for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;%dH" FIELD_BG "\x1b[K" C_RESET, top + 1 + i, FIELD_X0);
     sb_printf(o, "\x1b[%d;%dH", top + 1, FIELD_X0 + 1);
     if (!g_field_view) sb_puts(o, field_prompt());
+    sb_puts(o, FIELD_ON);
     if (typed) {
         /* not the editor's text: one line, tail kept, with a block for the cursor */
         int avail = width - vis_width(field_prompt()) - 2;
@@ -603,7 +608,7 @@ static void field_draw(sbuf *o, const char *typed) {
             sb_puts(o, "…"); mark = 1;
         }
         size_t sp[MENTION_MAX][2]; int ns = field_mentions(t, strlen(t), sp);
-        put_mentions(o, t, (size_t)(p - t), strlen(p), sp, NULL, ns); sb_puts(o, C_DIM "▏" C_RESET);
+        put_mentions(o, t, (size_t)(p - t), strlen(p), sp, NULL, ns); sb_puts(o, C_DIM "▏" C_RESET FIELD_ON);
         /* the caret is the ▏: after the prompt, the … if any, and the tail */
         g_ta_caret_col = FIELD_X0 + (g_field_view ? 0 : vis_width(field_prompt())) + mark + vis_width(p) + 1;
         free(t);
@@ -625,10 +630,11 @@ static void field_draw(sbuf *o, const char *typed) {
             if (to > g_field_len) to = g_field_len;
             sb_printf(o, "\x1b[%d;%dH", top + 1 + i, FIELD_X0 + 1);
             if (i == 0 && g_field_view == 0) sb_puts(o, field_prompt());
+            sb_puts(o, FIELD_ON);
             size_t n = to > from ? to - from : 0;
             while (n && g_field_text[from + n - 1] == '\n') n--;
             put_mentions(o, g_field_text, from, n, sp, kind, ns);
-            sb_puts(o, C_RESET "\x1b[K");
+            sb_puts(o, "\x1b[K" C_RESET);
             from = to;
         }
     }
