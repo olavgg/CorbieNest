@@ -611,6 +611,8 @@ typedef struct {
 } orch_task;
 #define ORCH_OWNS_MAX 16
 int  orch_parse_plan(const char *text, orch_task **tasks);
+bool owns_overlap_one(const char *a, const char *b);   /* two OWNS: paths name the same file, or one holds the other */
+bool owns_overlap(char **a, int na, char **b, int nb); /* any path of one list overlaps any path of the other */
 int  orch_parse_plan_ex(const char *text, orch_task **tasks, char **contract);   /* contract: the "CONTRACT:" block before the first task, malloc'd or NULL */
 void orch_tasks_free(orch_task *t, int n);
 

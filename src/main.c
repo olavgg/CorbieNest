@@ -3005,8 +3005,12 @@ static void orch_schedule(orch_run *r, int maxpar) {
                 if (!(r->tasks[i].after & (1u << j)) || task_ok(&r->w[j])) continue;
                 if (r->w[j].state == T_WAITING || r->w[j].state == T_RUNNING) ready = false; else lost = true;
             }
+            /* a task that owns paths waits while a running task owns an overlapping one; a task with no OWNS: clashes with nothing */
+            bool clash = false;
+            for (int j = 0; j < r->nt && !clash; j++)
+                if (j != i && r->w[j].state == T_RUNNING && owns_overlap(r->tasks[i].owns, r->tasks[i].nowns, r->tasks[j].owns, r->tasks[j].nowns)) clash = true;
             if (lost) task_end(&r->w[i], T_SKIPPED, "not started: a task it waits for was not accepted");
-            else if (ready && running < maxpar) { worker_begin(r, i); if (r->w[i].state == T_RUNNING) running++; }
+            else if (ready && !clash && running < maxpar) { worker_begin(r, i); if (r->w[i].state == T_RUNNING) running++; }
         }
         if (!running || r->aborted) break;
         char now[64]; snprintf(now, sizeof now, running == 1 ? "worker · 1 task running" : "workers · %d tasks running", running);

@@ -567,6 +567,37 @@ static void plan_owns(orch_task *t, const char *v, size_t vl) {
     }
 }
 
+/* An OWNS: path without its "./" in front and its "/" behind: "" is the whole project */
+static char *owns_norm(const char *p) {
+    while (p[0] == '.' && p[1] == '/') p += 2;
+    size_t l = strlen(p);
+    while (l && p[l - 1] == '/') l--;
+    if (l == 1 && p[0] == '.') l = 0;
+    return xstrndup(p, l);
+}
+
+/* Two OWNS: paths overlap when they are the same file, or one is a directory (a prefix up to a '/') holding the other.
+ * The whole project ("." or "./") overlaps everything. */
+bool owns_overlap_one(const char *a, const char *b) {
+    char *x = owns_norm(a), *y = owns_norm(b);
+    bool hit = false;
+    if (!x[0] || !y[0]) hit = true;
+    else {
+        size_t lx = strlen(x), ly = strlen(y);
+        if (lx > ly) { char *t = x; x = y; y = t; size_t tl = lx; lx = ly; ly = tl; }   /* x is the shorter */
+        hit = !strcmp(x, y) || (!strncmp(x, y, lx) && y[lx] == '/');
+    }
+    free(x); free(y);
+    return hit;
+}
+
+bool owns_overlap(char **a, int na, char **b, int nb) {
+    for (int i = 0; i < na; i++)
+        for (int j = 0; j < nb; j++)
+            if (owns_overlap_one(a[i], b[j])) return true;
+    return false;
+}
+
 int orch_parse_plan(const char *text, orch_task **tasks) {
     return orch_parse_plan_ex(text, tasks, NULL);
 }

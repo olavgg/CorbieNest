@@ -1256,6 +1256,13 @@ static void test_orchestrate(void) {
     n = orch_parse_plan_ex("TASK 1: a\ndo a\n", &t, &contract);
     CHECK(n == 1 && contract == NULL && t[0].role == NULL && t[0].owns == NULL);   /* a plan without the new lines parses as before */
     orch_tasks_free(t, n);
+    /* OWNS: paths clash when they name one file, or a directory and what is in it; a prefix that is no directory does not */
+    CHECK(!owns_overlap_one("src/a", "src/ab") && !owns_overlap_one("pom.xml", "src/pom.xml"));
+    CHECK(owns_overlap_one("src/a", "src/a") && owns_overlap_one("src/main/java/x/", "src/main/java/x/service/S.java"));
+    CHECK(owns_overlap_one("./src/", "src/x") && owns_overlap_one("pom.xml/", "pom.xml"));
+    CHECK(owns_overlap_one(".", "anything/at/all") && owns_overlap_one("", "x"));   /* the whole project clashes with all */
+    char *la[] = { "x/a.java", "pom.xml" }, *lb[] = { "pom.xml" }, *lc[] = { "y/" };
+    CHECK(owns_overlap(la, 2, lb, 1) && !owns_overlap(la, 2, lc, 1) && !owns_overlap(la, 2, NULL, 0));
     CHECK(orch_parse_plan("I would rather talk first.\nThe task is unclear.", &t) == 0 && t == NULL);
     CHECK(orch_parse_plan("", &t) == 0 && orch_parse_plan(NULL, &t) == 0);
     sbuf many; sb_init(&many);
