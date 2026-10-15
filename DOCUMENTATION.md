@@ -632,19 +632,28 @@ hosted, cloud or a bigger local one) is in charge, and the model doing the work 
 ```
 
 - **Plan.** The orchestrator is shown the request (with its `@files`), the project instructions,
-  a listing of the directory and the conversation so far, and answers with up to 12 tasks. It has
-  no tools, so a plan that needs to know the code first begins with a task that explores.
+  a listing of the directory, the conversation so far and the roles it may name, and answers with
+  up to 24 tasks. It has no tools, so a plan that needs to know the code first begins with a task
+  that explores.
   Outside auto mode you are asked before the tasks run; in plan mode they are only shown.
 - **Work.** Each task is an agent of its own on the main model, with a fresh context: its task
-  and the reports of the tasks before it. It has every tool but `task` and `advisor`, and its
+  and the reports of the tasks before it. A task may name a **role** (`ROLE: tester`): a skill (see
+  [Skills](#skills)) whose instructions are added to the worker's prompt and whose `model:` it
+  runs on. A role that is not a skill, or whose model is not there, runs the default worker, and
+  the line under the task says why. The plan's **contract** (a `CONTRACT:` block before the first
+  task) is shown to every worker before its task: the names, signatures and paths the tasks share. It has every tool but `task` and `advisor`, and its
   writes go through the permission mode like any other.
 - **Review.** The orchestrator sees the task, the worker's report and the diff of the files it
   wrote, and accepts it or sends it back with what to do — twice at most. A task that is still
   not accepted takes the tasks that wait for it with it; the others go on. `/rewind` undoes the
   whole run.
+- **Owned paths.** A task may list the paths it may write (`OWNS: src/service/, pom.xml`): a
+  file or a directory. A task does not start while a running task owns an overlapping path; a
+  task without `OWNS:` clashes with nothing. The planner is asked to give each shared file to one
+  later task.
 - **Several at a time.** The planner may mark tasks that do not need each other and write
   different files (`AFTER: none`, `AFTER: 1, 2`); those run at the same time, up to `/workers`
-  of them (default 3). What overlaps is the model calls — each on a thread of its own — while
+  of them (default 3, at most 20). What overlaps is the model calls — each on a thread of its own — while
   the workers' tools, the confirmations and the reviews still happen one at a time, so their
   lines in the transcript are tagged `[2]` with the task they belong to. A plan that marks
   nothing runs in order. Whether it is faster is up to the server: Ollama answers parallel
