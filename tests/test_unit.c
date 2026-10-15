@@ -661,8 +661,15 @@ static void test_skills(void) {
     CHECK(write_whole_file(".corbienest/skills/rev/SKILL.md", body, strlen(body)) == 0);
     const char *flat = "No frontmatter here.\n";
     CHECK(write_whole_file(".corbienest/skills/plain.md", flat, strlen(flat)) == 0);
-    CHECK(skills_load() == 2);
+    CHECK(mkdir_p(".corbienest/skills/tester") == 0);   /* a role: its frontmatter names a model */
+    const char *role = "---\nname: tester\ndescription: Writes the tests\nmodel: qwen3-coder:30b\n---\nWrite the tests.\n";
+    CHECK(write_whole_file(".corbienest/skills/tester/SKILL.md", role, strlen(role)) == 0);
+    CHECK(skills_load() == 3);
     const skill_t *s = skill_find("/rev"); CHECK(s != NULL);
+    if (s) CHECK(s->model == NULL);   /* no model: inherit the one in use */
+    s = skill_find("tester"); CHECK(s != NULL);
+    if (s) { CHECK_STR(s->model, "qwen3-coder:30b"); CHECK_STR(s->body, "Write the tests.\n"); }
+    s = skill_find("/rev"); CHECK(s != NULL);
     if (s) {
         CHECK_STR(s->desc, "Review things"); CHECK_STR(s->body, "Review: $ARGUMENTS\nEnd.\n"); CHECK_STR(s->source, "project");
         char *e = skill_expand(s, "a.c b.c");
@@ -678,7 +685,7 @@ static void test_skills(void) {
     char path[512]; CHECK(skill_scaffold("new-one", path, sizeof path) == 0); CHECK(is_file(path));
     CHECK(skill_scaffold("new-one", path, sizeof path) == 1);
     CHECK(skill_scaffold("bad name!", path, sizeof path) == -1);
-    CHECK(skills_load() == 3);
+    CHECK(skills_load() == 4);   /* rev, plain, tester and the scaffolded one */
     char *sec = skills_prompt_section(); CHECK(sec && strstr(sec, "/new-one") && strstr(sec, "written in C")); free(sec);
     CHECK(chdir(old) == 0);
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}

@@ -537,6 +537,7 @@ const char *tools_summary_line(void);   /* short list for help */
 /* ---------- skills.h ---------- */
 typedef struct {
     char *name, *desc, *path, *dir, *body;
+    char *model;          /* the frontmatter's "model:": the model a worker in this role runs on (NULL: the one in use) */
     const char *source;   /* "project" or "user" */
 } skill_t;
 int   skills_load(void);                 /* (re)scan skill directories, returns count */

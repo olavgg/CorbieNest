@@ -397,6 +397,8 @@ Review these files carefully: $ARGUMENTS
 Report findings as a list.
 ```
 
+An optional `model:` line names the model the skill runs on when it is a role of a plan (see [Orchestrating](#orchestrating)); without it the role runs on the model in use.
+
 Put project skills in `.corbienest/skills/NAME/SKILL.md` (or `NAME.md`; `.claude/skills/` is
 read too), personal ones in `~/.config/corbienest/skills/`. Claude Code's flat custom
 commands are picked up as well: `.corbienest/commands/NAME.md`, `.claude/commands/NAME.md`,
