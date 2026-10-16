@@ -2140,6 +2140,40 @@ check(not any("side question" in (m.get("content") or "") for m in nxt), "the si
 check(sum(1 for m in nxt if m.get("role") == "user") == 2, f"and the conversation has only the two real messages: {[m.get('role') for m in nxt]}")
 b.close()
 
+# ---------- /orchestrate roles: a skill sets the worker's model and prompt, the contract is shown, owned paths wait ----------
+print("test interactive: /orchestrate with roles, a contract and owned paths")
+RP = make_repo()
+os.makedirs(os.path.join(RP, ".corbienest", "skills", "tester"), exist_ok=True)
+open(os.path.join(RP, ".corbienest", "skills", "tester", "SKILL.md"), "w").write(
+    "---\nname: tester\ndescription: Writes the item and the tests for it\nmodel: fake-levels:latest\n---\n"
+    "ROLE-BODY: you write the tests first, then the code they need.\n")
+RCFG = tempfile.mkdtemp(prefix="crowroles_")   # its own config: the sections before it leave theirs behind
+os.makedirs(os.path.join(RCFG, "corbienest"), exist_ok=True)
+open(os.path.join(RCFG, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\n")
+ENVR = dict(ENV2, XDG_CONFIG_HOME=RCFG)
+rp = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVR, cwd=RP); rp.expect("Ctrl-D to quit")
+rp.send("/advisor fake-big:latest\r"); rp.expect("advisor: fake-big:latest")
+n0 = len(requests())
+rp.send("/orchestrate ROLEPLAN build the item\r")
+check(rp.expect("orchestrated: 3 of 3 tasks accepted", 90), f"the run of three tasks comes to its end: {since_send(rp)[-500:]!r}")
+out = since_send(rp)
+check("role nosuchrole is not a skill here: the default worker" in out, "a role that is not a skill says so and runs the default worker")
+check("· role tester" in out, "a worker's line names its role")
+rev1 = out.index("reviews task 1/3")
+check(out.index("⤷ worker 2/3") > out.index("accepted", rev1), "the task that owns the same file as task 1 starts only after task 1 is accepted")
+reqs = requests()[n0:]
+def worker(task): return [r for r in reqs if "You are a worker agent" in r["messages"][0]["content"] and f"# Your task ({task} of 3)" in r["messages"][1]["content"]]
+w1, w2, w3 = worker(1), worker(2), worker(3)
+check(w1 and w1[0]["model"] == "fake-levels:latest", f"a role's model runs its worker: {w1[0]['model'] if w1 else None!r}")
+check(w3 and w3[0]["model"] == "fake-coder:latest", f"the default worker runs on the model in use: {w3[0]['model'] if w3 else None!r}")
+check(w2 and "# Your role: tester" in w2[0]["messages"][0]["content"] and "ROLE-BODY: you write the tests first" in w2[0]["messages"][0]["content"],
+      f"the skill's body is in the worker's prompt: {w2[0]['messages'][0]['content'][-300:] if w2 else None!r}")
+check(w2 and "# The contract (what all the tasks share)" in w2[0]["messages"][1]["content"] and "the tests import Item from src/x.c" in w2[0]["messages"][1]["content"],
+      "every worker is shown the contract, before its task")
+check(w3 and "# The contract" in w3[0]["messages"][1]["content"] and "# Your role" not in w3[0]["messages"][0]["content"], "and the default worker gets the contract, but no role")
+rp.close()
+shutil.rmtree(RP, ignore_errors=True); shutil.rmtree(RCFG, ignore_errors=True)
+
 shutil.rmtree(WORK, ignore_errors=True); shutil.rmtree(CFG, ignore_errors=True)
 print(f"{passed} checks passed, {failed} failed")
 sys.exit(1 if failed else 0)

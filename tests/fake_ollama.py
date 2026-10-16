@@ -66,6 +66,11 @@ def advisor_text(brief):
     ends) and a check (of the first change) find something unless the request says APPROVE."""
     if "# PLAN this request" in brief:   # /orchestrate: the plan, in the markdown a real model wraps it in
         if "NOPLAN" in brief: return "I would rather talk this through first."
+        if "ROLEPLAN" in brief:   # a contract; two tasks that own the same file (they wait for each other); a role nobody has
+            return ("CONTRACT: the tests import Item from src/x.c\n\n"
+                    "TASK 1: write the item\nROLE: tester\nOWNS: src/x.c\nAFTER: none\nTOOL_WRITE the file made.txt.\nDONE WHEN: made.txt exists\n\n"
+                    "TASK 2: test the item\nROLE: tester\nOWNS: src/x.c\nAFTER: none\nJust reply.\nDONE WHEN: you replied\n\n"
+                    "TASK 3: write the notes\nROLE: nosuchrole\nOWNS: docs/\nAFTER: none\nJust reply.\nDONE WHEN: you replied\n")
         if "PARALLEL" in brief:   # two tasks that may overlap (each a slow answer), and one that waits for both
             return ("TASK 1: first slow thing\nAFTER: none\nSLOW one\n\nTASK 2: second slow thing\nAFTER: none\nSLOW two\n\n"
                     "TASK 3: wrap it up\nAFTER: 1, 2\nTOOL_WRITE the file made.txt.\n")
