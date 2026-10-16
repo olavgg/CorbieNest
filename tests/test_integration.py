@@ -904,7 +904,7 @@ sp = Session(["-m", "fake-coder:latest"]); sp.expect("Ctrl-D to quit")
 body = "\n".join(f"line{i}" for i in range(10))
 sp.send("\x1b[200~" + body + "\x1b[201~", 1.0)
 check(sp.expect("[Pasted text #1 +10 lines]"), "a paste of more than three lines shows as a token")
-sp.send("\x1b[<0;5;37M", 0.3); sp.send("\x1b[<0;5;37m", 0.6); sp.expect("(no such text)", 0.8)   # the modal is a repaint: read it with since_send
+sp.send("\x1b[<0;5;38M", 0.3); sp.send("\x1b[<0;5;38m", 0.6); sp.expect("(no such text)", 0.8)   # row 38: the field's text row (a 40-row screen)   # the modal is a repaint: read it with since_send
 check("pasted text #1 · 10 lines" in since_send(sp) and "line9" in since_send(sp), "a click on the token opens the paste")
 sp.send("\x1b[6~", 0.6); sp.expect("(no such text)", 0.6)
 sp.send("\x1b", 0.8); sp.expect("(no such text)", 0.6)
