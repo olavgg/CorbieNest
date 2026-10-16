@@ -166,6 +166,10 @@ class Session:
         except Exception: pass
 
 def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
+def new_session(args=(), **kw):
+    """A session of its own, started and at its prompt: a section that uses it stands alone."""
+    sess = Session(list(args), **kw); sess.expect("Ctrl-D to quit")
+    return sess
 
 def click_rows(sess, rows=40):
     """Left-click every row of the screen, top to bottom, and return what was drawn in answer:
@@ -596,7 +600,7 @@ sp.close()
 
 
 print("test interactive: confirmation menu — deny with reason, arrow keys, then always")
-s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")   # its own session: it stands alone
+s = new_session(["-m", "fake-coder:latest"])   # its own session: it stands alone
 s.send("TOOL_BASH\r")
 check(s.expect("Run this command?"), "confirmation prompt")
 check(s.expect("1. Yes") and "3. Yes, and always allow `echo …` in this project" in s.text() and "4. No, and tell the model" in s.text(), f"menu options shown: {s.text()[-400:]!r}")
@@ -1176,7 +1180,7 @@ s.send("x"); check(s.expect("❯ x"), "a key typed in the viewer goes back to th
 s.send("\x15")
 
 print("test interactive: scrolling back while the model works")
-s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")   # its own session: it stands alone
+s = new_session(["-m", "fake-coder:latest"])   # its own session: it stands alone
 s.send("SLOW please\r"); check(s.expect("one"), "the reply starts")
 s.send(wheel(True, n=2)); check(s.expect("scrollback · rows"), f"the wheel scrolls back while the reply streams: {s.text()[-200:]!r}")
 check("esc to interrupt" in since() and "manual mode" in since(), "the bar is still the bar: the mode, and the conversation's spinner says the model is working")

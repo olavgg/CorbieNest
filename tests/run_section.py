@@ -16,14 +16,23 @@ def sections(lines):
     starts = [i for i, l in enumerate(lines) if l.startswith('print("test ')]
     return starts, starts[1:] + [len(lines)]
 
-def build(lines, starts, ends, target, prelude_end):
-    """The file with every section's checks muted except the target's; the target is the last one that runs."""
-    out = list(lines[:prelude_end])
-    out.append("_QUIET_CHECKS = True\n_real_check = check\ncheck = lambda *a, **k: True")
-    for k, st in enumerate(starts):
-        if k == target:
-            out.append("check = _real_check")
-        out += lines[st:ends[k]]
+def build(lines, starts, ends, keep, target):
+    """The test file with only the sections in `keep` (indices into starts) present, the others emptied, so every
+    line keeps its number. The first kept section's checks are muted until the target's, which are reported."""
+    kept_lines = set()
+    for k in keep:
+        kept_lines.update(range(starts[k], ends[k]))
+    first, last_kept = keep[0], keep[-1]
+    out = []
+    for i, l in enumerate(lines):
+        if i >= starts[0] and i not in kept_lines:
+            out.append(""); continue
+        extra = ""
+        if i == starts[first]:
+            extra += "; _real_check = check; check = lambda *a, **k: True"
+        if i == starts[target]:
+            extra += "; check = _real_check"
+        out.append(l + extra if extra else l)
     out.append('print(f"{passed} checks passed, {failed} failed")')
     out.append("sys.exit(1 if failed else 0)")
     return "\n".join(out)
@@ -43,8 +52,7 @@ def main():
     target = hits[0]
     # the target runs with everything before it; sections after it are not needed
     keep = [target] if alone else list(range(target + 1))
-    sub_starts = [starts[k] for k in keep]; sub_ends = [ends[k] for k in keep]
-    code = build(lines, sub_starts, sub_ends, keep.index(target), starts[0])
+    code = build(lines, starts, ends, keep, target)
     fd, path = tempfile.mkstemp(prefix="_section_", suffix=".py", dir=HERE)
     with os.fdopen(fd, "w", encoding="utf-8") as f: f.write(code)
     try:
