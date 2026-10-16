@@ -3542,7 +3542,7 @@ static void cmd_help(void) {
            "  /goal \"METRIC\" [min|max] [-n R] [-k K] [-m MODEL,...] GOAL\n"
            "                        candidates in git worktrees race to the goal, each on its model; the metric's best is kept as uncommitted changes\n"
            "  /btw QUESTION         a side question: the model answers from the conversation so far; the answer is printed, not kept in it\n"
-           "  /workers [N]          how many tasks of /orchestrate may run at the same time (the model calls, each on a thread; default 3, 1 = in turn)\n"
+           "  /workers [N]          how many tasks of /orchestrate may run at the same time (the model calls, each on a thread; default 3, at most 20, 1 = in turn)\n"
            "  /advisor [MODEL|off]  a stronger model the agent may consult when the work is hard (the advisor tool): a bigger local model, a cloud one\n"
            "                        (NAME-cloud, after `ollama signin`) or a hosted API: xai:MODEL, openai:MODEL, anthropic:MODEL (key from XAI_API_KEY,\n"
            "                        OPENAI_API_KEY, ANTHROPIC_API_KEY). It is shown the conversation and answers with advice; it has no tools.\n"
