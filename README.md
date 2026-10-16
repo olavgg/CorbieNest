@@ -70,12 +70,16 @@ Build options:
 
 ## Quick start
 
-1. Install [Ollama](https://ollama.com), start it and pull a model with tool support:
+1. Choose a model. Either install [Ollama](https://ollama.com), start it and pull a model with tool
+   support:
 
    ```sh
    ollama serve
    ollama pull qwen3-coder:30b
    ```
+
+   or export `ANTHROPIC_API_KEY` (see below). Without either, corbienest still starts: it says there is
+   no model yet, and `/model` picks one once Ollama or a key is there.
 
 2. Run corbienest in a project directory:
 
@@ -88,8 +92,9 @@ Build options:
    Type `/help` for the commands, `/mode` to change the permission mode, and `/quit` (or Ctrl-D)
    to leave.
 
-To use Claude instead, export `ANTHROPIC_API_KEY` and start with
-`./corbienest --model anthropic:claude-haiku-5-5`.
+To use Claude, export `ANTHROPIC_API_KEY`. With no model in the config and none on Ollama, corbienest
+uses `anthropic:claude-opus-5` for that run (it is not saved; `/model` chooses another). To pick a cheaper
+one from the start: `./corbienest --model anthropic:claude-haiku-5-5`.
 
 ## Documentation
 

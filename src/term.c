@@ -254,9 +254,9 @@ static void bar_build(sbuf *o, int cols) {
     }
     char mshort[200];
     const char *model = "(no model)";
-    if (g_cfg.model) { model_short(mshort, sizeof mshort, g_cfg.model); model = mshort; }
+    if (g_cfg.model && *g_cfg.model) { model_short(mshort, sizeof mshort, g_cfg.model); model = mshort; }
     char mbuf[384];   /* an effort that was set goes with the model's name: it is a large part of how fast it answers */
-    const char *eff = g_cfg.model ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
+    const char *eff = g_cfg.model && *g_cfg.model ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
     if (eff) { snprintf(mbuf, sizeof mbuf, "%s · %s", model, eff); model = mbuf; }
     char tin[32], tout[32], ttot[32];
     long out_now = g_session.eval_tokens + g_live_out;

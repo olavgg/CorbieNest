@@ -448,7 +448,7 @@ void config_save(void) {
     snprintf(path, sizeof path, "%s/config", config_dir());
     sbuf b; sb_init(&b);
     sb_puts(&b, "# corbienest config (auto-written)\n");
-    if (g_cfg.model) sb_printf(&b, "model=%s\n", g_cfg.model);
+    if (g_cfg.model && *g_cfg.model) sb_printf(&b, "model=%s\n", g_cfg.model);
     if (g_cfg.host) sb_printf(&b, "host=%s\n", g_cfg.host);
     sb_printf(&b, "num_ctx=%d\n", g_cfg.num_ctx);
     if (g_cfg.temperature >= 0) sb_printf(&b, "temperature=%g\n", g_cfg.temperature);

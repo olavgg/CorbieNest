@@ -364,9 +364,19 @@ static bool model_messages(const char *name) {
     return p && p->style == PROVIDER_MESSAGES;
 }
 static bool model_hosted(void) { return model_messages(g_cfg.model); }
+/* "" is the working model when none is chosen yet (no Ollama model, no provider key): the screen starts and
+ * says so, and nothing is sent until /model picks one. NULL is "not read yet" (refresh_model_caps picks). */
+static bool model_set(void) { return g_cfg.model && *g_cfg.model; }
 
 static cJSON *model_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted) {
     const char *model = ollama_call.model ? ollama_call.model : g_cfg.model;
+    if (!model || !*model) {   /* no model yet: nothing is sent (g_model_err says how to get one) */
+        *aborted = false;
+        if (stats) memset(stats, 0, sizeof *stats);
+        snprintf(ollama_error, sizeof ollama_error, "%s", g_model_err);
+        printf(C_RED "✗ %s" C_RESET "\n", g_model_err);
+        return NULL;
+    }
     const provider_def *p = provider_find(model, NULL);
     if (p && p->style == PROVIDER_MESSAGES) return provider_turn(messages, tools, stats, aborted);
     if (p) {
@@ -484,7 +494,7 @@ static void memory_arm_idle(void) {
  * and flush when enough have accumulated. Aborted requests are not counted but stay
  * covered by the range. One-shot runs flush at once (the process is about to exit). */
 static void memory_note(int first, bool aborted) {
-    if (!g_cfg.memory) return;
+    if (!g_cfg.memory || !model_set()) return;   /* a refused turn (no model yet) is not a request */
     int total = cJSON_GetArraySize(g_messages);
     if (first < 0 || first > total) first = 0;   /* the conversation was replaced meanwhile (compact) */
     if (g_mem_first < 0 || first < g_mem_first) g_mem_first = first;
@@ -898,7 +908,7 @@ static void cmd_cost(void) {
     printf("  wall time     %s\n", wall);
     if (g_cfg.num_ctx > 0 && g_session.last_prompt_tokens > 0)
         printf("  context       %d of %d tokens (%d%%)\n", g_session.last_prompt_tokens, g_cfg.num_ctx, (int)(100.0 * g_session.last_prompt_tokens / g_cfg.num_ctx));
-    printf("  model         %s\n", g_cfg.model ? g_cfg.model : "(none)");
+    printf("  model         %s\n", model_set() ? g_cfg.model : "(none)");
 }
 
 /* ---------- /diff: what changed in the working tree (not sent to the model) ---------- */
@@ -1168,8 +1178,10 @@ static void clamp_ctx_budget(void) {
 }
 
 /* ---------- model info ---------- */
+#define MODEL_LIST_WAIT_MS 3000   /* how long a list of models is waited for (the suggestions, the start-up check) */
 static void refresh_model_caps(bool quiet) {
     g_model_bad = false; g_model_err[0] = 0;
+    if (g_cfg.model && !*g_cfg.model) return;   /* no model yet: nothing to look up */
     const provider_def *hosted = g_cfg.model ? provider_find(g_cfg.model, NULL) : NULL;
     if (hosted && hosted->style != PROVIDER_MESSAGES) {
         g_model_bad = true;
@@ -1191,7 +1203,7 @@ static void refresh_model_caps(bool quiet) {
             printf(C_YELLOW "⚠ effort '%s' is saved for %s, which does not offer it (any more) — it is left to the model; /effort to pick one" C_RESET "\n", saved, g_cfg.model);
         return;
     }
-    cJSON *list = ollama_list_models();
+    cJSON *list = quiet ? ollama_list_models_quiet(MODEL_LIST_WAIT_MS) : ollama_list_models();
     if (!list) return;
     bool found = false;
     cJSON *m;
@@ -2457,6 +2469,14 @@ static bool reply_is_empty(cJSON *reply) {
 
 /* Returns true if the user interrupted the turn. */
 static bool run_turn(void) {
+    if (!model_set()) {   /* no model yet: say why, and take the message back out of the conversation */
+        printf(C_YELLOW "%s" C_RESET "\n", g_model_err);
+        size_t n = cJSON_GetArraySize(g_messages);
+        cJSON *last = n ? cJSON_GetArrayItem(g_messages, (int)n - 1) : NULL;
+        cJSON *role = last ? cJSON_GetObjectItemCaseSensitive(last, "role") : NULL;
+        if (role && cJSON_IsString(role) && !strcmp(role->valuestring, "user")) cJSON_DeleteItemFromArray(g_messages, (int)n - 1);
+        return false;
+    }
     int iters = 0, shrinks = 0, empties = 0;
     int round_first = -1;   /* where this round's tool results start (-1 before the first round) */
     g_session.turns++;
@@ -3042,7 +3062,7 @@ static void orch_schedule(orch_run *r, int maxpar) {
 static int cmd_orchestrate(const char *arg) {
     if (!arg || !*arg) {
         printf("usage: /orchestrate REQUEST\n" C_DIM "  the advisor model (%s) plans the request as tasks, %s does them as workers — those that do not wait for each other at the same time (/workers) — and the advisor reviews each" C_RESET "\n",
-               g_cfg.advisor ? g_cfg.advisor : "none set: /advisor MODEL", g_cfg.model ? g_cfg.model : "the model");
+               g_cfg.advisor ? g_cfg.advisor : "none set: /advisor MODEL", model_set() ? g_cfg.model : "the model");
         return 0;
     }
     if (!g_cfg.advisor) { printf(C_DIM "no advisor is set — /advisor MODEL names the model that plans and reviews (bare /advisor says what it can be)" C_RESET "\n"); return 0; }
@@ -4297,6 +4317,7 @@ static void host_warning(const char *lead) {
 }
 
 static bool ollama_needed(void) {   /* the working model is local, or the advisor is a model on the Ollama server */
+    if (!model_set()) return g_cfg.advisor && !provider_find(g_cfg.advisor, NULL);   /* no model yet: only the advisor can need it */
     return !model_hosted() || (g_cfg.advisor && !provider_find(g_cfg.advisor, NULL));
 }
 
@@ -4537,8 +4558,8 @@ static void banner_items(bool need_ollama, int ok) {
     box_add(1, C_BOLD "Corbie Nest" C_RESET " v%s — a coding agent for local and hosted models", CORBIE_VERSION);
     for (int r = 0; r < CROW_ROWS; r++) { box_add(2, ""); g_box.it[g_box.n - 1].crow = r; }
     box_add(0, "");   /* a gap between the crow and the lines below it */
-    const char *eff = g_cfg.model ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
-    box_add(0, C_DIM "model:" C_RESET " %s%s" C_DIM " · ctx %s%s%s%s%s" C_RESET, g_cfg.model ? g_cfg.model : "(none)", g_model_tools ? "" : C_DIM " (chat-only)" C_RESET,
+    const char *eff = model_set() ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
+    box_add(0, C_DIM "model:" C_RESET " %s%s" C_DIM " · ctx %s%s%s%s%s" C_RESET, model_set() ? g_cfg.model : "(none)", g_model_tools ? "" : C_DIM " (chat-only)" C_RESET,
             fmt_ctx(g_cfg.num_ctx), g_model_max_ctx > 0 ? " of " : "", g_model_max_ctx > 0 ? fmt_ctx(g_model_max_ctx) : "", eff ? " · effort " : "", eff ? eff : "");
     if (g_cfg.advisor) {
         /* a hosted advisor without its key is one that will not answer: say so here, not at the first consultation */
@@ -4554,7 +4575,7 @@ static void banner_items(bool need_ollama, int ok) {
         box_add(0, C_DIM "api:  " C_RESET " %s · %s %s", pv ? provider_base_url(pv) : "", pv ? pv->key_env : "", key && *key ? C_GREEN "set" C_RESET : C_RED "not set" C_RESET);
         if (need_ollama) box_add(0, C_DIM "host: " C_RESET " %s %s" C_DIM " (the advisor)" C_RESET, g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);
     } else {
-        box_add(0, C_DIM "host: " C_RESET " %s %s", g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);
+        if (model_set()) box_add(0, C_DIM "host: " C_RESET " %s %s", g_cfg.host, ok == 0 ? C_GREEN "● connected" C_RESET : C_RED "● unreachable" C_RESET);   /* no model yet: Ollama was not asked */
         host_warning_text(g_host_note, sizeof g_host_note);
     }
     box_add(0, C_DIM "cwd:  " C_RESET " %s%s", g_cwd, g_project_instructions ? C_DIM " (project instructions loaded)" C_RESET : "");
@@ -4584,6 +4605,7 @@ static void banner(void) {
     printf(C_BOLD "Corbie Nest" C_RESET C_DIM " v%s · /banner shows the box again" C_RESET "\n", CORBIE_VERSION);
     if (g_advisor_note[0]) printf("%s\n", g_advisor_note);
     if (g_host_note[0]) printf("%s\n", g_host_note);
+    if (!model_set()) printf(C_YELLOW "%s" C_RESET "\n", g_model_err);
     if (need_ollama && ok != 0) {
         if (model_hosted()) printf(C_YELLOW "cannot reach ollama at %s: %s — the advisor's consultations need it" C_RESET "\n" C_DIM "start it with `ollama serve`, or set the host with /host or OLLAMA_HOST" C_RESET "\n", g_cfg.host, ver);
         else printf(C_RED "cannot reach ollama at %s: %s" C_RESET "\n" C_DIM "start it with `ollama serve`, or set the host with /host or OLLAMA_HOST" C_RESET "\n", g_cfg.host, ver);
@@ -4620,7 +4642,6 @@ static void sug_add(term_sug **v, int *n, const char *text, const char *desc, bo
  * runs inside the poll of a live request as well, where a second request must not start: there
  * it gets what is already known. */
 #define MODEL_LIST_SECS 60
-#define MODEL_LIST_WAIT_MS 3000
 #define MODEL_LISTS 8
 #define MODEL_SUG_MAX 60
 static struct { cJSON *list; char *from; time_t at; char why[240]; } g_model_lists[MODEL_LISTS];   /* why: what kept a provider's list away */
@@ -5094,6 +5115,36 @@ static void usage(void) {
            "  -h, --help           this help\n");
 }
 
+/* No model in the config and none on the Ollama server: the first provider that speaks Messages (Anthropic)
+ * with its key in the environment becomes the working model, for this run only (it is not saved). Only the
+ * Messages providers can do the work; the others are advisors. Returns false when there is no key. */
+static bool hosted_fallback(bool quiet) {
+    const provider_def *p = NULL;
+    for (int i = 0; (p = provider_at(i)) != NULL; i++) {
+        if (p->style != PROVIDER_MESSAGES) continue;
+        const char *key = getenv(p->key_env);
+        if (key && *key) break;
+        p = NULL;
+    }
+    if (!p) {
+        snprintf(g_model_err, sizeof g_model_err, "no model yet: ollama has none at %s — ollama pull <model>, set ANTHROPIC_API_KEY, or /model", g_cfg.host);
+        return false;
+    }
+    char m[256]; snprintf(m, sizeof m, "%s:%s", p->name, p->example);
+    free(g_cfg.model); g_cfg.model = xstrdup(m);
+    refresh_model_caps(true);
+    if (!g_model_bad) {
+        if (!quiet) printf(C_DIM "no model in the config and none on ollama: using %s for this run (/model to choose another)" C_RESET "\n", m);
+        return true;
+    }
+    /* the provider refused it: no model yet, and the reason says so (copied first: g_model_err is both) */
+    char why[160]; snprintf(why, sizeof why, "%.150s", g_model_err);
+    snprintf(g_model_err, sizeof g_model_err, "no model yet: %s could not be used (%s) — /model to choose one", m, why);
+    free(g_cfg.model); g_cfg.model = NULL;
+    g_model_bad = false;
+    return false;
+}
+
 int main(int argc, char **argv) {
     g_argc = argc; g_argv = argv;
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
@@ -5160,9 +5211,15 @@ int main(int argc, char **argv) {
     load_memory();
     tools_permissions_load();
     skills_load();
-    refresh_model_caps(oneshot != NULL || bench_runs);
+    bool quiet_caps = oneshot != NULL || bench_runs;
+    if (g_cfg.model && !*g_cfg.model) { free(g_cfg.model); g_cfg.model = NULL; }   /* an empty model= in the config is no model */
+    refresh_model_caps(quiet_caps);
+    if (!g_cfg.model && !hosted_fallback(quiet_caps)) {
+        /* nothing to work with yet: a one-shot run cannot do anything without a model; the screen starts and says so */
+        if (quiet_caps) { fprintf(stderr, "corbienest: %s\n", g_model_err); term_restore(); return 1; }
+        g_cfg.model = xstrdup("");
+    }
     if (g_model_bad) { fprintf(stderr, "corbienest: %s\n", g_model_err); term_restore(); return 1; }
-    if (!g_cfg.model) { fprintf(stderr, "corbienest: no models found on %s (run `ollama pull <model>`)\n", g_cfg.host); return 1; }
     if (cli_effort) {   /* only now is it known what the model offers */
         if (!strcmp(cli_effort, "default")) effort_set(g_cfg.model, NULL);
         else if (!effort_resolve(&g_model_info, cli_effort, NULL)) {
