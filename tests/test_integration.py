@@ -260,6 +260,10 @@ def guided(level, prompt, advisor="fake-big:latest"):
     out, rc = run(["-m", "fake-coder:latest", "--advisor", advisor, "--advisor-guidance", level, "--yolo", "-p", prompt], env=ENVK)
     return out, rc, requests()[n0:]
 
+def big_made():
+    """made.txt as 50 lines: the fake's write replaces it with one, which is 51 changed lines (a substantial change)."""
+    open(os.path.join(WORK, "made.txt"), "w").write("old line\n" * 50)
+
 def make_repo():
     d = tempfile.mkdtemp(prefix="crowgoal_")
     subprocess.run(["git", "init", "-q", d], check=True)
@@ -1889,8 +1893,11 @@ out, rc, rs = guided("normal", "TOOL_WRITE please")
 check("reviews the work" not in out and os.path.exists(os.path.join(WORK, "made.txt")), "normal: no review of its own")
 check(not any(r["model"] == "fake-big:latest" for r in rs), "and no consultation the agent did not ask for")
 
-print("test advisor guidance strong: the work is reviewed before the request ends")
+print("test advisor guidance strong: a substantial change is reviewed before the request ends")
 os.remove(os.path.join(WORK, "made.txt"))
+out, rc, rs = guided("strong", "TOOL_WRITE please")
+check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), f"strong: a one-line change to a new file is not reviewed: {out[-300:]!r}")
+big_made()
 out, rc, rs = guided("strong", "TOOL_WRITE please")
 check(rc == 0 and "⤷ advisor fake-big:latest · reviews the work before the request ends" in out, f"a request that changed files is reviewed: {out[-600:]!r}")
 check("Tool said: ADVICE: REVIEW-FINDING" in out, f"and what it finds goes to the agent, which gets another round: {out[-300:]!r}")
@@ -1904,13 +1911,13 @@ sysmsg = main[0]["messages"][0]["content"]
 check("Lean on it" in sysmsg and "at most 6 times per request" in sysmsg and "It reviews your work by itself" in sysmsg and "do not try a second fix on a guess" in sysmsg and "when your tool calls keep failing" in sysmsg, f"the agent is told how to lean on it: {sysmsg[-700:]!r}")
 adv = [r for r in rs if r["model"] == "fake-big:latest"][0]
 check("under about 700 words" in adv["messages"][0]["content"] and "exact steps" in adv["messages"][0]["content"], "the advisor is asked for concrete steps")
-os.remove(os.path.join(WORK, "made.txt"))
+big_made()
 out, rc, rs = guided("strong", "TOOL_WRITE APPROVE")
 check("reviews the work" in out and "nothing to change" in out and len([r for r in rs if r["model"] == "fake-coder:latest"]) == 2, f"LGTM: the request ends there, no extra round: {out[-300:]!r}")
 out, rc, rs = guided("strong", "hello there")
 check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), "a request that changed nothing is not reviewed")
 out, rc, rs = guided("strong", "TOOL_READS APPROVE")
-check("reviews the work before the request ends" in out and "nothing to change" in out, f"unless it took several tool calls: then it is, file or no file: {out[-400:]!r}")
+check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), f"several tool calls with no change are not reviewed at strong: {out[-400:]!r}")
 out, rc, rs = guided("normal", "TOOL_READS APPROVE")
 check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), "(not at normal)")
 out, rc, rs = guided("strong", "TOOL_FAILS now")
@@ -1926,7 +1933,7 @@ check("steps in: the tool calls keep failing" in out and "Gave up after 2 tries.
 check("It is brought in by itself when your tool calls keep failing" in rs[0]["messages"][0]["content"], "and the agent is told")
 out, rc, rs = guided("light", "TOOL_FAILS now")
 check("steps in" not in out and "Gave up after 5 tries." in out and not any(r["model"] == "fake-big:latest" for r in rs), f"at light the agent is left to it: {out[-300:]!r}")
-os.remove(os.path.join(WORK, "made.txt"))
+big_made()
 out, rc, rs = guided("strong", "TOOL_WRITE please", advisor="anthropic:claude-fake-opus")
 check("reviews the work before the request ends" in out and "Tool said: ADVICE: REVIEW-FINDING" in out, "a hosted advisor reviews the same way")
 check("The agent has ended its turn" in last_preq("anthropic")["body"]["messages"][0]["content"], "and is asked the same")
