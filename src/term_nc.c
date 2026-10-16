@@ -15,7 +15,11 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/select.h>
+#include <sys/wait.h>
+#include <termios.h>
 #ifdef WITH_NOTCURSES
 #include <notcurses/notcurses.h>
 #endif
@@ -977,15 +981,56 @@ static void nc_flush_due(void) {
 void nc_output(void) { nc_render_soon(); }
 
 /* ---------- the screen's life ---------- */
+/* notcurses 3.0.17 waits inside notcurses_init for the terminal's DA1 reply, and some replies its parser
+ * cannot read (tmux 3.6 sends "\e[?1;2;4c", for one) leave it waiting for good. So the init is first run in
+ * a child process, with the same options: if the child does not come back within NC_PROBE_MS it is killed,
+ * the terminal is put back as it was, and the caller falls back to the ANSI UI. A child that fails at once
+ * is no reason to refuse: the real init below reports that. */
+#define NC_PROBE_MS 2000
+static bool nc_probe(const notcurses_options *o) {
+    struct termios saved;
+    bool have = tcgetattr(STDIN_FILENO, &saved) == 0;
+    fflush(NULL);   /* the child must not flush what the parent has buffered */
+    pid_t pid = fork();
+    if (pid < 0) return true;   /* no child to ask: start as before */
+    if (pid == 0) {
+        FILE *fp = fdopen(dup(STDOUT_FILENO), "w");
+        struct notcurses *nc = fp ? notcurses_init(o, fp) : NULL;
+        if (nc) notcurses_stop(nc);
+        _exit(nc ? 0 : 1);
+    }
+    double t0 = now_s();
+    int st = 0;
+    bool back = false;
+    while (!back) {
+        if (waitpid(pid, &st, WNOHANG) == pid) { back = true; break; }
+        if (now_s() - t0 > NC_PROBE_MS / 1000.0) break;
+        usleep(10000);
+    }
+    if (back) return true;   /* the child came back: notcurses starts here too */
+    kill(pid, SIGKILL);
+    waitpid(pid, &st, 0);
+    if (have) tcsetattr(STDIN_FILENO, TCSANOW, &saved);   /* the child left the terminal in its own state */
+    int tty = open("/dev/tty", O_WRONLY | O_NOCTTY);
+    if (tty >= 0) {   /* leave the alternate screen and the keyboard mode the child pushed */
+        const char undo[] = "\x1b[<u\x1b[>4m\x1b[?1049l";
+        if (write(tty, undo, sizeof undo - 1) < 0) { /* nothing more to do */ }
+        close(tty);
+    }
+    fprintf(stderr, "corbienest: the terminal did not answer notcurses' start-up queries (under tmux, its DA1 reply); using the ANSI UI\n");
+    return false;
+}
+
 bool nc_start(void) {
     if (g_nc) return true;
+    notcurses_options o; memset(&o, 0, sizeof o);
+    o.flags = NCOPTION_NO_QUIT_SIGHANDLERS | NCOPTION_SUPPRESS_BANNERS;   /* atexit() restores the terminal */
+    o.loglevel = NCLOGLEVEL_SILENT;
+    if (!nc_probe(&o)) return false;
     int fd = dup(STDOUT_FILENO);
     if (fd < 0) { fprintf(stderr, "corbienest: cannot dup the terminal for notcurses; using the ANSI UI\n"); return false; }
     g_nc_out = fdopen(fd, "w");
     if (!g_nc_out) { close(fd); fprintf(stderr, "corbienest: cannot open the terminal for notcurses; using the ANSI UI\n"); return false; }
-    notcurses_options o; memset(&o, 0, sizeof o);
-    o.flags = NCOPTION_NO_QUIT_SIGHANDLERS | NCOPTION_SUPPRESS_BANNERS;   /* atexit() restores the terminal */
-    o.loglevel = NCLOGLEVEL_SILENT;
     g_nc = notcurses_init(&o, g_nc_out);
     if (!g_nc) {
         fclose(g_nc_out); g_nc_out = NULL;
