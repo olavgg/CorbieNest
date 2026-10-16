@@ -166,6 +166,14 @@ class Session:
         except Exception: pass
 
 def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
+def seen(sess, pat, t=15):
+    """Wait until pat is in the output since the last key, as it was written: a reply's text can sit in a repainted
+    region, which expect() skips on purpose (it is old text drawn again). True when it came."""
+    end = time.time() + t
+    while True:
+        if pat in since_send(sess): return True
+        if time.time() >= end: return False
+        sess.expect("(no such text)", 0.3)
 def new_session(args=(), **kw):
     """A session of its own, started and at its prompt: a section that uses it stands alone."""
     sess = Session(list(args), **kw); sess.expect("Ctrl-D to quit")
@@ -438,8 +446,9 @@ out, rc = run(["-m", "fake-coder:latest", "-p", "ERROR now"])
 check("boom from fake" in out, "error surfaced")
 out, rc = run(["-m", "nope:latest", "-p", "hi"])
 check("not found" in out, f"unknown model error: {out!r}")
-out = clean(subprocess.run([BIN, "-H", "http://127.0.0.1:1", "-p", "hi"], cwd=WORK, env=ENV, capture_output=True, timeout=30).stdout.decode())
-check("connect" in out or "no models" in out, "unreachable host reported")
+r = subprocess.run([BIN, "-H", "http://127.0.0.1:1", "-p", "hi"], cwd=WORK, env=ENV, capture_output=True, timeout=30)
+err = clean(r.stderr.decode())
+check(r.returncode == 1 and "no model yet" in err and "127.0.0.1:1" in err, f"unreachable host: no model, the notice names the host, exit 1: rc={r.returncode} err={err!r}")
 out, rc = run(["-H", f"localhost:{PORT}", "-m", "fake-coder:latest", "-p", "no scheme"])
 check(rc == 0 and "Echo: no scheme" in out, f"a host written the way OLLAMA_HOST is (no scheme) is plain http: {out[-200:]!r}")
 
@@ -1791,37 +1800,38 @@ check(rc == 0 and "Anthropic does not know a model 'claude-nope'" in out, f"no s
 check(key_nowhere() is None, f"the key was written nowhere: {key_nowhere()!r}")
 
 print("test interactive: /advisor with a hosted API")
-s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); seen(s, "Ctrl-D to quit")
 s.send("/advisor anthropic:"); s.send("c"); view = listed()
 check("anthropic:claude-fake-opus" in view and "Claude Fake Haiku" in view and "grok-fake" not in view, f"behind a provider's prefix its own model list is suggested: {view!r}")
 s.send("\x7f" * 20); s.send("/advisor xai:g"); s.send("r"); check("xai:grok-fake" in listed(), "each provider's own")
-s.send("\t\r"); check(s.expect("advisor: xai:grok-fake"), "and Tab + Enter takes one")
+s.send("\t\r"); check(seen(s, "advisor: xai:grok-fake"), "and Tab + Enter takes one")
 check(key_nowhere() is None, f"listing the models wrote the key nowhere: {key_nowhere()!r}")
-s.send("/advisor xai:grok-nope\r"); check(s.expect("xAI does not know a model 'grok-nope'"), "the model endpoint is asked: an unknown model is refused")
-s.send("/advisor xai:grok-fake\r"); check(s.expect("advisor: xai:grok-fake"), "/advisor PROVIDER:MODEL")
-check(s.expect(f"sent to {HOST}/xai/v1 with each consultation, billed to the key in XAI_API_KEY"), f"with where the conversation goes: {since_send(s)[-300:]!r}")
+s.send("/advisor xai:grok-nope\r"); check(seen(s, "xAI does not know a model 'grok-nope'"), "the model endpoint is asked: an unknown model is refused")
+s.send("/advisor xai:grok-fake\r"); check(seen(s, "advisor: xai:grok-fake"), "/advisor PROVIDER:MODEL")
+check(seen(s, f"sent to {HOST}/xai/v1 with each consultation, billed to the key in XAI_API_KEY"), f"with where the conversation goes: {since_send(s)[-300:]!r}")
 cfg = open(CFG2_FILE).read(); check("advisor=xai:grok-fake" in cfg and "test-key" not in cfg, "saved, without the key")
-s.send("/advisor effort\r"); check(s.expect("advisor effort for xai:grok-fake"), "/advisor effort offers its levels"); check(s.expect("xhigh"), "the ones xAI's models take")
-s.send("\x1b"); s.expect("unchanged")
-s.send("/advisor effort max\r"); check(s.expect("sent as xhigh, its strongest level"), "max is as hard as it goes, in xAI's name")
-s.send("TOOL_ADVISOR now\r"); check(s.expect("Tool said: ADVICE"), "consulted"); check(last_preq("xai")["body"].get("reasoning_effort") == "xhigh", "with that effort")
-s.send("TOOL_ADVISOR SLOWADVICE\r"); check(s.expect("⤷ advisor xai:grok-fake"), "a slow consultation")
+s.send("/advisor effort\r"); check(seen(s, "advisor effort for xai:grok-fake"), "/advisor effort offers its levels"); check(seen(s, "xhigh"), "the ones xAI's models take")
+s.send("\x1b"); seen(s, "unchanged")
+s.send("/advisor effort max\r"); check(seen(s, "sent as xhigh, its strongest level"), "max is as hard as it goes, in xAI's name")
+s.send("TOOL_ADVISOR now\r"); check(seen(s, "Tool said: ADVICE"), "consulted"); check(last_preq("xai")["body"].get("reasoning_effort") == "xhigh", "with that effort")
+s.send("TOOL_ADVISOR SLOWADVICE\r"); check(seen(s, "⤷ advisor xai:grok-fake"), "a slow consultation")
 time.sleep(0.8); s.send("never mind, do this\r")
-check(s.expect("Echo: never mind, do this", 15), "a queued message does not stop a hosted consultation either: it reaches the model after it")
-s.send("TOOL_ADVISOR SLOWADVICE again\r"); s.expect("⤷ advisor"); time.sleep(0.8); s.send("\x1b")
-check(s.expect("⎿ interrupted", 10), "Esc skips it"); check(s.expect("Tool said: error: the consultation was interrupted", 15), "and the turn carries on")
-s.send("/cost\r"); check(s.expect("advisor       2 consultations "), f"/cost counts the two that gave advice (the skipped one did not): {since_send(s)[-300:]!r}")
-s.send("/usage\r"); check(s.expect("local: no charge") and "fake-coder:latest" in since_send(s), f"/usage lists the model doing the work: {since_send(s)[-400:]!r}")
-check(s.expect("no price known") and re.search(r"xai:grok-fake\s+\d+ calls?\s+↑", since_send(s)), f"and the hosted advisor with its own tokens — a model the price list does not know: {since_send(s)[-400:]!r}")
-s.send("/usage price xai:grok-fake 2 6\r"); check(s.expect("xai:grok-fake: $2 in · $6 out per million tokens"), "/usage price sets one")
+check(seen(s, "Echo:", 15) and seen(s, "never mind, do", 15), "a queued message does not stop a hosted consultation either: it reaches the model after it")   # streamed in pieces, the chrome redrawn between them
+s.send("TOOL_ADVISOR SLOWADVICE again\r"); seen(s, "⤷ advisor"); time.sleep(0.8); s.send("\x1b")
+check(seen(s, "⎿ interrupted", 10), "Esc skips it"); check(seen(s, "Tool said: error: the consultation was interrupted", 15), "and the turn carries on")
+s.send("/cost\r"); check(seen(s, "advisor       2 consultations "), f"/cost counts the two that gave advice (the skipped one did not): {since_send(s)[-300:]!r}")
+s.send("/usage\r"); check(seen(s, "local: no charge") and "fake-coder:latest" in since_send(s), f"/usage lists the model doing the work: {since_send(s)[-400:]!r}")
+check(seen(s, "no price known") and re.search(r"xai:grok-fake\s+\d+ calls?\s+↑", since_send(s)), f"and the hosted advisor with its own tokens — a model the price list does not know: {since_send(s)[-400:]!r}")
+seen(s, "[ready]", 60)   # the reply to the queued message may still be streaming: /usage runs only when the prompt is ready
+s.send("/usage price xai:grok-fake 2 6\r"); check(seen(s, "xai:grok-fake: $2 in · $6 out per million tokens"), "/usage price sets one")
 check("price.xai:grok-fake=2/6" in open(CFG2_FILE).read(), "saved in the config")
-s.send("/usage\r"); check(s.expect("set with /usage price") and re.search(r"≈ \$\d+\.\d+", since_send(s)), f"and the cost is estimated from it: {since_send(s)[-400:]!r}")
-check(s.expect("estimated cost"), "with a total")
-s.send("TOOL_ADVISOR priced\r"); check(s.expect("Tool said: ADVICE") and re.search(r"▸ advice · \S+ tokens · \d+s · ≈ \$\d+\.\d+", since_send(s)), f"a consultation of a priced model says what it came to: {since_send(s)[-400:]!r}")
-s.send("/cost\r"); check(s.expect("est. cost     ≈ $"), f"and /cost has the session's estimate: {since_send(s)[-300:]!r}")
-s.send("/usage price xai:grok-fake default\r"); check(s.expect("xai:grok-fake: no price"), "default forgets it"); check("price.xai" not in open(CFG2_FILE).read(), "in the config too")
-s.send("/advisor anthropic:claude-fake-haiku\r"); check(s.expect("advisor: anthropic:claude-fake-haiku"), "switched to Anthropic")
-s.send("/advisor effort on\r"); check(s.expect("advisor effort: on"), "a thinking budget, on")
+s.send("/usage\r"); check(seen(s, "set with /usage price") and re.search(r"≈ \$\d+\.\d+", since_send(s)), f"and the cost is estimated from it: {since_send(s)[-400:]!r}")
+check(seen(s, "estimated cost"), "with a total")
+s.send("TOOL_ADVISOR priced\r"); check(seen(s, "Tool said: ADVICE") and re.search(r"▸ advice · \S+ tokens · \d+s · ≈ \$\d+\.\d+", since_send(s)), f"a consultation of a priced model says what it came to: {since_send(s)[-400:]!r}")
+s.send("/cost\r"); check(seen(s, "est. cost     ≈ $"), f"and /cost has the session's estimate: {since_send(s)[-300:]!r}")
+s.send("/usage price xai:grok-fake default\r"); check(seen(s, "xai:grok-fake: no price"), "default forgets it"); check("price.xai" not in open(CFG2_FILE).read(), "in the config too")
+s.send("/advisor anthropic:claude-fake-haiku\r"); check(seen(s, "advisor: anthropic:claude-fake-haiku"), "switched to Anthropic")
+s.send("/advisor effort on\r"); check(seen(s, "advisor effort: on"), "a thinking budget, on")
 s.send("\x04"); s.close()
 check(key_nowhere() is None, f"still nowhere: {key_nowhere()!r}")
 
