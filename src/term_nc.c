@@ -69,15 +69,15 @@ size_t nc_sgr_parse(const char *s, size_t n, nc_style *st) {
         else if (v == 23) st->styles &= ~NC_ST_ITALIC;
         else if (v == 24) st->styles &= ~NC_ST_UNDER;
         else if (v == 27) st->styles &= ~NC_ST_REVERSE;
-        else if (v >= 30 && v <= 37) st->fg = NC_BASE[v - 30];
+        else if (v >= 30 && v <= 37) { unsigned rgb; st->fg = theme_fg_code(v, &rgb) ? rgb : NC_BASE[v - 30]; }
         else if (v == 39) st->fg = NC_DEFAULT;
         else if (v >= 40 && v <= 47) st->bg = NC_BASE[v - 40];
         else if (v == 49) st->bg = NC_DEFAULT;
-        else if (v >= 90 && v <= 97) st->fg = NC_BASE[v - 90 + 8];
+        else if (v >= 90 && v <= 97) { unsigned rgb; st->fg = theme_fg_code(v, &rgb) ? rgb : NC_BASE[v - 90 + 8]; }
         else if (v >= 100 && v <= 107) st->bg = NC_BASE[v - 100 + 8];
         else if (v == 38 || v == 48) {
             unsigned *dst = v == 38 ? &st->fg : &st->bg;
-            if (k + 2 < np && p[k + 1] == 5) { *dst = nc_color256(p[k + 2]); k += 2; }
+            if (k + 2 < np && p[k + 1] == 5) { *dst = v == 38 && p[k + 2] == 208 ? g_theme->accent : nc_color256(p[k + 2]); k += 2; }
             else if (k + 4 < np && p[k + 1] == 2) {
                 *dst = ((unsigned)(p[k + 2] & 255) << 16) | ((unsigned)(p[k + 3] & 255) << 8) | (unsigned)(p[k + 4] & 255);
                 k += 4;
@@ -196,19 +196,20 @@ int    nc_select(const char *title, const char **items, const char **descs, int 
 bool nc_compiled(void) { return true; }
 
 /* the frame's colours (0xRRGGBB) */
-#define C_TEXT    0xE5E9F0u
-#define C_MENTION 0x56B6C2u   /* a @file that is there, in the field: the cyan the ANSI screen uses */
-#define C_ACCENT  0xF0883Eu   /* the orange of the prompt, the menus and the busy mark */
-#define C_MUTED   0x7C8799u
-#define C_RULE    0x3B4252u
-#define C_MENU    0x1E2330u   /* a menu's background */
-#define C_BAR_A   0x161A24u   /* the status bar: a gradient from here … */
-#define C_BAR_B   0x2A1F3Du   /* … to here */
-#define C_FIELD_TEXT 0xFFF1B8u /* what is typed in the field: a light yellow on a darker ground (the ANSI field uses the same) */
-#define C_FIELD_BG   0x151922u
-#define C_OK      0xA3BE8Cu
-#define C_BAD     0xBF616Au
-#define C_WARN    0xEBCB8Bu
+/* the palette: the current theme's (theme.c); the ANSI screen draws the same colours from the same table */
+#define C_TEXT    (g_theme->text)
+#define C_MENTION (g_theme->info)     /* a @file that is there, in the field: the cyan the ANSI screen maps 36 to */
+#define C_ACCENT  (g_theme->accent)   /* the orange of the prompt, the menus and the busy mark */
+#define C_MUTED   (g_theme->muted)
+#define C_RULE    (g_theme->rule)
+#define C_MENU    (g_theme->menu)     /* a menu's background */
+#define C_BAR_A   (g_theme->bar_a)    /* the status bar: a gradient from here … */
+#define C_BAR_B   (g_theme->bar_b)    /* … to here */
+#define C_FIELD_TEXT (g_theme->field_text)   /* what is typed in the field: a light yellow on a darker ground */
+#define C_FIELD_BG   (g_theme->field_bg)
+#define C_OK      (g_theme->ok)
+#define C_BAD     (g_theme->bad)
+#define C_WARN    (g_theme->warn)
 
 #define FIELD_MAX 6            /* most text rows the field grows to */
 #define REDRAW_MS 30           /* output that arrives faster than this is drawn once per interval */
@@ -676,7 +677,7 @@ static void draw_field(int top) {
     int shown = rows > FIELD_MAX ? FIELD_MAX : rows;
     int first = cr - shown + 1 > 0 ? cr - shown + 1 : 0;      /* keep the cursor's row in view */
     if (first > rows - shown) first = rows - shown > 0 ? rows - shown : 0;
-    unsigned rc = term_is_ready() ? 0x5FD75Fu : C_RULE;   /* the edges: C_EDGE_READY / C_EDGE_IDLE on the ANSI screen (common.h) */
+    unsigned rc = term_is_ready() ? g_theme->edge_ready : g_theme->edge_idle;   /* the edges, as the ANSI screen draws them */
     for (int x = 1; x < g_cols - 1; x++) {                   /* the top and bottom edges, rounded at the corners */
         put_text(top, x, "─", 1, rc, NC_DEFAULT, false, NULL);
         put_text(top + shown + 1, x, "─", 1, rc, NC_DEFAULT, false, NULL);
@@ -692,7 +693,7 @@ static void draw_field(int top) {
     }
     if (term_is_ready() && g_cols >= 10) {   /* [ready], upper right, as on the ANSI screen */
         nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 };
-        put_text(top, g_cols - 8, "[ready]", 7, 0x5FD75Fu, NC_DEFAULT, false, &carry);
+        put_text(top, g_cols - 8, "[ready]", 7, g_theme->edge_ready, NC_DEFAULT, false, &carry);
     }
     if (first == 0) put_text(top + 1, 2, "❯", 1, C_ACCENT, C_FIELD_BG, false, NULL);   /* the prompt, inside the border */
     {   /* the mode, on the lower rule, its last cell two columns in from the edge (as the ANSI screen puts it) */
@@ -831,7 +832,7 @@ static void draw_strip(int first, int rows, const char *text) {
         const char *e = strchr(p, '\n');
         size_t len = e ? (size_t)(e - p) : strlen(p);
         sbuf line; sb_init(&line); sb_append(&line, p, len);
-        unsigned bg = i == sel ? 0x2A2F3Au : NC_DEFAULT;
+        unsigned bg = i == sel ? g_theme->select : NC_DEFAULT;
         fill_row(first + i, 0, g_cols, bg, false);
         nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 };
         put_text(first + i, 0, line.data ? line.data : "", g_cols, NC_DEFAULT, bg, false, &carry);

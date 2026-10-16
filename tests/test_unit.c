@@ -1641,13 +1641,14 @@ static void test_nc_pure(void) {
     CHECK(nc_sgr_parse("\x1b[31m", 5, &st) == 5 && st.fg == 0xbf616au);
     CHECK(nc_sgr_parse("\x1b[1;3m", 6, &st) == 6 && (st.styles & NC_ST_BOLD) && (st.styles & NC_ST_ITALIC));
     CHECK(nc_sgr_parse("\x1b[22m", 5, &st) == 5 && !(st.styles & NC_ST_BOLD));
-    CHECK(nc_sgr_parse("\x1b[38;5;208m", strlen("\x1b[38;5;208m"), &st) == strlen("\x1b[38;5;208m") && st.fg == nc_color256(208));
+    CHECK(nc_sgr_parse("\x1b[38;5;208m", strlen("\x1b[38;5;208m"), &st) == strlen("\x1b[38;5;208m") && st.fg == g_theme->accent);   /* the theme's orange */
     CHECK(nc_sgr_parse("\x1b[48;2;1;2;3m", strlen("\x1b[48;2;1;2;3m"), &st) == strlen("\x1b[48;2;1;2;3m") && st.bg == 0x010203u);
     /* the location line's rose (256-colour 132, LOC_ROSE in term.c): the index maps to #af5f87, and no style comes with it */
     st = (nc_style){ NC_DEFAULT, NC_DEFAULT, 0 };
     CHECK(nc_sgr_parse("\x1b[38;5;132m", strlen("\x1b[38;5;132m"), &st) == strlen("\x1b[38;5;132m") && st.fg == 0xaf5f87u && st.styles == 0);
     CHECK(nc_sgr_parse("\x1b[m", 3, &st) == 3 && st.fg == NC_DEFAULT && st.styles == 0);   /* ESC[m is a reset */
-    CHECK(nc_sgr_parse("\x1b[97m", 5, &st) == 5 && st.fg == 0xeceff4u);
+    CHECK(nc_sgr_parse("\x1b[97m", 5, &st) == 5 && st.fg == g_theme->text);   /* a bright white is the theme's text: the basic codes are the theme's */
+    CHECK(nc_sgr_parse("\x1b[31m", 5, &st) == 5 && st.fg == g_theme->bad);   /* 31 is the theme's red on both screens */
     /* a CSI that is not SGR is consumed and changes nothing; a private mode too */
     st.fg = 0x123456;
     CHECK(nc_sgr_parse("\x1b[2K", 4, &st) == 4 && st.fg == 0x123456);
@@ -1693,6 +1694,56 @@ static void test_wrap(void) {
     CHECK(st == 2);
 }
 
+/* ---------- themes ---------- */
+static char *map_all(const char *in) {
+    theme_map m; memset(&m, 0, sizeof m);
+    sbuf o; sb_init(&o);
+    theme_map_bytes(&m, in, strlen(in), &o);
+    return o.data ? o.data : xstrdup("");
+}
+static void test_theme(void) {
+    const theme_t *def = g_theme;
+    CHECK(theme_set("nope") == false && g_theme == def);   /* an unknown name keeps the theme in use */
+    CHECK(theme_set("default") && g_theme == def && !strcmp(g_theme->name, "default"));
+    /* a basic code becomes the theme's RGB; the sequence keeps its other parameters */
+    char *a = map_all("\x1b[31mred\x1b[0m");
+    CHECK_STR(a, "\x1b[38;2;191;97;106mred\x1b[0m");   /* #BF616A */
+    free(a);
+    a = map_all("\x1b[1;36mx\x1b[m");
+    CHECK_STR(a, "\x1b[1;38;2;86;182;194mx\x1b[m");     /* bold stays; 36 is the info colour #56B6C2 */
+    free(a);
+    a = map_all("\x1b[38;5;208mo\x1b[90mg");
+    CHECK_STR(a, "\x1b[38;2;240;136;62mo\x1b[38;2;124;135;153mg");   /* the orange, and 90 grey */
+    free(a);
+    /* an extended colour is numbers, not codes: 38;2;95;215;95 is the green of the field's edge, not a magenta */
+    a = map_all("\x1b[38;2;95;215;95m\x1b[48;5;236m");
+    CHECK_STR(a, "\x1b[38;2;95;215;95m\x1b[48;5;236m");
+    free(a);
+    /* what is not a themed colour goes as it came: resets, cursor moves, erases, 256-colour codes other than the accent */
+    a = map_all("\x1b[0m\x1b[2K\x1b[5;9H\x1b[38;5;132mx");
+    CHECK_STR(a, "\x1b[0m\x1b[2K\x1b[5;9H\x1b[38;5;132mx");
+    free(a);
+    /* a sequence the write ends inside is held and finished by the next write */
+    theme_map m; memset(&m, 0, sizeof m);
+    sbuf o; sb_init(&o);
+    theme_map_bytes(&m, "ab\x1b[3", 5, &o);
+    CHECK(o.len == 2 && m.np > 0);
+    theme_map_bytes(&m, "1mcd", 4, &o);
+    CHECK(o.data && !strcmp(o.data, "ab\x1b[38;2;191;97;106mcd"));
+    CHECK(m.np == 0);
+    sb_free(&o);
+    /* an ESC that is not a CSI goes out as it came */
+    a = map_all("\x1b" "7x\x1b" "8");
+    CHECK_STR(a, "\x1b" "7x\x1b" "8");
+    free(a);
+    /* the basic codes of the theme, for both screens: 30..37 and the bright 9x */
+    unsigned rgb = 0;
+    CHECK(theme_fg_code(32, &rgb) && rgb == g_theme->ok && theme_fg_code(92, &rgb) && rgb == g_theme->ok);
+    CHECK(theme_fg_code(90, &rgb) && rgb == g_theme->gray && !theme_fg_code(40, &rgb));   /* a background is not a fg */
+    CHECK(th_fg(0x5FD75Fu) && !strcmp(th_fg(0x5FD75Fu), "\x1b[38;2;95;215;95m"));
+    CHECK(!strcmp(th_bg(0x151922u), "\x1b[48;2;21;25;34m"));
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -1702,7 +1753,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap },
+        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

@@ -17,10 +17,6 @@
 #define C_ITALIC  "\x1b[3m"
 #define C_RED     "\x1b[31m"
 #define C_GREEN   "\x1b[32m"
-/* the input field's edges, as the same colours on both screens (the notcurses screen draws these): green while the
- * prompt waits, a slate grey while a turn runs. A basic colour would take each terminal's own green. */
-#define C_EDGE_READY "\x1b[38;2;95;215;95m"
-#define C_EDGE_IDLE  "\x1b[38;2;59;66;82m"
 #define C_YELLOW  "\x1b[33m"
 #define C_BLUE    "\x1b[34m"
 #define C_MAGENTA "\x1b[35m"
@@ -28,11 +24,36 @@
 #define C_GRAY    "\x1b[90m"
 #define C_ORANGE  "\x1b[38;5;208m"
 
+
 /* ---------- growable string buffer ---------- */
 typedef struct {
     char *data;
     size_t len, cap;
 } sbuf;
+
+/* ---------- themes ----------
+ * A theme is the palette both screens draw from. The basic codes above are tokens: the ANSI screen maps them to the
+ * theme's RGB as the bytes leave (theme_map_bytes), the notcurses screen maps them as it parses (nc_sgr_parse).
+ * theme.c holds the themes; "theme=NAME" in the config picks one. */
+typedef struct {
+    const char *name;
+    unsigned text, muted, rule, menu;           /* the text, the dimmed text, the rules, a menu's ground */
+    unsigned bar_a, bar_b;                      /* the status bar: from bar_a to bar_b */
+    unsigned field_text, field_bg;              /* what is typed in the field, and its ground */
+    unsigned edge_ready, edge_idle;             /* the field's edges while the prompt waits, and while a turn runs */
+    unsigned loc;                               /* the location line */
+    unsigned select;                            /* the row the keys are on, in the sub-agents strip */
+    unsigned accent, ok, bad, warn, info, blue, magenta, gray;   /* the orange, and the basic codes 32, 31, 33, 36, 34, 35, 90 */
+} theme_t;
+typedef struct {
+    char pend[32]; int np;                      /* an escape sequence the last write ended inside, not yet written */
+} theme_map;
+extern const theme_t *g_theme;
+bool theme_set(const char *name);               /* "theme=NAME": false, and the theme stays, when there is none */
+bool theme_fg_code(int code, unsigned *rgb);    /* the theme's colour of a basic fg code (30-37, 90-97) */
+void theme_map_bytes(theme_map *m, const char *in, size_t n, sbuf *out);   /* the bytes with their themed codes mapped */
+const char *th_fg(unsigned rgb);                /* "\x1b[38;2;R;G;Bm" for an RGB colour (a short-lived string) */
+const char *th_bg(unsigned rgb);                /* the background form */
 
 void  sb_init(sbuf *b);
 void  sb_free(sbuf *b);
@@ -214,6 +235,7 @@ typedef struct {
     int   memory_idle;   /* seconds idle at the prompt after which a pending extraction runs anyway (0 = only at memory_every / exit) */
     char *keep_alive;    /* ollama keep_alive for the model ("30m", "-1" = forever, "0" = unload); NULL = server default */
     char *ui;            /* "ansi" (default) or "notcurses" (needs a build made with notcurses installed); NULL = ansi */
+    char *theme;         /* "theme=NAME": the colour theme (theme.c); NULL = the default one */
 } config_t;
 
 extern config_t g_cfg;

@@ -192,7 +192,6 @@ void fmt_tokens(long n, char *out, size_t sz) {
 
 /* Appends the status bar text, at most `cols - 1` visible columns wide. Segments are
  * dropped from the right when the terminal is narrow. */
-#define LOC_ROSE "\x1b[38;5;132m"   /* the location line: a muted rose, so it reads as a tint, not an accent */
 /* the mode, as the field's rule shows it: an icon, its name, and how to switch it */
 static void mode_text(sbuf *o, bool hint) {
     const char *icon, *col, *text;
@@ -243,7 +242,7 @@ static void loc_text(sbuf *o, int maxw) {
         while (*q && (*q & 0xC0) == 0x80) q++;   /* not in the middle of a character */
         snprintf(shown, sizeof shown, "…%s", q);
     } else snprintf(shown, sizeof shown, "%s", cwd);
-    sb_printf(o, LOC_ROSE "%s%s" C_RESET, shown, tail);
+    sb_printf(o, "%s%s%s" C_RESET, th_fg(g_theme->loc), shown, tail);   /* the location line: a muted rose, a tint not an accent */
 }
 
 static void bar_build(sbuf *o, int cols) {
@@ -523,9 +522,8 @@ static int field_mentions(const char *text, size_t len, size_t (*sp)[2]) {
     return len && text[0] != '/' && text[0] != '!' ? mention_spans(text, len, sp, MENTION_MAX) : 0;
 }
 /* what is typed in the field: a light yellow on a darker ground (notcurses uses the same colours) */
-#define FIELD_FG "\x1b[38;2;255;241;184m"
-#define FIELD_BG "\x1b[48;2;21;25;34m"
-#define FIELD_ON FIELD_BG FIELD_FG
+/* the typed text's ground and colour, from the theme */
+static void put_field_on(sbuf *o) { sb_puts(o, th_bg(g_theme->field_bg)); sb_puts(o, th_fg(g_theme->field_text)); }
 /* kind[i] 1 = a paste token (reverse video), anything else a mention (cyan); kind may be NULL */
 static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_t (*sp)[2], const int *kind, int ns) {
     size_t at = from, end = from + n;
@@ -535,7 +533,7 @@ static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_
         size_t a = sp[i][0] > at ? sp[i][0] : at, b = sp[i][1] < end ? sp[i][1] : end;
         sb_append(o, text + at, a - at);
         if (kind && kind[i] == 1) { sb_puts(o, "\x1b[7m"); sb_append(o, text + a, b - a); sb_puts(o, "\x1b[27m"); }
-        else { sb_puts(o, C_CYAN); sb_append(o, text + a, b - a); sb_puts(o, FIELD_FG); }
+        else { sb_puts(o, C_CYAN); sb_append(o, text + a, b - a); sb_puts(o, th_fg(g_theme->field_text)); }
         at = b;
     }
     if (at < end) sb_append(o, text + at, end - at);
@@ -547,7 +545,7 @@ static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_
  * field drew there stays behind. */
 /* the top or bottom edge of the field: rounded corners, green while the prompt waits */
 static void field_edge(sbuf *o, int row, bool top) {
-    sb_printf(o, "\x1b[%d;1H%s%s", row, g_ready ? C_EDGE_READY : C_EDGE_IDLE, top ? "╭" : "╰");
+    sb_printf(o, "\x1b[%d;1H%s%s", row, th_fg(g_ready ? g_theme->edge_ready : g_theme->edge_idle), top ? "╭" : "╰");
     for (int i = 0; i < g_fs_cols - 2; i++) sb_puts(o, "─");
     sb_puts(o, top ? "╮" : "╯");
     sb_puts(o, C_RESET);
@@ -570,7 +568,7 @@ static void strip_draw(sbuf *o, int top) {
         sbuf line; sb_init(&line);
         sb_append(&line, p, len);
         sb_printf(o, "\x1b[%d;1H", top + i);
-        if (i == g_strip_sel) sb_puts(o, "\x1b[48;5;236m");   /* the row the keys are on: a dark band, padded with spaces */
+        if (i == g_strip_sel) sb_puts(o, th_bg(g_theme->select));   /* the row the keys are on: a dark band, padded with spaces */
         sb_append(o, line.data ? line.data : "", line.len);
         for (int w = vis_width(line.data ? line.data : ""); w < cols; w++) sb_putc(o, ' ');
         sb_puts(o, C_RESET);
@@ -588,12 +586,12 @@ static void field_draw(sbuf *o, const char *typed) {
     field_edge(o, top, true);
     if (g_ready) {   /* [ready], upper right, two cells in from the edge (as the mode is on the lower rule) */
         int c = g_fs_cols - 7 - 1;
-        if (c >= 1) sb_printf(o, "\x1b[%d;%dH" C_EDGE_READY "[ready]" C_RESET, top, c);
+        if (c >= 1) sb_printf(o, "\x1b[%d;%dH%s[ready]" C_RESET, top, c, th_fg(g_theme->edge_ready));
     }
-    for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;%dH" FIELD_BG "\x1b[K" C_RESET, top + 1 + i, FIELD_X0);
+    for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;%dH%s\x1b[K" C_RESET, top + 1 + i, FIELD_X0, th_bg(g_theme->field_bg));
     sb_printf(o, "\x1b[%d;%dH", top + 1, FIELD_X0 + 1);
     if (!g_field_view) sb_puts(o, field_prompt());
-    sb_puts(o, FIELD_ON);
+    put_field_on(o);
     if (typed) {
         /* not the editor's text: one line, tail kept, with a block for the cursor */
         int avail = width - vis_width(field_prompt()) - 2;
@@ -608,7 +606,7 @@ static void field_draw(sbuf *o, const char *typed) {
             sb_puts(o, "…"); mark = 1;
         }
         size_t sp[MENTION_MAX][2]; int ns = field_mentions(t, strlen(t), sp);
-        put_mentions(o, t, (size_t)(p - t), strlen(p), sp, NULL, ns); sb_puts(o, C_DIM "▏" C_RESET FIELD_ON);
+        put_mentions(o, t, (size_t)(p - t), strlen(p), sp, NULL, ns); sb_puts(o, C_DIM "▏" C_RESET); put_field_on(o);
         /* the caret is the ▏: after the prompt, the … if any, and the tail */
         g_ta_caret_col = FIELD_X0 + (g_field_view ? 0 : vis_width(field_prompt())) + mark + vis_width(p) + 1;
         free(t);
@@ -630,7 +628,7 @@ static void field_draw(sbuf *o, const char *typed) {
             if (to > g_field_len) to = g_field_len;
             sb_printf(o, "\x1b[%d;%dH", top + 1 + i, FIELD_X0 + 1);
             if (i == 0 && g_field_view == 0) sb_puts(o, field_prompt());
-            sb_puts(o, FIELD_ON);
+            put_field_on(o);
             size_t n = to > from ? to - from : 0;
             while (n && g_field_text[from + n - 1] == '\n') n--;
             put_mentions(o, g_field_text, from, n, sp, kind, ns);
@@ -641,8 +639,8 @@ static void field_draw(sbuf *o, const char *typed) {
     /* the side borders of the text rows (after the text, which is cut short of them) */
     for (int i = 0; i < g_field_rows; i++) {
         int r = top + 1 + i;
-        sb_printf(o, "\x1b[%d;1H%s│" C_RESET, r, g_ready ? C_EDGE_READY : C_EDGE_IDLE);
-        sb_printf(o, "\x1b[%d;%dH%s│" C_RESET, r, g_fs_cols, g_ready ? C_EDGE_READY : C_EDGE_IDLE);
+        sb_printf(o, "\x1b[%d;1H%s│" C_RESET, r, th_fg(g_ready ? g_theme->edge_ready : g_theme->edge_idle));
+        sb_printf(o, "\x1b[%d;%dH%s│" C_RESET, r, g_fs_cols, th_fg(g_ready ? g_theme->edge_ready : g_theme->edge_idle));
     }
     field_edge(o, top + g_field_rows + 1, false);
     {   /* the mode, on the lower rule: its last cell two columns in from the edge (the hint goes first when it does not fit) */
@@ -723,11 +721,10 @@ static bool layout_sync(void) {
  * their text ends in a reset, which would drop it: sb_bar_row() puts it back after every reset, and pads the
  * row to its full width with spaces in it. (Not with an erase to the end of the line: tmux, for one, then
  * shows the row below without its background.) Truecolor: a terminal without it shows no background. */
-#define BAR_BG "\x1b[48;2;22;26;36m"   /* #161A24 */
 static void sb_bar_row(sbuf *o, const char *text, int cols) {
-    sb_puts(o, BAR_BG);
+    sb_puts(o, th_bg(g_theme->bar_a));
     for (const char *p = text; *p; ) {
-        if (!strncmp(p, C_RESET, strlen(C_RESET))) { sb_puts(o, C_RESET BAR_BG); p += strlen(C_RESET); }
+        if (!strncmp(p, C_RESET, strlen(C_RESET))) { sb_puts(o, C_RESET); sb_puts(o, th_bg(g_theme->bar_a)); p += strlen(C_RESET); }
         else sb_putc(o, *p++);
     }
     for (int w = vis_width(text); w < cols; w++) sb_putc(o, ' ');
@@ -1080,6 +1077,7 @@ static void park_hold(void) {
 }
 static void park_free(void) { if (g_no_park > 0) g_no_park--; }
 
+static theme_map g_th_map;   /* an escape sequence a write ended inside (see theme_map_bytes) */
 /* stdout hook: every byte goes to fd 1 and, unless paused, into the model above */
 static ssize_t sb_write_fn(void *cookie, const char *buf, size_t n) {
     (void)cookie;
@@ -1091,8 +1089,16 @@ static ssize_t sb_write_fn(void *cookie, const char *buf, size_t n) {
     if (g_away && !g_sb_pause && !g_ui_nc) { sbuf mv; sb_init(&mv); transcript_move(&mv, false); fd1_write(mv.data, mv.len); sb_free(&mv); }
     trace_bytes('O', buf, n);
     if (!g_ui_nc) {   /* notcurses draws the screen itself: the output is only recorded */
+        /* the basic colour codes become the theme's RGB here, on the way out; the model keeps them as they came */
+        sbuf mapped; sb_init(&mapped);
+        theme_map_bytes(&g_th_map, buf, n, &mapped);
         size_t off = 0;
-        while (off < n) { ssize_t w = write(STDOUT_FILENO, buf + off, n - off); if (w < 0) { if (errno == EINTR) continue; return off ? (ssize_t)off : -1; } off += (size_t)w; }
+        while (off < mapped.len) {
+            ssize_t w = write(STDOUT_FILENO, mapped.data + off, mapped.len - off);
+            if (w < 0) { if (errno == EINTR) continue; sb_free(&mapped); return -1; }
+            off += (size_t)w;
+        }
+        sb_free(&mapped);
     }
     if (!g_sb_pause) sb_feed(buf, n);
     if (g_ui_nc) nc_output();

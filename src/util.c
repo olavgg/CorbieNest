@@ -419,6 +419,10 @@ void config_load(void) {
         else if (!strcmp(k, "advisor_guidance")) { int n = advisor_guidance_parse(v); if (n >= 0) g_cfg.advisor_guidance = n; }
         else if (!strcmp(k, "show_thinking")) g_cfg.show_thinking = atoi(v) != 0;
         else if (!strcmp(k, "ui")) { free(g_cfg.ui); g_cfg.ui = !strcmp(v, "notcurses") ? xstrdup("notcurses") : NULL; }
+        else if (!strcmp(k, "theme")) {   /* a name no theme has is said, and the default is used */
+            if (theme_set(v)) { free(g_cfg.theme); g_cfg.theme = xstrdup(v); }
+            else fprintf(stderr, "corbienest: no theme named \"%s\" in the config: the default is used\n", v);
+        }
         else if (!strcmp(k, "yolo")) { if (atoi(v)) g_cfg.mode = MODE_AUTO; }
         else if (!strcmp(k, "mode")) { int m = mode_parse(v); if (m >= 0) g_cfg.mode = m; }
         else if (!strcmp(k, "memory")) g_cfg.memory = atoi(v) != 0;
@@ -467,6 +471,7 @@ void config_save(void) {
     sb_printf(&b, "memory_idle=%d\n", g_cfg.memory_idle);
     sb_printf(&b, "keep_alive=%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "");
     if (g_cfg.ui) sb_printf(&b, "ui=%s\n", g_cfg.ui);
+    if (g_cfg.theme) sb_printf(&b, "theme=%s\n", g_cfg.theme);
     write_whole_file_atomic(path, b.data, b.len);
     sb_free(&b);
 }

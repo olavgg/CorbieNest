@@ -22,7 +22,7 @@ else
 NC_DEFS   :=
 endif
 
-SRC := src/main.c src/util.c src/http.c src/term.c src/term_nc.c src/tools.c src/ollama.c src/provider.c src/skills.c
+SRC := src/main.c src/util.c src/http.c src/term.c src/term_nc.c src/tools.c src/ollama.c src/provider.c src/skills.c src/theme.c
 OBJ := $(SRC:.c=.o)
 
 corbienest: $(OBJ)

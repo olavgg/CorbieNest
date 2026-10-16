@@ -1133,7 +1133,7 @@ s.send("\x15")
 s.send("/sta\t"); check(s.expect("❯ /status"), "Tab completes a command that is the only match")
 s.send("\x15")
 s.send("see @sugsrc/twin.txt and @sugsrc/nope.tx"); s.send("t"); s.expect("(no such text)", 0.3); raw = s.out[s.mark:]
-check(b"\x1b[36m@sugsrc/twin.txt\x1b[39m" in raw and b"\x1b[36m@sugsrc/nope" not in raw, f"a mention that names a file is coloured in the input field, one that names nothing is not: {raw[-300:]!r}")
+check(b"\x1b[38;2;86;182;194m@sugsrc/twin.txt\x1b[39m" in raw and b"\x1b[38;2;86;182;194m@sugsrc/nope" not in raw, f"a mention that names a file is coloured in the input field, one that names nothing is not: {raw[-300:]!r}")
 s.send("\x7f" * 44)
 s.send("see @zebr"); s.send("a"); view = listed()
 check("sugsrc/zebra_term.c" in view and "sugsrc/deep/zebra_notes.md" in view, f"@ and part of a name finds the files it could be, wherever they are: {view!r}")
@@ -1888,13 +1888,13 @@ print("test highlight: code in a reply and a file's preview are coloured by thei
 sh = Session(["-m", "fake-coder:latest"]); sh.expect("Ctrl-D to quit")
 m0 = sh.mark
 sh.send("CODE_REPLY\r"); check(sh.expect("Done.", 10), "the reply with a code block")
-check(b"\x1b[35mdef\x1b[0m" in sh.out[m0:], "a keyword is magenta")
-check(b"\x1b[90m# say hi\x1b[0m" in sh.out[m0:], "a comment is grey")
-check(b"\x1b[32m'hi '\x1b[0m" in sh.out[m0:], "a string is green")
+check(b"\x1b[38;2;180;142;173mdef\x1b[0m" in sh.out[m0:], "a keyword is magenta")
+check(b"\x1b[38;2;124;135;153m# say hi\x1b[0m" in sh.out[m0:], "a comment is grey")
+check(b"\x1b[38;2;163;190;140m'hi '\x1b[0m" in sh.out[m0:], "a string is green")
 sh.send("/mode auto\r"); sh.expect("mode: auto")
 m1 = sh.mark
 sh.send("TOOL_WRITE_CODE\r"); check(sh.expect("create hello.py", 10), "a file is written")
-check(b"\x1b[35mdef\x1b[0m" in sh.out[m1:], "its preview shows the code coloured by the extension")
+check(b"\x1b[38;2;180;142;173mdef\x1b[0m" in sh.out[m1:], "its preview shows the code coloured by the extension")
 check(sh.expect("Echo", 10) or True, "the turn ends")
 sh.send("/mode manual\r"); sh.expect("mode: manual")   # the shared config: back to the default
 sh.send("\x04"); sh.close()
