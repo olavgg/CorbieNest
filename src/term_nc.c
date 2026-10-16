@@ -256,6 +256,7 @@ static char *g_ed = NULL;
 static size_t g_len = 0, g_cap = 0, g_cur = 0;
 static int g_hist_pos = 0;             /* an index into the history; hist_count() = the line being typed */
 static char *g_draft = NULL;           /* what was typed before the history was walked */
+static bool g_browse = false;          /* a history browse is on: g_hist_pos is a history entry, and g_draft is the line typed before */
 static char *g_pre = NULL;             /* text for the next prompt (term_editor_prefill) */
 
 /* a menu over the screen (confirm, select) */
@@ -1132,6 +1133,9 @@ static void sug_tab(void) {
     free(pre);
 }
 
+/* The line is the one being typed again: no browse, and the position is the end of the history. */
+static void nc_unbrowse(void) { g_browse = false; g_hist_pos = hist_count(); }
+
 /* The list's keys (the same ones as the ANSI UI): true when it took the key. Enter with nothing
  * highlighted is not taken, so it still sends the line; Esc closes the list before anything else. */
 static bool sug_key(int k) {
@@ -1141,7 +1145,7 @@ static bool sug_key(int k) {
         return true;
     }
     if (!g_sug_n) return false;
-    if ((k == NK_UP || k == NK_DOWN) && g_hist_pos < hist_count()) return false;   /* browsing the history: ↑/↓ scroll it */
+    if ((k == NK_UP || k == NK_DOWN) && g_browse) return false;   /* browsing the history: ↑/↓ scroll it */
     if (k == NK_DOWN) { if (g_sug_sel < g_sug_n - 1) g_sug_sel++; return true; }
     if (k == NK_UP && g_sug_sel >= 0) { g_sug_sel--; return true; }
     if (k == 13 && g_sug_sel >= 0) { sug_accept(g_sug_sel); return true; }
@@ -1154,9 +1158,9 @@ static bool sug_key(int k) {
 /* A history browse ends (the turn is over, or the queue comes back): the line typed before it returns to the
  * field, so a message being written is not lost in the history. */
 void nc_leave_browse(void) {
-    if (g_hist_pos >= hist_count()) return;
+    if (!g_browse) return;
     ed_set(g_draft ? g_draft : "");
-    g_hist_pos = hist_count();
+    nc_unbrowse();
 }
 
 static void nc_hist(int k, bool queue) {
@@ -1175,14 +1179,16 @@ static void nc_hist(int k, bool queue) {
         return;
     }
     if (k == NK_UP) {
-        if (g_hist_pos > 0) {
-            if (g_hist_pos == hist_count()) { free(g_draft); g_draft = xstrdup(g_ed ? g_ed : ""); }
-            g_hist_pos--;
-            ed_set(hist_get(g_hist_pos));
+        if (!g_browse) {   /* the browse starts at the end: the line typed so far is kept for ↓ */
+            if (!hist_count()) return;
+            nc_unbrowse();
+            free(g_draft); g_draft = xstrdup(g_ed ? g_ed : "");
+            g_browse = true;
         }
-    } else if (g_hist_pos < hist_count()) {
+        if (g_hist_pos > 0) { g_hist_pos--; ed_set(hist_get(g_hist_pos)); }
+    } else if (g_browse) {
         g_hist_pos++;
-        if (g_hist_pos == hist_count()) ed_set(g_draft ? g_draft : "");
+        if (g_hist_pos == hist_count()) { g_browse = false; ed_set(g_draft ? g_draft : ""); }
         else ed_set(hist_get(g_hist_pos));
     }
 }
@@ -1206,7 +1212,7 @@ int nc_poll_interrupt(void) {
                 free(text);
             }
             ed_set("");
-            g_hist_pos = hist_count();   /* the line is sent: the next one is typed from the end of the history */
+            nc_unbrowse();   /* the line is sent: the next one is typed from the end of the history */
             continue;
         }
         edit_key(k);
@@ -1247,17 +1253,17 @@ static char *readline_loop(void) {
         if (k == 13) {
             char *line = xstrdup(g_ed ? g_ed : "");
             ed_set("");
-            g_hist_pos = hist_count();
+            nc_unbrowse();
             return line;
         }
         if (k == 4 && g_len == 0) return NULL;         /* Ctrl-D on an empty line */
         if (k == 3) {
             if (g_len == 0) { if (++ctrl_c >= 2) return NULL; }
-            else { ctrl_c = 0; ed_set(""); g_hist_pos = hist_count(); }
+            else { ctrl_c = 0; ed_set(""); nc_unbrowse(); }
             continue;
         }
         ctrl_c = 0;
-        if (k == 27) { ed_set(""); g_hist_pos = hist_count(); continue; }
+        if (k == 27) { ed_set(""); nc_unbrowse(); continue; }
         if (k == NK_UP || k == NK_DOWN) { nc_hist(k, false); continue; }
         edit_key(k);
     }
@@ -1268,18 +1274,18 @@ char *nc_readline(const char *prompt, bool in_field) {
     if (!g_nc) return NULL;
     if (in_field && !g_pre) {   /* the text typed while the model worked is still in the field: the prompt goes on from it */
         sug_forget();           /* (the list is worked out again for it by readline_loop) */
-        g_hist_pos = hist_count();
+        nc_unbrowse();
         return readline_loop();
     }
     /* a question asked while a line is typed (the type-ahead) keeps that line for after it */
-    char *s_ed = g_ed, *s_draft = g_draft; size_t s_len = g_len, s_cap = g_cap, s_cur = g_cur; int s_pos = g_hist_pos;
-    g_ed = NULL; g_len = g_cap = g_cur = 0; g_draft = NULL; g_hist_pos = hist_count();
+    char *s_ed = g_ed, *s_draft = g_draft; size_t s_len = g_len, s_cap = g_cap, s_cur = g_cur; int s_pos = g_hist_pos; bool s_browse = g_browse;
+    g_ed = NULL; g_len = g_cap = g_cur = 0; g_draft = NULL; nc_unbrowse();
     sug_forget();   /* the list of the line set aside is not this one's */
     if (in_field && g_pre) { ed_set(g_pre); free(g_pre); g_pre = NULL; }
     char *out = readline_loop();
     sug_forget();
     free(g_ed); free(g_draft);
-    g_ed = s_ed; g_draft = s_draft; g_len = s_len; g_cap = s_cap; g_cur = s_cur; g_hist_pos = s_pos;
+    g_ed = s_ed; g_draft = s_draft; g_len = s_len; g_cap = s_cap; g_cur = s_cur; g_hist_pos = s_pos; g_browse = s_browse;
     return out;
 }
 
