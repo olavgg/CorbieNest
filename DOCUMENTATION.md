@@ -752,7 +752,7 @@ Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its
 ## Colours
 
 Both screens draw from one palette, a **theme** (`src/theme.c`). The default theme is the one
-the notcurses screen has always drawn. Pick one with `/ui theme` (a list, with the one in use marked;
+the notcurses screen has always drawn. There are two: `default` (dark) and `bright` (for a light terminal). Pick one with `/ui theme` (a list, with the one in use marked;
 `/ui theme NAME` names it, and Tab completes the names). The choice is saved as `theme=NAME` in the
 config; a name that does not exist there is said at start-up and the default is used.
 

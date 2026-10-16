@@ -1705,7 +1705,7 @@ static void test_theme(void) {
     const theme_t *def = g_theme;
     CHECK(theme_set("nope") == false && g_theme == def);   /* an unknown name keeps the theme in use */
     CHECK(theme_set("default") && g_theme == def && !strcmp(g_theme->name, "default"));
-    CHECK(theme_count() >= 2 && !strcmp(theme_name(0), "default") && theme_set("amber") && !strcmp(g_theme->name, "amber"));   /* the picker's list */
+    CHECK(theme_count() >= 2 && !strcmp(theme_name(0), "default") && theme_set("bright") && !strcmp(g_theme->name, "bright"));   /* the picker's list */
     CHECK(theme_set("default") && g_theme == def);
     /* a basic code becomes the theme's RGB; the sequence keeps its other parameters */
     char *a = map_all("\x1b[31mred\x1b[0m");
