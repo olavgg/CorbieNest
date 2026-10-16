@@ -717,16 +717,11 @@ static bool layout_sync(void) {
 
 /* The location line, on the last row, right-aligned: the working directory as an absolute path, and the git branch it is on
  * when it is in a repository. Too long for the width, the path loses its start (…) and the branch stays. */
-/* The two bottom rows share one background, flat (the notcurses UI draws the same colour). Each segment of
- * their text ends in a reset, which would drop it: sb_bar_row() puts it back after every reset, and pads the
- * row to its full width with spaces in it. (Not with an erase to the end of the line: tmux, for one, then
- * shows the row below without its background.) Truecolor: a terminal without it shows no background. */
+/* The two bottom rows have the window's own background, the terminal's: no fill of their own, so they read as part
+ * of the window (the notcurses UI draws them on its default background too). The row is padded to its full width,
+ * so a reset in the text leaves nothing undrawn. */
 static void sb_bar_row(sbuf *o, const char *text, int cols) {
-    sb_puts(o, th_bg(g_theme->bar_a));
-    for (const char *p = text; *p; ) {
-        if (!strncmp(p, C_RESET, strlen(C_RESET))) { sb_puts(o, C_RESET); sb_puts(o, th_bg(g_theme->bar_a)); p += strlen(C_RESET); }
-        else sb_putc(o, *p++);
-    }
+    for (const char *p = text; *p; ) sb_putc(o, *p++);
     for (int w = vis_width(text); w < cols; w++) sb_putc(o, ' ');
     sb_puts(o, C_RESET);
 }

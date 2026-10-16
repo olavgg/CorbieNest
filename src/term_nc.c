@@ -738,9 +738,9 @@ static void draw_field(int top) {
 static void draw_bar(int row) {
     sbuf t; sb_init(&t);
     term_status_text(&t, g_cols);
-    fill_row(row, 0, g_cols, C_BAR_A, false);   /* flat, the same as the location line and the ANSI bar */
+    fill_row(row, 0, g_cols, NC_DEFAULT, false);   /* the window's own background, as the ANSI bar has */
     nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 };
-    put_text(row, 0, t.data ? t.data : "", g_cols, C_TEXT, C_BAR_A, false, &carry);   /* the text starts with its own space: from column 0, all of the row (a column less cut off the last letter of "ready") */
+    put_text(row, 0, t.data ? t.data : "", g_cols, C_TEXT, NC_DEFAULT, false, &carry);   /* the text starts with its own space: from column 0, all of the row (a column less cut off the last letter of "ready") */
     sb_free(&t);
 }
 /* a menu, centred over the field: a rounded frame, the title, the rows, the keys */
