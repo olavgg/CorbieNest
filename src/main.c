@@ -1258,7 +1258,7 @@ static const char *fmt_ctx(int n) {
     return b;
 }
 
-/* Parses a context size: "65536", "64k", "128K", "1m", "max" (the model's trained
+/* Parses a context size: "65536", "64k", "512kb", "128K", "1m", "1MB", "max" (the model's trained
  * length), "default"/"0" (leave to the server). Returns -1 if unusable. */
 static int parse_ctx_arg(const char *a) {
     if (!a) return -1;
@@ -1268,8 +1268,8 @@ static int parse_ctx_arg(const char *a) {
     char *end; double v = strtod(a, &end);
     if (end == a || v <= 0) return -1;
     while (*end == ' ') end++;
-    if (*end == 'k' || *end == 'K') { v *= 1024; end++; }
-    else if (*end == 'm' || *end == 'M') { v *= 1024 * 1024; end++; }
+    if (*end == 'k' || *end == 'K') { v *= 1024; end++; if (*end == 'b' || *end == 'B') end++; }
+    else if (*end == 'm' || *end == 'M') { v *= 1024 * 1024; end++; if (*end == 'b' || *end == 'B') end++; }
     if (*end) return -1;
     if (v < 512 || v > 64.0 * 1024 * 1024) return -1;
     return (int)v;
@@ -1302,13 +1302,14 @@ static void set_ctx(int n) {
 /* /ctx: no argument opens a picker of sizes up to the model's trained maximum;
  * /ctx N|Nk|max|default sets it directly. */
 /* The context sizes worth offering for the current model: the standard powers of two up to
- * the model's trained maximum, the maximum itself, and `extra` (the current setting; 0 = none),
+ * the model's trained maximum (or, with `all`, up to 1M whatever the model was trained for: a
+ * local model takes any num_ctx), the maximum itself, and `extra` (the current setting; 0 = none),
  * ascending. Returns the count. */
-static int ctx_size_list(int *sizes, int cap, int extra) {
+static int ctx_size_list(int *sizes, int cap, int extra, bool all) {
     static const int STD[] = { 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576 };
     int n = 0;
     for (size_t i = 0; i < sizeof STD / sizeof *STD && n < cap; i++)
-        if (!g_model_max_ctx || STD[i] <= g_model_max_ctx) sizes[n++] = STD[i];
+        if (all || !g_model_max_ctx || STD[i] <= g_model_max_ctx) sizes[n++] = STD[i];
     int add[2] = { g_model_max_ctx, extra };
     for (int k = 0; k < 2; k++) {
         if (add[k] <= 0 || n >= cap) continue;
@@ -1336,7 +1337,7 @@ static void cmd_ctx(const char *arg) {
         printf("\n");
         return;
     }
-    int sizes[16], n = ctx_size_list(sizes, 14, g_cfg.num_ctx);
+    int sizes[16], n = ctx_size_list(sizes, 14, g_cfg.num_ctx, !model_hosted());
     sizes[n++] = 0;   /* server default, last */
     const char **items = xmalloc(sizeof(char*) * (size_t)n), **descs = xmalloc(sizeof(char*) * (size_t)n);
     char **own = xmalloc(sizeof(char*) * (size_t)n * 2);
@@ -5055,7 +5056,7 @@ static int run_benchmark(int runs, const char *prompt, bool ctx_given, bool json
     if (runs < 1) runs = 1;
     int sizes[16], n = 0;
     if (ctx_given || g_cfg.num_ctx <= 0) sizes[n++] = g_cfg.num_ctx;   /* one size (0 = the server's default) */
-    else n = ctx_size_list(sizes, 16, 0);
+    else n = ctx_size_list(sizes, 16, 0, false);
     int draft = ollama_model_draft(g_cfg.model);
     printf(C_BOLD "benchmark" C_RESET "  %s · %d run%s × %d tokens per context size · ", g_cfg.model, runs, runs == 1 ? "" : "s", BENCH_TOKENS);
     if (g_cfg.draft >= 0) printf("draft %d (--draft)", g_cfg.draft);
