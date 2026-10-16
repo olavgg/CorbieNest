@@ -110,6 +110,157 @@ def run(args, stdin=b"", env=None):
 def requests(): return json.loads(urllib.request.urlopen(f"{HOST}/_requests").read())
 
 # ---------- non-interactive ----------
+class Session:
+    def __init__(self, args=(), cols=100, rows=40, env=None, cwd=None, banner=False):
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.chdir(cwd or WORK)
+            # the child inherits the shell's environment: a hosted key the shell exports must not reach it unless the test gives one
+            for k in ("XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+                if k not in (env or ENV): os.environ.pop(k, None)
+            for k, v in (env or ENV).items(): os.environ[k] = v
+            os.execv(BIN, ["corbienest"] + list(args))
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        self.out = b""; self.mark = 0
+        if not banner: self.close_banner()
+    def close_banner(self):
+        """The start-up banner is a modal: while it is up, the output is kept for the scrollback and not written to the
+        terminal, and the box is what the screen shows. Wait for the box, then close it with Esc, so the rest of the
+        session is what the tests read. A test that reads the box passes banner=True and closes it itself."""
+        end = time.time() + 10
+        while time.time() < end and b"Corbie Nest" not in self.out:
+            r, _, _ = select.select([self.fd], [], [], 0.1)
+            if r:
+                try: d = os.read(self.fd, READ_MAX)
+                except OSError: return
+                if not d: return
+                self.out += d
+        time.sleep(0.3)
+        self.send("\x1b", wait=0.3)
+        self.mark = 0
+    def expect(self, pat, t=15):
+        """Wait until `pat` appears in output produced since the last send()."""
+        end = time.time() + t
+        while time.time() < end:
+            r, _, _ = select.select([self.fd], [], [], 0.1)
+            if r:
+                try: d = os.read(self.fd, READ_MAX)
+                except OSError: return False
+                if not d: return False
+                self.out += d
+            t = fresh(self.out[self.mark:].decode("utf-8", "replace"))
+            if pat in clean(t) or pat in transcript(t): return True   # the chrome is read on purpose too ("1 queued", the bar's effort)
+        return False
+    def send(self, s, wait=0.15):
+        self.mark = len(self.out)
+        os.write(self.fd, s.encode() if isinstance(s, str) else s); time.sleep(wait)
+    def text(self): return clean(self.out.decode("utf-8", "replace"))
+    def close(self):
+        """Kill it and wait: a session that is still exiting writes the config one last time,
+        and a test that writes its own config next would lose it to that write."""
+        try: os.kill(self.pid, 9)
+        except Exception: pass
+        try: os.waitpid(self.pid, 0)
+        except Exception: pass
+        try: os.close(self.fd)
+        except Exception: pass
+
+def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
+
+def click_rows(sess, rows=40):
+    """Left-click every row of the screen, top to bottom, and return what was drawn in answer:
+    a pty has no screen to say where a line is, and a click only acts on the head of a fold."""
+    at = len(sess.out)
+    for y in range(1, rows + 1): sess.send(f"\x1b[<0;5;{y}M\x1b[<0;5;{y}m", wait=0.01)
+    time.sleep(0.5); sess.expect("(no such text)", 0.3)
+    return clean(sess.out[at:].decode("utf-8", "replace"))
+
+def scrolled(sess):
+    """Whether the chrome as last drawn says the conversation is scrolled back: the line for that
+    is drawn right above the input field's upper rule. (The status bar says nothing about it —
+    it stays what it is.)"""
+    sess.expect("(no such text)", 0.4)   # let the redraw finish
+    return "scrollback · rows" in sess.text().rsplit("❯", 1)[0].rstrip("─")[-130:]
+
+def perm_files(): return glob.glob(os.path.join(CFG, "corbienest", "permissions", "*.rules"))
+
+def titles():
+    """The titles of the saved sessions. A file is written next to its place and renamed into it,
+    so the listing may name a temporary that is gone by the time it is opened."""
+    out = []
+    for f in os.listdir(SESS):
+        if not f.endswith(".json"): continue
+        try: out.append(json.load(open(os.path.join(SESS, f)))["title"])
+        except (OSError, ValueError, KeyError): pass
+    return out
+
+def since(): return clean(s.out[s.mark:].decode("utf-8", "replace"))
+
+def viewrange():   # the viewer's own "rows X-Y of Z" header (the window depends on the region height)
+    m = re.findall(r"rows (\d+)-(\d+) of (\d+)", since())
+    return tuple(int(x) for x in m[-1]) if m else None
+
+def wheel(up, row=5, n=1): return ("\x1b[<%d;10;%dM" % (64 if up else 65, row)) * n   # the terminal has 40 rows: 1-36 are the conversation
+
+def quiet(sess, data):
+    """Send, and say whether nothing at all was drawn in answer."""
+    sess.send(data); sess.expect("(no such text)", 0.6); return len(sess.out) == sess.mark
+
+def listed():
+    """What the last redraw put under the input field: the list, its hint and the bar."""
+    s.expect("(no such text)", 0.3)
+    return since().rsplit("─", 1)[-1]
+
+def thinks(rs): return [r.get("think", "absent") for r in rs]
+
+def run_rounds(model, args):
+    """run() in ENV2; returns (out, rc, the requests this run made to `model`) — not the log's last n, which may be an earlier run's"""
+    n0 = len(requests())
+    out, rc = run(args, env=ENV2)
+    return out, rc, [r for r in requests()[n0:] if r["model"] == model]
+
+def preqs(): return json.loads(urllib.request.urlopen(f"{HOST}/_provider_requests").read())
+
+def last_preq(prov): return [r for r in preqs() if r["provider"] == prov][-1]
+
+def key_nowhere():
+    """the key is never written anywhere: not the config, not a session, not the history"""
+    for root, _, files in os.walk(CFG2):
+        for f in files:
+            if "test-key" in open(os.path.join(root, f), errors="replace").read(): return os.path.join(root, f)
+    return None
+
+def anth_since(n0): return [r for r in preqs()[n0:] if r["provider"] == "anthropic"]
+
+def work_posts(posts): return [r for r in posts if "tools" in r["body"] or isinstance(r["body"].get("system"), list)]
+
+def consult_posts(posts):
+    return [r for r in posts if isinstance(r["body"].get("system"), str) and r["body"]["system"].startswith("You are the advisor")]
+
+def has_tool_result(r):
+    for m in r["body"].get("messages") or []:
+        c = m.get("content")
+        if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c): return True
+    return False
+
+def guided(level, prompt, advisor="fake-big:latest"):
+    n0, p0 = len(requests()), len(preqs())
+    out, rc = run(["-m", "fake-coder:latest", "--advisor", advisor, "--advisor-guidance", level, "--yolo", "-p", prompt], env=ENVK)
+    return out, rc, requests()[n0:]
+
+def make_repo():
+    d = tempfile.mkdtemp(prefix="crowgoal_")
+    subprocess.run(["git", "init", "-q", d], check=True)
+    for k, v in (("user.name", "t"), ("user.email", "t@t")): subprocess.run(["git", "-C", d, "config", k, v], check=True)
+    open(os.path.join(d, "README.md"), "w").write("hi\n")
+    subprocess.run(["git", "-C", d, "add", "-A"], check=True)
+    subprocess.run(["git", "-C", d, "commit", "-qm", "init"], check=True)
+    return d
+
+def provider_requests(): return json.loads(urllib.request.urlopen(f"{HOST}/_provider_requests").read())
+
+def worker(task): return [r for r in reqs if "You are a worker agent" in r["messages"][0]["content"] and f"# Your task ({task} of 3)" in r["messages"][1]["content"]]
+
 print("test oneshot echo")
 out, rc = run(["-m", "fake-coder:latest", "-p", "hello there"])
 check(rc == 0, "exit 0"); check("Echo: hello there" in out, f"echo reply: {out!r}")
@@ -339,75 +490,7 @@ out, rc = run(["-m", "fake-coder:latest", "--draft", "x", "-p", "hi"]); check(rc
 # How much of the output one read may take. A loaded machine hands it over in small pieces — a repaint cut in
 # two, a line without its end — and CORBIE_TEST_READ=200 makes this one do the same, to see what a CI runner sees.
 READ_MAX = int(os.environ.get("CORBIE_TEST_READ", "65536"))
-class Session:
-    def __init__(self, args=(), cols=100, rows=40, env=None, cwd=None, banner=False):
-        self.pid, self.fd = pty.fork()
-        if self.pid == 0:
-            os.chdir(cwd or WORK)
-            # the child inherits the shell's environment: a hosted key the shell exports must not reach it unless the test gives one
-            for k in ("XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
-                if k not in (env or ENV): os.environ.pop(k, None)
-            for k, v in (env or ENV).items(): os.environ[k] = v
-            os.execv(BIN, ["corbienest"] + list(args))
-        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-        self.out = b""; self.mark = 0
-        if not banner: self.close_banner()
-    def close_banner(self):
-        """The start-up banner is a modal: while it is up, the output is kept for the scrollback and not written to the
-        terminal, and the box is what the screen shows. Wait for the box, then close it with Esc, so the rest of the
-        session is what the tests read. A test that reads the box passes banner=True and closes it itself."""
-        end = time.time() + 10
-        while time.time() < end and b"Corbie Nest" not in self.out:
-            r, _, _ = select.select([self.fd], [], [], 0.1)
-            if r:
-                try: d = os.read(self.fd, READ_MAX)
-                except OSError: return
-                if not d: return
-                self.out += d
-        time.sleep(0.3)
-        self.send("\x1b", wait=0.3)
-        self.mark = 0
-    def expect(self, pat, t=15):
-        """Wait until `pat` appears in output produced since the last send()."""
-        end = time.time() + t
-        while time.time() < end:
-            r, _, _ = select.select([self.fd], [], [], 0.1)
-            if r:
-                try: d = os.read(self.fd, READ_MAX)
-                except OSError: return False
-                if not d: return False
-                self.out += d
-            t = fresh(self.out[self.mark:].decode("utf-8", "replace"))
-            if pat in clean(t) or pat in transcript(t): return True   # the chrome is read on purpose too ("1 queued", the bar's effort)
-        return False
-    def send(self, s, wait=0.15):
-        self.mark = len(self.out)
-        os.write(self.fd, s.encode() if isinstance(s, str) else s); time.sleep(wait)
-    def text(self): return clean(self.out.decode("utf-8", "replace"))
-    def close(self):
-        """Kill it and wait: a session that is still exiting writes the config one last time,
-        and a test that writes its own config next would lose it to that write."""
-        try: os.kill(self.pid, 9)
-        except Exception: pass
-        try: os.waitpid(self.pid, 0)
-        except Exception: pass
-        try: os.close(self.fd)
-        except Exception: pass
 
-def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
-def click_rows(sess, rows=40):
-    """Left-click every row of the screen, top to bottom, and return what was drawn in answer:
-    a pty has no screen to say where a line is, and a click only acts on the head of a fold."""
-    at = len(sess.out)
-    for y in range(1, rows + 1): sess.send(f"\x1b[<0;5;{y}M\x1b[<0;5;{y}m", wait=0.01)
-    time.sleep(0.5); sess.expect("(no such text)", 0.3)
-    return clean(sess.out[at:].decode("utf-8", "replace"))
-def scrolled(sess):
-    """Whether the chrome as last drawn says the conversation is scrolled back: the line for that
-    is drawn right above the input field's upper rule. (The status bar says nothing about it —
-    it stays what it is.)"""
-    sess.expect("(no such text)", 0.4)   # let the redraw finish
-    return "scrollback · rows" in sess.text().rsplit("❯", 1)[0].rstrip("─")[-130:]
 
 print("test interactive: an Ollama on another machine over plain http is said to be one")
 s = Session(["-H", "http://ollama.invalid:9", "-m", "fake-coder:latest"])
@@ -511,7 +594,6 @@ check(s.text().count("Run this command?") == 1, "always suppresses further promp
 
 print("test interactive: project permission rules (kept in the config directory, per project)")
 import glob
-def perm_files(): return glob.glob(os.path.join(CFG, "corbienest", "permissions", "*.rules"))
 s3 = Session(["-m", "fake-coder:latest"]); s3.expect("Ctrl-D to quit")
 s3.send("TOOL_BASH\r"); check(s3.expect("Run this command?"), "prompt")
 s3.send("p"); check(s3.expect("saved to "), "answered with p")
@@ -731,15 +813,6 @@ check([m["content"] for m in msgs if m["role"] == "user"] == ["session one", "an
 s.send("/status\r"); check(s.expect("session    " + sid), "/status shows the session id")
 s.send("/clear\r"); s.expect("new conversation")
 s.send("fresh start\r"); check(s.expect("Echo: fresh start"), "reply")
-def titles():
-    """The titles of the saved sessions. A file is written next to its place and renamed into it,
-    so the listing may name a temporary that is gone by the time it is opened."""
-    out = []
-    for f in os.listdir(SESS):
-        if not f.endswith(".json"): continue
-        try: out.append(json.load(open(os.path.join(SESS, f)))["title"])
-        except (OSError, ValueError, KeyError): pass
-    return out
 end = time.time() + 3   # the session is saved when the request is over — a moment after the reply was printed
 while "fresh start" not in titles() and time.time() < end: time.sleep(0.05)
 check("fresh start" in titles(), "/clear starts a new session file")
@@ -1033,13 +1106,9 @@ s.send("\x04"); s.close()
 
 print("test interactive: PgUp/PgDn scrollback viewer")
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
-def since(): return clean(s.out[s.mark:].decode("utf-8", "replace"))
 for pfx in "abcd":
     s.send("!seq -f '%s-%%02g' 1 30\r" % pfx); check(s.expect(pfx + "-30", 10), "30 rows printed")
 s.send("hello before\r"); check(s.expect("Echo: hello before"), "reply")
-def viewrange():   # the viewer's own "rows X-Y of Z" header (the window depends on the region height)
-    m = re.findall(r"rows (\d+)-(\d+) of (\d+)", since())
-    return tuple(int(x) for x in m[-1]) if m else None
 s.send("\x1b[5~"); check(s.expect("scrollback · rows"), f"PgUp opens the viewer: {s.text()[-200:]!r}")
 view = since(); first = viewrange()
 check("manual mode" in view.split("scrollback · rows")[-1] and "tokens" in view.split("scrollback · rows")[-1], f"where the window is has a line of its own: the status bar stays what it is: {view[-300:]!r}")
@@ -1063,10 +1132,6 @@ print("test interactive: the mouse wheel scrolls the conversation; the arrows st
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
 raw = s.out.decode("utf-8", "replace")
 check("\x1b[?1000h" in raw and "\x1b[?1006h" in raw, "the mouse is asked for, with SGR coordinates: otherwise the wheel arrives as arrow keys")
-def wheel(up, row=5, n=1): return ("\x1b[<%d;10;%dM" % (64 if up else 65, row)) * n   # the terminal has 40 rows: 1-36 are the conversation
-def quiet(sess, data):
-    """Send, and say whether nothing at all was drawn in answer."""
-    sess.send(data); sess.expect("(no such text)", 0.6); return len(sess.out) == sess.mark
 for pfx in "abc":
     s.send("!seq -f '%s-%%02g' 1 30\r" % pfx); check(s.expect(pfx + "-30", 10), "30 rows printed")
 s.send("older prompt\r"); check(s.expect("Echo: older prompt"), "reply")
@@ -1121,10 +1186,6 @@ for rel in ("sugsrc/zebra_term.c", "sugsrc/deep/zebra_notes.md", "sugsrc/twin.tx
 open(os.path.join(SIB, "zeta_parser.c"), "w").write("content of the sibling\n")
 sib = "../" + os.path.basename(SIB)
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
-def listed():
-    """What the last redraw put under the input field: the list, its hint and the bar."""
-    s.expect("(no such text)", 0.3)
-    return since().rsplit("─", 1)[-1]
 s.send("/m"); s.send("o"); check(s.expect("pick a model from a menu"), f"typing /mo lists the commands it could become, each with what it does: {since()[-300:]!r}")
 view = listed()
 check("/models" in view and "permission mode: manual" in view and "/memory" in view and "/status" not in view, f"only the matching ones — a name that starts with it first, then one that contains it: {view!r}")
@@ -1337,12 +1398,6 @@ CFG2 = tempfile.mkdtemp(prefix="crowcfg2_")
 ENV2 = dict(ENV, XDG_CONFIG_HOME=CFG2)
 CFG2_FILE = os.path.join(CFG2, "corbienest", "config")
 os.makedirs(os.path.join(CFG2, "corbienest")); open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
-def thinks(rs): return [r.get("think", "absent") for r in rs]
-def run_rounds(model, args):
-    """run() in ENV2; returns (out, rc, the requests this run made to `model`) — not the log's last n, which may be an earlier run's"""
-    n0 = len(requests())
-    out, rc = run(args, env=ENV2)
-    return out, rc, [r for r in requests()[n0:] if r["model"] == model]
 
 print("test effort: a level is part of the prompt, so it goes with every call; a model that cannot stop is never told to")
 out, rc, rs = run_rounds("fake-levels:latest", ["-m", "fake-levels:latest", "--yolo", "--effort", "high", "-p", "TOOL_BASH please"])
@@ -1598,14 +1653,6 @@ open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
 KEYS = dict(XAI_API_KEY="test-key", OPENAI_API_KEY="test-key", ANTHROPIC_API_KEY="test-key",
             XAI_BASE_URL=f"{HOST}/xai/v1", OPENAI_BASE_URL=f"{HOST}/openai/v1", ANTHROPIC_BASE_URL=f"{HOST}/anthropic")
 ENVK = dict(ENV2, **KEYS)
-def preqs(): return json.loads(urllib.request.urlopen(f"{HOST}/_provider_requests").read())
-def last_preq(prov): return [r for r in preqs() if r["provider"] == prov][-1]
-def key_nowhere():
-    """the key is never written anywhere: not the config, not a session, not the history"""
-    for root, _, files in os.walk(CFG2):
-        for f in files:
-            if "test-key" in open(os.path.join(root, f), errors="replace").read(): return os.path.join(root, f)
-    return None
 
 print("test advisor on a hosted API: xAI and OpenAI through Chat Completions")
 out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
@@ -1654,15 +1701,6 @@ check(rc == 0 and b.get("thinking") == {"type": "enabled", "budget_tokens": 8000
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
 
 print("test the model that does the work on Anthropic: haiku works, opus advises")
-def anth_since(n0): return [r for r in preqs()[n0:] if r["provider"] == "anthropic"]
-def work_posts(posts): return [r for r in posts if "tools" in r["body"] or isinstance(r["body"].get("system"), list)]
-def consult_posts(posts):
-    return [r for r in posts if isinstance(r["body"].get("system"), str) and r["body"]["system"].startswith("You are the advisor")]
-def has_tool_result(r):
-    for m in r["body"].get("messages") or []:
-        c = m.get("content")
-        if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c): return True
-    return False
 n0 = len(preqs())
 out, rc = run(["-m", "anthropic:claude-fake-haiku", "--advisor", "anthropic:claude-fake-opus", "--yolo", "-p", "TOOL_BASH please"], env=ENVK)
 check(rc == 0 and "hello-from-tool" in out and "Tool said:" in out, f"the tool ran, and the model read its result: {out[-400:]!r}")
@@ -1783,10 +1821,6 @@ check(key_nowhere() is None, f"completing the models wrote the key nowhere: {key
 
 # ---------- /advisor guidance: how much the agent leans on it ----------
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
-def guided(level, prompt, advisor="fake-big:latest"):
-    n0, p0 = len(requests()), len(preqs())
-    out, rc = run(["-m", "fake-coder:latest", "--advisor", advisor, "--advisor-guidance", level, "--yolo", "-p", prompt], env=ENVK)
-    return out, rc, requests()[n0:]
 
 print("test advisor guidance: light and normal leave it to the agent")
 out, rc, rs = guided("light", "TOOL_ADVISOR ADVISOR_LOOP")
@@ -2100,16 +2134,7 @@ check(not [f for f in os.listdir(os.path.join(CFG, "corbienest")) if ".tmp" in f
 ha.send("\x04"); hb.send("\x04"); ha.close(); hb.close()
 
 # ---------- /goal: candidates in git worktrees race to a metric ----------
-def make_repo():
-    d = tempfile.mkdtemp(prefix="crowgoal_")
-    subprocess.run(["git", "init", "-q", d], check=True)
-    for k, v in (("user.name", "t"), ("user.email", "t@t")): subprocess.run(["git", "-C", d, "config", k, v], check=True)
-    open(os.path.join(d, "README.md"), "w").write("hi\n")
-    subprocess.run(["git", "-C", d, "add", "-A"], check=True)
-    subprocess.run(["git", "-C", d, "commit", "-qm", "init"], check=True)
-    return d
 GOALENV = dict(ENVK, DEEPSEEK_API_KEY="test-key", DEEPSEEK_BASE_URL=f"{HOST}/deepseek", MOONSHOT_API_KEY="test-key", MOONSHOT_BASE_URL=f"{HOST}/kimi/v1")
-def provider_requests(): return json.loads(urllib.request.urlopen(f"{HOST}/_provider_requests").read())
 
 print("test goal: a local model and xAI race in worktrees; the higher score is applied, the copies are gone")
 repo = make_repo()
@@ -2183,7 +2208,6 @@ check("· role tester" in out, "a worker's line names its role")
 rev1 = out.index("reviews task 1/3")
 check(out.index("⤷ worker 2/3") > out.index("accepted", rev1), "the task that owns the same file as task 1 starts only after task 1 is accepted")
 reqs = requests()[n0:]
-def worker(task): return [r for r in reqs if "You are a worker agent" in r["messages"][0]["content"] and f"# Your task ({task} of 3)" in r["messages"][1]["content"]]
 w1, w2, w3 = worker(1), worker(2), worker(3)
 check(w1 and w1[0]["model"] == "fake-levels:latest", f"a role's model runs its worker: {w1[0]['model'] if w1 else None!r}")
 check(w3 and w3[0]["model"] == "fake-coder:latest", f"the default worker runs on the model in use: {w3[0]['model'] if w3 else None!r}")
