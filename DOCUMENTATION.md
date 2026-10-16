@@ -745,7 +745,23 @@ goal, and keeps the one the metric scores best.
 ## Config
 
 Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N`, `/subagent` are saved to
-`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`, the sub-agents' model as `subagent=`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, `CORBIENEST_TRACE` (a file to record the session's drawing into, see below), and for a hosted model or advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
+`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`, the sub-agents' model as `subagent=`, the colour theme as `theme=`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, `CORBIENEST_TRACE` (a file to record the session's drawing into, see below), and for a hosted model or advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
+
+## Colours
+
+Both screens draw from one palette, a **theme** (`src/theme.c`). The default theme is the one
+the notcurses screen has always drawn. `theme=NAME` in the config picks a theme; a name that does
+not exist is said at start-up and the default is used. There is no command to switch a theme yet.
+
+The conversation and the chrome are written with the basic colour codes (red, green, yellow,
+cyan, magenta, grey, orange). The ANSI screen maps those to the theme's colours as its output
+leaves for the terminal, and the notcurses screen maps them as it reads the same text, so the
+same code is the same colour on both. The colours of a tool's own output that uses those codes
+are mapped too. Extended colours (`38;5;…`, `38;2;…`) are left as they are, except orange.
+
+What the terminal draws for plain text and for the background is still the terminal's own on the
+ANSI screen, while notcurses paints the theme's text and ground. A new theme is one entry in
+`theme.c`: its name and the colours of its fields.
 
 ## Running more than one session
 
