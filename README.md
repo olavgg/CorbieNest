@@ -61,8 +61,11 @@ make test             # the unit tests: no model or network needed
 ```
 
 Build options:
-- `make NOTCURSES=0` leaves the notcurses screen out even when it is installed.
-- `make NOTCURSES=1` requires it and fails without it.
+- The notcurses screen is built when libunistring, zlib and terminfo are installed. On Debian and
+  Ubuntu: `sudo apt install libunistring-dev zlib1g-dev libncurses-dev` (Fedora: `libunistring-devel
+  zlib-devel ncurses-devel`).
+- `make NOTCURSES=0` leaves the notcurses screen out even when those libraries are installed.
+- `make NOTCURSES=1` requires them and fails without them.
 - On macOS with Homebrew: `make CFLAGS="-O2 -std=gnu11 -I$(brew --prefix)/include" LDLIBS="-L$(brew --prefix)/lib -lcjson -lcurl"`.
 
 ## Quick start
