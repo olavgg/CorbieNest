@@ -490,6 +490,7 @@ void   nc_render_soon(void);                          /* the same, at most every
 void   nc_output(void);                               /* a write reached the conversation */
 void   nc_clear(void);                                /* the conversation starts over at the top */
 void   nc_prefill(const char *text);                  /* text for the field at the next prompt */
+void   nc_leave_browse(void);                         /* a history browse ends: the line typed before it is back in the field */
 char  *nc_readline(const char *prompt, bool in_field);
 int    nc_poll_interrupt(void);                       /* keys read while the model works: 1 = stop */
 int    nc_input_fd(void);                             /* the fd that signals keys to read (-1: none) */

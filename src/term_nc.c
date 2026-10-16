@@ -182,6 +182,7 @@ bool   nc_overlay_open(void) { return false; }
 void   nc_output(void) {}
 void   nc_clear(void) {}
 void   nc_prefill(const char *text) { (void)text; }
+void   nc_leave_browse(void) {}
 char  *nc_readline(const char *prompt, bool in_field) { (void)prompt; (void)in_field; return NULL; }
 int    nc_poll_interrupt(void) { return 0; }
 int    nc_input_fd(void) { return -1; }
@@ -1105,8 +1106,17 @@ static bool sug_key(int k) {
 
 /* ↑/↓ on the line: the history, as at the prompt; while busy the queued messages come back into the field first
  * (queue true), as the ANSI screen does. The line typed before a browse is kept in g_draft for ↓. */
+/* A history browse ends (the turn is over, or the queue comes back): the line typed before it returns to the
+ * field, so a message being written is not lost in the history. */
+void nc_leave_browse(void) {
+    if (g_hist_pos >= hist_count()) return;
+    ed_set(g_draft ? g_draft : "");
+    g_hist_pos = hist_count();
+}
+
 static void nc_hist(int k, bool queue) {
     if (k == NK_UP && queue && term_queue_count()) {
+        nc_leave_browse();
         sbuf b; sb_init(&b);
         while (term_queue_count()) {
             char *m = term_queue_pop();
@@ -1151,6 +1161,7 @@ int nc_poll_interrupt(void) {
                 free(text);
             }
             ed_set("");
+            g_hist_pos = hist_count();   /* the line is sent: the next one is typed from the end of the history */
             continue;
         }
         edit_key(k);

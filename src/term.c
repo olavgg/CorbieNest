@@ -2216,8 +2216,15 @@ static char *g_hist[HIST_MAX];
 static int g_hist_n = 0;
 /* ↑/↓ while busy: the history the type-ahead shows (g_ta_hist = g_hist_n: none, -1: not browsing since the
  * last line), and what was typed before browsing (g_ta_draft), which ↓ back to the end brings back. */
+/* A history browse ends (the turn is over, or the queue comes back): the line typed before it returns to the
+ * field, so a message being written is not lost in the history. */
+static void ta_end_browse(void) {
+    if (g_ta_hist < 0 || g_ta_hist >= g_hist_n) return;
+    ta_set_text(g_ta_draft ? g_ta_draft : "");
+    g_ta_hist = -1; free(g_ta_draft); g_ta_draft = NULL;
+}
 static void ta_hist(int k) {
-    if (k == K_UP && term_queue_count()) { term_queue_to_editor(); term_status_refresh(); return; }   /* the queue comes back first */
+    if (k == K_UP && term_queue_count()) { ta_end_browse(); term_queue_to_editor(); term_status_refresh(); return; }   /* the queue comes back first */
     if (g_ta_hist < 0) g_ta_hist = g_hist_n;
     if (k == K_UP) {
         if (g_ta_hist == 0) return;
@@ -3051,6 +3058,7 @@ bool term_is_ready(void) { return g_ready; }
 char *term_readline(const char *prompt) {
     g_ready = true; term_status_refresh();
     g_tick_live = g_tick_fn != NULL; g_tick_next = mono_ms() + TICK_MS;
+    if (g_ui_nc) nc_leave_browse(); else ta_end_browse();   /* the turn is over: the message being written is back in the field */
     char *s = g_ui_nc ? nc_readline(prompt, true) : readline_impl(prompt, true);
     if (g_tick_live && g_tick_fn) g_tick_fn(true);   /* the block settles on its last frame */
     /* the first task ends the banner's animation for good: a slash command or a shell line is not work */
