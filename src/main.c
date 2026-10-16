@@ -2407,7 +2407,7 @@ static char *expand_mentions(const char *input);
 /* Echo a message the user queued while the model was busy, the way it would have
  * looked had they typed it at the prompt. */
 static void echo_queued(const char *text) {
-    char *b = term_user_band(C_BOLD C_ORANGE "› " C_RESET C_DIM, text);   /* a user message: on the user's ground */
+    char *b = term_user_band(C_BOLD C_ORANGE "› " C_RESET, text);   /* a user message: on the user's ground, text as typed (not dim) */
     fputs(b, stdout);
     free(b);
 }
