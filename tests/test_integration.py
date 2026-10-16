@@ -1224,7 +1224,8 @@ open(os.path.join(SIB, "zeta_parser.c"), "w").write("content of the sibling\n")
 sib = "../" + os.path.basename(SIB)
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
 s.send("/m"); s.send("o"); check(s.expect("pick a model from a menu"), f"typing /mo lists the commands it could become, each with what it does: {since()[-300:]!r}")
-view = listed()
+s.expect("(no such text)", 1)
+_t = since(); view = _t[_t.rfind("❯ /mo"):] if "❯ /mo" in _t else ""   # the list is drawn under the field: from the field's row on
 check("/models" in view and "permission mode: manual" in view and "/memory" in view and "/status" not in view, f"only the matching ones — a name that starts with it first, then one that contains it: {view!r}")
 check("tab complete · ↓ choose · esc close" in view, "and a line that says which keys work")
 _regions = [int(x) for x in re.findall(r"\x1b\[1;(\d+)r", s.out.decode("utf-8", "replace"))]
