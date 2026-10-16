@@ -52,6 +52,7 @@ extern const theme_t *g_theme;
 bool theme_set(const char *name);               /* "theme=NAME": false, and the theme stays, when there is none */
 bool theme_fg_code(int code, unsigned *rgb);    /* the theme's colour of a basic fg code (30-37, 90-97) */
 void theme_map_bytes(theme_map *m, const char *in, size_t n, sbuf *out);   /* the bytes with their themed codes mapped */
+bool theme_map_pending(const theme_map *m);     /* the last write ended inside an escape sequence: its bytes are not out yet */
 const char *th_fg(unsigned rgb);                /* "\x1b[38;2;R;G;Bm" for an RGB colour (a short-lived string) */
 const char *th_bg(unsigned rgb);                /* the background form */
 

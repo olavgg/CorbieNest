@@ -1133,7 +1133,7 @@ s.send("\x15")
 s.send("/sta\t"); check(s.expect("❯ /status"), "Tab completes a command that is the only match")
 s.send("\x15")
 s.send("see @sugsrc/twin.txt and @sugsrc/nope.tx"); s.send("t"); s.expect("(no such text)", 0.3); raw = s.out[s.mark:]
-check(b"\x1b[38;2;86;182;194m@sugsrc/twin.txt\x1b[39m" in raw and b"\x1b[38;2;86;182;194m@sugsrc/nope" not in raw, f"a mention that names a file is coloured in the input field, one that names nothing is not: {raw[-300:]!r}")
+check(b"\x1b[38;2;86;182;194m@sugsrc/twin.txt\x1b[38;2;255;241;184m" in raw and b"\x1b[38;2;86;182;194m@sugsrc/nope" not in raw, f"a mention that names a file is coloured in the input field, one that names nothing is not: {raw[-300:]!r}")
 s.send("\x7f" * 44)
 s.send("see @zebr"); s.send("a"); view = listed()
 check("sugsrc/zebra_term.c" in view and "sugsrc/deep/zebra_notes.md" in view, f"@ and part of a name finds the files it could be, wherever they are: {view!r}")

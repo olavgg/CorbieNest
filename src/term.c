@@ -1105,7 +1105,7 @@ static ssize_t sb_write_fn(void *cookie, const char *buf, size_t n) {
     /* parked again only where the chunk ends between sequences: a chunk can end anywhere in a large write,
      * and a cursor move spliced into an escape would corrupt it. Until the next refresh the cursor stays at
      * the transcript, where the next chunk goes anyway. */
-    else if (!g_sb_pause && want_box() && !tail_incomplete(buf, n)) { sbuf mv; sb_init(&mv); box_move(&mv); fd1_write(mv.data, mv.len); sb_free(&mv); }
+    else if (!g_sb_pause && want_box() && !tail_incomplete(buf, n) && !theme_map_pending(&g_th_map)) { sbuf mv; sb_init(&mv); box_move(&mv); fd1_write(mv.data, mv.len); sb_free(&mv); }
     return (ssize_t)n;
 }
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)

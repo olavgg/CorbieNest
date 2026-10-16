@@ -1732,6 +1732,14 @@ static void test_theme(void) {
     CHECK(o.data && !strcmp(o.data, "ab\x1b[38;2;191;97;106mcd"));
     CHECK(m.np == 0);
     sb_free(&o);
+    /* a sequence split at a write's end: nothing of it goes out before its end, and the next write completes it */
+    memset(&m, 0, sizeof m);
+    sb_init(&o);
+    theme_map_bytes(&m, "x\x1b[3", strlen("x\x1b[3"), &o);
+    CHECK(o.len == 1 && o.data[0] == 'x' && theme_map_pending(&m));   /* the partial escape is held, not written */
+    theme_map_bytes(&m, "2mz", 3, &o);
+    CHECK(!theme_map_pending(&m) && !strcmp(o.data, "x\x1b[38;2;163;190;140mz"));   /* 32 is the green */
+    sb_free(&o);
     /* an ESC that is not a CSI goes out as it came */
     a = map_all("\x1b" "7x\x1b" "8");
     CHECK_STR(a, "\x1b" "7x\x1b" "8");

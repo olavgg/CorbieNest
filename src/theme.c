@@ -89,6 +89,8 @@ static void map_csi(sbuf *out, const char *q, size_t n) {
     sb_free(&o);
 }
 
+bool theme_map_pending(const theme_map *m) { return m->np > 0; }
+
 /* The bytes of one write, mapped. A sequence the write ends inside is kept in m and finished by the next write. */
 void theme_map_bytes(theme_map *m, const char *in, size_t n, sbuf *out) {
     for (size_t i = 0; i < n; i++) {
