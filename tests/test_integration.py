@@ -340,7 +340,7 @@ out, rc = run(["-m", "fake-coder:latest", "--draft", "x", "-p", "hi"]); check(rc
 # two, a line without its end — and CORBIE_TEST_READ=200 makes this one do the same, to see what a CI runner sees.
 READ_MAX = int(os.environ.get("CORBIE_TEST_READ", "65536"))
 class Session:
-    def __init__(self, args=(), cols=100, rows=40, env=None, cwd=None):
+    def __init__(self, args=(), cols=100, rows=40, env=None, cwd=None, banner=False):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(cwd or WORK)
@@ -351,6 +351,22 @@ class Session:
             os.execv(BIN, ["corbienest"] + list(args))
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self.out = b""; self.mark = 0
+        if not banner: self.close_banner()
+    def close_banner(self):
+        """The start-up banner is a modal: while it is up, the output is kept for the scrollback and not written to the
+        terminal, and the box is what the screen shows. Wait for the box, then close it with Esc, so the rest of the
+        session is what the tests read. A test that reads the box passes banner=True and closes it itself."""
+        end = time.time() + 10
+        while time.time() < end and b"Corbie Nest" not in self.out:
+            r, _, _ = select.select([self.fd], [], [], 0.1)
+            if r:
+                try: d = os.read(self.fd, READ_MAX)
+                except OSError: return
+                if not d: return
+                self.out += d
+        time.sleep(0.3)
+        self.send("\x1b", wait=0.3)
+        self.mark = 0
     def expect(self, pat, t=15):
         """Wait until `pat` appears in output produced since the last send()."""
         end = time.time() + t
@@ -399,13 +415,15 @@ check(s.expect("⚠ plain http to ollama.invalid: the conversation crosses the n
 s.close()
 
 print("test interactive: banner, echo, editor keys, history")
-s = Session(["-m", "fake-coder:latest"])
-check(s.expect("Ctrl-D to quit"), "banner"); check("● connected" in s.text(), "connected marker")
+s = Session(["-m", "fake-coder:latest"], banner=True)
+check(s.expect("Corbie Nest"), "banner"); check("● connected" in s.text(), "connected marker")
+s.send("\x1b"); s.expect("(no such text)", 2); check("Ctrl-D to quit" in s.text(), "closed with Esc, the footer comes (it is painted again with the conversation, so expect() does not see it)")
 check("plain http to" not in s.text(), "no unencrypted-host warning for an Ollama on this machine")
 raw = s.out.decode("utf-8", "replace")
 check("\x1b[?1049h" in raw, "alternate screen entered (full screen)")
-check(re.search(r"\x1b\[1;35r", raw) is not None, "scroll region reserves the input field, the status bar and the location line")
-check(re.search(r"\x1b\[39;1H[^\n]*manual mode[^\n]*fake-coder:latest[^\n]*0 tokens", raw) is not None, f"status bar on the row above the last: {raw[-300:]!r}")
+check(re.search(r"\x1b\[1;36r", raw) is not None, "scroll region reserves the input field and the status bar, which shares the last row with the location line")
+check(re.search(r"\x1b\[40;1H[^\n]*fake-coder:latest[^\n]*0 tokens", raw) is not None, f"the last row: the model and the tokens: {raw[-300:]!r}")
+check(re.search(r"\x1b\[39;1H[^\n]*manual mode", raw) is not None, "the mode is on the lower rule of the field, above the last row")
 check(re.search(r"\x1b\[40;1H[^\n]*" + re.escape(WORK), raw) is not None, "the last row says the working folder, as an absolute path")
 check("manual mode (shift+tab to cycle)" in clean(raw), "mode-cycling hint sits next to the mode in the bar")
 check(re.search(r"\x1b\[37;1H[^\n]*─{20}", raw) is not None, "the input field is framed by a rule above the prompt")
@@ -438,24 +456,24 @@ print("test interactive: the input field grows with the input and survives a res
 sf = Session(["-m", "fake-coder:latest"], cols=60, rows=20); sf.expect("Ctrl-D to quit")
 sf.send("one line")
 check(sf.expect("❯ one line"), "single-row field")
-check(re.search(r"\x1b\[1;15r", sf.out.decode("utf-8", "replace")) is not None, "region is rows minus field, bar and location line")
+check(re.search(r"\x1b\[1;16r", sf.out.decode("utf-8", "replace")) is not None, "region is rows minus the field (three rules and the text) and the bar row")
 sf.send("\x1b\rtwo\x1b\rthree")   # alt+enter twice: three input rows
 check(sf.expect("three"), "multi-line input")
 raw = sf.out.decode("utf-8", "replace")
-check(re.search(r"\x1b\[1;13r", raw) is not None, f"the region shrank by the two extra input rows: {raw[-200:]!r}")
-check(re.search(r"\x1b\[17;1H[^\n]*three", raw) is not None, "the last input row sits just above the lower rule")
+check(re.search(r"\x1b\[1;14r", raw) is not None, f"the region shrank by the two extra input rows: {raw[-200:]!r}")
+check(re.search(r"\x1b\[18;1H[^\n]*three", raw) is not None, "the last input row sits just above the lower rule")
 sf.send("\x15")   # ctrl-u back to one row
 check(sf.expect("❯ "), "cleared")
 raw = sf.out.decode("utf-8", "replace")[-4000:]
-check(re.search(r"\x1b\[1;15r", raw) is not None, "the region grew back")
-check(re.search(r"\x1b\[14;1H\x1b\[2K", raw) and re.search(r"\x1b\[15;1H\x1b\[2K", raw),
+check(re.search(r"\x1b\[1;16r", raw) is not None, "the region grew back")
+check(re.search(r"\x1b\[15;1H\x1b\[2K", raw) and re.search(r"\x1b\[16;1H\x1b\[2K", raw),
       f"the rows the field gave back are painted again from the transcript, not left showing its old text: {raw[-300:]!r}")
 sf.mark = len(sf.out)
 fcntl.ioctl(sf.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
 os.kill(sf.pid, __import__("signal").SIGWINCH)
 check(sf.expect("manual mode", 3), "a resize at an idle prompt is drawn at once, not at the next key (a tmux pane is resized all the time)")
 raw = sf.out[sf.mark:].decode("utf-8", "replace")
-check(re.search(r"\x1b\[1;25r", raw) is not None, f"the region was re-cut for the new height: {raw[-300:]!r}")
+check(re.search(r"\x1b\[1;26r", raw) is not None, f"the region was re-cut for the new height: {raw[-300:]!r}")
 check(re.search(r"\x1b\[29;1H[^\n]*manual mode", raw) is not None, "the bar is on the new row above the last")
 check("Corbie Nest" in clean(raw), "and the conversation is painted again for the new size, from the top of the transcript")
 sf.send("after resize")
@@ -1125,7 +1143,7 @@ s.send("/mode manual\r"); s.expect("✓ mode: ")
 s.send("/stat\r"); check(s.expect("unknown command /stat"), "with nothing highlighted Enter sends what was typed: the list is only a preview")
 s.send("/h"); s.send("e"); check("commands, keys and input tricks" in listed(), "the list for /he")
 s.send("\x1b"); check("commands, keys" not in listed(), "Esc closes the list")
-check(re.search(r"\x1b\[1;35r", s.out[s.mark:].decode("utf-8", "replace")) is not None, "and the conversation gets its rows back")
+check(re.search(r"\x1b\[1;36r", s.out[s.mark:].decode("utf-8", "replace")) is not None, "and the conversation gets its rows back")
 s.send("\x1b[A"); check(s.expect("❯ /stat"), "after which arrow up is the history again")
 check("model, context usage" not in listed(), "a recalled line brings no list up: the next arrow goes on through the history")
 s.send("\x1b[A"); check(s.expect("❯ /mode manual"), "as it does")
@@ -1386,9 +1404,9 @@ check(adv["options"]["num_ctx"] == 8192 and adv.get("think") is False, f"the sav
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nadvisor=fake-big:latest\nadvisor_ctx=100\neffort.fake-levels:latest=ultra\n")
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENV2)
 check([r for r in requests() if r["model"] == "fake-big:latest"][-1]["options"]["num_ctx"] == 16384, "an advisor_ctx too small to be one is ignored")
-s = Session(["-m", "fake-levels:latest"], env=ENV2)
+s = Session(["-m", "fake-levels:latest"], env=ENV2, banner=True)
 check(s.expect("effort 'ultra' is saved for fake-levels:latest, which does not offer it"), "a saved effort the model does not offer is said at start-up, and left to the model")
-check(s.expect("advisor: fake-big:latest"), "the banner names the advisor"); s.expect("Ctrl-D to quit")
+check(s.expect("advisor: fake-big:latest"), "the banner names the advisor"); s.send("\x1b"); s.expect("(no such text)", 1)
 s.send("hello\r"); s.expect("Echo: hello"); check("think" not in requests()[-1] and "· ultra" not in s.text(), "and neither sent nor shown in the bar")
 s.send("\x04"); s.close()
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
@@ -2006,9 +2024,9 @@ check(not os.path.exists(MADE), "nothing was written then either")
 s.send("\x04"); s.close()
 print("test interactive: /orchestrate with a hosted model, and the banner")
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nadvisor=xai:grok-fake\n")
-s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2)
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2, banner=True)
 check(s.expect("advisor: xai:grok-fake") and s.expect("XAI_API_KEY is not set"), "the banner names the saved advisor, and says when its key is missing")
-s.expect("Ctrl-D to quit"); s.send("\x04"); s.close()
+s.send("\x1b"); s.expect("(no such text)", 1); s.send("\x04"); s.close()
 s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
 check("advisor: xai:grok-fake" in s.text() and "is not set" not in s.text(), "with the key there it is just named")
 np = len(preqs())
