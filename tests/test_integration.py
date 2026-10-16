@@ -596,6 +596,7 @@ sp.close()
 
 
 print("test interactive: confirmation menu — deny with reason, arrow keys, then always")
+s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")   # its own session: it stands alone
 s.send("TOOL_BASH\r")
 check(s.expect("Run this command?"), "confirmation prompt")
 check(s.expect("1. Yes") and "3. Yes, and always allow `echo …` in this project" in s.text() and "4. No, and tell the model" in s.text(), f"menu options shown: {s.text()[-400:]!r}")
@@ -607,7 +608,7 @@ s.send("\x1b[B"); s.send("\x1b[B"); s.send("\x1b[A"); s.send("\r")   # down, dow
 check(s.expect("hello-from-tool"), "command ran after selecting 'always' with arrows+enter")
 check("Run this command?" in s.text() and "● bash(echo hello-from-tool)" in s.text(), "the approval asked, and the call's one line says what ran")
 s.send("TOOL_BASH\r"); check(s.expect("Tool said: hello-from-tool", 15), "no prompt after 'always'")
-check(s.text().count("Run this command?") == 1, "always suppresses further prompts")
+check(since_send(s).count("Run this command?") == 0, "always suppresses further prompts: none is asked after the second call")
 
 print("test interactive: project permission rules (kept in the config directory, per project)")
 s3 = Session(["-m", "fake-coder:latest"]); s3.expect("Ctrl-D to quit")
