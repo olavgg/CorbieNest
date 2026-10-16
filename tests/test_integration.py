@@ -847,7 +847,7 @@ check(s.text().count("auto-compacting") == 1, "did not compact again (usage figu
 
 print("test interactive: /resume picker")
 s.send("/resume\r"); check(s.expect("Resume a session"), "picker opens")
-check(s.expect("session two") and s.expect("session one"), "earlier sessions listed, this directory")
+check(s.expect("session two") and re.search(r"… \d+ of \d+ shown", since_send(s)), "earlier sessions listed, this directory: the picker lists the latest and says how many there are (the oldest is past the list)")
 s.send("\x1b"); check(s.expect("cancelled"), "esc cancels")
 s.send("/resume " + sid + "\r"); check(s.expect("resumed session " + sid), "/resume ID loads it")
 check(s.expect("last reply:") and s.expect("Echo: three"), "recap shows the last reply")
