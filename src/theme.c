@@ -13,11 +13,11 @@
 static const theme_t THEMES[] = {
     {
         .name = "default",
-        .text = 0xE5E9F0u, .muted = 0x7C8799u, .rule = 0x3B4252u, .menu = 0x1E2330u,
+        .text = 0xE5E9F0u, .muted = 0x7C8799u, .rule = 0x3B4252u, .menu = 0x1E2330u, .window = 0,
         .bar_a = 0x161A24u, .bar_b = 0x2A1F3Du,
-        .field_text = 0xFFF1B8u, .field_bg = 0x151922u,
+        .field_text = 0xFFF1B8u,
         .edge_ready = 0x5FD75Fu, .edge_idle = 0x3B4252u,
-        .loc = 0xAF5F87u, .select = 0x2A2F3Au, .user_bg = 0x2C3445u,
+        .loc = 0xAF5F87u, .select = 0x2A2F3Au, .user_bg = 0x2C3445u, .user_text = 0xEFBCFFu,
         .accent = 0xF0883Eu,
         .ok = 0xA3BE8Cu, .bad = 0xBF616Au, .warn = 0xEBCB8Bu,
         .info = 0x56B6C2u, .blue = 0x81A1C1u, .magenta = 0xB48EADu, .gray = 0x7C8799u,
@@ -26,11 +26,11 @@ static const theme_t THEMES[] = {
     },
     {   /* the bright theme: for a light terminal (the default is the dark one) */
         .name = "bright",
-        .text = 0x1F2328u, .muted = 0x656D76u, .rule = 0xD1D9E0u, .menu = 0xF6F8FAu,
+        .text = 0x1F2328u, .muted = 0x656D76u, .rule = 0xD1D9E0u, .menu = 0xF6F8FAu, .window = 0xFFFFFFu,
         .bar_a = 0xFFFFFFu, .bar_b = 0xFFFFFFu,
-        .field_text = 0x1F2328u, .field_bg = 0xF6F8FAu,
+        .field_text = 0x1F2328u,
         .edge_ready = 0x1A7F37u, .edge_idle = 0xAFB8C1u,
-        .loc = 0x8250DFu, .select = 0xDDF4FFu, .user_bg = 0xE3ECF7u,
+        .loc = 0x8250DFu, .select = 0xDDF4FFu, .user_bg = 0xE3ECF7u, .user_text = 0x8250DFu,
         .accent = 0xBC4C00u,
         .ok = 0x1A7F37u, .bad = 0xCF222Eu, .warn = 0x9A6700u,
         .info = 0x0550AEu, .blue = 0x0969DAu, .magenta = 0x8250DFu, .gray = 0x656D76u,
@@ -98,11 +98,33 @@ void theme_recolor(const char *s, sbuf *out, const unsigned *from, const unsigne
     }
 }
 
-static void put_rgb_params(sbuf *o, unsigned rgb) {
-    sb_printf(o, "38;2;%u;%u;%u", (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
+static void put_rgb_code(sbuf *o, int code, unsigned rgb) {   /* code 38 (fg) or 48 (bg) with the colour */
+    sb_printf(o, "%d;2;%u;%u;%u", code, (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
+}
+static void put_rgb_params(sbuf *o, unsigned rgb) { put_rgb_code(o, 38, rgb); }
+
+bool theme_role(int code, unsigned *rgb, bool *bg) {
+    if (code == THEME_ROLE_USER_TEXT) { *rgb = g_theme->user_text; *bg = false; return true; }
+    if (code == THEME_ROLE_USER_BG) { *rgb = g_theme->user_bg; *bg = true; return true; }
+    return false;
 }
 
 /* one finished CSI sequence: an SGR (…m) is rewritten where it names a themed colour; anything else as it came */
+static bool g_paint_window;   /* the full-screen ANSI screen paints the window's ground (theme_paint_window) */
+
+void theme_paint_window(bool on) { g_paint_window = on; }
+
+/* the SGR that sets the window's ground and text before a screen is cleared (the erase takes the ground with it),
+ * or "" where the window is the terminal's own */
+const char *theme_base_sgr(void) {
+    static char b[80];
+    const theme_t *t = g_theme;
+    if (!(g_paint_window && t->window)) return "";
+    snprintf(b, sizeof b, "\x1b[0;38;2;%u;%u;%u;48;2;%u;%u;%um", (t->text >> 16) & 255, (t->text >> 8) & 255, t->text & 255,
+             (t->window >> 16) & 255, (t->window >> 8) & 255, t->window & 255);
+    return b;
+}
+
 static void map_csi(sbuf *out, const char *q, size_t n) {
     if (q[n - 1] != 'm' || memchr(q, ':', n)) { sb_append(out, q, n); return; }   /* sub-parameters: not ours */
     int p[32], np = 0; int cur = 0; bool have = false;
@@ -112,12 +134,20 @@ static void map_csi(sbuf *out, const char *q, size_t n) {
     }
     if (np < 32) p[np++] = have ? cur : 0;
     sbuf o; sb_init(&o);
+    const bool win = g_paint_window && g_theme->window;
     sb_puts(&o, "\x1b[");
     bool changed = false;
     for (int k = 0; k < np; k++) {
-        unsigned rgb = 0;
+        unsigned rgb = 0; bool isbg = false;
         if (k) sb_putc(&o, ';');
-        if (p[k] == 38 && k + 2 < np && p[k + 1] == 5 && p[k + 2] == 208) {   /* orange: the theme's accent */
+        if (win && p[k] == 0) {          /* a reset: the window's ground and text come back with it */
+            sb_puts(&o, "0;"); put_rgb_code(&o, 38, g_theme->text); sb_putc(&o, ';'); put_rgb_code(&o, 48, g_theme->window);
+            changed = true;
+        } else if (win && p[k] == 39) {  /* the default text colour: the theme's */
+            put_rgb_code(&o, 38, g_theme->text); changed = true;
+        } else if (win && p[k] == 49) {  /* the default ground: the theme's */
+            put_rgb_code(&o, 48, g_theme->window); changed = true;
+        } else if (p[k] == 38 && k + 2 < np && p[k + 1] == 5 && p[k + 2] == 208) {   /* orange: the theme's accent */
             put_rgb_params(&o, g_theme->accent); k += 2; changed = true;
         } else if ((p[k] == 38 || p[k] == 48) && k + 1 < np && (p[k + 1] == 2 || p[k + 1] == 5)) {
             /* an extended colour: its parameters are numbers of the colour, not codes (38;2;95;215;95 is no magenta) */
@@ -127,6 +157,8 @@ static void map_csi(sbuf *out, const char *q, size_t n) {
             k += extra < np - k ? extra : np - k - 1;
         } else if (theme_fg_code(p[k], &rgb)) {
             put_rgb_params(&o, rgb); changed = true;
+        } else if (theme_role(p[k], &rgb, &isbg)) {
+            sb_printf(&o, "%d;2;%u;%u;%u", isbg ? 48 : 38, (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255); changed = true;
         } else sb_printf(&o, "%d", p[k]);
     }
     sb_putc(&o, 'm');

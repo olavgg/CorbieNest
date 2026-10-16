@@ -38,12 +38,13 @@ typedef struct {
 typedef struct {
     const char *name;
     unsigned text, muted, rule, menu;           /* the text, the dimmed text, the rules, a menu's ground */
+    unsigned window;                            /* the window's ground and the text's default colour; 0 = the terminal's own */
     unsigned bar_a, bar_b;                      /* the status bar: from bar_a to bar_b */
-    unsigned field_text, field_bg;              /* what is typed in the field, and its ground */
+    unsigned field_text;                        /* what is typed in the field (the field has the window's own background) */
     unsigned edge_ready, edge_idle;             /* the field's edges while the prompt waits, and while a turn runs */
     unsigned loc;                               /* the location line */
     unsigned select;                            /* the row the keys are on, in the sub-agents strip */
-    unsigned user_bg;                           /* the ground of a line the user sent, in the conversation */
+    unsigned user_bg, user_text;                /* the ground and the text of a line the user sent, in the conversation */
     unsigned brand, spark_hi, spark_mid, spark_lo;   /* the banner: its title and the spark's head, then its tail */
     unsigned crow_dark, crow_body, crow_light, crow_beak;   /* the banner's crow: outline, body, highlight, beak */
     unsigned accent, ok, bad, warn, info, blue, magenta, gray;   /* the orange, and the basic codes 32, 31, 33, 36, 34, 35, 90 */
@@ -56,6 +57,13 @@ bool theme_set(const char *name);               /* "theme=NAME": false, and the 
 int  theme_count(void);                         /* the themes there are, for the picker and the completions */
 const char *theme_name(int i);
 bool theme_fg_code(int code, unsigned *rgb);    /* the theme's colour of a basic fg code (30-37, 90-97) */
+void theme_paint_window(bool on);              /* the full-screen ANSI screen paints the theme's window ground */
+const char *theme_base_sgr(void);              /* the SGR for the window's ground and text ("" when none) */
+/* Theme roles as SGR parameters: a line stored with one is coloured by the theme when it is drawn, so a switch
+ * recolours the conversation already on screen (the ANSI screen maps it in theme_map_bytes, notcurses in nc_sgr_parse). */
+#define THEME_ROLE_USER_TEXT 1001   /* the text of a line the user sent (theme user_text) */
+#define THEME_ROLE_USER_BG   1002   /* the ground of a line the user sent (theme user_bg) */
+bool theme_role(int code, unsigned *rgb, bool *bg);   /* the colour a role code stands for, and whether it is a background; false if it is no role */
 void theme_recolor(const char *s, sbuf *out, const unsigned *from, const unsigned *to, int count);   /* the 38;2 colours in s that are from[i] become to[i] */
 void theme_map_bytes(theme_map *m, const char *in, size_t n, sbuf *out);   /* the bytes with their themed codes mapped */
 bool theme_map_pending(const theme_map *m);     /* the last write ended inside an escape sequence: its bytes are not out yet */
@@ -229,6 +237,7 @@ typedef struct {
     int   advisor_guidance; /* how much the agent leans on it, GUIDANCE_* (/advisor guidance) */
     int   advisor_window;   /* seconds after which a request's count of consultations starts again (/advisor window, given in minutes); 0 = never */
     int   workers;       /* tasks of /orchestrate that may run at the same time (/workers); 0 = ORCH_WORKERS_DEFAULT */
+    char *build;         /* /plan: the command that builds the project after each layer (build=); NULL = detected from the project's build file */
     bool  show_thinking; /* print thinking tokens */
     int   mode;          /* permission mode, see MODE_* */
     bool  no_tools;      /* don't send tools at all */
@@ -646,6 +655,7 @@ typedef struct {
                        * "AFTER: 1, 3" or "AFTER: none" line of the plan — and without one, the task before it */
     char *role;       /* "ROLE: name" of the plan: the skill that does this task (malloc'd; NULL = the default worker) */
     char **owns; int nowns;   /* "OWNS: a, b": the paths it may write, literal files or directory prefixes (malloc'd) */
+    int layer;         /* /plan: "LAYER: n" of the plan, at least 1 and never lower than the task before (1 when the plan says none) */
 } orch_task;
 #define ORCH_OWNS_MAX 16
 int  orch_parse_plan(const char *text, orch_task **tasks);

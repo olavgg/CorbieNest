@@ -521,9 +521,8 @@ static int field_top(void) { return g_fs_rows - g_field_rows - 2 - g_sug_rows - 
 static int field_mentions(const char *text, size_t len, size_t (*sp)[2]) {
     return len && text[0] != '/' && text[0] != '!' ? mention_spans(text, len, sp, MENTION_MAX) : 0;
 }
-/* what is typed in the field: a light yellow on a darker ground (notcurses uses the same colours) */
-/* the typed text's ground and colour, from the theme */
-static void put_field_on(sbuf *o) { sb_puts(o, th_bg(g_theme->field_bg)); sb_puts(o, th_fg(g_theme->field_text)); }
+/* what is typed in the field: the theme's text colour on the window's own background (no fill; notcurses does the same) */
+static void put_field_on(sbuf *o) { sb_puts(o, th_fg(g_theme->field_text)); }
 /* kind[i] 1 = a paste token (reverse video), anything else a mention (cyan); kind may be NULL */
 static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_t (*sp)[2], const int *kind, int ns) {
     size_t at = from, end = from + n;
@@ -588,7 +587,7 @@ static void field_draw(sbuf *o, const char *typed) {
         int c = g_fs_cols - 7 - 1;
         if (c >= 1) sb_printf(o, "\x1b[%d;%dH%s[ready]" C_RESET, top, c, th_fg(g_theme->edge_ready));
     }
-    for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;%dH%s\x1b[K" C_RESET, top + 1 + i, FIELD_X0, th_bg(g_theme->field_bg));
+    for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;%dH\x1b[49m\x1b[K" C_RESET, top + 1 + i, FIELD_X0);
     sb_printf(o, "\x1b[%d;%dH", top + 1, FIELD_X0 + 1);
     if (!g_field_view) sb_puts(o, field_prompt());
     put_field_on(o);
@@ -837,12 +836,16 @@ void term_fullscreen(bool on) {
         g_fs = true; g_fs_rows = g_fs_cols = g_fs_reserved = 0; g_live_out = 0;
         g_field_rows = 1; g_field_view = 0; g_conv_row = g_conv_col = 1;
         g_sug_rows = 0; g_view_top = -1;
-        fputs("\x1b[?1049h\x1b[H\x1b[2J" MOUSE_ON CURSOR_BLINK, stdout);   /* alternate screen, cleared; a blinking cursor where the output goes on */
+        theme_paint_window(true);
+        fputs("\x1b[?1049h", stdout);
+        fputs(theme_base_sgr(), stdout);             /* the window's ground, before the clear (an erase takes it) */
+        fputs("\x1b[H\x1b[2J" MOUSE_ON CURSOR_BLINK, stdout);   /* alternate screen, cleared; a blinking cursor where the output goes on */
         term_status_refresh();                       /* also sets the scroll region */
     } else if (!on && g_fs) {
         g_fs = false; g_view_top = -1;
         fputs(C_RESET MOUSE_OFF CURSOR_DEFAULT "\x1b[r\x1b[?1049l", stdout);      /* reset margins, back to the main screen */
         fflush(stdout);
+        theme_paint_window(false);
     }
 }
 
@@ -1305,13 +1308,13 @@ static void paint_rows(sbuf *o, const sb_row *r, int n, int from, int count, int
         const char *t = g_sb[r[idx].line].data ? g_sb[r[idx].line].data + r[idx].off : "";
         if (idx == mark && at_mark) { sb_clear(at_mark); sb_append(at_mark, st.data, st.len); }
         if (idx >= from) {
-            sb_printf(o, "\x1b[%d;1H\x1b[2K", idx - from + 1);
+            sb_printf(o, "\x1b[%d;1H" C_RESET "\x1b[2K", idx - from + 1);   /* a reset first: the erase takes the ground it is left with */
             sb_puts(o, C_RESET); sb_append(o, st.data, st.len);
             sb_append(o, t, r[idx].len); sb_puts(o, C_RESET);
         }
         term_sgr_track(&st, t, r[idx].len);
     }
-    for (int i = n > from ? n - from : 0; i < count; i++) sb_printf(o, "\x1b[%d;1H\x1b[2K", i + 1);
+    for (int i = n > from ? n - from : 0; i < count; i++) sb_printf(o, "\x1b[%d;1H" C_RESET "\x1b[2K", i + 1);
     sb_free(&st);
 }
 
@@ -3071,10 +3074,16 @@ static void band_put(sbuf *o, const char *s, const char *bg) {
     }
 }
 /* A line the user sent, as the conversation shows it: the lead (its own colours) and the text on the user's
- * ground (theme user_bg), padded to the width so the band is whole; a line longer than the width wraps as it is.
- * Lines after the first have no lead. malloc'd, every line ends in a newline. */
+ * ground and in the user's text colour, as theme roles (THEME_ROLE_*): padded to the width so the band is whole; a line
+ * longer than the width wraps as it is. Lines after the first have no lead. malloc'd, every line ends in a newline. */
 char *term_user_band(const char *lead, const char *text) {
-    char *bg = xstrdup(th_bg(g_theme->user_bg));
+    /* the ground and the text colour, re-applied after every reset (the lead's included). Where stdout is the hook the
+     * bytes are mapped on the way out, or parsed by notcurses, so they are theme roles; without the hook they go to the
+     * terminal as they are, and the theme's RGB is written. */
+    char roles[64];
+    if (g_sb_active) snprintf(roles, sizeof roles, "\x1b[%dm\x1b[%dm", THEME_ROLE_USER_BG, THEME_ROLE_USER_TEXT);
+    else snprintf(roles, sizeof roles, "%s%s", th_bg(g_theme->user_bg), th_fg(g_theme->user_text));
+    char *bg = xstrdup(roles);
     int width = term_width();
     sbuf o; sb_init(&o);
     const char *p = text ? text : "";

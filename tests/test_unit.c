@@ -1238,6 +1238,18 @@ static void test_orchestrate(void) {
     CHECK(t[4].after == 1u);                                             /* itself and a task that is not there do not count */
     CHECK_STR(t[2].body, "do c"); CHECK_STR(t[3].body, "do d after lunch");   /* the line is no part of the instructions; a sentence stays */
     orch_tasks_free(t, n);
+    /* LAYER: n (/plan): a task with none takes the layer before it, the first is in layer 1, and a layer never goes back */
+    n = orch_parse_plan("TASK 1: pom\nLAYER: 1\ndo pom\n\nTASK 2: entity\n**Layer:** 2\ndo entity\n\nTASK 3: repo\ndo repo\n\n"
+                        "TASK 4: service\nLAYER: 3\ndo service\n\nTASK 5: back\nLAYER: 2\ndo back\n\nTASK 6: x\nLAYER: 4\nAFTER: none\ndo x\n", &t);
+    CHECK(n == 6 && t[0].layer == 1 && t[1].layer == 2 && t[2].layer == 2 && t[3].layer == 3 && t[4].layer == 3 && t[5].layer == 4);
+    CHECK_STR(t[2].body, "do repo"); CHECK(t[5].after == 0);   /* the layer line is no part of the instructions; AFTER still reads */
+    orch_tasks_free(t, n);
+    n = orch_parse_plan("TASK 1: a\ndo a\n\nTASK 2: b\ndo b\n", &t);
+    CHECK(n == 2 && t[0].layer == 1 && t[1].layer == 1);   /* a plan with no layers is one layer */
+    orch_tasks_free(t, n);
+    n = orch_parse_plan("TASK 1: a\nLAYER: 2\ndo a\n\nTASK 2: b\nLAYER: x\ndo b\n", &t);
+    CHECK(n == 2 && t[0].layer == 2 && t[1].layer == 2);   /* a layer that is no number is not one: the layer before it stands */
+    orch_tasks_free(t, n);
     n = orch_parse_plan("TASK 1\nJust the instructions.\n\nTASK 2: —\n", &t);
     CHECK(n == 2); CHECK_STR(t[0].title, ""); CHECK_STR(t[0].body, "Just the instructions.");
     orch_tasks_free(t, n);
@@ -1639,6 +1651,9 @@ static void test_nc_pure(void) {
     nc_style st = { NC_DEFAULT, NC_DEFAULT, 0 };
     /* SGR: colours, styles, resets */
     CHECK(nc_sgr_parse("\x1b[31m", 5, &st) == 5 && st.fg == 0xbf616au);
+    CHECK(nc_sgr_parse("\x1b[1002m", 7, &st) == 7 && st.bg == 0x2c3445u);   /* the theme roles, as the notcurses screen draws them */
+    CHECK(nc_sgr_parse("\x1b[1001m", 7, &st) == 7 && st.fg == 0xefbcffu);
+    st.bg = NC_DEFAULT; st.fg = NC_DEFAULT;
     CHECK(nc_sgr_parse("\x1b[1;3m", 6, &st) == 6 && (st.styles & NC_ST_BOLD) && (st.styles & NC_ST_ITALIC));
     CHECK(nc_sgr_parse("\x1b[22m", 5, &st) == 5 && !(st.styles & NC_ST_BOLD));
     CHECK(nc_sgr_parse("\x1b[38;5;208m", strlen("\x1b[38;5;208m"), &st) == strlen("\x1b[38;5;208m") && st.fg == g_theme->accent);   /* the theme's orange */
@@ -1714,6 +1729,34 @@ static void test_theme(void) {
     a = map_all("\x1b[1;36mx\x1b[m");
     CHECK_STR(a, "\x1b[1;38;2;86;182;194mx\x1b[m");     /* bold stays; 36 is the info colour #56B6C2 */
     free(a);
+    /* a theme role is the theme's colour when the bytes leave, so the conversation recolours with the theme */
+    theme_set("default");
+    a = map_all("\x1b[1002m\x1b[1001mhi");
+    CHECK_STR(a, "\x1b[48;2;44;52;69m\x1b[38;2;239;188;255mhi");   /* user_bg #2C3445, user_text #EFBCFF */
+    free(a);
+    theme_set("bright");
+    a = map_all("\x1b[1002m\x1b[1001mhi");
+    CHECK_STR(a, "\x1b[48;2;227;236;247m\x1b[38;2;130;80;223mhi");  /* the bright theme's own pair */
+    free(a);
+    theme_set("default");
+    CHECK(theme_role(1001, &(unsigned){0}, &(bool){0}) && !theme_role(31, &(unsigned){0}, &(bool){0}));
+    /* the window's ground: the bright theme paints it on the full-screen ANSI screen only; the default leaves it */
+    CHECK(!strcmp(theme_base_sgr(), ""));
+    theme_set("bright");
+    CHECK(!strcmp(theme_base_sgr(), ""));                    /* not in full-screen mode: nothing is painted */
+    theme_paint_window(true);
+    CHECK_STR(theme_base_sgr(), "\x1b[0;38;2;31;35;40;48;2;255;255;255m");   /* text #1F2328 on window #FFFFFF */
+    a = map_all("x\x1b[0my\x1b[39mz\x1b[49mw");
+    CHECK_STR(a, "x\x1b[0;38;2;31;35;40;48;2;255;255;255my\x1b[38;2;31;35;40mz\x1b[48;2;255;255;255mw");
+    free(a);
+    a = map_all("x\x1b[my");
+    CHECK(strstr(a, "48;2;255;255;255") != NULL);            /* a bare ESC[m is a reset too */
+    free(a);
+    theme_paint_window(false);
+    a = map_all("x\x1b[0my");
+    CHECK_STR(a, "x\x1b[0my");                              /* off: a reset is a reset */
+    free(a);
+    theme_set("default");
     a = map_all("\x1b[38;5;208mo\x1b[90mg");
     CHECK_STR(a, "\x1b[38;2;240;136;62mo\x1b[38;2;124;135;153mg");   /* the orange, and 90 grey */
     free(a);

@@ -415,6 +415,7 @@ void config_load(void) {
         else if (!strcmp(k, "advisor_ctx")) { int n = atoi(v); if (n == 0 || n >= ADVISOR_CTX_MIN) g_cfg.advisor_ctx = n; }
         else if (!strcmp(k, "subagent")) { free(g_cfg.subagent); g_cfg.subagent = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "workers")) { int n = atoi(v); if (n >= 1 && n <= ORCH_PARALLEL_MAX) g_cfg.workers = n; }
+        else if (!strcmp(k, "build")) { free(g_cfg.build); g_cfg.build = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "advisor_window")) { double m = atof(v); if (m >= 0 && m <= 24 * 60) g_cfg.advisor_window = (int)(m * 60 + 0.5); }
         else if (!strcmp(k, "advisor_guidance")) { int n = advisor_guidance_parse(v); if (n >= 0) g_cfg.advisor_guidance = n; }
         else if (!strcmp(k, "show_thinking")) g_cfg.show_thinking = atoi(v) != 0;
@@ -459,6 +460,7 @@ void config_save(void) {
     if (g_cfg.advisor_ctx > 0) sb_printf(&b, "advisor_ctx=%d\n", g_cfg.advisor_ctx);
     if (g_cfg.subagent && *g_cfg.subagent) sb_printf(&b, "subagent=%s\n", g_cfg.subagent);
     if (g_cfg.workers > 0) sb_printf(&b, "workers=%d\n", g_cfg.workers);
+    if (g_cfg.build && *g_cfg.build) sb_printf(&b, "build=%s\n", g_cfg.build);
     if (g_cfg.advisor_window != ADVISOR_WINDOW_DEFAULT) sb_printf(&b, "advisor_window=%g\n", g_cfg.advisor_window / 60.0);   /* in minutes, as it is typed */
     if (g_cfg.advisor_guidance != GUIDANCE_NORMAL) sb_printf(&b, "advisor_guidance=%s\n", advisor_guidance()->name);
     sb_printf(&b, "show_thinking=%d\n", g_cfg.show_thinking ? 1 : 0);
@@ -633,6 +635,11 @@ int orch_parse_plan_ex(const char *text, orch_task **tasks, char **contract) {
             free((*tasks)[n - 1].role);
             (*tasks)[n - 1].role = vl ? xstrndup(v, vl) : NULL;
         } else if (n && plan_field(p, len, "owns", &v, &vl)) plan_owns(&(*tasks)[n - 1], v, vl);
+        else if (n && plan_field(p, len, "layer", &v, &vl)) {
+            int lv = 0;
+            for (size_t k = 0; k < vl && k < 4 && isdigit((unsigned char)v[k]); k++) lv = lv * 10 + (v[k] - '0');
+            if (lv > 0) (*tasks)[n - 1].layer = lv;
+        }
         else if (!n && plan_field(p, len, "contract", &v, &vl)) {
             in_contract = true;
             if (vl) { sb_append(&csb, v, vl); sb_putc(&csb, '\n'); }
@@ -661,6 +668,9 @@ int orch_parse_plan_ex(const char *text, orch_task **tasks, char **contract) {
         }
         at[i] = keep; (*tasks)[keep++] = (*tasks)[i];
     }
+    /* layers (/plan): a task with none is in the layer of the one before it, the first in layer 1; a layer never goes back */
+    int lay = 1;
+    for (int k = 0; k < keep; k++) { if ((*tasks)[k].layer > lay) lay = (*tasks)[k].layer; (*tasks)[k].layer = lay; }
     /* what each waits for: the tasks its AFTER line names — earlier ones only, so nothing can wait
      * in a circle — or, having none, the task before it: a plan that says nothing runs in order */
     for (int i = 0; i < n; i++) {

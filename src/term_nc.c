@@ -63,7 +63,9 @@ size_t nc_sgr_parse(const char *s, size_t n, nc_style *st) {
     if (np < 32) p[np++] = cur < 0 ? 0 : cur;
     for (int k = 0; k < np; k++) {
         int v = p[k];
-        if (v == 0) { st->fg = st->bg = NC_DEFAULT; st->styles = 0; }
+        unsigned role; bool role_bg;
+        if (theme_role(v, &role, &role_bg)) { if (role_bg) st->bg = role; else st->fg = role; }
+        else if (v == 0) { st->fg = st->bg = NC_DEFAULT; st->styles = 0; }
         else if (v == 1) st->styles |= NC_ST_BOLD;
         else if (v == 2) st->styles |= NC_ST_DIM;
         else if (v == 3) st->styles |= NC_ST_ITALIC;
@@ -211,7 +213,7 @@ bool nc_compiled(void) { return true; }
 #define C_BAR_A   (g_theme->bar_a)    /* the status bar: a gradient from here … */
 #define C_BAR_B   (g_theme->bar_b)    /* … to here */
 #define C_FIELD_TEXT (g_theme->field_text)   /* what is typed in the field: a light yellow on a darker ground */
-#define C_FIELD_BG   (g_theme->field_bg)
+#define C_FIELD_BG   NC_DEFAULT   /* the window's own background, as the status bar has */
 #define C_OK      (g_theme->ok)
 #define C_BAD     (g_theme->bad)
 #define C_WARN    (g_theme->warn)
@@ -525,6 +527,10 @@ static int nc_getkey(int ms) {
 /* ---------- drawing ---------- */
 static uint64_t chans(unsigned fg, unsigned bg) {
     uint64_t ch = 0;
+    if (g_theme->window) {                          /* a theme with its own window: the terminal's defaults are the theme's */
+        if (fg == NC_DEFAULT) fg = g_theme->text;
+        if (bg == NC_DEFAULT) bg = g_theme->window;
+    }
     if (fg == NC_DEFAULT) ncchannels_set_fg_default(&ch);
     else ncchannels_set_fg_rgb8(&ch, (fg >> 16) & 255, (fg >> 8) & 255, fg & 255);
     if (bg == NC_DEFAULT) ncchannels_set_bg_default(&ch);
@@ -938,7 +944,13 @@ static void draw_suggest(void) {
              g_cols - 4, C_MUTED, C_MENU, false, NULL);
 }
 
+/* the standard plane's base cell: the window's ground under every cell nothing was drawn on (a theme switch moves it) */
+static void nc_apply_base(void) {
+    if (g_std) (void)ncplane_set_base(g_std, " ", 0, chans(NC_DEFAULT, NC_DEFAULT));
+}
+
 void nc_render(void) {
+    nc_apply_base();
     if (!g_nc || !g_std) return;
     g_pending = false; g_last_draw = now_s();
     unsigned r = 0, c = 0;

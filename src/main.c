@@ -52,6 +52,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/advisor", "a stronger model the agent may consult: a local one, or Claude, ChatGPT, Grok by API key" },
     { "/subagent", "the model sub-agents (task) run on, and how hard it thinks" },
     { "/orchestrate", "the advisor model plans the request as tasks, this model does them, the advisor reviews each" },
+    { "/plan", "the advisor plans the request in layers, you approve, and the project is built after each layer" },
     { "/goal", "candidates in git worktrees, on one or more models, race to a metric: the best score is kept" },
     { "/btw", "a side question: answered from the conversation, and not kept in it" },
     { "/workers", "how many tasks of /orchestrate may run at the same time" },
@@ -2685,6 +2686,7 @@ static char *expand_mentions(const char *input) {
 #define ORCH_ATTEMPTS 3        /* a task is tried, and sent back at most twice */
 #define ORCH_REPLY_MIN 2048    /* tokens a plan may take, whatever the guidance allows a piece of advice */
 static bool g_orch_no_ask = false;   /* "run these tasks?" was answered with "don't ask again" in this session */
+static bool g_plan_no_ask = false;   /* "build this plan?" was answered with "don't ask again" in this session (/plan only) */
 
 /* The roles the planner may name: every skill is one (its instructions and its model are the worker's). */
 static void orch_roles(sbuf *b) {
@@ -2694,7 +2696,7 @@ static void orch_roles(sbuf *b) {
     for (int i = 0; i < n; i++) sb_printf(b, "- %s: %.120s\n", skill_get(i)->name, skill_get(i)->desc);
 }
 
-static void orch_system(sbuf *b, int workers) {
+static void orch_system(sbuf *b, int workers, bool layered) {
     sbuf roles; sb_init(&roles); orch_roles(&roles);
     sb_printf(b,
         "You are the orchestrator of Corbie Nest (corbienest), a coding agent in the user's terminal. You do not do the work yourself. "
@@ -2711,7 +2713,7 @@ static void orch_system(sbuf *b, int workers) {
         "- Every task stands by itself: name the files, the functions, the commands to run and what must not change. A worker knows nothing you do not tell it, and cannot ask.\n"
         "- Order them so that each builds on finished work; no two tasks change the same lines.\n"
         "- An OWNS: list is a promise: the task writes only there. Tasks that may run at the same time must not own the same paths; a file several tasks must change belongs to one later task.\n"
-        "%s"
+        "%s%s"
         "- Where you would need to read the code first, make the first task an exploration that reports what it found: the later workers get that report.\n"
         "- Where the project has a build or tests, a task says to run them. When the request changes code, the last task builds the project, runs its tests and fixes what fails.\n"
         "%s\n"
@@ -2721,16 +2723,20 @@ static void orch_system(sbuf *b, int workers) {
         workers > 1 ? "- The tasks run one after another unless you say otherwise. Tasks that do not need each other's result AND write different files may run at the same time: "
                       "give such a task a line \"AFTER: none\" (it can start at once) or \"AFTER: 1, 2\" (the tasks that must be finished first), right under its title. "
                       "A task without that line waits for the task before it. When in doubt, leave the line out.\n" : "",
+        layered ? "- The request is built in LAYERS, in order. Under a title, a line \"LAYER: n\" (n = 1, 2, 3, ...) says which layer the task belongs to. "
+                  "Layer 1 is the foundation the rest stands on (the build file, the configuration, the core types); a later layer uses only what the layers before it made. "
+                  "The project is built after each layer, so every layer must leave it compiling. Tasks of one layer may run at the same time when they own different paths and say \"AFTER: none\".\n"
+                  "- The CONTRACT is what makes the layers fit: it names the packages, classes, method signatures, fields and paths that the layers share, exactly.\n" : "",
         roles.data);
     sb_free(&roles);
 }
 
 /* One call of the orchestrating model, with its line in the transcript. The answer, malloc'd,
  * for ADVICE_GIVEN; NULL otherwise, and the line under it has said why. */
-static char *orch_ask(const char *what, const char *user, chat_stats *st, int *how) {
+static char *orch_ask(const char *what, const char *user, chat_stats *st, int *how, bool layered) {
     bool known = advisor_info();
     advisor_plan plan; advisor_plan_now(&plan);
-    sbuf sys; sb_init(&sys); orch_system(&sys, g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT);
+    sbuf sys; sb_init(&sys); orch_system(&sys, g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT, layered);
     printf("  " C_CYAN "⤷ orchestrator" C_RESET " " C_BOLD "%s" C_RESET C_DIM " · %s · %zu KB · esc stops the run" C_RESET "\n", g_cfg.advisor, what, (strlen(user) + 1023) / 1024);
     char label[96]; snprintf(label, sizeof label, "orchestrator · %.70s", g_cfg.advisor);
     advisor_reply ar;
@@ -2790,6 +2796,7 @@ typedef struct {
     bool aborted;                /* the user stopped the run */
     const goal_ctx *goal;        /* /goal: candidates, not tasks — no reviews, a metric instead (NULL for /orchestrate) */
     char *contract;              /* the plan's CONTRACT: block: what the tasks share, shown to every worker (NULL: none) */
+    int upto;                    /* /plan: the layer the run may start up to (its tasks of later layers wait); 0 = no layers */
 } orch_run;
 #define GOAL_METRIC_TIMEOUT 900
 #define GOAL_GIT "GIT_AUTHOR_NAME=corbienest GIT_AUTHOR_EMAIL=corbienest@localhost GIT_COMMITTER_NAME=corbienest GIT_COMMITTER_EMAIL=corbienest@localhost "
@@ -2915,7 +2922,7 @@ static void worker_review(orch_run *r, int i) {
     sb_printf(&rb, "\n\n# REVIEW this task (attempt %d of %d)\nIs it done and correct? " ADVISOR_REVIEW_OK " alone if so; otherwise what the worker must do.", w->attempt, ORCH_ATTEMPTS);
     char what[64], spent[96]; snprintf(what, sizeof what, "reviews task %d/%d", i + 1, r->nt);
     chat_stats st; int how;
-    char *verdict = orch_ask(what, rb.data, &st, &how);
+    char *verdict = orch_ask(what, rb.data, &st, &how, false);
     sb_free(&rb); sb_free(&diff);
     if (how == ADVICE_SKIPPED) { task_end(w, T_STOPPED, "done, but the run was stopped before its review"); r->aborted = true; }
     else if (how != ADVICE_GIVEN) task_end(w, T_UNREVIEWED, "done, not reviewed (the orchestrator could not be asked)");
@@ -3030,7 +3037,7 @@ static void orch_schedule(orch_run *r, int maxpar) {
         int running = 0;
         for (int i = 0; i < r->nt; i++) if (r->w[i].state == T_RUNNING) running++;
         for (int i = 0; i < r->nt && !r->aborted; i++) {
-            if (r->w[i].state != T_WAITING) continue;
+            if (r->w[i].state != T_WAITING || (r->upto && r->tasks[i].layer > r->upto)) continue;
             bool ready = true, lost = false;
             for (int j = 0; j < i; j++) {
                 if (!(r->tasks[i].after & (1u << j)) || task_ok(&r->w[j])) continue;
@@ -3065,17 +3072,132 @@ static void orch_schedule(orch_run *r, int maxpar) {
     }
 }
 
-static int cmd_orchestrate(const char *arg) {
+/* ---------- /plan: the same run, built layer by layer ----------
+ * /plan is /orchestrate whose plan says "LAYER: n" under each task. The layers run one after
+ * another: the tasks of a layer are one schedule of the run (orch_run.upto keeps the later ones
+ * back), and once they are all accepted the project is built — plan_build_cmd(): build= in the
+ * config, else the project's own build file — before the next layer starts. A failed build becomes
+ * a fix task of the layer, appended to the same run so that its review is the orchestrator's; at
+ * most ORCH_FIXES per layer, then the run stops and says why. Times are kept per layer and printed
+ * and reported, so how fast a plan is gets measured rather than guessed. */
+#define ORCH_FIXES 2
+#define PLAN_BUILD_TIMEOUT 900
+
+static double mono_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9; }
+static void fmt_secs(double s, char *out, size_t n) {
+    if (s < 60) snprintf(out, n, "%.0fs", s);
+    else snprintf(out, n, "%dm%02ds", (int)(s / 60), (int)s % 60);
+}
+
+/* the command that builds the project: build= if set, else what the project's build file says (checked at each gate:
+ * layer 1 may be the one that creates the build file). NULL when there is none. */
+static char *plan_build_cmd(void) {
+    if (g_cfg.build && *g_cfg.build) return xstrdup(g_cfg.build);
+    if (is_file("mvnw") && !access("mvnw", X_OK)) return xstrdup("./mvnw -q -DskipTests compile");
+    if (is_file("pom.xml")) return xstrdup("mvn -q -DskipTests compile");
+    if (is_file("gradlew") && !access("gradlew", X_OK)) return xstrdup("./gradlew -q compileJava");
+    if (is_file("build.gradle") || is_file("build.gradle.kts")) return xstrdup("gradle -q compileJava");
+    if (is_file("Makefile")) return xstrdup("make");
+    return NULL;
+}
+
+static int plan_layers(const orch_task *t, int nt) {   /* how many layers the plan has (they never go back, so a change is a new one) */
+    int n = 0, last = 0;
+    for (int i = 0; i < nt; i++) if (t[i].layer != last) { n++; last = t[i].layer; }
+    return n;
+}
+
+/* a failed build's fix: a task of the run, in the slot reserved for it, of the layer that failed to build */
+static void orch_add_fix(orch_run *r, int layer, const char *cmd, const char *out) {
+    orch_task *t = &r->tasks[r->nt];
+    sbuf b; sb_init(&b);
+    sb_printf(&b, "The project does not build after layer %d. Its build command is `%s`; the end of its output:\n\n", layer, cmd);
+    size_t ol = strlen(out), from = ol > 4096 ? ol - 4096 : 0;
+    if (from) { while (from < ol && out[from] != '\n') from++; if (from < ol) from++; }   /* the errors are at the end; start on a whole line */
+    sb_append(&b, out + from, ol - from);
+    sb_puts(&b, "\n\nFind what the errors name and fix it. Change nothing else, and run the build command again to see it pass. Report what you fixed.");
+    *t = (orch_task){ .title = xstrdup("Fix the build"), .body = sb_detach(&b), .layer = layer };
+    r->nt++;
+}
+
+/* Runs the plan layer by layer (r->nt tasks of the plan, nplan of them: the fix tasks come after). Sets r->aborted
+ * when the user stopped it; a layer with a task not accepted, or a build that still fails after its fixes, stops it. */
+static void orch_layers(orch_run *r, int nplan, int maxpar, sbuf *report) {
+    double t_all = mono_now(), t_build = 0; int fixes_all = 0, layers_done = 0; bool halted = false;
+    int L = 0;
+    for (;;) {
+        int next = 0;   /* the lowest layer above the last one run */
+        for (int i = 0; i < nplan; i++) if (r->tasks[i].layer > L && (!next || r->tasks[i].layer < next)) next = r->tasks[i].layer;
+        if (!next) break;
+        L = next; r->upto = L;
+        int ntask = 0;
+        for (int i = 0; i < nplan; i++) ntask += r->tasks[i].layer == L;
+        double t0 = mono_now();
+        orch_schedule(r, maxpar);
+        double t_work = mono_now() - t0;
+        if (r->aborted) break;
+        bool ok = true;
+        for (int i = 0; i < nplan; i++) if (r->tasks[i].layer == L && !task_ok(&r->w[i])) ok = false;
+        if (!ok) {
+            printf(C_YELLOW "⏹ layer %d: a task was not accepted, so the later layers are not run" C_RESET "\n", L);
+            sb_printf(report, "\n[layer %d: a task was not accepted, so the later layers were not run.]\n", L);
+            halted = true; break;
+        }
+        char *cmd = plan_build_cmd();
+        int fixes = 0; double t_bl = 0; bool built = false, stop = false;
+        if (!cmd) printf(C_DIM "    layer %d is not built: no build command (build= in the config, or a build file)" C_RESET "\n", L);
+        while (cmd && !built && !stop) {
+            sbuf out; sb_init(&out); bool intr = false;
+            double tb = mono_now();
+            int rc = tools_shell_in(NULL, cmd, PLAN_BUILD_TIMEOUT, &out, &intr, "building the project", "building");
+            t_bl += mono_now() - tb;
+            if (intr) { r->aborted = true; stop = true; }
+            else if (rc == 0) { built = true; printf("    " C_GREEN "✓ built" C_RESET C_DIM " · %s" C_RESET "\n", cmd); }
+            else if (fixes == ORCH_FIXES) {
+                printf("    " C_RED "✗ still does not build after %d fixes" C_RESET "\n", fixes);
+                stop = halted = true;
+            } else {
+                printf("    " C_YELLOW "✗ does not build (exit %d): a fix task" C_RESET "\n", rc);
+                orch_add_fix(r, L, cmd, out.data ? out.data : "");
+                fixes++;
+                orch_schedule(r, maxpar);   /* (the fix is the only task of the layer still to run) */
+                if (r->aborted) stop = true;
+                else if (!task_ok(&r->w[r->nt - 1])) { printf(C_YELLOW "⏹ the fix was not accepted, so the later layers are not run" C_RESET "\n"); stop = halted = true; }
+            }
+            sb_free(&out);
+        }
+        const char *bs = !cmd ? "not built" : built ? "built" : "not built";
+        free(cmd);
+        if (r->aborted || halted) break;
+        t_build += t_bl; fixes_all += fixes; layers_done++;
+        char tw[24], tb[24]; fmt_secs(t_work, tw, sizeof tw); fmt_secs(t_bl, tb, sizeof tb);
+        printf("  " C_DIM "layer %d: %d task%s · %s · %s%s%s · %d fix%s" C_RESET "\n", L, ntask, ntask == 1 ? "" : "s", tw,
+               bs, built ? " in " : "", built ? tb : "", fixes, fixes == 1 ? "" : "es");
+        sb_printf(report, "[layer %d: %d task%s, %s; %s%s%s; %d fix%s]\n", L, ntask, ntask == 1 ? "" : "s", tw,
+                  bs, built ? " in " : "", built ? tb : "", fixes, fixes == 1 ? "" : "es");
+    }
+    char ta[24], tbt[24]; fmt_secs(mono_now() - t_all, ta, sizeof ta); fmt_secs(t_build, tbt, sizeof tbt);
+    if (layers_done || halted || r->aborted) {
+        printf("  " C_DIM "total: %s · building %s · %d fix%s · %d layer%s done" C_RESET "\n", ta, tbt, fixes_all, fixes_all == 1 ? "" : "es", layers_done, layers_done == 1 ? "" : "s");
+        sb_printf(report, "[total: %s, of which building %s; %d fix%s; %d layer%s done]\n", ta, tbt, fixes_all, fixes_all == 1 ? "" : "es", layers_done, layers_done == 1 ? "" : "s");
+    }
+}
+
+static int orchestrate_run(const char *arg, bool plan) {
+    const char *cmd = plan ? "/plan" : "/orchestrate";
+    int ntcap = 0;   /* the size of the tasks array (a /plan run keeps room for its fix tasks) */
     if (!arg || !*arg) {
-        printf("usage: /orchestrate REQUEST\n" C_DIM "  the advisor model (%s) plans the request as tasks, %s does them as workers — those that do not wait for each other at the same time (/workers) — and the advisor reviews each" C_RESET "\n",
+        if (plan) printf("usage: /plan REQUEST\n" C_DIM "  the advisor model (%s) plans the request in layers, and you approve the plan; then %s builds each layer as workers and the project is built before the next one. Shift+tab's plan mode is different: it only reads" C_RESET "\n",
+                         g_cfg.advisor ? g_cfg.advisor : "none set: /advisor MODEL", model_set() ? g_cfg.model : "the model");
+        else printf("usage: /orchestrate REQUEST\n" C_DIM "  the advisor model (%s) plans the request as tasks, %s does them as workers — those that do not wait for each other at the same time (/workers) — and the advisor reviews each" C_RESET "\n",
                g_cfg.advisor ? g_cfg.advisor : "none set: /advisor MODEL", model_set() ? g_cfg.model : "the model");
         return 0;
     }
     if (!g_cfg.advisor) { printf(C_DIM "no advisor is set — /advisor MODEL names the model that plans and reviews (bare /advisor says what it can be)" C_RESET "\n"); return 0; }
     if (!g_model_tools || g_cfg.no_tools) { printf(C_DIM "the workers are %s, and it has no tools to work with here (/tools, or another /model)" C_RESET "\n", g_cfg.model ? g_cfg.model : "the model"); return 0; }
     if (!advisor_info()) { printf(C_RED "✗ %s" C_RESET "\n", g_advisor_err); return 0; }
-    advisor_plan plan; advisor_plan_now(&plan);
-    size_t budget = plan.budget > 12288 ? plan.budget - 6144 : 6144;   /* (less the system prompt and the headings) */
+    advisor_plan ap; advisor_plan_now(&ap);
+    size_t budget = ap.budget > 12288 ? ap.budget - 6144 : 6144;   /* (less the system prompt and the headings) */
 
     /* what the planner is shown, taken before the request joins the conversation */
     char *before = cJSON_GetArraySize(g_messages) ? transcript_text(g_messages, -1, budget / 4) : NULL;
@@ -3091,12 +3213,12 @@ static int cmd_orchestrate(const char *arg) {
         sb_puts(&brief, "\n# The working directory\n"); sb_put_cut(&brief, ls.data ? ls.data : "", 4096); sb_putc(&brief, '\n');
         sb_free(&ls); cJSON_Delete(a); }
     if (before) { sb_puts(&brief, "\n# The conversation before this request\n"); sb_puts(&brief, before); sb_putc(&brief, '\n'); free(before); }
-    sb_puts(&brief, "\n# PLAN this request\n"); sb_put_cut(&brief, request, budget / 3);
+    sb_printf(&brief, "\n# PLAN this request%s\n", plan ? " in layers (LAYER: n under each task)" : ""); sb_put_cut(&brief, request, budget / 3);
 
     bool aborted = false;
     sbuf report; sb_init(&report);   /* the agent's side of the conversation: what came of the run */
     chat_stats st; int how;
-    char *plan_text = orch_ask("plans the request", brief.data, &st, &how);
+    char *plan_text = orch_ask("plans the request", brief.data, &st, &how, plan);
     sb_free(&brief);
     orch_task *tasks = NULL;
     char *contract = NULL;
@@ -3104,15 +3226,16 @@ static int cmd_orchestrate(const char *arg) {
     char spent[96];
     if (how != ADVICE_GIVEN) {
         aborted = how != ADVICE_NONE;
-        sb_printf(&report, "[/orchestrate: the orchestrator (%s) gave no plan — %s. Nothing was changed.]", g_cfg.advisor, aborted ? "the run was stopped" : "its call failed");
+        sb_printf(&report, "[%s: the orchestrator (%s) gave no plan — %s. Nothing was changed.]", cmd, g_cfg.advisor, aborted ? "the run was stopped" : "its call failed");
     } else if (!nt) {
         printf("    " C_RED "⎿ no tasks in its answer:" C_RESET "\n"); print_result_preview(plan_text, 8);
-        sb_printf(&report, "[/orchestrate: the orchestrator (%s) answered without a plan. Nothing was changed. It said:]\n%s", g_cfg.advisor, plan_text);
+        sb_printf(&report, "[%s: the orchestrator (%s) answered without a plan. Nothing was changed. It said:]\n%s", cmd, g_cfg.advisor, plan_text);
     } else {
         orch_spent(&st, spent, sizeof spent);
-        printf("    " C_DIM "⎿ plan · %d task%s · %s:" C_RESET "\n", nt, nt == 1 ? "" : "s", spent);
+        printf("    " C_DIM "⎿ plan · %d task%s%s · %s:" C_RESET "\n", nt, nt == 1 ? "" : "s", plan ? (plan_layers(tasks, nt) == 1 ? " in one layer" : "") : "", spent);
         for (int i = 0; i < nt; i++) {
             const char *title = tasks[i].title[0] ? tasks[i].title : "(untitled)";
+            if (plan && (i == 0 || tasks[i].layer != tasks[i - 1].layer)) printf("    " C_CYAN "layer %d" C_RESET "\n", tasks[i].layer);
             int w = term_width() - 12 - 30; if (w < 20) w = 20;   /* "      12. " prefix + ellipsis + what it waits for */
             size_t n = strlen(title), cut = n > (size_t)w ? (size_t)w : n;
             while (cut > 0 && cut < n && ((unsigned char)title[cut] & 0xC0) == 0x80) cut--;   /* don't split UTF-8 */
@@ -3125,41 +3248,52 @@ static int cmd_orchestrate(const char *arg) {
         }
         bool go = true; char *reason = NULL;
         if (g_cfg.mode == MODE_PLAN) {
-            printf(C_DIM "    plan mode: the tasks are not run — shift+tab leaves it, then /orchestrate again" C_RESET "\n");
-            sb_printf(&report, "[/orchestrate in plan mode: the orchestrator (%s) planned %d task%s; none was run.]\n\n%s", g_cfg.advisor, nt, nt == 1 ? "" : "s", plan_text);
+            printf(C_DIM "    plan mode: the tasks are not run — shift+tab leaves it, then %s again" C_RESET "\n", cmd);
+            sb_printf(&report, "[%s in plan mode: the orchestrator (%s) planned %d task%s; none was run.]\n\n%s", cmd, g_cfg.advisor, nt, nt == 1 ? "" : "s", plan_text);
             go = false;
-        } else if (g_cfg.interactive && g_cfg.mode != MODE_AUTO && !g_orch_no_ask) {
-            char q[200]; snprintf(q, sizeof q, "Run %s with %.80s?", nt == 1 ? "this task" : "these tasks", g_cfg.model);
+        } else if (plan && !g_cfg.interactive) {
+            printf(C_DIM "    /plan asks before it runs, and there is no terminal to ask in" C_RESET "\n");
+            sb_printf(&report, "[/plan needs a terminal to ask before it runs. Nothing was changed.]\n\n%s", plan_text);
+            go = false;
+        } else if (plan ? !g_plan_no_ask : (g_cfg.interactive && g_cfg.mode != MODE_AUTO && !g_orch_no_ask)) {   /* /plan asks in every mode (the approval) until told not to */
+            char q[200];
+            if (plan) snprintf(q, sizeof q, "Build %d task%s in %d layer%s with %.60s, building after each layer?", nt, nt == 1 ? "" : "s", plan_layers(tasks, nt), plan_layers(tasks, nt) == 1 ? "" : "s", g_cfg.model);
+            else snprintf(q, sizeof q, "Run %s with %.80s?", nt == 1 ? "this task" : "these tasks", g_cfg.model);
             int r = term_confirm(q, "Yes, and don't ask about a plan again this session", NULL, &reason);
-            if (r == 2) g_orch_no_ask = true;
+            if (r == 2) { if (plan) g_plan_no_ask = true; else g_orch_no_ask = true; }
             if (!r) {
                 go = false;
                 printf(C_DIM "    the plan was not run" C_RESET "\n");
-                sb_printf(&report, "[/orchestrate: the orchestrator (%s) planned %d task%s and the user declined to run them%s%s. Nothing was changed.]\n\n%s",
-                          g_cfg.advisor, nt, nt == 1 ? "" : "s", reason ? ", saying: " : "", reason ? reason : "", plan_text);
+                sb_printf(&report, "[%s: the orchestrator (%s) planned %d task%s and the user declined to run them%s%s. Nothing was changed.]\n\n%s",
+                          cmd, g_cfg.advisor, nt, nt == 1 ? "" : "s", reason ? ", saying: " : "", reason ? reason : "", plan_text);
             }
         }
         free(reason);
-        if (go) sb_printf(&report, "[/orchestrate: %s planned %d task%s, %s did them as workers, and %s reviewed each.]\n", g_cfg.advisor, nt, nt == 1 ? "" : "s", g_cfg.model, g_cfg.advisor);
+        if (go) sb_printf(&report, "[%s: %s planned %d task%s, %s did them as workers, and %s reviewed each.]\n", cmd, g_cfg.advisor, nt, nt == 1 ? "" : "s", g_cfg.model, g_cfg.advisor);
 
         if (go) {
             int maxpar = g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT;
-            orch_run run = { arg, tasks, xmalloc(sizeof(orch_worker) * (size_t)nt), nt, cJSON_CreateArray(), first, budget, false, NULL, .contract = contract };
-            memset(run.w, 0, sizeof(orch_worker) * (size_t)nt);
-            for (int i = 0; i < nt; i++) { sb_init(&run.w[i].out); sb_init(&run.w[i].objection); }
+            ntcap = plan ? 3 * nt : nt;   /* a layered run: two fix tasks per layer at most, and there are at most nt layers */
+            tasks = xrealloc(tasks, sizeof *tasks * (size_t)ntcap);
+            memset(tasks + nt, 0, sizeof *tasks * (size_t)(ntcap - nt));
+            orch_run run = { arg, tasks, xmalloc(sizeof(orch_worker) * (size_t)ntcap), nt, cJSON_CreateArray(), first, budget, false, NULL, .contract = contract };
+            memset(run.w, 0, sizeof(orch_worker) * (size_t)ntcap);
+            for (int i = 0; i < ntcap; i++) { sb_init(&run.w[i].out); sb_init(&run.w[i].objection); }
             /* what a worker may call: everything but another agent and the advisor (its reviewer is the orchestrator) */
             cJSON *t;
             cJSON_ArrayForEach(t, g_tools) {
                 cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function"), *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
                 if (cJSON_IsString(nm) && strcmp(nm->valuestring, "task") && strcmp(nm->valuestring, "advisor")) cJSON_AddItemReferenceToArray(run.tools, t);
             }
-            orch_schedule(&run, maxpar);
+            if (plan) orch_layers(&run, nt, maxpar, &report);
+            else orch_schedule(&run, maxpar);
             tools_checkpoint_step(0);
             aborted = run.aborted;
-            for (int i = 0; i < nt; i++) {
+            int nr = run.nt;   /* the plan's tasks and the fix tasks that were added */
+            for (int i = 0; i < nr; i++) {
                 orch_worker *w = &run.w[i];
                 if (task_ok(w)) accepted++;
-                sb_printf(&report, "\n## Task %d of %d: %s — %s\n", i + 1, nt, tasks[i].title, w->status ? w->status : "not started");
+                sb_printf(&report, "\n## Task %d of %d: %s — %s\n", i + 1, nr, tasks[i].title, w->status ? w->status : "not started");
                 if (w->state != T_SKIPPED) sb_put_cut(&report, w->out.data && w->out.data[0] ? w->out.data : "(no report)", 6144);
                 if (!task_ok(w) && w->objection.len) { sb_puts(&report, "\n\nThe orchestrator's objection:\n"); sb_put_cut(&report, w->objection.data, 2048); }
                 sb_putc(&report, '\n');
@@ -3167,18 +3301,20 @@ static int cmd_orchestrate(const char *arg) {
                 free(w->role_model);
                 sb_free(&w->out); sb_free(&w->objection);
             }
+            for (int i = nr; i < ntcap; i++) { orch_worker *w = &run.w[i]; sb_free(&w->out); sb_free(&w->objection); }
             free(run.w); cJSON_Delete(run.tools);
+            nt = nr;   /* (the tasks array is freed below with its room) */
             sbuf names; sb_init(&names);
             int nf = tools_checkpoint_files(first, &names);
             if (nf) sb_printf(&report, "\nFiles written: %s\n", names.data);
-            printf("%s%s orchestrated: %d of %d task%s accepted" C_RESET C_DIM "%s%s%s" C_RESET "\n", accepted == nt ? C_GREEN : C_YELLOW, accepted == nt ? "✓" : "!", accepted, nt, nt == 1 ? "" : "s",
+            printf("%s%s %s: %d of %d task%s accepted" C_RESET C_DIM "%s%s%s" C_RESET "\n", accepted == nt ? C_GREEN : C_YELLOW, accepted == nt ? "✓" : "!", plan ? "planned run" : "orchestrated", accepted, nt, nt == 1 ? "" : "s",
                    nf ? " · files written: " : "", nf ? names.data : "", accepted == nt ? "" : " — the tasks that are left were not run; /rewind undoes what was written");
             sb_free(&names);
         }
     }
     add_message("assistant", report.data ? report.data : "[/orchestrate: nothing was done]");
     sb_free(&report); free(plan_text); free(request);
-    if (tasks) orch_tasks_free(tasks, nt);
+    if (tasks) orch_tasks_free(tasks, ntcap ? ntcap : nt);
     free(contract);
     session_save();
     memory_note(first, aborted);
@@ -3567,6 +3703,8 @@ static void cmd_help(void) {
            "                        no argument opens a picker, default leaves it to the model. Kept per model; a level is sent with every call\n"
            "  /orchestrate REQUEST  the advisor model in charge: it plans the request as tasks, this model does them as workers with a fresh context\n"
            "                        each — those that do not wait for each other at the same time — and the advisor reviews every task's report and diff\n"
+           "  /plan REQUEST         /orchestrate with the plan in layers (LAYER: n): you approve it, then each layer runs and the project is built before the next.\n"
+           "                        Build command: build=CMD in the config; else mvn, gradle or make, by the build file. Not the plan mode of shift+tab\n"
            "  /goal \"METRIC\" [min|max] [-n R] [-k K] [-m MODEL,...] GOAL\n"
            "                        candidates in git worktrees race to the goal, each on its model; the metric's best is kept as uncommitted changes\n"
            "  /btw QUESTION         a side question: the model answers from the conversation so far; the answer is printed, not kept in it\n"
@@ -4089,7 +4227,8 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/diff")) cmd_diff(arg);
     else if (!strcmp(cmd, "/rewind")) return cmd_rewind();
     else if (!strcmp(cmd, "/init")) return cmd_init();
-    else if (!strcmp(cmd, "/orchestrate")) return cmd_orchestrate(arg);
+    else if (!strcmp(cmd, "/orchestrate")) return orchestrate_run(arg, false);
+    else if (!strcmp(cmd, "/plan")) return orchestrate_run(arg, true);
     else if (!strcmp(cmd, "/goal")) return cmd_goal(arg);
     else if (!strcmp(cmd, "/btw")) return cmd_btw(arg);
     else if (!strcmp(cmd, "/status") || !strcmp(cmd, "/cost")) cmd_status();
@@ -4261,6 +4400,9 @@ static bool slash_runs_while_busy(const char *cmd, const char *arg) {
     if (!strcmp(cmd, "/think")) return !arg || !strcmp(arg, "show") || !strcmp(arg, "hide");
     if (!strcmp(cmd, "/effort")) return !arg;
     if (!strcmp(cmd, "/subagent")) return !arg;   /* with a model: asked of its server, so it waits for the turn to end (like /model) */
+    /* /ui theme NAME only sets the palette and repaints, which a resize does mid-turn too; the bare form opens a
+     * picker, and /ui ansi|notcurses restart the program: none of those while busy */
+    if (!strcmp(cmd, "/ui")) return arg && !strncmp(arg, "theme ", 6) && arg[6];
     /* /memory update — and "every N" once N requests are pending — runs the extraction call;
      * "idle N" only sets the delay for the next prompt, so it is safe mid-turn */
     if (!strcmp(cmd, "/memory") && arg && strcmp(arg, "on") && strcmp(arg, "off") && strcmp(arg, "clear")

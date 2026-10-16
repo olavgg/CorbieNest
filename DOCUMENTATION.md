@@ -84,6 +84,7 @@ without thinking about them: the status bar, the field, and the strip.
 | `/diff [git args]` | show `git diff` of the working tree (stat, patch, untracked files) for you only — nothing is added to the conversation; `/diff --staged`, `/diff HEAD~1` … pass through |
 | `/rewind` | (or **Esc Esc** at an empty prompt) pick an earlier request and go back: undo the file changes the model made since (files are checkpointed before every `write_file`/`edit_file`), truncate the conversation to just before it (the request text returns to the editor), or both |
 | `/orchestrate REQUEST` | the advisor model in charge: it plans the request as tasks, the main model does them as workers — several at a time where the plan allows — and the advisor reviews each; see [Orchestrating](#orchestrating) |
+| `/plan REQUEST` | `/orchestrate` in layers: the advisor plans the request as tasks grouped into layers (`LAYER: n`), you approve the plan, then each layer runs and the project is built before the next one starts; a failed build becomes a fix task. See [Planning in layers](#planning-in-layers-plan) |
 | `/workers [N]` | how many tasks of `/orchestrate` may run at the same time (default 3, at most 20, `1` = one after another) |
 | `/goal "METRIC" [min\|max] [-n R] [-k K] [-m MODEL,…] GOAL` | candidates in git worktrees race to a metric, each on its model; the best score is kept and applied |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
@@ -664,6 +665,58 @@ hosted, cloud or a bigger local one) is in charge, and the model doing the work 
 - The expensive model never reads a worker's transcript — only plans, reports and diffs — so
   its tokens stay few; `/usage` shows what they came to.
 
+### Planning in layers (`/plan`)
+
+`/plan REQUEST` is `/orchestrate` for work that has to build as it goes: the foundation first, then
+what stands on it, with the project compiling after each step. The advisor plans the request as
+usual, but every task says which **layer** it belongs to, and the layers run one after another.
+
+```
+› /plan add a --dry-run flag to the importer, with a test
+  ⤷ orchestrator anthropic:claude-opus-5 · plans the request in layers · 5 KB · esc stops the run
+    ⎿ plan · 3 tasks · 3.4k tokens · 16s · ≈ $0.05:
+      1. Add the flag to the config type
+      2. Thread it through the importer
+      3. Test it
+Build 3 tasks in 2 layers with qwen3-coder:30b, building after each layer?
+  …
+    ✓ built · make
+  layer 1: 1 task · 42s · built in 7s · 0 fixes
+  layer 2: 2 tasks · 2m10s · built in 9s · 1 fix
+  total: 3m20s · building 16s · 1 fix · 2 layers done
+```
+
+- **The plan.** The same planner and the same task format as `/orchestrate` (see
+  [Orchestrating](#orchestrating)), with one addition: under a task's title a line `LAYER: n`
+  (n = 1, 2, 3, …). Layer 1 is the foundation (the build file, the configuration, the core types);
+  a later layer uses only what the layers before it made. The planner also writes a `CONTRACT:`
+  block, the names, signatures and paths the layers share, which every worker is shown.
+  Tasks of one layer may run at the same time under the same rules as `/orchestrate`
+  (`AFTER:`, `OWNS:`, `/workers`).
+- **Approval.** `/plan` asks before anything runs, in every permission mode, including `auto` and
+  `--yolo`: the question gives the number of tasks and layers. Its menu offers "Yes, and don't ask
+  about a plan again this session"; after that choice `/plan` runs its plans without asking until
+  corbienest restarts. It is kept apart from `/orchestrate`'s "don't ask again". Refused, nothing
+  runs; the plan is kept in the conversation with your reason, if you gave one. In plan mode (Shift+Tab) the plan is
+  shown and not run. With `-p` there is no one to ask, so the plan is printed and nothing runs.
+- **Layers.** A layer's tasks run and are reviewed by the advisor as in `/orchestrate`. When all of
+  them are accepted, the project is **built**, and the next layer starts only after it builds.
+  A layer with a task that is not accepted, or a build that still fails, stops the run; the later
+  layers are not run, and the transcript says which layer stopped it and why.
+- **The build command.** `build=CMD` in the config file (set it by hand; it is not a slash command)
+  is run after each layer, in the project directory, with a 15-minute limit. Without it the
+  command comes from the project's build file, checked at each layer: `./mvnw -q -DskipTests compile`,
+  `mvn -q -DskipTests compile`, `./gradlew -q compileJava`, `gradle -q compileJava`, or `make`.
+  A layer 1 that creates the build file is picked up after it runs. A project with none of these
+  is not built, and its layers say so.
+- **Fixes.** A failed build becomes a fix task of its layer: the end of the build output, and the
+  instruction to fix what it names and change nothing else. The fix is reviewed like any task. At
+  most two fixes per layer; a build that still fails after them stops the run.
+- **Timing.** Each layer's work time and build time are printed when it ends, with its fix count,
+  and the total at the end; the same figures go into the report the model reads.
+- **Limits.** `/plan` needs what `/orchestrate` needs: an advisor set (`/advisor MODEL`) and a model
+  that uses tools. Esc stops the run, as it does a `/orchestrate` run.
+
 ### Hosted advisors
 
 `/advisor PROVIDER:MODEL` consults a hosted API directly — no Ollama in between:
@@ -747,7 +800,7 @@ goal, and keeps the one the metric scores best.
 ## Config
 
 Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N`, `/subagent` are saved to
-`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`, the sub-agents' model as `subagent=`, the colour theme as `theme=`). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, `CORBIENEST_TRACE` (a file to record the session's drawing into, see below), and for a hosted model or advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
+`~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`, the sub-agents' model as `subagent=`, the colour theme as `theme=`, and the command that builds the project between the layers of `/plan` as `build=`, which is set by hand in that file). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, `CORBIENEST_TRACE` (a file to record the session's drawing into, see below), and for a hosted model or advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
 
 ## Colours
 
