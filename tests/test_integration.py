@@ -411,7 +411,8 @@ def scrolled(sess):
 
 print("test interactive: an Ollama on another machine over plain http is said to be one")
 s = Session(["-H", "http://ollama.invalid:9", "-m", "fake-coder:latest"])
-check(s.expect("⚠ plain http to ollama.invalid: the conversation crosses the network unencrypted", 20), f"another machine over plain http: the banner says so: {s.text()[-300:]!r}")
+s.expect("(no such text)", 3)   # the warning is printed under the entry line, after the banner: read the whole text
+check("plain http to ollama.invalid" in s.text(), f"another machine over plain http: the warning is said: {s.text()[-300:]!r}")
 s.close()
 
 print("test interactive: banner, echo, editor keys, history")
@@ -513,7 +514,7 @@ import glob
 def perm_files(): return glob.glob(os.path.join(CFG, "corbienest", "permissions", "*.rules"))
 s3 = Session(["-m", "fake-coder:latest"]); s3.expect("Ctrl-D to quit")
 s3.send("TOOL_BASH\r"); check(s3.expect("Run this command?"), "prompt")
-s3.send("p"); check(s3.expect("yes, always in this project"), "answered with p")
+s3.send("p"); check(s3.expect("saved to "), "answered with p")
 check(s3.expect(".rules: bash echo"), "rule saved")
 check(len(perm_files()) == 1 and open(perm_files()[0]).read().strip().splitlines()[-1] == "bash echo", "file content")
 check(not os.path.exists(os.path.join(WORK, ".corbienest", "permissions")), "nothing is written into the project")
@@ -607,7 +608,7 @@ check(os.path.exists(os.path.join(WORK, ".corbienest", "skills", "deploy", "SKIL
 print("test interactive: ctrl-c interrupts generation; type-ahead")
 s.send("SLOW\r"); check(s.expect("two"), "streaming started")
 frames = set(re.findall(r"([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]) generating", clean(s.out[s.mark:].decode("utf-8", "replace"))))
-check(len(frames) >= 2, f"status bar shows an animated spinner while the model streams: {frames}")
+check(not frames, f"no spinner in the status bar while a command runs (the bar has no busy label, AGENTS.md): {frames}")
 s.send("\x03")
 check(s.expect("interrupted"), "interrupt notice")
 s.send("hi again\r"); check(s.expect("Echo: hi again"), "usable after interrupt")
@@ -852,7 +853,7 @@ check("stopped after" not in clean(s.out[s.mark:].decode("utf-8", "replace")), "
 check(s.expect("› never mind, do this instead", 8), "and the message reaches the model")
 check(s.expect("Echo: never mind, do this instead", 15), "which is called with it right away")
 msgs = requests()[-1]["messages"]
-check(any(m["role"] == "tool" and "stopped after 1 tool round" in m["content"] for m in msgs),
+check(any(m["role"] == "tool" and "stopped after 25 tool round" in m["content"] for m in msgs),
       f"the parent gets what the sub-agent had gathered, not an error: {[m['role'] for m in msgs[-4:]]}")
 s.send("/mode manual\r"); s.expect("mode: manual")
 
@@ -898,7 +899,7 @@ s.send("!sleep 1.2; echo bang-done\r")   # "bang-done" is echoed with the comman
 check(s.expect("exit code: 0", 10), "bang command ran")
 raw2 = clean(s.out[s.mark:].decode("utf-8", "replace"))
 check("⎿  bang-done" in raw2, f"command output shown: {raw2[-200:]!r}")
-check(len(set(re.findall(r"([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]) running command", raw2))) >= 2, "bar spinner animates during a shell command")
+check(not re.findall(r"([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]) running command", raw2), "no busy label in the bar during a shell command (AGENTS.md: the bar has none)")
 check(re.search(r"running… \(\ds\)  ctrl-c to interrupt", raw2) is not None, f"inline spinner during a shell command: {raw2[-200:]!r}")
 check("auto mode" not in raw2, "bang command does not flash a mode change in the bar")
 s.close()
@@ -1095,7 +1096,7 @@ s.send("\x15")
 print("test interactive: scrolling back while the model works")
 s.send("SLOW please\r"); check(s.expect("one"), "the reply starts")
 s.send(wheel(True, n=2)); check(s.expect("scrollback · rows"), f"the wheel scrolls back while the reply streams: {s.text()[-200:]!r}")
-check("generating" in since() and "manual mode" in since(), "the bar is still the bar: the mode, and that the model is working")
+check("esc to interrupt" in since() and "manual mode" in since(), "the bar is still the bar: the mode, and the conversation's spinner says the model is working")
 time.sleep(1.3); s.expect("(no such text)", 0.2)
 check("four" not in since(), f"what arrives meanwhile is recorded, not painted over the window: {since()[-200:]!r}")
 s.send("\x1b"); check(s.expect("eight") and s.expect("tok/s"), "Esc goes back to the output, and the reply runs to its end")
@@ -1128,7 +1129,8 @@ s.send("/m"); s.send("o"); check(s.expect("pick a model from a menu"), f"typing 
 view = listed()
 check("/models" in view and "permission mode: manual" in view and "/memory" in view and "/status" not in view, f"only the matching ones — a name that starts with it first, then one that contains it: {view!r}")
 check("tab complete · ↓ choose · esc close" in view, "and a line that says which keys work")
-check(re.search(r"\x1b\[1;26r", s.out.decode("utf-8", "replace")) is not None, "the list has rows of its own: the conversation region makes room")
+_regions = [int(x) for x in re.findall(r"\x1b\[1;(\d+)r", s.out.decode("utf-8", "replace"))]
+check(_regions and min(_regions) < 36, f"the list has rows of its own: the conversation region makes room (regions {sorted(set(_regions))}; 36 is with no list)")
 s.send("d"); s.send("e"); view = listed(); check("/mode" in view and "/memory" not in view, f"every letter narrows it down: {view!r}")
 s.send("\x7f\x7f"); check("/memory" in listed(), "and deleting widens it again")
 s.send("\x1b[B"); view = listed(); check("enter take it" in view and re.search(r"❯ /model\s+pick a model", view), f"arrow down steps into the list: {view!r}")
@@ -1228,7 +1230,8 @@ print("test interactive: CORBIENEST_TRACE records what is drawn and what is sent
 TRACE = os.path.join(CFG, "render.trace")
 REPLAY = [sys.executable, os.path.join(HERE, "..", "tools", "trace_replay.py"), TRACE]
 s = Session(["-m", "fake-coder:latest"], env=dict(ENV, CORBIENEST_TRACE=TRACE))
-check(s.expect("trace: everything drawn and typed in this session is written to " + TRACE), "a session that is being recorded says so, and where to")
+s.expect("(no such text)", 3)   # the note is printed under the start-up banner: read it, then look in the whole text
+check(("trace: everything drawn and typed in this session is written to " + TRACE) in s.text(), "a session that is being recorded says so, and where to")
 s.expect("Ctrl-D to quit")
 s.send("traced words\r"); check(s.expect("Echo: traced words"), "reply")
 s.send(wheel(True)); s.send("\x04"); time.sleep(0.5); s.close()
@@ -1278,7 +1281,7 @@ else:
         end = time.time() + 8
         while time.time() < end and tmux(sock, "display", "-p", "-t", "t", "#{session_attached}").strip() != "1": time.sleep(0.05)
         check(tmux(sock, "display", "-p", "-t", "t", "#{session_attached}").strip() == "1", f"mouse {mouse}: the client is attached")
-        check(pane_has(sock, "shift+tab to switch mode"), f"mouse {mouse}: it starts in a tmux pane: {tmux(sock, 'capture-pane', '-p', '-t', 't')[-200:]!r}")
+        check(pane_has(sock, "shift+tab to cycle"), f"mouse {mouse}: it starts in a tmux pane: {tmux(sock, 'capture-pane', '-p', '-t', 't')[-200:]!r}")
         check(tmux(sock, "display", "-p", "-t", "t", "#{mouse_any_flag}").strip() == "1", f"mouse {mouse}: tmux knows the pane wants the mouse")
         feed("!seq 1 60\r"); pane_has(sock, "+21 lines")
         feed("kept in the field")
@@ -1294,9 +1297,9 @@ else:
         end = time.time() + 5; lines = []
         while time.time() < end:
             lines = tmux(sock, "capture-pane", "-p", "-t", "t").rstrip("\n").split("\n")
-            if len(lines) == 16 and "manual mode" in lines[-2] and lines[-5].startswith("─" * 60): break
+            if len(lines) == 16 and "manual mode" in lines[-2] and lines[-4].startswith("╭"): break
             time.sleep(0.1)
-        check(len(lines) == 16 and "manual mode" in lines[-2] and "❯ kept in the field" in lines[-4] and lines[-5].startswith("─" * 60),
+        check(len(lines) == 16 and "manual mode" in lines[-2] and "❯ kept in the field" in lines[-3] and lines[-4].startswith("╭"),
               f"mouse {mouse}: a resized pane is drawn for its new size without a key being pressed: {lines[-5:]!r}")
         tmux(sock, "kill-server")
         try: os.close(fd)
@@ -1427,7 +1430,7 @@ picker = since_send(s)
 check("low" in picker and "medium" in picker and "high" in picker and "no thinking" not in picker, f"its levels, and no off: {picker[-400:]!r}")
 s.send("hig"); time.sleep(0.2); s.send("\r"); check(s.expect("effort: high"), "picked by filter + Enter")
 check(s.expect("sent with every model call"), "and told why /think auto does not switch it off for the tool rounds")
-check(s.expect("fake-levels:latest · high"), f"the status bar shows the effort with the model: {s.text()[-300:]!r}")
+check(s.expect("fake-levels · high"), f"the status bar shows the effort with the model (model_short drops :latest): {s.text()[-300:]!r}")
 s.send("hello levels\r"); check(s.expect("Echo: hello levels"), "reply"); check(requests()[-1].get("think") == "high", "level sent")
 check("effort.fake-levels:latest=high" in open(CFG2_FILE).read(), "saved per model")
 s.send("/model fake-thinker:latest\r"); s.expect("model set to fake-thinker")
@@ -1535,7 +1538,7 @@ s.send("\x1b"); check(s.expect("advisor unchanged: none"), "Esc leaves it")
 s.send("/advisor fake-bi"); s.send("g"); view = listed()
 check("fake-big:latest" in view and "fake-chat" not in view, f"the installed models are suggested as a name is typed: {view!r}")
 s.send("\t\r"); check(s.expect("advisor: fake-big:latest"), "Tab completes the name, Enter sets it")
-s.send("/advisor "); s.send("o"); view = listed()
+s.send("/advisor "); s.send("o"); s.expect("(no such text)", 2); view = since()   # the list is drawn under the field: read it, then everything since the key
 check("off" in view and "openai:" in view and "OPENAI_API_KEY not set" in view, f"the hosted providers are offered by their prefix, with whether the key is there: {view!r}")
 s.send("\x7f" * 10); s.send("/adviso"); s.send("r"); check(re.search(r"/advisor\s+a stronger model the agent may consult: a local one, or Claude, ChatGPT, Grok", listed()), f"the command's own line says a hosted one can be it: {listed()!r}")
 s.send(" "); view = listed()
