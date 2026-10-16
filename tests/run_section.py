@@ -1,6 +1,7 @@
 """Run one section of tests/test_integration.py and report only its checks.
 
-    python3 tests/run_section.py "a pasted block is a token"   # any part of a section's title
+    python3 tests/run_section.py "a pasted block is a token"          # with the sections it needs
+    python3 tests/run_section.py --alone "a pasted block is a token"  # the prelude and this section only
 
 The sections share state (a session started in one is used by the next), so the sections a
 chosen one depends on run first, silently: their checks are not reported or counted. Only the
@@ -15,10 +16,9 @@ def sections(lines):
     starts = [i for i, l in enumerate(lines) if l.startswith('print("test ')]
     return starts, starts[1:] + [len(lines)]
 
-def build(lines, starts, ends, target):
+def build(lines, starts, ends, target, prelude_end):
     """The file with every section's checks muted except the target's; the target is the last one that runs."""
-    out, top_end = [], starts[0]
-    out += lines[:top_end]
+    out = list(lines[:prelude_end])
     out.append("_QUIET_CHECKS = True\n_real_check = check\ncheck = lambda *a, **k: True")
     for k, st in enumerate(starts):
         if k == target:
@@ -29,19 +29,22 @@ def build(lines, starts, ends, target):
     return "\n".join(out)
 
 def main():
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    alone = "--alone" in args
+    args = [a for a in args if a != "--alone"]
+    if len(args) != 1:
         print(__doc__); return 2
     lines = open(SRC, encoding="utf-8").read().split("\n")
     starts, ends = sections(lines)
     titles = [lines[s][len('print("'):-2] for s in starts]
-    hits = [k for k, t in enumerate(titles) if sys.argv[1] in t]
+    hits = [k for k, t in enumerate(titles) if args[0] in t]
     if len(hits) != 1:
-        print(f"{len(hits)} sections match {sys.argv[1]!r}:"); [print("  ", titles[k]) for k in hits]; return 2
+        print(f"{len(hits)} sections match {args[0]!r}:"); [print("  ", titles[k]) for k in hits]; return 2
     target = hits[0]
     # the target runs with everything before it; sections after it are not needed
-    keep = list(range(target + 1))
+    keep = [target] if alone else list(range(target + 1))
     sub_starts = [starts[k] for k in keep]; sub_ends = [ends[k] for k in keep]
-    code = build(lines, sub_starts, sub_ends, target)
+    code = build(lines, sub_starts, sub_ends, keep.index(target), starts[0])
     fd, path = tempfile.mkstemp(prefix="_section_", suffix=".py", dir=HERE)
     with os.fdopen(fd, "w", encoding="utf-8") as f: f.write(code)
     try:

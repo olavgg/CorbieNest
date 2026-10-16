@@ -261,6 +261,25 @@ def provider_requests(): return json.loads(urllib.request.urlopen(f"{HOST}/_prov
 
 def worker(task): return [r for r in reqs if "You are a worker agent" in r["messages"][0]["content"] and f"# Your task ({task} of 3)" in r["messages"][1]["content"]]
 
+SESS = os.path.join(CFG, "corbienest", "sessions")
+READ_MAX = int(os.environ.get("CORBIE_TEST_READ", "65536"))
+import glob
+SIB = tempfile.mkdtemp(prefix="crowsib_", dir=os.path.dirname(WORK))   # a directory next to the working directory
+BINDIR = tempfile.mkdtemp(prefix="crowbin_")
+TRACE = os.path.join(CFG, "render.trace")
+REPLAY = [sys.executable, os.path.join(HERE, "..", "tools", "trace_replay.py"), TRACE]
+CFG2 = tempfile.mkdtemp(prefix="crowcfg2_")
+ENV2 = dict(ENV, XDG_CONFIG_HOME=CFG2)
+CFG2_FILE = os.path.join(CFG2, "corbienest", "config")
+KEYS = dict(XAI_API_KEY="test-key", OPENAI_API_KEY="test-key", ANTHROPIC_API_KEY="test-key",
+            XAI_BASE_URL=f"{HOST}/xai/v1", OPENAI_BASE_URL=f"{HOST}/openai/v1", ANTHROPIC_BASE_URL=f"{HOST}/anthropic")
+ENVK = dict(ENV2, **KEYS)
+MADE = os.path.join(WORK, "made.txt")
+GOALENV = dict(ENVK, DEEPSEEK_API_KEY="test-key", DEEPSEEK_BASE_URL=f"{HOST}/deepseek", MOONSHOT_API_KEY="test-key", MOONSHOT_BASE_URL=f"{HOST}/kimi/v1")
+RP = make_repo()
+RCFG = tempfile.mkdtemp(prefix="crowroles_")   # its own config: the sections before it leave theirs behind
+ENVR = dict(ENV2, XDG_CONFIG_HOME=RCFG)
+
 print("test oneshot echo")
 out, rc = run(["-m", "fake-coder:latest", "-p", "hello there"])
 check(rc == 0, "exit 0"); check("Echo: hello there" in out, f"echo reply: {out!r}")
@@ -432,7 +451,6 @@ check("ALWAYS-SAY-MOO" in sysmsg and "EXTRA-SYS" in sysmsg, "project + extra sys
 os.remove(os.path.join(WORK, "CORBIENEST.md"))
 
 print("test sessions: saved after each request, --continue / --resume")
-SESS = os.path.join(CFG, "corbienest", "sessions")
 shutil.rmtree(SESS, ignore_errors=True)   # earlier one-shot runs saved sessions too
 out, rc = run(["-m", "fake-coder:latest", "-p", "session one"])
 files = sorted(os.listdir(SESS)); check(len(files) == 1, f"one session file after a one-shot run: {files}")
@@ -489,7 +507,6 @@ out, rc = run(["-m", "fake-coder:latest", "--draft", "x", "-p", "hi"]); check(rc
 # ---------- interactive via pty ----------
 # How much of the output one read may take. A loaded machine hands it over in small pieces — a repaint cut in
 # two, a line without its end — and CORBIE_TEST_READ=200 makes this one do the same, to see what a CI runner sees.
-READ_MAX = int(os.environ.get("CORBIE_TEST_READ", "65536"))
 
 
 print("test interactive: an Ollama on another machine over plain http is said to be one")
@@ -593,7 +610,6 @@ s.send("TOOL_BASH\r"); check(s.expect("Tool said: hello-from-tool", 15), "no pro
 check(s.text().count("Run this command?") == 1, "always suppresses further prompts")
 
 print("test interactive: project permission rules (kept in the config directory, per project)")
-import glob
 s3 = Session(["-m", "fake-coder:latest"]); s3.expect("Ctrl-D to quit")
 s3.send("TOOL_BASH\r"); check(s3.expect("Run this command?"), "prompt")
 s3.send("p"); check(s3.expect("saved to "), "answered with p")
@@ -1179,7 +1195,6 @@ s.send("\x03"); check(s.expect("interrupted"), "Ctrl-C while scrolled back stops
 s.send("\x04"); s.close()
 
 print("test interactive: suggestions under the input field while a /command or an @file is typed")
-SIB = tempfile.mkdtemp(prefix="crowsib_", dir=os.path.dirname(WORK))   # a directory next to the working directory
 os.makedirs(os.path.join(WORK, "sugsrc", "deep"))
 for rel in ("sugsrc/zebra_term.c", "sugsrc/deep/zebra_notes.md", "sugsrc/twin.txt", "sugsrc/deep/twin.txt"):
     open(os.path.join(WORK, rel), "w").write("content of %s\n" % rel)
@@ -1262,7 +1277,6 @@ out, rc = run(["-m", "fake-coder:latest", "-T", "-p", "look at @zebra_notes.md"]
 check("(attached sugsrc/deep/zebra_notes.md" in out, f"-p finds a file by its name too: {out!r}")
 
 print("test interactive: a !line is completed the way a shell would: programs where a command goes, paths elsewhere")
-BINDIR = tempfile.mkdtemp(prefix="crowbin_")
 for name in ("zzcorbie-tool", "zzcorbie-tool-extra"):
     open(os.path.join(BINDIR, name), "w").write('#!/bin/sh\necho "ran-%s $*"\n' % name); os.chmod(os.path.join(BINDIR, name), 0o755)
 open(os.path.join(BINDIR, "zzcorbie-notes.txt"), "w").write("not a program\n")
@@ -1288,8 +1302,6 @@ shutil.rmtree(BINDIR, ignore_errors=True)
 shutil.rmtree(SIB, ignore_errors=True)
 
 print("test interactive: CORBIENEST_TRACE records what is drawn and what is sent, and tools/trace_replay.py plays it back")
-TRACE = os.path.join(CFG, "render.trace")
-REPLAY = [sys.executable, os.path.join(HERE, "..", "tools", "trace_replay.py"), TRACE]
 s = Session(["-m", "fake-coder:latest"], env=dict(ENV, CORBIENEST_TRACE=TRACE))
 s.expect("(no such text)", 3)   # the note is printed under the start-up banner: read it, then look in the whole text
 check(("trace: everything drawn and typed in this session is written to " + TRACE) in s.text(), "a session that is being recorded says so, and where to")
@@ -1394,9 +1406,6 @@ s.send("\x04"); s.close()
 # ---------- /effort and /advisor ----------
 # a config directory of their own: what they save (an advisor, per-model efforts) would
 # otherwise follow every test that comes after
-CFG2 = tempfile.mkdtemp(prefix="crowcfg2_")
-ENV2 = dict(ENV, XDG_CONFIG_HOME=CFG2)
-CFG2_FILE = os.path.join(CFG2, "corbienest", "config")
 os.makedirs(os.path.join(CFG2, "corbienest")); open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
 
 print("test effort: a level is part of the prompt, so it goes with every call; a model that cannot stop is never told to")
@@ -1650,9 +1659,6 @@ s.send("\x04"); s.close()
 
 # ---------- the advisor on a hosted API: xAI, OpenAI, Anthropic ----------
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
-KEYS = dict(XAI_API_KEY="test-key", OPENAI_API_KEY="test-key", ANTHROPIC_API_KEY="test-key",
-            XAI_BASE_URL=f"{HOST}/xai/v1", OPENAI_BASE_URL=f"{HOST}/openai/v1", ANTHROPIC_BASE_URL=f"{HOST}/anthropic")
-ENVK = dict(ENV2, **KEYS)
 
 print("test advisor on a hosted API: xAI and OpenAI through Chat Completions")
 out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
@@ -1976,7 +1982,6 @@ so.send("\x04"); so.close()
 
 # ---------- /orchestrate: the advisor model plans and reviews, the main model does the tasks ----------
 print("test interactive: /orchestrate")
-MADE = os.path.join(WORK, "made.txt")
 if os.path.exists(MADE): os.remove(MADE)
 os.makedirs(os.path.join(CFG2, "corbienest"), exist_ok=True)
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
@@ -2134,7 +2139,6 @@ check(not [f for f in os.listdir(os.path.join(CFG, "corbienest")) if ".tmp" in f
 ha.send("\x04"); hb.send("\x04"); ha.close(); hb.close()
 
 # ---------- /goal: candidates in git worktrees race to a metric ----------
-GOALENV = dict(ENVK, DEEPSEEK_API_KEY="test-key", DEEPSEEK_BASE_URL=f"{HOST}/deepseek", MOONSHOT_API_KEY="test-key", MOONSHOT_BASE_URL=f"{HOST}/kimi/v1")
 
 print("test goal: a local model and xAI race in worktrees; the higher score is applied, the copies are gone")
 repo = make_repo()
@@ -2188,15 +2192,12 @@ b.close()
 
 # ---------- /orchestrate roles: a skill sets the worker's model and prompt, the contract is shown, owned paths wait ----------
 print("test interactive: /orchestrate with roles, a contract and owned paths")
-RP = make_repo()
 os.makedirs(os.path.join(RP, ".corbienest", "skills", "tester"), exist_ok=True)
 open(os.path.join(RP, ".corbienest", "skills", "tester", "SKILL.md"), "w").write(
     "---\nname: tester\ndescription: Writes the item and the tests for it\nmodel: fake-levels:latest\n---\n"
     "ROLE-BODY: you write the tests first, then the code they need.\n")
-RCFG = tempfile.mkdtemp(prefix="crowroles_")   # its own config: the sections before it leave theirs behind
 os.makedirs(os.path.join(RCFG, "corbienest"), exist_ok=True)
 open(os.path.join(RCFG, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\n")
-ENVR = dict(ENV2, XDG_CONFIG_HOME=RCFG)
 rp = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVR, cwd=RP); rp.expect("Ctrl-D to quit")
 rp.send("/advisor fake-big:latest\r"); rp.expect("advisor: fake-big:latest")
 n0 = len(requests())
