@@ -296,6 +296,19 @@ check("you are not finished" in req["messages"][0]["content"], "the report is co
 check(any(t["function"]["name"] == "bash" for t in req.get("tools", [])), "tools sent")
 check(req["options"]["num_ctx"] == 32768, "default num_ctx")
 check(req["keep_alive"] == "30m" and "num_predict" not in req["options"] and "think" not in req, "default keep_alive 30m; no num_predict/think on a normal call")
+
+print("test oneshot: no model and no provider key says so and exits 1; a failed model call exits 1, the JSON says error")
+NOMODEL_CFG = tempfile.mkdtemp(prefix="crownomodel_")   # an empty config: no model= in it, nothing on the Ollama server
+out, rc = run(["-p", "hi"], env=dict(ENV, XDG_CONFIG_HOME=NOMODEL_CFG, OLLAMA_HOST="http://127.0.0.1:1"))
+check(rc == 1 and "no model yet" in run.err, f"no model, no key: exit 1 with the notice: rc={rc} err={run.err!r}")
+out, rc = run(["-m", "anthropic:claude-opus-5", "-p", "hi", "--output-format", "json"],
+              env=dict(ENV, XDG_CONFIG_HOME=NOMODEL_CFG, ANTHROPIC_API_KEY="test-key", ANTHROPIC_BASE_URL="http://127.0.0.1:1/anthropic"))
+check(rc == 1, f"an unreachable provider: exit 1, not 0: rc={rc}")
+try:
+    j = json.loads(out)
+    check(j.get("error") is True and j.get("result") == "" and j.get("model") == "anthropic:claude-opus-5", f"the JSON says error: {j}")
+except ValueError:
+    check(False, f"the JSON of a failed run is JSON: {out[-300:]!r}")
 out, rc = run(["-m", "fake-coder:latest", "--keep-alive", "-1", "-p", "hello"])
 check(requests()[-1]["keep_alive"] == -1, "--keep-alive -1 sent as a number: the server refuses the string (missing unit in duration)")
 out, rc = run(["-m", "fake-coder:latest", "--keep-alive", "default", "-p", "hello"])

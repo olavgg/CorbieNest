@@ -2468,8 +2468,11 @@ static bool reply_is_empty(cJSON *reply) {
 }
 
 /* Returns true if the user interrupted the turn. */
+static bool g_turn_failed = false;   /* the last turn ended on an error (no reply from the model): -p exits 1 */
 static bool run_turn(void) {
+    g_turn_failed = false;
     if (!model_set()) {   /* no model yet: say why, and take the message back out of the conversation */
+        g_turn_failed = true;
         printf(C_YELLOW "%s" C_RESET "\n", g_model_err);
         size_t n = cJSON_GetArraySize(g_messages);
         cJSON *last = n ? cJSON_GetArrayItem(g_messages, (int)n - 1) : NULL;
@@ -2509,6 +2512,7 @@ static bool run_turn(void) {
                     || compact_conversation(true, pending_request())) { round_first = -1; continue; }
             }
             /* On failure, keep the conversation as is; the user can retry. */
+            g_turn_failed = !aborted;
             return aborted;
         }
         cJSON_AddItemToArray(g_messages, reply);
@@ -2528,6 +2532,7 @@ static bool run_turn(void) {
                     continue;
                 }
                 printf(C_YELLOW "⚠ empty reply again — stopping here" C_RESET "\n");
+                g_turn_failed = true;
                 printf(C_DIM "  nothing was added to the conversation; send another message to continue, or /model to try a different one" C_RESET "\n");
                 return false;
             }
@@ -5283,6 +5288,7 @@ int main(int argc, char **argv) {
             }
             cJSON_AddStringToObject(o, "result", last);
             cJSON_AddBoolToObject(o, "interrupted", aborted);
+            cJSON_AddBoolToObject(o, "error", g_turn_failed);
             cJSON_AddStringToObject(o, "session_id", g_session_id);
             cJSON_AddStringToObject(o, "model", g_cfg.model);
             cJSON_AddNumberToObject(o, "prompt_tokens", (double)g_session.prompt_tokens);
@@ -5296,7 +5302,7 @@ int main(int argc, char **argv) {
             if (json_fd >= 0) { if (write(json_fd, txt, strlen(txt)) < 0 || write(json_fd, "\n", 1) < 0) {} }
             free(txt); cJSON_Delete(o);
         }
-        return aborted ? 130 : 0;
+        return aborted ? 130 : g_turn_failed ? 1 : 0;   /* -p: an error (the model did not answer) is a failed run */
     }
 
     banner();
