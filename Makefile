@@ -96,7 +96,7 @@ test-integration: corbienest
 	python3 tests/test_integration.py
 
 clean:
-	rm -f $(OBJ) $(NC_OBJ) corbienest tests/test_unit .notcurses-*
+	rm -f $(OBJ) $(NC_SRC:.c=.o) corbienest tests/test_unit .notcurses-*
 	rm -rf build
 
 .PHONY: install clean test test-unit test-integration release
