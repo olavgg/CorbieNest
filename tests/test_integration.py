@@ -1823,6 +1823,7 @@ s.send("/cost\r"); check(seen(s, "advisor       2 consultations "), f"/cost coun
 s.send("/usage\r"); check(seen(s, "local: no charge") and "fake-coder:latest" in since_send(s), f"/usage lists the model doing the work: {since_send(s)[-400:]!r}")
 check(seen(s, "no price known") and re.search(r"xai:grok-fake\s+\d+ calls?\s+↑", since_send(s)), f"and the hosted advisor with its own tokens — a model the price list does not know: {since_send(s)[-400:]!r}")
 seen(s, "[ready]", 60)   # the reply to the queued message may still be streaming: /usage runs only when the prompt is ready
+s.send("\x1b"); s.expect("(no such text)", 0.5)   # an overlay from the /usage check before, if still up, holds the output back: Esc closes it
 s.send("/usage price xai:grok-fake 2 6\r"); check(seen(s, "xai:grok-fake: $2 in · $6 out per million tokens"), "/usage price sets one")
 check("price.xai:grok-fake=2/6" in open(CFG2_FILE).read(), "saved in the config")
 s.send("/usage\r"); check(seen(s, "set with /usage price") and re.search(r"≈ \$\d+\.\d+", since_send(s)), f"and the cost is estimated from it: {since_send(s)[-400:]!r}")
