@@ -1176,6 +1176,7 @@ s.send("x"); check(s.expect("❯ x"), "a key typed in the viewer goes back to th
 s.send("\x15")
 
 print("test interactive: scrolling back while the model works")
+s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")   # its own session: it stands alone
 s.send("SLOW please\r"); check(s.expect("one"), "the reply starts")
 s.send(wheel(True, n=2)); check(s.expect("scrollback · rows"), f"the wheel scrolls back while the reply streams: {s.text()[-200:]!r}")
 check("esc to interrupt" in since() and "manual mode" in since(), "the bar is still the bar: the mode, and the conversation's spinner says the model is working")
