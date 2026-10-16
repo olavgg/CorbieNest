@@ -358,7 +358,8 @@ const char *hist_get(int i);   /* 0 = oldest kept … hist_count()-1 = most rece
 
 /* Interactive line editor. Returns malloc'd string, or NULL on EOF (Ctrl-D). */
 char *term_readline(const char *prompt);
-char *term_user_band(const char *lead, const char *text);   /* a line the user sent, on the user's ground (theme user_bg), padded to the width; malloc'd */
+char *term_user_band(const char *lead, const char *text);
+void  nc_echo_line(const char *prompt, const char *s);   /* notcurses: the line sent goes into the conversation (term.c) */   /* a line the user sent, on the user's ground (theme user_bg), padded to the width; malloc'd */
 
 /* Read a single key while in raw mode. Returns the byte or -1. */
 int term_getkey(void);

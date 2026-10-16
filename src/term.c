@@ -3054,6 +3054,14 @@ static char *readline_impl(const char *prompt, bool in_field) {
 
 bool term_is_ready(void) { return g_ready; }
 
+/* The notcurses screen: a line the user sent goes into the conversation on the user's ground, as the ANSI
+ * editor's submitted line does (readline_impl). An empty line leaves nothing, as it does there. */
+void nc_echo_line(const char *prompt, const char *s) {
+    if (!s || !*s) return;
+    char *b = term_user_band(prompt, s);
+    fputs(b, stdout); fflush(stdout);
+    free(b);
+}
 /* Append s to o with the user's ground in place, and again after every reset in s (a reset clears the ground). */
 static void band_put(sbuf *o, const char *s, const char *bg) {
     size_t rl = strlen(C_RESET);
@@ -3094,6 +3102,7 @@ char *term_readline(const char *prompt) {
     g_tick_live = g_tick_fn != NULL; g_tick_next = mono_ms() + TICK_MS;
     if (g_ui_nc) nc_leave_browse(); else ta_end_browse();   /* the turn is over: the message being written is back in the field */
     char *s = g_ui_nc ? nc_readline(prompt, true) : readline_impl(prompt, true);
+    if (g_ui_nc) nc_echo_line(prompt, s);   /* the notcurses field does not print what was sent; the ANSI editor does */
     if (g_tick_live && g_tick_fn) g_tick_fn(true);   /* the block settles on its last frame */
     /* the first task ends the banner's animation for good: a slash command or a shell line is not work */
     if (s && *s && *s != '/' && *s != '!' && !g_tick_done) { g_tick_fn = NULL; g_tick_done = true; }
@@ -3104,7 +3113,7 @@ char *term_readline(const char *prompt) {
     return s;
 }
 char *term_ask_line(const char *prompt) {
-    if (g_ui_nc) return nc_readline(prompt, false);
+    if (g_ui_nc) { char *r = nc_readline(prompt, false); nc_echo_line(prompt, r); return r; }
     park_hold(); char *r = readline_impl(prompt, false); park_free();
     return r;
 }
