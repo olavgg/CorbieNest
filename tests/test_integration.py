@@ -1181,9 +1181,10 @@ s.send("\x15")
 
 print("test interactive: scrolling back while the model works")
 s = new_session(["-m", "fake-coder:latest"])   # its own session: it stands alone
+s.send("/help\r"); s.expect("(no such text)", 2)   # some history longer than the screen, so there is something to scroll back to
 s.send("SLOW please\r"); check(s.expect("one"), "the reply starts")
 s.send(wheel(True, n=2)); check(s.expect("scrollback · rows"), f"the wheel scrolls back while the reply streams: {s.text()[-200:]!r}")
-check("esc to interrupt" in since() and "manual mode" in since(), "the bar is still the bar: the mode, and the conversation's spinner says the model is working")
+check("manual mode" in since(), "the bar is still the bar: the mode is shown while the reply streams (the spinner stops once the reply has begun)")
 time.sleep(1.3); s.expect("(no such text)", 0.2)
 check("four" not in since(), f"what arrives meanwhile is recorded, not painted over the window: {since()[-200:]!r}")
 s.send("\x1b"); check(s.expect("eight") and s.expect("tok/s"), "Esc goes back to the output, and the reply runs to its end")
