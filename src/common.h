@@ -17,6 +17,10 @@
 #define C_ITALIC  "\x1b[3m"
 #define C_RED     "\x1b[31m"
 #define C_GREEN   "\x1b[32m"
+/* the input field's edges, as the same colours on both screens (the notcurses screen draws these): green while the
+ * prompt waits, a slate grey while a turn runs. A basic colour would take each terminal's own green. */
+#define C_EDGE_READY "\x1b[38;2;95;215;95m"
+#define C_EDGE_IDLE  "\x1b[38;2;59;66;82m"
 #define C_YELLOW  "\x1b[33m"
 #define C_BLUE    "\x1b[34m"
 #define C_MAGENTA "\x1b[35m"

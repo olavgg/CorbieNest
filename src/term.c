@@ -547,7 +547,7 @@ static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_
  * field drew there stays behind. */
 /* the top or bottom edge of the field: rounded corners, green while the prompt waits */
 static void field_edge(sbuf *o, int row, bool top) {
-    sb_printf(o, "\x1b[%d;1H%s%s", row, g_ready ? C_GREEN : C_DIM, top ? "╭" : "╰");
+    sb_printf(o, "\x1b[%d;1H%s%s", row, g_ready ? C_EDGE_READY : C_EDGE_IDLE, top ? "╭" : "╰");
     for (int i = 0; i < g_fs_cols - 2; i++) sb_puts(o, "─");
     sb_puts(o, top ? "╮" : "╯");
     sb_puts(o, C_RESET);
@@ -588,7 +588,7 @@ static void field_draw(sbuf *o, const char *typed) {
     field_edge(o, top, true);
     if (g_ready) {   /* [ready], upper right, two cells in from the edge (as the mode is on the lower rule) */
         int c = g_fs_cols - 7 - 1;
-        if (c >= 1) sb_printf(o, "\x1b[%d;%dH" C_GREEN "[ready]" C_RESET, top, c);
+        if (c >= 1) sb_printf(o, "\x1b[%d;%dH" C_EDGE_READY "[ready]" C_RESET, top, c);
     }
     for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;%dH" FIELD_BG "\x1b[K" C_RESET, top + 1 + i, FIELD_X0);
     sb_printf(o, "\x1b[%d;%dH", top + 1, FIELD_X0 + 1);
@@ -641,8 +641,8 @@ static void field_draw(sbuf *o, const char *typed) {
     /* the side borders of the text rows (after the text, which is cut short of them) */
     for (int i = 0; i < g_field_rows; i++) {
         int r = top + 1 + i;
-        sb_printf(o, "\x1b[%d;1H%s│" C_RESET, r, g_ready ? C_GREEN : C_DIM);
-        sb_printf(o, "\x1b[%d;%dH%s│" C_RESET, r, g_fs_cols, g_ready ? C_GREEN : C_DIM);
+        sb_printf(o, "\x1b[%d;1H%s│" C_RESET, r, g_ready ? C_EDGE_READY : C_EDGE_IDLE);
+        sb_printf(o, "\x1b[%d;%dH%s│" C_RESET, r, g_fs_cols, g_ready ? C_EDGE_READY : C_EDGE_IDLE);
     }
     field_edge(o, top + g_field_rows + 1, false);
     {   /* the mode, on the lower rule: its last cell two columns in from the edge (the hint goes first when it does not fit) */

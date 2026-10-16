@@ -676,7 +676,7 @@ static void draw_field(int top) {
     int shown = rows > FIELD_MAX ? FIELD_MAX : rows;
     int first = cr - shown + 1 > 0 ? cr - shown + 1 : 0;      /* keep the cursor's row in view */
     if (first > rows - shown) first = rows - shown > 0 ? rows - shown : 0;
-    unsigned rc = term_is_ready() ? 0x5FD75Fu : C_RULE;   /* the edges: green while the prompt waits (as the ANSI screen's C_GREEN) */
+    unsigned rc = term_is_ready() ? 0x5FD75Fu : C_RULE;   /* the edges: C_EDGE_READY / C_EDGE_IDLE on the ANSI screen (common.h) */
     for (int x = 1; x < g_cols - 1; x++) {                   /* the top and bottom edges, rounded at the corners */
         put_text(top, x, "─", 1, rc, NC_DEFAULT, false, NULL);
         put_text(top + shown + 1, x, "─", 1, rc, NC_DEFAULT, false, NULL);
