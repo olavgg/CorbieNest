@@ -43,6 +43,7 @@ typedef struct {
     unsigned edge_ready, edge_idle;             /* the field's edges while the prompt waits, and while a turn runs */
     unsigned loc;                               /* the location line */
     unsigned select;                            /* the row the keys are on, in the sub-agents strip */
+    unsigned user_bg;                           /* the ground of a line the user sent, in the conversation */
     unsigned brand, spark_hi, spark_mid, spark_lo;   /* the banner: its title and the spark's head, then its tail */
     unsigned crow_dark, crow_body, crow_light, crow_beak;   /* the banner's crow: outline, body, highlight, beak */
     unsigned accent, ok, bad, warn, info, blue, magenta, gray;   /* the orange, and the basic codes 32, 31, 33, 36, 34, 35, 90 */
@@ -357,6 +358,7 @@ const char *hist_get(int i);   /* 0 = oldest kept … hist_count()-1 = most rece
 
 /* Interactive line editor. Returns malloc'd string, or NULL on EOF (Ctrl-D). */
 char *term_readline(const char *prompt);
+char *term_user_band(const char *lead, const char *text);   /* a line the user sent, on the user's ground (theme user_bg), padded to the width; malloc'd */
 
 /* Read a single key while in raw mode. Returns the byte or -1. */
 int term_getkey(void);

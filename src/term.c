@@ -3028,7 +3028,7 @@ static char *readline_impl(const char *prompt, bool in_field) {
         printf("\x1b[%d;%dH", g_conv_row, g_conv_col);
         fflush(stdout);
         sb_pause(false);
-        if (result) printf("%s%s" C_RESET "\n", prompt, result);
+        if (result) { char *b = term_user_band(prompt, result); fputs(b, stdout); free(b); }
         else printf("\n");
         term_status_refresh();
     } else {   /* drawn inline (a question inside a turn): finish where it stands */
@@ -3042,9 +3042,8 @@ static char *readline_impl(const char *prompt, bool in_field) {
         fputs("\x1b[?2004l", stdout);
         term_status_refresh();   /* "\x1b[J" wiped the bar */
         sb_pause(false);
-        if (result) {   /* what stays on screen: the prompt and the submitted text */
-            sbuf n; sb_init(&n); sb_puts(&n, prompt); sb_puts(&n, result); sb_puts(&n, C_RESET "\n");
-            sb_note(n.data); sb_free(&n);
+        if (result) {   /* what stays on screen: the prompt and the submitted text, on the user's ground */
+            char *b = term_user_band(prompt, result); sb_note(b); free(b);
         } else sb_note("\n");
     }
     fflush(stdout);
@@ -3055,6 +3054,41 @@ static char *readline_impl(const char *prompt, bool in_field) {
 
 bool term_is_ready(void) { return g_ready; }
 
+/* Append s to o with the user's ground in place, and again after every reset in s (a reset clears the ground). */
+static void band_put(sbuf *o, const char *s, const char *bg) {
+    size_t rl = strlen(C_RESET);
+    for (const char *q = s; *q; ) {
+        if (!strncmp(q, C_RESET, rl)) { sb_puts(o, C_RESET); sb_puts(o, bg); q += rl; }
+        else sb_putc(o, *q++);
+    }
+}
+/* A line the user sent, as the conversation shows it: the lead (its own colours) and the text on the user's
+ * ground (theme user_bg), padded to the width so the band is whole; a line longer than the width wraps as it is.
+ * Lines after the first have no lead. malloc'd, every line ends in a newline. */
+char *term_user_band(const char *lead, const char *text) {
+    char *bg = xstrdup(th_bg(g_theme->user_bg));
+    int width = term_width();
+    sbuf o; sb_init(&o);
+    const char *p = text ? text : "";
+    bool first = true;
+    for (;;) {
+        const char *nl = strchr(p, '\n');
+        char *line = xstrndup(p, nl ? (size_t)(nl - p) : strlen(p));
+        int used = nc_text_width(line);
+        sb_puts(&o, bg);
+        if (first && lead) { band_put(&o, lead, bg); used += nc_text_width(lead); }
+        band_put(&o, line, bg);
+        for (int pad = width - used; pad > 0; pad--) sb_putc(&o, ' ');
+        sb_puts(&o, C_RESET "\n");
+        free(line);
+        if (!nl) break;
+        p = nl + 1; first = false;
+    }
+    free(bg);
+    char *r = xstrndup(o.data, o.len);
+    sb_free(&o);
+    return r;
+}
 char *term_readline(const char *prompt) {
     g_ready = true; term_status_refresh();
     g_tick_live = g_tick_fn != NULL; g_tick_next = mono_ms() + TICK_MS;
