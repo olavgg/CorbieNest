@@ -60,7 +60,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/tools", "tool calling on or off" },
     { "/web", "web_search and web_fetch: on, off, engine URL" },
     { "/max_iters", "tool rounds one request may run" },
-    { "/ui", "the screen: ansi, or notcurses (restarts into this session)" },
+    { "/ui", "the screen: ansi, or notcurses (restarts into this session); theme: the colours" },
     { "/ctx", "context window: a size, max, default — or a picker" },
     { "/temp", "temperature (-1 = the server's default)" },
     { "/host", "the ollama host" },
@@ -87,7 +87,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
  * them. The key is the command line up to the word being typed. (/effort and /cd are worked
  * out in suggest(): the levels are the model's, the directories the disk's.) */
 static const struct { const char *after, *opts; } SLASH_ARGS[] = {
-    { "/ui", "ansi:the ANSI screen (default)|notcurses:the notcurses screen: planes, true colour (needs notcurses installed at build time)" },
+    { "/ui", "ansi:the ANSI screen (default)|notcurses:the notcurses screen: planes, true colour (needs notcurses installed at build time)|theme:the colour theme: a list to pick from, or a name" },
     { "/goal", "min:a lower score is better|max:a higher score is better (the default)|-n:rounds, 1 to 10|-k:candidates, 2 to 8|-m:models, a,b,c (round-robin)" },
     { "/mode", "manual:ask before every edit and command|accept-edits:file edits go ahead, commands still ask|plan:read-only: the model proposes a plan|auto:nothing asks (dangerous)" },
     { "/think", "on:think on every call|off:do not think|auto:think once per request, not after every tool result|show:show the thinking|hide:hide the thinking" },
@@ -3955,12 +3955,42 @@ static int g_argc = 0;
 
 /* /ui [ansi|notcurses]: the choice is saved, the session with it, and the program starts again on the
  * same session (--resume) with the other screen. Only from the prompt: a turn in flight keeps its screen. */
+/* /ui theme: the picker (a modal list of the themes, the one in use marked), or /ui theme NAME. The theme is saved,
+ * and the screen takes it at once: the conversation is painted again from the model, the notcurses screen draws next frame. */
+static void cmd_ui_theme(const char *name) {
+    int n = theme_count(), cur = 0;
+    const char *items[32], *descs[32];
+    if (n > 32) n = 32;
+    for (int i = 0; i < n; i++) {
+        items[i] = theme_name(i);
+        descs[i] = !strcmp(theme_name(i), g_theme->name) ? "in use" : "";
+        if (!strcmp(theme_name(i), g_theme->name)) cur = i;
+    }
+    if (!name) {
+        int pick = term_select("Colour theme", items, descs, n, cur);
+        if (pick < 0) return;
+        name = items[pick];
+    }
+    if (!theme_set(name)) { printf("no theme named %s (themes: ", name); for (int i = 0; i < n; i++) printf("%s%s", i ? ", " : "", items[i]); printf(")\n"); return; }
+    free(g_cfg.theme); g_cfg.theme = !strcmp(name, "default") ? NULL : xstrdup(name);
+    config_save();
+    term_repaint();
+    printf("theme: %s\n", name);
+}
+
 static void cmd_ui(const char *arg) {
     const char *now = g_cfg.ui ? "notcurses" : "ansi";
+    if (arg && !strncmp(arg, "theme", 5) && (arg[5] == ' ' || !arg[5])) {
+        const char *name = arg[5] ? arg + 5 : NULL;
+        while (name && *name == ' ') name++;
+        cmd_ui_theme(name && *name ? name : NULL);
+        return;
+    }
     if (!arg) {
         printf("screen: %s%s" C_RESET "%s\n", now, g_ui_nc ? " (running)" : "",
                nc_compiled() ? "" : C_DIM "  · notcurses is not in this build (it was not installed when built)" C_RESET);
-        printf(C_DIM "  /ui ansi | /ui notcurses" C_RESET "\n");
+        printf("theme: %s\n", g_theme->name);
+        printf(C_DIM "  /ui ansi | /ui notcurses | /ui theme [NAME]" C_RESET "\n");
         return;
     }
     if (strcmp(arg, "ansi") && strcmp(arg, "notcurses")) { printf("usage: /ui ansi|notcurses\n"); return; }
@@ -4767,6 +4797,10 @@ static int suggest(const char *buf, size_t cur, size_t *from, term_sug **items) 
     while (bl > 0 && buf[bl - 1] == ' ') bl--;
     char *before = xstrndup(buf, bl);
     if (!strcmp(before, "/cd")) n = suggest_files(word, true, items);
+    else if (!strcmp(before, "/ui theme")) {   /* the themes by name, with what each is */
+        for (int i = 0; i < theme_count(); i++)
+            if (!strncmp(theme_name(i), word, wl)) sug_add(items, &n, theme_name(i), !strcmp(theme_name(i), g_theme->name) ? "in use" : "a colour theme", false);
+    }
     else if (!strcmp(before, "/effort")) {
         const model_info *mi = &g_model_info;
         const char *opt[EFFORT_LEVELS_MAX + 3], *why[EFFORT_LEVELS_MAX + 3]; int no = 0;

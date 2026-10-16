@@ -1077,6 +1077,15 @@ static void park_hold(void) {
 }
 static void park_free(void) { if (g_no_park > 0) g_no_park--; }
 
+/* the conversation painted again from the model: a colour theme changed, so what is on screen takes its colours */
+void term_repaint(void) {
+    if (!g_fs || g_ui_nc || !g_sb_active) return;
+    sbuf o; sb_init(&o);
+    conv_repaint(&o);
+    fwrite(o.data, 1, o.len, stdout); fflush(stdout);
+    sb_free(&o);
+}
+
 static theme_map g_th_map;   /* an escape sequence a write ended inside (see theme_map_bytes) */
 /* stdout hook: every byte goes to fd 1 and, unless paused, into the model above */
 static ssize_t sb_write_fn(void *cookie, const char *buf, size_t n) {

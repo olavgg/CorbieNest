@@ -97,6 +97,8 @@ without thinking about them: the status bar, the field, and the strip.
 | `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (kept in the config directory, `permissions/`, keyed by the project's path — a file in the project itself is never read) |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
+| `/ui [ansi\|notcurses]` | the screen; restarts into this session |
+| `/ui theme [NAME]` | the colour theme: a picker of the themes (the one in use marked), or the named one; saved, and the screen takes it at once |
 | `/init` | have the model explore the project and write an `AGENTS.md` (build/test commands, architecture, conventions); improves an existing one |
 | `/skills [reload\|new NAME]` | list skills; run one with `/NAME [args]` |
 | `/tools on\|off` | enable/disable tools |
@@ -750,8 +752,9 @@ Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its
 ## Colours
 
 Both screens draw from one palette, a **theme** (`src/theme.c`). The default theme is the one
-the notcurses screen has always drawn. `theme=NAME` in the config picks a theme; a name that does
-not exist is said at start-up and the default is used. There is no command to switch a theme yet.
+the notcurses screen has always drawn. Pick one with `/ui theme` (a list, with the one in use marked;
+`/ui theme NAME` names it, and Tab completes the names). The choice is saved as `theme=NAME` in the
+config; a name that does not exist there is said at start-up and the default is used.
 
 The conversation and the chrome are written with the basic colour codes (red, green, yellow,
 cyan, magenta, grey, orange). The ANSI screen maps those to the theme's colours as its output

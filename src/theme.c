@@ -18,16 +18,32 @@ static const theme_t THEMES[] = {
         .field_text = 0xFFF1B8u, .field_bg = 0x151922u,
         .edge_ready = 0x5FD75Fu, .edge_idle = 0x3B4252u,
         .loc = 0xAF5F87u, .select = 0x2A2F3Au,
-        .brand = 0xE6FBFFu, .spark_hi = 0x8FE3FFu, .spark_mid = 0x4FB8E0u, .spark_lo = 0x3A8FB8u,
-        .crow_dark = 0x4A6A8Au, .crow_body = 0x6B7890u, .crow_light = 0xA9B6CCu, .crow_beak = 0x7A6650u,
         .accent = 0xF0883Eu,
         .ok = 0xA3BE8Cu, .bad = 0xBF616Au, .warn = 0xEBCB8Bu,
         .info = 0x56B6C2u, .blue = 0x81A1C1u, .magenta = 0xB48EADu, .gray = 0x7C8799u,
+        .brand = 0xE6FBFFu, .spark_hi = 0x8FE3FFu, .spark_mid = 0x4FB8E0u, .spark_lo = 0x3A8FB8u,
+        .crow_dark = 0x4A6A8Au, .crow_body = 0x6B7890u, .crow_light = 0xA9B6CCu, .crow_beak = 0x7A6650u,
+    },
+    {   /* an example of a second theme: warm on a dark ground (copy an entry to make another) */
+        .name = "amber",
+        .text = 0xF2E6C9u, .muted = 0x8C7B5Eu, .rule = 0x4A3F2Cu, .menu = 0x2A2317u,
+        .bar_a = 0x1C1710u, .bar_b = 0x3A2C14u,
+        .field_text = 0xFFE08Au, .field_bg = 0x1F1A12u,
+        .edge_ready = 0xE0A030u, .edge_idle = 0x4A3F2Cu,
+        .loc = 0xB5785Cu, .select = 0x33291Au,
+        .accent = 0xF5A524u,
+        .ok = 0xB5C46Au, .bad = 0xD9694Au, .warn = 0xF2C14Eu,
+        .info = 0xE0A458u, .blue = 0xA7B88Fu, .magenta = 0xC98A6Bu, .gray = 0x8C7B5Eu,
+        .brand = 0xFFF4D6u, .spark_hi = 0xFFD58Au, .spark_mid = 0xE0A030u, .spark_lo = 0xB5785Cu,
+        .crow_dark = 0x6B4F2Eu, .crow_body = 0x8C7B5Eu, .crow_light = 0xD6C29Au, .crow_beak = 0xF5A524u,
     },
 };
 #define THEME_COUNT ((int)(sizeof THEMES / sizeof THEMES[0]))
 
 const theme_t *g_theme = &THEMES[0];
+
+int theme_count(void) { return THEME_COUNT; }
+const char *theme_name(int i) { return THEMES[i].name; }
 
 /* "theme=NAME": the theme of that name; false (and the theme stays as it is) when there is none */
 bool theme_set(const char *name) {

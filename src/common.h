@@ -52,6 +52,8 @@ typedef struct {
 } theme_map;
 extern const theme_t *g_theme;
 bool theme_set(const char *name);               /* "theme=NAME": false, and the theme stays, when there is none */
+int  theme_count(void);                         /* the themes there are, for the picker and the completions */
+const char *theme_name(int i);
 bool theme_fg_code(int code, unsigned *rgb);    /* the theme's colour of a basic fg code (30-37, 90-97) */
 void theme_recolor(const char *s, sbuf *out, const unsigned *from, const unsigned *to, int count);   /* the 38;2 colours in s that are from[i] become to[i] */
 void theme_map_bytes(theme_map *m, const char *in, size_t n, sbuf *out);   /* the bytes with their themed codes mapped */
@@ -434,6 +436,7 @@ typedef struct { char *text; char *desc; bool open; } term_sug;
 extern int (*term_suggest)(const char *buf, size_t cur, size_t *from, term_sug **items);
 /* Interactive list picker: returns chosen index or -1 if cancelled. */
 int term_select(const char *title, const char **items, const char **descs, int n, int current);
+void term_repaint(void);                       /* the ANSI conversation painted again from the model (after a theme change) */
 
 /* What term_nc.c draws from, and what term.c exports for it (the ANSI UI uses none of this) */
 extern bool g_ui_nc;                                  /* the notcurses frontend is the screen */
