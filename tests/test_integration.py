@@ -1826,7 +1826,8 @@ s.send("\x1b"); s.expect("(no such text)", 0.5)   # a bare /usage opens an overl
 seen(s, "[ready]", 60)   # the reply to the queued message may still be streaming: /usage runs only when the prompt is ready
 s.send("/usage price xai:grok-fake 2 6\r"); check(seen(s, "xai:grok-fake: $2 in · $6 out per million tokens"), "/usage price sets one")
 check("price.xai:grok-fake=2/6" in open(CFG2_FILE).read(), "saved in the config")
-s.send("/usage\r"); check(seen(s, "set with /usage price") and re.search(r"≈ \$\d+\.\d+", since_send(s)), f"and the cost is estimated from it: {since_send(s)[-400:]!r}")
+s.send("/usage\r"); # the overlay's border is drawn across "set with", so the stream never has it as one run; the estimate and the price are checked
+check(seen(s, "$2 in · $6 out per million") and re.search(r"≈ \$\d+\.\d+", since_send(s)), f"and the cost is estimated from it: {since_send(s)[-400:]!r}")
 check(seen(s, "estimated cost"), "with a total")
 s.send("\x1b"); s.expect("(no such text)", 0.5)
 s.send("TOOL_ADVISOR priced\r"); check(seen(s, "Tool said: ADVICE") and re.search(r"▸ advice · \S+ tokens · \d+s · ≈ \$\d+\.\d+", since_send(s)), f"a consultation of a priced model says what it came to: {since_send(s)[-400:]!r}")
