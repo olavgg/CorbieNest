@@ -2596,6 +2596,7 @@ static void ta_sug_sync(void) {
 static bool ta_sug_key(int k) {
     ta_sug_sync();   /* (a newline typed with Alt+Enter is in the text without a refresh having seen it) */
     if (!g_ta_sug_for || g_field_focus) return false;
+    if ((k == K_UP || k == K_DOWN) && g_ta_hist >= 0 && g_ta_hist < g_hist_n) return false;   /* browsing the history: ↑/↓ scroll it */
     editor e; memset(&e, 0, sizeof e);   /* the text as an editor's, for sug_tab() and sug_accept() */
     sb_init(&e.buf); sb_puts(&e.buf, g_ta_sug_for); e.cur = e.buf.len;
     if (k == '\t' && !g_sug_n) { sug_fill(e.buf.data, e.cur); g_ta_sug_for = xstrdup(e.buf.data); }   /* closed: Tab asks again */
@@ -2878,9 +2879,11 @@ static char *readline_impl(const char *prompt, bool in_field) {
             ed_refresh(&e);
             continue;
         }
-        if (g_sug_n > 0) {   /* the list under the field is up: these keys are its own */
+        if (g_sug_n > 0) {   /* the list under the field is up: these keys are its own — but ↑/↓ scroll the history while it is browsed */
             bool taken = true;
-            if (k == K_DOWN || k == 14) { if (g_sug_sel < g_sug_n - 1) g_sug_sel++; }
+            bool arrow = k == K_UP || k == K_DOWN || k == 14 || k == 16;
+            if (arrow && e.hist_idx < g_hist_n) taken = false;
+            else if (k == K_DOWN || k == 14) { if (g_sug_sel < g_sug_n - 1) g_sug_sel++; }
             else if ((k == K_UP || k == 16) && g_sug_sel >= 0) g_sug_sel--;
             else if (k == '\r' && g_sug_sel >= 0) { sug_accept(&e, g_sug_sel); sug_update(&e); }
             else if (k == K_ESC) { e.sug_off = true; sug_update(&e); }

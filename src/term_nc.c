@@ -1095,6 +1095,7 @@ static bool sug_key(int k) {
         return true;
     }
     if (!g_sug_n) return false;
+    if ((k == NK_UP || k == NK_DOWN) && g_hist_pos < hist_count()) return false;   /* browsing the history: ↑/↓ scroll it */
     if (k == NK_DOWN) { if (g_sug_sel < g_sug_n - 1) g_sug_sel++; return true; }
     if (k == NK_UP && g_sug_sel >= 0) { g_sug_sel--; return true; }
     if (k == 13 && g_sug_sel >= 0) { sug_accept(g_sug_sel); return true; }
