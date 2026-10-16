@@ -2,11 +2,11 @@
 
 corbienest is a Claude-Code-style terminal coding agent for local and hosted models (Ollama,
 Anthropic, xAI, OpenAI, DeepSeek, Kimi), written in plain C11 with no dependencies beyond libc,
-POSIX, cJSON and libcurl. No readline, no ncurses, nothing more — with one exception, optional:
-a notcurses frontend, built when libunistring, zlib and terminfo are installed
-(`NOTCURSES=auto`, the default) and left out otherwise (see "The notcurses frontend" below). The
-notcurses core it runs on is vendored in `vendor/notcurses/` (a copy of 3.0.17 with the tmux 3.4+ DA1
-fix; see its README) and built by make, so no notcurses package is used. Without the three libraries
+POSIX, cJSON and libcurl. No readline, nothing more — with one exception, optional: a notcurses
+frontend, which needs libunistring, zlib and terminfo (ncurses). It is built when all three are
+installed (`NOTCURSES=auto`, the default) and left out otherwise (see "The notcurses frontend" below).
+The notcurses core it runs on is vendored in `vendor/notcurses/` (a copy of 3.0.17 with the tmux 3.4+
+DA1 fix; see its README) and built by make, so no notcurses package is used. Without the three libraries
 the build is the dependency-free one; with them the binary has the notcurses screen.
 HTTP (and HTTPS, for an Anthropic model that does the work and for the hosted APIs an advisor can
 consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), or notcurses
