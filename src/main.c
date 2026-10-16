@@ -1686,8 +1686,10 @@ static const subagent_rec *running_at(int idx) {
 }
 static int strip_lines(sbuf *o, int cols, int max) {
     int total = running_count();
-    int rows = total < max ? total : max;
-    for (int i = 0; i < rows; i++) {
+    int more = total > max ? total - (max - 1) : 0;   /* past the rows the strip has: the last row says how many are not shown */
+    int shown = more ? max - 1 : total;
+    int rows = shown + (more ? 1 : 0);
+    for (int i = 0; i < shown; i++) {
         const subagent_rec *r = running_at(i);
         char line[480];
         snprintf(line, sizeof line, "◆ #%d %s · round %d · %s", r->id, r->desc, r->rounds, r->activity);
@@ -1701,6 +1703,7 @@ static int strip_lines(sbuf *o, int cols, int max) {
         if (i) sb_putc(o, '\n');
         sb_printf(o, "  " C_ORANGE "%s" C_RESET, line);
     }
+    if (more) { if (shown) sb_putc(o, '\n'); sb_printf(o, "  " C_DIM "+%d more running" C_RESET, more); }
     return rows;
 }
 static void strip_open(int idx) {
