@@ -1557,15 +1557,27 @@ char *transcript_text(cJSON *msgs, int keep, size_t budget) {
 /* ---------- the advisor: how much it is leaned on ----------
  * normal is what the advisor always was: the agent asks when it judges the work hard. A small
  * model is a poor judge of that — it is sure of the wrong approach, and calls a task done that is
- * not — so strong has corbienest ask as well, before a request that changed files ends, and max
+ * not — so strong has corbienest ask as well, before a request that changed a lot ends, and max
  * also before the request's first change is made. The advice gets longer and more concrete the
  * higher it goes: the reader is a model that follows steps better than it follows advice. */
 const advisor_guidance_def ADVISOR_GUIDANCE[GUIDANCE_COUNT] = {
-    { "light",  1, 250, 32 * 1024, false, false, false, "only when the agent is stuck · 1 consultation per request · short answers" },
-    { "normal", 3, 400, 48 * 1024, false, false, true,  "when the work is hard · 3 per request" },
-    { "strong", 6, 700, 96 * 1024, true,  false, true,  "early and often · 6 per request · concrete steps · and reviews the work before a request ends" },
-    { "max",   10, 900, 96 * 1024, true,  true,  true,  "as strong, 10 per request · and checks the first change of a request before it is made" },
+    { "light",  1, 250, 32 * 1024, false, false, false, false, "only when the agent is stuck · 1 consultation per request · short answers" },
+    { "normal", 3, 400, 48 * 1024, false, false, false, true,  "when the work is hard · 3 per request" },
+    { "strong", 6, 700, 96 * 1024, true,  false, false, true,  "early and often · 6 per request · concrete steps · and reviews a request that changed a lot (40 lines or 3 files) before it ends" },
+    { "max",   10, 900, 96 * 1024, true,  true,  true,  true,  "as strong, 10 per request · reviews any change before the request ends · and checks the first change of a request before it is made" },
 };
+
+/* Changed lines of a unified diff: the lines that add or remove text, not the ---/+++ headers. */
+int diff_changed_lines(const char *d) {
+    int n = 0;
+    for (const char *p = d ? d : ""; *p; ) {
+        if ((*p == '+' && strncmp(p, "+++", 3)) || (*p == '-' && strncmp(p, "---", 3))) n++;
+        const char *nl = strchr(p, '\n');
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return n;
+}
 
 /* What counts as a tool call that failed, for the advisor stepping in: a result that is an error,
  * or a shell command whose last line says it did not exit with 0. A consultation that could not

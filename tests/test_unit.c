@@ -1018,6 +1018,14 @@ static void test_advisor(void) {
     CHECK(!tool_result_failed("advisor", "error: the advisor has been consulted 6 times", true) && !tool_result_failed("bash", NULL, false));
     CHECK(advisor_guidance_parse("strong") == GUIDANCE_STRONG && advisor_guidance_parse("MAX") == GUIDANCE_MAX && advisor_guidance_parse("ultra") == -1);
     CHECK(ADVISOR_GUIDANCE[GUIDANCE_NORMAL].uses == 3 && !ADVISOR_GUIDANCE[GUIDANCE_NORMAL].review && ADVISOR_GUIDANCE[GUIDANCE_STRONG].review && ADVISOR_GUIDANCE[GUIDANCE_MAX].check_first_edit);
+    for (int i = 0; i < GUIDANCE_COUNT; i++) CHECK(ADVISOR_GUIDANCE[i].desc && *ADVISOR_GUIDANCE[i].desc && ADVISOR_GUIDANCE[i].name && *ADVISOR_GUIDANCE[i].name);
+    CHECK(!ADVISOR_GUIDANCE[GUIDANCE_NORMAL].check_first_edit && ADVISOR_GUIDANCE[GUIDANCE_NORMAL].step_in && !ADVISOR_GUIDANCE[GUIDANCE_LIGHT].step_in && !ADVISOR_GUIDANCE[GUIDANCE_LIGHT].review);
+    /* the review: strong only for a request that changed a lot, max for any change */
+    CHECK(ADVISOR_GUIDANCE[GUIDANCE_STRONG].review && !ADVISOR_GUIDANCE[GUIDANCE_STRONG].review_any && !ADVISOR_GUIDANCE[GUIDANCE_STRONG].check_first_edit);
+    CHECK(ADVISOR_GUIDANCE[GUIDANCE_MAX].review && ADVISOR_GUIDANCE[GUIDANCE_MAX].review_any && !ADVISOR_GUIDANCE[GUIDANCE_NORMAL].review_any);
+    CHECK(diff_changed_lines("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n") == 2);   /* the headers are not counted */
+    CHECK(diff_changed_lines("--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n-a\n-b\n+c\n d\n\\ No newline\n") == 3);
+    CHECK(diff_changed_lines("+one\n+two") == 2 && diff_changed_lines(NULL) == 0 && diff_changed_lines("") == 0);
     for (int i = 1; i < GUIDANCE_COUNT; i++) CHECK(ADVISOR_GUIDANCE[i].uses > ADVISOR_GUIDANCE[i - 1].uses && ADVISOR_GUIDANCE[i].words > ADVISOR_GUIDANCE[i - 1].words);
     g_cfg.advisor_guidance = old_guid;
 

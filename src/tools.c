@@ -245,27 +245,51 @@ int tools_checkpoint_files(int turn, sbuf *names) {
  * the state saved before its first write to what is on disk now, appended to `out`. Returns the
  * number of files that differ. diff(1) does the comparing — it is on every POSIX system, and
  * writing the saved state to a temporary file for it is all it takes. */
+/* One checkpoint against the file as it is now: the unified diff appended to `out`; 1 if the file differs. */
+static int ckpt_diff1(const ckpt_t *c, sbuf *out) {
+    const char *tmpdir = getenv("TMPDIR");
+    char tmp[1100]; snprintf(tmp, sizeof tmp, "%s/corbienest_was_XXXXXX", tmpdir && *tmpdir ? tmpdir : "/tmp");
+    int fd = mkstemp(tmp);
+    if (fd < 0) return 0;
+    size_t off = 0;
+    while (c->existed && off < c->len) { ssize_t w = write(fd, c->content + off, c->len - off); if (w <= 0) break; off += (size_t)w; }
+    close(fd);
+    char *qold = shell_escape(tmp), *qnew = shell_escape(is_file(c->path) ? c->path : "/dev/null"), *qname = shell_escape(c->path);
+    sbuf cmd; sb_init(&cmd);
+    sb_printf(&cmd, "diff -u -L a/%s -L b/%s %s %s 2>&1", qname, qname, qold, qnew);
+    FILE *p = popen(cmd.data, "r");
+    size_t before = out->len;
+    if (p) { char buf[4096]; size_t k; while ((k = fread(buf, 1, sizeof buf, p)) > 0) sb_append(out, buf, k); pclose(p); }
+    int differ = 0;
+    if (out->len > before) { differ = 1; if (out->data[out->len - 1] != '\n') sb_putc(out, '\n'); }
+    sb_free(&cmd); free(qold); free(qnew); free(qname);
+    unlink(tmp);
+    return differ;
+}
+
 int tools_checkpoint_diff(int turn, int step, sbuf *out) {
     int n = 0;
-    const char *tmpdir = getenv("TMPDIR");
     for (int i = 0; i < g_ckpt_n; i++) {
         ckpt_t *c = &g_ckpt[i];
         if (c->turn != turn || c->step != step) continue;
-        char tmp[1100]; snprintf(tmp, sizeof tmp, "%s/corbienest_was_XXXXXX", tmpdir && *tmpdir ? tmpdir : "/tmp");
-        int fd = mkstemp(tmp);
-        if (fd < 0) continue;
-        size_t off = 0;
-        while (c->existed && off < c->len) { ssize_t w = write(fd, c->content + off, c->len - off); if (w <= 0) break; off += (size_t)w; }
-        close(fd);
-        char *qold = shell_escape(tmp), *qnew = shell_escape(is_file(c->path) ? c->path : "/dev/null"), *qname = shell_escape(c->path);
-        sbuf cmd; sb_init(&cmd);
-        sb_printf(&cmd, "diff -u -L a/%s -L b/%s %s %s 2>&1", qname, qname, qold, qnew);
-        FILE *p = popen(cmd.data, "r");
-        size_t before = out->len;
-        if (p) { char buf[4096]; size_t k; while ((k = fread(buf, 1, sizeof buf, p)) > 0) sb_append(out, buf, k); pclose(p); }
-        if (out->len > before) { n++; if (out->data[out->len - 1] != '\n') sb_putc(out, '\n'); }
-        sb_free(&cmd); free(qold); free(qnew); free(qname);
-        unlink(tmp);
+        n += ckpt_diff1(c, out);
+    }
+    return n;
+}
+
+/* What the request that began at `turn` changed on disk: for each file it wrote, the diff from its state before the
+ * request's first write to what is there now, so an edit that was undone counts as nothing. Returns the files that
+ * differ; *lines is the number of changed lines over all of them. */
+int tools_request_changes(int turn, int *lines) {
+    int n = 0; *lines = 0;
+    for (int i = 0; i < g_ckpt_n; i++) {
+        if (g_ckpt[i].turn < turn) continue;
+        bool seen = false; for (int j = 0; j < i; j++) if (g_ckpt[j].turn >= turn && !strcmp(g_ckpt[j].path, g_ckpt[i].path)) { seen = true; break; }
+        if (seen) continue;
+        sbuf d; sb_init(&d);
+        n += ckpt_diff1(&g_ckpt[i], &d);
+        *lines += diff_changed_lines(d.data);
+        sb_free(&d);
     }
     return n;
 }

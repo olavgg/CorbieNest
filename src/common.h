@@ -178,14 +178,15 @@ int    messages_repair(cJSON *msgs);
 #define ADVISOR_QUESTION_MAX 4000
 /* How much the agent leans on the advisor (/advisor guidance). A weak model is a poor judge of
  * when it needs help, so the upper levels have corbienest ask as well: a review before a request
- * that changed files ends, and (max) a check of the request's first change before it is made. */
+ * that changed a lot ends (any change at max), and (max) a check of the request's first change before it is made. */
 enum { GUIDANCE_LIGHT, GUIDANCE_NORMAL, GUIDANCE_STRONG, GUIDANCE_MAX, GUIDANCE_COUNT };
 typedef struct {
     const char *name;
     int    uses;               /* consultations the agent may ask for in one request */
     int    words;              /* how long the advice may be */
     size_t brief_max;          /* bytes it is shown at most, whatever the window: reading it is what the user waits for */
-    bool   review;             /* it reviews a request that changed files before the request ends */
+    bool   review;             /* it reviews a request that changed a lot before the request ends */
+    bool   review_any;         /* that review is for any change; without it, only for a substantial one (ADVISOR_REVIEW_LINES / _FILES) */
     bool   check_first_edit;   /* it checks the first change of a request before the change is made */
     bool   step_in;            /* it is brought in, unasked, when the agent's tool calls keep failing (ADVISOR_FAIL_ROUNDS) */
     const char *desc;          /* for the picker */
@@ -207,7 +208,9 @@ void  advisor_plan_for(const char *advisor, int trained_ctx, advisor_plan *p);  
 char *advisor_brief(cJSON *msgs, int keep, size_t budget, const char *env, bool plan_mode, const char *rules, const char *question, int words);
 #define ADVISOR_WINDOW_DEFAULT (15 * 60)   /* a long request gets its consultations again every quarter of an hour */
 #define ADVISOR_FAIL_ROUNDS 2    /* rounds of tool calls in a row with a failure in them before the advisor steps in (step_in) */
-#define ADVISOR_REVIEW_CALLS 4   /* tool calls from which a request is reviewed even though it wrote no file (review) */
+#define ADVISOR_REVIEW_LINES 40  /* changed lines from which a request is reviewed at guidance strong (review, not review_any) */
+#define ADVISOR_REVIEW_FILES 3   /* or files that differ from which it is reviewed at strong */
+int   diff_changed_lines(const char *d);                  /* lines of a unified diff that add or remove something (not the --- +++ headers) */
 bool  tool_result_failed(const char *name, const char *result, bool error);   /* an error result, or a shell command that did not exit with 0 */
 #define ADVISOR_REVIEW_OK "LGTM"   /* what the advisor answers a review or a check with when nothing needs to change */
 bool  advisor_approves(const char *advice);   /* the answer is ADVISOR_REVIEW_OK and not much more */
@@ -565,6 +568,7 @@ bool tools_enter(const char *root);                /* a tool call runs in root (
 void tools_leave(void);                            /* back to the directory tools_enter() left */
 int  tools_shell_in(const char *dir, const char *cmd, int timeout_s, sbuf *out, bool *interrupted, const char *busy, const char *verb);   /* a shell command in dir (NULL = here), its exit code; -1 if it could not run */
 int  tools_checkpoint_diff(int turn, int step, sbuf *out);   /* what that step did to the files it wrote, as unified diffs; returns files that differ */
+int  tools_request_changes(int turn, int *lines);            /* what the request from `turn` changed on disk, against its first write to each file; files that differ, changed lines in *lines */
 int  tools_checkpoint_files(int turn, sbuf *names);/* files changed in that request or later */
 int  tools_checkpoint_restore(int turn);           /* put them back; returns files restored */
 void tools_checkpoint_clear(void);

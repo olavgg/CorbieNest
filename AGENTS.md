@@ -261,8 +261,8 @@ build must be warning-free with `-Wall -Wextra`.
   `begin_request()`), whatever comes of it, so it cannot loop. A small model does not ask when
   it should, so being told to is not what the levels rest on: corbienest asks for it — from `normal`,
   `advisor_step_in()` once `ADVISOR_FAIL_ROUNDS` rounds of tool calls in a row had a failure
-  (`tool_result_failed()`); from `strong`, the review (files changed, or `ADVISOR_REVIEW_CALLS`
-  tool calls).
+  (`tool_result_failed()`); from `strong`, the review (a request that changed `ADVISOR_REVIEW_LINES` lines or
+  `ADVISOR_REVIEW_FILES` files, any change at `max`; `tools_request_changes()`).
   To make a level lean harder, add a trigger of that kind; stronger wording alone changes little.
   The agent's own limit (`advisor_guidance()->uses`) is per request, and so that a request of an
   hour is not held to the number that suits a question, `advisor_window_roll()` starts the count

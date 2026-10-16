@@ -36,7 +36,6 @@ static bool   g_advisor_reviewed = false;        /* this request's review before
 static bool   g_advisor_checked = false;         /* and the check of its first change (max) */
 static bool   g_advisor_stepped_in = false;      /* and its stepping in when the tool calls kept failing (normal and up) */
 static int    g_fail_rounds = 0;                 /* rounds of tool calls in a row, in this request, with a failure in them */
-static int    g_request_calls0 = 0;              /* g_session.tool_calls when this request began */
 
 /* The commands, each with the line the suggestions under the input field show for it. */
 static const struct { const char *name, *desc; } SLASH_CMDS[] = {
@@ -102,7 +101,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host" },
     { "/advisor", "off:no advisor|guidance:how much the agent leans on it|effort:how hard it thinks|window:minutes after which a long request gets its consultations again|ctx:its context window" },
     { "/subagent", "default:the model doing the work|effort:how hard the sub-agents' model thinks" },
-    { "/advisor guidance", "light:consulted rarely|normal:the default — and brought in when tool calls keep failing|strong:also reviews the work before a request ends|max:also checks the first change before it is made" },
+    { "/advisor guidance", "light:consulted rarely|normal:the default — and brought in when tool calls keep failing|strong:also reviews a request that changed a lot before it ends|max:also reviews any change, and checks the first change before it is made" },
     { "/advisor ctx", "auto:the main window, within the advisor's bounds" },
     { "/advisor window", "15:the default, a quarter of an hour|off:never: the limit holds for the whole request" },
     { "/usage", "price:what a model costs per million tokens — MODEL IN OUT, or MODEL default" },
@@ -290,7 +289,7 @@ static int begin_request(void) {
     if (g_prev_request_first >= 0 && g_prev_request_first <= first) elide_old_tool_results(g_prev_request_first);
     g_prev_request_first = first;
     g_advisor_uses = 0; g_advisor_since = time(NULL); g_advisor_reviewed = g_advisor_checked = g_advisor_stepped_in = false;
-    g_fail_rounds = 0; g_request_calls0 = g_session.tool_calls;
+    g_fail_rounds = 0;
     tools_checkpoint_turn(first);
     return first;
 }
@@ -1097,7 +1096,7 @@ static char *build_system_prompt(void) {
             else
                 sb_printf(&b, "Lean on it — it is there to be used, and a wrong turn costs more than a question: once you have read the code involved, ask before you commit to an approach "
                     "(put your plan in the question), again before each non-trivial change, and as soon as a build, a test or a command fails in a way you do not understand at once — "
-                    "do not try a second fix on a guess. It reviews your work by itself before a request ends in which you changed files or made several tool calls, "
+                    "do not try a second fix on a guess. It reviews your work by itself before a request ends in which you changed a lot (many lines or several files; at the top level, any change), "
                     "and it is brought in when your tool calls keep failing%s. ",
                     g->check_first_edit ? "; it also checks the first change of a request before it is made" : "");
             if (g->uses == 1) sb_puts(&b, "Not for what a tool call can tell you, and at most once per request");
@@ -1883,8 +1882,8 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
  * model's prompt.
  *
  * How much it is leaned on is /advisor guidance (ADVISOR_GUIDANCE in util.c): from strong up,
- * corbienest consults it as well — it reviews a request that changed files before the request
- * ends, and at max it checks the request's first change before the change is made. Those two
+ * corbienest consults it as well — it reviews a request that changed a lot before the request
+ * ends (any change at max), and at max it checks the request's first change before the change is made. Those two
  * come as a tool call of the agent's own (advisor_inject()), so the conversation keeps the shape
  * every chat template knows, and they do not count against the agent's consultations. */
 static const char *effort_label(const char *model, const model_info *mi);
@@ -2133,11 +2132,17 @@ static void advisor_inject(cJSON *reply, const char *label, const char *result) 
     cJSON_AddItemToArray(g_messages, tool_result_message("advisor", id, result));
 }
 
-/* guidance strong and up: before a request that changed files ends, the advisor looks at it */
+/* guidance strong and up: before a request that changed a lot ends, the advisor looks at it. Strong reviews one
+ * that changed ADVISOR_REVIEW_LINES lines or ADVISOR_REVIEW_FILES files; max any change. Tool calls alone are not a change: git work and
+ * a reading run are not reviewed. Edits made by a shell command (sed, a script) are not checkpoints, so they are not
+ * counted. */
 static bool advisor_review_due(void) {
-    return g_cfg.advisor && advisor_guidance()->review && !g_advisor_reviewed && g_model_tools && !g_cfg.no_tools
-        && g_cfg.mode != MODE_PLAN && g_prev_request_first >= 0
-        && (tools_checkpoint_files(g_prev_request_first, NULL) > 0 || g_session.tool_calls - g_request_calls0 >= ADVISOR_REVIEW_CALLS);
+    if (!(g_cfg.advisor && advisor_guidance()->review && !g_advisor_reviewed && g_model_tools && !g_cfg.no_tools
+          && g_cfg.mode != MODE_PLAN && g_prev_request_first >= 0)) return false;
+    if (tools_checkpoint_files(g_prev_request_first, NULL) == 0) return false;
+    if (advisor_guidance()->review_any) return true;
+    int lines = 0, files = tools_request_changes(g_prev_request_first, &lines);
+    return files >= ADVISOR_REVIEW_FILES || lines >= ADVISOR_REVIEW_LINES;
 }
 
 /* normal and up: the tool calls have failed ADVISOR_FAIL_ROUNDS rounds in a row. A small model
@@ -2540,8 +2545,8 @@ static bool run_turn(void) {
             }
             if (aborted && calls && cJSON_GetArraySize(calls) > 0) answer_calls_unrun(calls, TOOL_NOT_RUN);
             print_stats(&st);
-            /* guidance strong and up: the advisor looks at a request that changed files before it
-             * ends; what it finds goes to the agent, which gets another round for it */
+            /* guidance strong and up: the advisor looks at a request that changed a lot before it
+             * ends (any change at max); what it finds goes to the agent, which gets another round for it */
             if (!aborted && advisor_review_due() && advisor_review(reply)) { round_first = cJSON_GetArraySize(g_messages) - 1; inject_queued(); continue; }
             if (!aborted) { check_model_placement(false); maybe_auto_compact(false, NULL); }
             return aborted;
@@ -3713,8 +3718,8 @@ static void cmd_help(void) {
            "                        (NAME-cloud, after `ollama signin`) or a hosted API: xai:MODEL, openai:MODEL, anthropic:MODEL (key from XAI_API_KEY,\n"
            "                        OPENAI_API_KEY, ANTHROPIC_API_KEY). It is shown the conversation and answers with advice; it has no tools.\n"
            "                        /advisor guidance light|normal|strong|max (how much the agent leans on it: consultations per request, how\n"
-           "                        detailed; from normal it is brought in, unasked, when tool calls keep failing; strong+ also reviews the work before a\n"
-           "                        request ends, max checks the first change before it is made)\n"
+           "                        detailed; from normal it is brought in, unasked, when tool calls keep failing; strong+ also reviews a request that\n"
+           "                        changed a lot (40 lines or 3 files) before it ends; max reviews any change, and checks the first change)\n"
            "                        /advisor effort [LEVEL] (how hard it thinks) · /advisor ctx N|auto (its context window; auto = the main one, at most 16k)\n"
            "                        /advisor window MINUTES|off (a request that runs long gets its consultations again after that long; default 15)\n"
            "  /skills [reload|new NAME]  list skills (SKILL.md files); run one with /NAME [args]\n"

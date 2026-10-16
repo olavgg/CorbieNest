@@ -584,8 +584,8 @@ the advisor — more tokens spent on advice, fewer spent on the agent going the 
 |---|---|---|---|---|
 | `light` | 1 | only when it is stuck | ≤ ~250 words | — |
 | `normal` (default) | 3 | when the work is hard (above) | ≤ ~400 words | it is **brought in** when tool calls have failed two rounds in a row |
-| `strong` | 6 | after reading the code and before committing to an approach, before each non-trivial change, when a build or test fails in a way it does not understand | ≤ ~700 words, concrete: file, function, the lines to change | that, and a **review** of the work before a request ends in which files changed or four or more tool calls were made |
-| `max` | 10 | as `strong` | ≤ ~900 words, as concrete | as `strong`, and a **check** of the request's first change before it is made |
+| `strong` | 6 | after reading the code and before committing to an approach, before each non-trivial change, when a build or test fails in a way it does not understand | ≤ ~700 words, concrete: file, function, the lines to change | that, and a **review** of a request that changed a lot before it ends: 40 changed lines or 3 files (git work and tool calls alone are not reviewed) |
+| `max` | 10 | as `strong` | ≤ ~900 words, as concrete | as `strong`, but a **review** of any change before the request ends, and a **check** of the request's first change before it is made |
 
 The limit is per request — one message of yours, however much work it sets off — and a request
 that runs long gets its consultations again every **15 minutes**: `/advisor window MINUTES`
@@ -594,7 +594,7 @@ run, and it is saved as `advisor_window=`. When the limit is reached the agent i
 until it can ask again.
 
 The review, the check and the stepping in do not count against the agent's consultations, and
-each happens at most once per request (the stepping in once per window). They are what makes the advisor work with a small model: it
+each happens at most once per request (the stepping in once per window). The review measures what the agent did with its file tools (`write_file`, `edit_file`), against each file's state before the request's first write: an edit that was undone counts as nothing, and an edit made by a shell command (`sed`, a script) is not counted at all. A request that only runs git or reads code is never reviewed. They are what makes the advisor work with a small model: it
 is told to ask, but a model that is going wrong rarely thinks so, and these do not wait for it. They enter the conversation the way a consultation does — as an
 `advisor` call and its result — so the agent reads them as advice, not as something you said:
 
