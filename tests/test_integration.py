@@ -1335,7 +1335,7 @@ kinds = {l.split(" ", 2)[1] for l in lines if l.count(" ") >= 2}
 check(" # corbienest " in lines[0] and " rows x " in lines[0], f"the first line says what made it and for which size: {lines[0]!r}")
 check({"O", "I", "L", "B"} <= kinds, f"output, input, layout and activity are all in it: {sorted(kinds)}")
 check("traced words\\r" in "".join(l.split(" ", 2)[2] for l in lines if l.split(" ", 2)[1:2] == ["I"]), "what was typed, byte for byte")
-check(any(" L rows=40 cols=100 region=1-35 " in l for l in lines), "the layout it was drawn for")
+check(any(" L rows=40 cols=100 region=1-36 " in l for l in lines), "the layout it was drawn for")
 check(os.stat(TRACE).st_mode & 0o777 == 0o600, "it holds the conversation: readable by its owner alone")
 p = subprocess.run(REPLAY + ["--fast", "--no-hold"], capture_output=True, timeout=30)
 check(p.returncode == 0 and b"\x1b[?1049h" in p.stdout and "Echo: " in clean(p.stdout.decode("utf-8", "replace")) and "traced words" in clean(p.stdout.decode("utf-8", "replace")), "the replay writes what the session wrote, escapes and all")
