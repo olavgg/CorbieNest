@@ -789,6 +789,7 @@ check(s.expect("❯ half typed", 5), f"pending text back in the editor without t
 s.send("\x15"); s.send("/mode manual\r"); s.expect("mode: manual")
 
 print("test interactive: slash commands that only report or set something run while the model works")
+s = new_session(["-m", "fake-coder:latest"])   # its own session: it stands alone
 s.send("SLOW\r"); check(s.expect("two"), "streaming")
 s.send("/status\r"); check(s.expect("keep_alive", 5), f"/status answered during generation: {s.text()[-300:]!r}")
 check(s.expect("not checked while the model is working", 3), "the /api/ps placement call is skipped mid-request")
@@ -931,6 +932,7 @@ s.send("/subagent xai:grok-fake\r"); check(s.expect("is an advisor only"), "an a
 s.send("/subagent default\r"); check(s.expect("run on the model doing the work"), "/subagent default")
 os.remove(os.path.join(WORK, "hay.txt"))
 print("test interactive: the options the model offers come up as a picker; the choice is the next message")
+s = new_session(["-m", "fake-coder:latest"])   # its own session: it stands alone
 s.send("OPTIONS_REPLY please\r"); check(s.expect("Implementation options", 10), "the reply's options block is offered as a picker")
 check(s.expect("recommended", 3), f"with the recommended one marked: {s.text()[-400:]!r}")
 s.send("\x1b[A"); s.send("\r"); check(s.expect("Echo: Go with this: Lock file — simple, but a crash leaves it behind", 10), "arrow up and Enter: that option is the next message")
