@@ -33,8 +33,10 @@ The complete reference is in [DOCUMENTATION.md](DOCUMENTATION.md).
 
 Dependencies: a C11 compiler, `make`, [cJSON](https://github.com/DaveGamble/cJSON) and
 [libcurl](https://curl.se/libcurl/) 7.66 or newer. That is all. The optional
-[notcurses](https://github.com/dankamongmen/notcurses) screen is compiled in when pkg-config
-finds `notcurses`.
+[notcurses](https://github.com/dankamongmen/notcurses) screen is compiled in when libunistring,
+zlib and terminfo (ncurses) are installed: the notcurses core is built from `vendor/notcurses`, so
+no notcurses package is needed (see `vendor/notcurses/README.md`).
+`make NOTCURSES=0` leaves it out in any case.
 
 ```sh
 # Debian 13 (trixie) / Ubuntu 26.04 (resolute)

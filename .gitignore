@@ -7,3 +7,4 @@ compile_commands.json
 *.dSYM/
 .DS_Store
 .notcurses-*
+build/
