@@ -43,6 +43,8 @@ typedef struct {
     unsigned edge_ready, edge_idle;             /* the field's edges while the prompt waits, and while a turn runs */
     unsigned loc;                               /* the location line */
     unsigned select;                            /* the row the keys are on, in the sub-agents strip */
+    unsigned brand, spark_hi, spark_mid, spark_lo;   /* the banner: its title and the spark's head, then its tail */
+    unsigned crow_dark, crow_body, crow_light, crow_beak;   /* the banner's crow: outline, body, highlight, beak */
     unsigned accent, ok, bad, warn, info, blue, magenta, gray;   /* the orange, and the basic codes 32, 31, 33, 36, 34, 35, 90 */
 } theme_t;
 typedef struct {
@@ -51,6 +53,7 @@ typedef struct {
 extern const theme_t *g_theme;
 bool theme_set(const char *name);               /* "theme=NAME": false, and the theme stays, when there is none */
 bool theme_fg_code(int code, unsigned *rgb);    /* the theme's colour of a basic fg code (30-37, 90-97) */
+void theme_recolor(const char *s, sbuf *out, const unsigned *from, const unsigned *to, int count);   /* the 38;2 colours in s that are from[i] become to[i] */
 void theme_map_bytes(theme_map *m, const char *in, size_t n, sbuf *out);   /* the bytes with their themed codes mapped */
 bool theme_map_pending(const theme_map *m);     /* the last write ended inside an escape sequence: its bytes are not out yet */
 const char *th_fg(unsigned rgb);                /* "\x1b[38;2;R;G;Bm" for an RGB colour (a short-lived string) */

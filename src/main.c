@@ -4326,8 +4326,15 @@ static const char *CROW[4][CROW_ROWS] = {
 #define SPARK_TICKS 30                          /* the spark's lap: 30 ticks of TICK_MS (100 ms), once every 3 s */
 #define SPARK_TAIL 4
 static const int CROW_FLAP[CROW_FLAP_TICKS] = { 0, 1, 2, 1, 0, 1, 2, 1, 0, 3 };
-static const char *BOX_EDGE = "\x1b[38;2;74;106;138m";   /* #4A6A8A, a slate blue */
-static const int SPARK_RGB[SPARK_TAIL][3] = { { 230, 251, 255 }, { 143, 227, 255 }, { 79, 184, 224 }, { 58, 143, 184 } };
+#define BOX_EDGE (th_fg(g_theme->crow_dark))   /* the box's outline: a slate blue, the crow's dark (theme.c) */
+/* the spark's colours, head first: the theme's (theme.c) */
+static unsigned spark_col(int d) { return d == 0 ? g_theme->brand : d == 1 ? g_theme->spark_hi : d == 2 ? g_theme->spark_mid : g_theme->spark_lo; }
+/* the crow's art in the theme's colours: the art is written with the default palette's RGB, which are read here as roles */
+static void crow_out(sbuf *o, const char *art) {
+    static const unsigned from[5] = { 0x4A6A8Au, 0x6B7890u, 0xA9B6CCu, 0x7A6650u, 0xE6FBFFu };
+    const unsigned to[5] = { g_theme->crow_dark, g_theme->crow_body, g_theme->crow_light, g_theme->crow_beak, g_theme->brand };
+    theme_recolor(art, o, from, to, 5);
+}
 
 struct box_item { int kind; int crow; sbuf text; };   /* kind: 0 left, 1 centred, 2 a row of the crow */
 static struct { int ml, bw, n, t; struct box_item it[BOX_ITEMS]; } g_box;
@@ -4369,7 +4376,7 @@ static void box_edge(sbuf *o, int k, int spark, int P, const char *glyph, int *l
     int d = spark < 0 ? -1 : ((spark - k) % P + P) % P;
     int want = d >= 0 && d < SPARK_TAIL ? 1 + d : 0;
     if (*last != want) {
-        if (want) sb_printf(o, "\x1b[38;2;%d;%d;%dm", SPARK_RGB[d][0], SPARK_RGB[d][1], SPARK_RGB[d][2]);
+        if (want) sb_puts(o, th_fg(spark_col(d)));
         else sb_puts(o, BOX_EDGE);
         *last = want;
     }
@@ -4386,8 +4393,8 @@ static int box_lines(int frame, int spark) {
             int bx = bw - BANNER_X_FROM_RIGHT - BANNER_X_W / 2;   /* the close button's first cell */
             for (int x = 0; x < bw; x++) {
                 if (row == 0 && x >= bx && x < bx + BANNER_X_W) {   /* "[×]": bold, the × brightest: the close button */
-                    if (x == bx + 1) sb_puts(o, "\x1b[1;38;2;230;251;255m×");
-                    else sb_printf(o, "\x1b[1;38;2;%d;%d;%dm%s", SPARK_RGB[3][0], SPARK_RGB[3][1], SPARK_RGB[3][2], x == bx ? "[" : "]");
+                    if (x == bx + 1) sb_printf(o, "\x1b[1m%s×", th_fg(g_theme->brand));
+                    else sb_printf(o, "\x1b[1m%s%s", th_fg(g_theme->spark_lo), x == bx ? "[" : "]");
                     last = -1;   /* the button's colours: the next edge cell names its own */
                     continue;
                 }
@@ -4401,7 +4408,7 @@ static int box_lines(int frame, int spark) {
         box_edge(o, box_k(bw, H, row, 0), spark, P, "│", &last);
         sb_puts(o, C_RESET " ");
         sbuf t; sb_init(&t);
-        if (it->kind == 2) sb_puts(&t, CROW[frame][it->crow]);
+        if (it->kind == 2) crow_out(&t, CROW[frame][it->crow]);
         else box_cut(&t, it->text.data ? it->text.data : "", inner);
         int w = plain_width(t.data ? t.data : ""), lp = it->kind == 0 ? 0 : (inner - w) / 2;
         for (int i = 0; i < lp; i++) sb_putc(o, ' ');
@@ -4482,7 +4489,7 @@ static bool box_title(void) {
             w += gw + (p != WORD && gap ? 1 : 0);
         }
         if (w <= inner) {
-            for (int i = 0; i < 3; i++) { box_add(1, C_BOLD "\x1b[38;2;230;251;255m%s" C_RESET, r[i].data ? r[i].data : ""); }
+            for (int i = 0; i < 3; i++) { box_add(1, C_BOLD "%s%s" C_RESET, th_fg(g_theme->brand), r[i].data ? r[i].data : ""); }
             for (int i = 0; i < 3; i++) sb_free(&r[i]);
             return true;
         }

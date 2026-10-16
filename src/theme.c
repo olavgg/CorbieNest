@@ -18,6 +18,8 @@ static const theme_t THEMES[] = {
         .field_text = 0xFFF1B8u, .field_bg = 0x151922u,
         .edge_ready = 0x5FD75Fu, .edge_idle = 0x3B4252u,
         .loc = 0xAF5F87u, .select = 0x2A2F3Au,
+        .brand = 0xE6FBFFu, .spark_hi = 0x8FE3FFu, .spark_mid = 0x4FB8E0u, .spark_lo = 0x3A8FB8u,
+        .crow_dark = 0x4A6A8Au, .crow_body = 0x6B7890u, .crow_light = 0xA9B6CCu, .crow_beak = 0x7A6650u,
         .accent = 0xF0883Eu,
         .ok = 0xA3BE8Cu, .bad = 0xBF616Au, .warn = 0xEBCB8Bu,
         .info = 0x56B6C2u, .blue = 0x81A1C1u, .magenta = 0xB48EADu, .gray = 0x7C8799u,
@@ -51,6 +53,33 @@ bool theme_fg_code(int code, unsigned *rgb) {
     }
     if (code >= 90) *rgb = code == 90 ? t->gray : *rgb;   /* 90 is grey; the bright ones keep the theme's hue */
     return true;
+}
+
+/* A string with truecolour SGR (38;2;R;G;B) in it, copied with each colour that equals from[i] replaced by to[i].
+ * The banner's crow is written with its colours as literals; the theme says what they are. */
+void theme_recolor(const char *s, sbuf *out, const unsigned *from, const unsigned *to, int count) {
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n; ) {
+        if (!strncmp(s + i, "38;2;", 5)) {
+            int v[3], k = 0; size_t j = i + 5;
+            while (k < 3 && j < n && s[j] >= '0' && s[j] <= '9') {
+                int x = 0;
+                while (j < n && s[j] >= '0' && s[j] <= '9') x = x * 10 + (s[j++] - '0');
+                v[k++] = x;
+                if (k < 3 && j < n && s[j] == ';') j++;
+            }
+            if (k == 3) {
+                unsigned rgb = ((unsigned)v[0] << 16) | ((unsigned)v[1] << 8) | (unsigned)v[2];
+                int hit = -1;
+                for (int c = 0; c < count && hit < 0; c++) if (from[c] == rgb) hit = c;
+                if (hit >= 0) {
+                    sb_printf(out, "38;2;%u;%u;%u", (to[hit] >> 16) & 255, (to[hit] >> 8) & 255, to[hit] & 255);
+                    i = j; continue;
+                }
+            }
+        }
+        sb_putc(out, s[i]); i++;
+    }
 }
 
 static void put_rgb_params(sbuf *o, unsigned rgb) {
