@@ -10,8 +10,11 @@ confirmed before it runs.
 ## Features
 
 - **Local or hosted models.** Ollama models, or Anthropic's Claude as the model that does the work
-  (`--model anthropic:claude-haiku-5-5`). A stronger model can be consulted as an *advisor*
-  (`--advisor`), locally, on Ollama's cloud, or through xAI, OpenAI or Anthropic.
+  (`--model anthropic:claude-haiku-5-5`).
+- **An advisor for cheaper models.** A stronger model can be consulted as an *advisor* (`--advisor`),
+  locally, on Ollama's cloud, or through xAI, OpenAI or Anthropic. The advisor lets a weaker, much
+  cheaper model do the work and get close to the performance of the frontier models: the stronger
+  one is asked only for advice on the hard decisions and for reviews.
 - **Tools with confirmation.** Read, write and edit files, grep, run shell and git commands,
   and look documentation up on the web. Four permission modes, from `manual` to `auto`.
 - **Sub-agents.** A read-only agent investigates a question in its own context and reports
