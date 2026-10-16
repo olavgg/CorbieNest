@@ -962,7 +962,7 @@ check("stopped after" not in clean(s.out[s.mark:].decode("utf-8", "replace")), "
 check(s.expect("› never mind, do this instead", 8), "and the message reaches the model")
 check(s.expect("Echo: never mind, do this instead", 15), "which is called with it right away")
 msgs = requests()[-1]["messages"]
-check(any(m["role"] == "tool" and "stopped after 25 tool round" in m["content"] for m in msgs),
+check(any(m["role"] == "tool" and "REPORT: found it in sub-slept" in m["content"] for m in msgs),
       f"the parent gets what the sub-agent had gathered, not an error: {[m['role'] for m in msgs[-4:]]}")
 s.send("/mode manual\r"); s.expect("mode: manual")
 
