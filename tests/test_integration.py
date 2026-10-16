@@ -1821,12 +1821,13 @@ s.send("TOOL_ADVISOR SLOWADVICE again\r"); seen(s, "⤷ advisor"); time.sleep(0.
 check(seen(s, "⎿ interrupted", 10), "Esc skips it"); check(seen(s, "Tool said: error: the consultation was interrupted", 15), "and the turn carries on")
 s.send("/cost\r"); check(seen(s, "advisor       2 consultations "), f"/cost counts the two that gave advice (the skipped one did not): {since_send(s)[-300:]!r}")
 s.send("/usage\r"); check(seen(s, "local: no charge") and "fake-coder:latest" in since_send(s), f"/usage lists the model doing the work: {since_send(s)[-400:]!r}")
+s.send("\x1b"); s.expect("(no such text)", 0.5)   # a bare /usage opens an overlay that holds the output back until Esc
 check(seen(s, "no price known") and re.search(r"xai:grok-fake\s+\d+ calls?\s+↑", since_send(s)), f"and the hosted advisor with its own tokens — a model the price list does not know: {since_send(s)[-400:]!r}")
 seen(s, "[ready]", 60)   # the reply to the queued message may still be streaming: /usage runs only when the prompt is ready
-s.send("\x1b"); s.expect("(no such text)", 0.5)   # an overlay from the /usage check before, if still up, holds the output back: Esc closes it
 s.send("/usage price xai:grok-fake 2 6\r"); check(seen(s, "xai:grok-fake: $2 in · $6 out per million tokens"), "/usage price sets one")
 check("price.xai:grok-fake=2/6" in open(CFG2_FILE).read(), "saved in the config")
 s.send("/usage\r"); check(seen(s, "set with /usage price") and re.search(r"≈ \$\d+\.\d+", since_send(s)), f"and the cost is estimated from it: {since_send(s)[-400:]!r}")
+s.send("\x1b"); s.expect("(no such text)", 0.5)
 check(seen(s, "estimated cost"), "with a total")
 s.send("TOOL_ADVISOR priced\r"); check(seen(s, "Tool said: ADVICE") and re.search(r"▸ advice · \S+ tokens · \d+s · ≈ \$\d+\.\d+", since_send(s)), f"a consultation of a priced model says what it came to: {since_send(s)[-400:]!r}")
 s.send("/cost\r"); check(seen(s, "est. cost     ≈ $"), f"and /cost has the session's estimate: {since_send(s)[-300:]!r}")
