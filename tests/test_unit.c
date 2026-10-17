@@ -266,9 +266,25 @@ static void test_tools_body(void *ud) {
     a = cJSON_CreateObject(); cJSON_AddStringToObject(a, "path", "bin.dat");
     CHECK(tools_execute("read_file", a, &out) == TOOL_ERROR); cJSON_Delete(a); CHECK(strstr(out.data, "binary") != NULL); sb_clear(&out);
 
+    /* todo_write: the list is checked, then kept (and an empty one clears it) */
+    cJSON *tl = cJSON_Parse("{\"todos\":[{\"content\":\"read\",\"status\":\"completed\"},{\"content\":\"edit\",\"status\":\"in_progress\"},{\"content\":\"test\",\"status\":\"pending\"}]}");
+    CHECK(tools_execute("todo_write", tl, &out) == TOOL_OK && tools_todos_get() && cJSON_GetArraySize(tools_todos_get()) == 3);
+    CHECK(strstr(out.data, "Tasks (1 of 3 done)") && strstr(out.data, "◐ edit")); sb_clear(&out); cJSON_Delete(tl);
+    tl = cJSON_Parse("{\"todos\":[{\"content\":\"a\",\"status\":\"in_progress\"},{\"content\":\"b\",\"status\":\"in_progress\"}]}");
+    CHECK(tools_execute("todo_write", tl, &out) == TOOL_ERROR && strstr(out.data, "only one task")); sb_clear(&out); cJSON_Delete(tl);
+    tl = cJSON_Parse("{\"todos\":[{\"content\":\"a\",\"status\":\"doing\"}]}");
+    CHECK(tools_execute("todo_write", tl, &out) == TOOL_ERROR && strstr(out.data, "status must be")); sb_clear(&out); cJSON_Delete(tl);
+    tl = cJSON_Parse("{\"todos\":\"x\"}");
+    CHECK(tools_execute("todo_write", tl, &out) == TOOL_ERROR && strstr(out.data, "must be an array")); sb_clear(&out); cJSON_Delete(tl);
+    tl = cJSON_Parse("{\"todos\":[{\"status\":\"pending\"}]}");
+    CHECK(tools_execute("todo_write", tl, &out) == TOOL_ERROR && strstr(out.data, "no content")); sb_clear(&out); cJSON_Delete(tl);
+    tl = cJSON_Parse("{\"todos\":[]}");
+    CHECK(tools_execute("todo_write", tl, &out) == TOOL_OK && strstr(out.data, "cleared") && tools_todos_get() && !cJSON_GetArraySize(tools_todos_get())); sb_clear(&out); cJSON_Delete(tl);
+    tools_todos_set(NULL);
+
     /* tool definitions are well-formed */
     cJSON *defs = tools_definitions();
-    CHECK(cJSON_GetArraySize(defs) == 8);   /* the seven, and exit */
+    CHECK(cJSON_GetArraySize(defs) == 9);   /* the seven, todo_write, and exit */
     cJSON *t; cJSON_ArrayForEach(t, defs) {
         cJSON *f = cJSON_GetObjectItem(t, "function");
         CHECK(cJSON_IsString(cJSON_GetObjectItem(f, "name")));

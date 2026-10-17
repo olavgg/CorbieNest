@@ -261,6 +261,7 @@ Cycle with **Shift+Tab** at the prompt, or set one with `/mode NAME`, `--mode NA
 | `write_file(path, content)` | yes — shows a preview |
 | `edit_file(path, old_string, new_string, replace_all?)` | yes — shows a diff |
 | `bash(command, timeout?)` | yes — shows the command; output/exit code returned to the model |
+| `todo_write(todos)` | none — keeps the task list of the request, shown in the transcript and saved with the session. Send the whole list each time, with each task `pending`, `in_progress` (at most one) or `completed`; an empty list clears it. For work of three or more steps; the sub-agents do not have it |
 | `web_search(query, max_results?)` | yes — shows the query and the engine; "always allow" saves the engine's **host** |
 | `web_fetch(url, offset?, timeout?)` | yes — shows the URL; "always allow" saves the **host** |
 | `task(description, prompt)` | none for the call itself — runs a **sub-agent**: a fresh, read-only agent loop (read_file, list_dir, grep, bash, web_search, web_fetch — with the usual confirmations) that investigates and returns a report as the tool result, keeping the noise out of the main context. Its tool calls are echoed as `⎿ grep(…)` lines and the report is previewed. Sub-agents cannot edit files or start further sub-agents. It runs on the model `/subagent` names, at that model's effort, and its tokens are priced as that model's |

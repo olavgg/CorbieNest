@@ -35,7 +35,7 @@ bool tools_no_confirm = false;   /* set by the caller for user-typed "!cmd": no 
 void tools_reset_permissions(void) { g_always_write = g_always_edit = g_always_bash = g_always_fetch = false; }
 const char *tools_summary_line(void) {
     static char b[160];
-    snprintf(b, sizeof b, "read_file, write_file, edit_file, list_dir, grep, bash, %stask%s", g_cfg.web ? "web_search, web_fetch, " : "", g_cfg.advisor ? ", advisor" : "");
+    snprintf(b, sizeof b, "read_file, write_file, edit_file, list_dir, grep, bash, todo_write, %stask%s", g_cfg.web ? "web_search, web_fetch, " : "", g_cfg.advisor ? ", advisor" : "");
     return b;
 }
 
@@ -394,6 +394,23 @@ cJSON *tools_definitions(void) {
             "Find documentation when you do not know its URL. Returns title, URL and snippet per result; the snippets are not the docs — web_fetch the best one, preferring the project's own domain over blogs and Q&A sites.",
             p, (const char*[]){"query", NULL}));
     }
+
+    p = cJSON_CreateObject();
+    cJSON *ts = cJSON_AddObjectToObject(p, "todos");
+    cJSON_AddStringToObject(ts, "type", "array");
+    cJSON_AddStringToObject(ts, "description", "The whole task list, in order: every task, not only the changed ones. An empty array clears it.");
+    cJSON *it = cJSON_AddObjectToObject(ts, "items");
+    cJSON_AddStringToObject(it, "type", "object");
+    cJSON *ip = cJSON_AddObjectToObject(it, "properties");
+    prop(ip, "content", "string", "What the task is, in a few words.");
+    cJSON *sp = prop(ip, "status", "string", "pending, in_progress (at most one) or completed.");
+    cJSON *en = cJSON_AddArrayToObject(sp, "enum");
+    cJSON_AddItemToArray(en, cJSON_CreateString("pending")); cJSON_AddItemToArray(en, cJSON_CreateString("in_progress")); cJSON_AddItemToArray(en, cJSON_CreateString("completed"));
+    cJSON *rq = cJSON_AddArrayToObject(it, "required");
+    cJSON_AddItemToArray(rq, cJSON_CreateString("content")); cJSON_AddItemToArray(rq, cJSON_CreateString("status"));
+    cJSON_AddItemToArray(arr, mk_tool("todo_write",
+        "Keep a visible task list for the work of this request. Send the whole list each time, with each task's status updated. Use it for work of three or more steps; skip it for a single change or a question.",
+        p, (const char*[]){"todos", NULL}));
 
     p = cJSON_CreateObject();
     cJSON_AddItemToArray(arr, mk_tool("exit",
@@ -1088,6 +1105,48 @@ static tool_status t_task(cJSON *args, sbuf *out) {
 static bool g_exit_asked = false;
 bool tools_exit_asked(void) { return g_exit_asked; }
 void tools_exit_clear(void) { g_exit_asked = false; }
+/* The task list (todo_write): the model's own plan for this request, shown in the transcript and saved with the session.
+ * Not a tool the sub-agents have (run_subagent offers its own list). */
+static cJSON *g_todos;
+cJSON *tools_todos_get(void) { return g_todos; }
+void tools_todos_set(cJSON *list) { cJSON_Delete(g_todos); g_todos = list; }
+void tools_todo_render(sbuf *out) {
+    if (!g_todos || !cJSON_GetArraySize(g_todos)) return;
+    int done = 0, n = 0;
+    cJSON *t;
+    cJSON_ArrayForEach(t, g_todos) { n++; cJSON *s = cJSON_GetObjectItemCaseSensitive(t, "status"); if (cJSON_IsString(s) && !strcmp(s->valuestring, "completed")) done++; }
+    sb_printf(out, "Tasks (%d of %d done)\n", done, n);
+    cJSON_ArrayForEach(t, g_todos) {
+        cJSON *c = cJSON_GetObjectItemCaseSensitive(t, "content"), *s = cJSON_GetObjectItemCaseSensitive(t, "status");
+        const char *st = cJSON_IsString(s) ? s->valuestring : "pending";
+        sb_printf(out, "  %s %s\n", !strcmp(st, "completed") ? "☑" : !strcmp(st, "in_progress") ? "◐" : "☐", cJSON_IsString(c) ? c->valuestring : "");
+    }
+}
+static tool_status t_todo_write(cJSON *args, sbuf *out) {
+    cJSON *todos = cJSON_GetObjectItemCaseSensitive(args, "todos");
+    if (!cJSON_IsArray(todos)) { sb_puts(out, "error: todos must be an array of {content, status}"); return TOOL_ERROR; }
+    cJSON *list = cJSON_CreateArray(), *t;
+    int busy = 0, i = 0;
+    cJSON_ArrayForEach(t, todos) {
+        i++;
+        cJSON *c = cJSON_GetObjectItemCaseSensitive(t, "content"), *s = cJSON_GetObjectItemCaseSensitive(t, "status");
+        const char *st = cJSON_IsString(s) ? s->valuestring : "";
+        if (!cJSON_IsString(c) || !c->valuestring[0]) { cJSON_Delete(list); sb_printf(out, "error: task %d has no content", i); return TOOL_ERROR; }
+        if (strcmp(st, "pending") && strcmp(st, "in_progress") && strcmp(st, "completed")) {
+            cJSON_Delete(list); sb_printf(out, "error: task %d: status must be pending, in_progress or completed", i); return TOOL_ERROR;
+        }
+        if (!strcmp(st, "in_progress")) busy++;
+        cJSON *n = cJSON_CreateObject();
+        cJSON_AddStringToObject(n, "content", c->valuestring); cJSON_AddStringToObject(n, "status", st);
+        cJSON_AddItemToArray(list, n);
+    }
+    if (busy > 1) { cJSON_Delete(list); sb_puts(out, "error: only one task may be in_progress at a time"); return TOOL_ERROR; }
+    tools_todos_set(list);
+    if (!cJSON_GetArraySize(list)) sb_puts(out, "Task list cleared.");
+    else tools_todo_render(out);
+    return TOOL_OK;
+}
+
 static tool_status t_exit(sbuf *out) {
     if (g_in_subagent) { sb_puts(out, "error: a sub-agent cannot end the program"); return TOOL_ERROR; }
     g_exit_asked = true;
@@ -1121,6 +1180,7 @@ tool_status tools_execute(const char *name, cJSON *args, sbuf *out) {
     else if (!strcmp(name, "web_search") || !strcmp(name, "search_web") || !strcmp(name, "search")) st = t_web_search(args, out);
     else if (!strcmp(name, "task")) st = t_task(args, out);
     else if (!strcmp(name, "advisor")) st = t_advisor(args, out);
+    else if (!strcmp(name, "todo_write")) st = t_todo_write(args, out);
     else if (!strcmp(name, "exit")) st = t_exit(out);
     else { sb_printf(out, "error: unknown tool '%s'. Available tools: %s", name, tools_summary_line()); st = TOOL_ERROR; }
     if (tmp) cJSON_Delete(tmp);

@@ -590,6 +590,7 @@ static void cmd_memory(const char *arg) {
 #define SESSIONS_KEEP 100
 static void print_result_preview(const char *text, int lines);
 static void print_result_folded(const char *text, int preview_lines, const char *lead);
+static void print_task_lines(const char *text);
 static void echo_queued(const char *text);
 static void tool_arg_summary(const char *name, cJSON *args, char *out, size_t n);
 
@@ -688,6 +689,7 @@ static void session_save(void) {
         cJSON_AddStringToObject(t, "raw", g_typed[i].raw); cJSON_AddStringToObject(t, "msg", g_typed[i].msg);
         cJSON_AddItemToArray(ty, t);
     }
+    if (tools_todos_get()) cJSON_AddItemReferenceToObject(o, "todos", tools_todos_get());   /* the task list, if the model kept one */
     cJSON_AddItemReferenceToObject(o, "messages", g_messages);
     char *txt = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
@@ -780,7 +782,8 @@ static void replay_conversation(void) {
         } else if (!strcmp(role, "tool")) {
             cJSON *tn = cJSON_GetObjectItemCaseSensitive(m, "tool_name");
             const char *name = cJSON_IsString(tn) ? tn->valuestring : "";
-            print_result_folded(text ? text : "", (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8, NULL);
+            if (!strcmp(name, "todo_write")) print_task_lines(text);
+            else print_result_folded(text ? text : "", (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8, NULL);
         }
     }
     if (n > from) printf(C_DIM "  — end of the earlier conversation —" C_RESET "\n");
@@ -798,6 +801,9 @@ static bool session_load(const char *id) {
     memory_flush();
     cJSON_Delete(g_messages); g_messages = msgs; g_prev_request_first = -1;
     typed_clear();
+    cJSON *td = cJSON_DetachItemFromObjectCaseSensitive(o, "todos");
+    tools_todos_set(cJSON_IsArray(td) ? td : NULL);
+    if (td && !cJSON_IsArray(td)) cJSON_Delete(td);
     cJSON *ty = cJSON_GetObjectItemCaseSensitive(o, "typed");
     g_typed_known = cJSON_IsArray(ty);
     if (g_typed_known) { cJSON *t; cJSON_ArrayForEach(t, ty) { cJSON *r = cJSON_GetObjectItemCaseSensitive(t, "raw"), *mm = cJSON_GetObjectItemCaseSensitive(t, "msg"); if (cJSON_IsString(r) && cJSON_IsString(mm)) typed_note(r->valuestring, mm->valuestring); } }
@@ -827,6 +833,9 @@ static bool session_load(const char *id) {
     if (g_cfg.interactive) {   /* a one-shot run (-p, a pipe) prints its answer and leaves the ↑ history alone */
         if (g_typed_known) { for (int i = 0; i < g_typed_n; i++) if (g_typed[i].raw[0] && !hist_contains(g_typed[i].raw)) hist_add(g_typed[i].raw); hist_save(); }
         replay_conversation();
+        sbuf tl; sb_init(&tl); tools_todo_render(&tl);
+        if (tl.len) { printf(C_BOLD "Tasks" C_RESET C_DIM " (the list as the session left it)" C_RESET "\n"); print_task_lines(tl.data); }
+        sb_free(&tl);
     }
     cJSON_Delete(o);
     term_status_refresh();
@@ -1153,6 +1162,7 @@ static char *build_system_prompt(void) {
             "used; skip the web when the repo answers it.\n");
         sb_puts(&b,
             "- When the user says they are finished and want to leave (\"exit\", \"bye\", \"that's all\"), reply with a short goodbye and call exit in the same turn; the program ends after that reply. Do not call exit otherwise.\n"
+            "- For work of three or more steps, keep a task list with todo_write: one task per step, at most one in_progress, and mark each completed as you finish it. Skip it for a single change or a question.\n"
             "- Use task to hand a broad, self-contained investigation (\"find all places that…\", \"how does X work across the code\") to a read-only sub-agent "
             "and get back a report, keeping the noise out of this conversation; give it a complete prompt, it knows nothing of this chat.\n");
         if (g_cfg.advisor) {   /* no model name in it: changing the advisor leaves the prompt, and its cache, alone (the guidance does not) */
@@ -1493,6 +1503,19 @@ static int plain_width(const char *s) {
 }
 /* `lead` is what the head starts with (NULL: the usual "  ⎿  "); a bash call's result line passes its
  * header, so the call is one line with its output's fold on it */
+/* A task list is shown whole, not folded: it is the state the user follows. */
+static void print_task_lines(const char *text) {
+    const char *p = text ? text : "";
+    bool first = true;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t l = nl ? (size_t)(nl - p) : strlen(p);
+        printf("%s%.*s" C_RESET "\n", first ? "  ⎿  " : "     ", (int)l, p);
+        first = false;
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
 static void print_result_folded(const char *text, int preview_lines, const char *lead) {
     int total = count_lines(text);
     bool plain = !lead;
@@ -2675,6 +2698,7 @@ static bool run_turn(void) {
             if (g_advisor_said) {}   /* run_advisor() has said what came of it: the advice is not shown twice */
             else if (ts == TOOL_DENIED) printf("%s" C_RED "denied" C_RESET "\n", bashline ? lead : "  ⎿  ");
             else if (ts == TOOL_ERROR) printf("%s" C_RED "%s" C_RESET "\n", bashline ? lead : "  ⎿  ", res);
+            else if (!strcmp(name, "todo_write") && !bashline) print_task_lines(res);
             else print_result_folded(res, (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8, bashline ? lead : NULL);
             if (tool_result_failed(name, res, ts == TOOL_ERROR)) failed = true;
             cJSON_AddItemToArray(g_messages, tool_result_message(name, tool_call_id(call), res));
@@ -4297,7 +4321,7 @@ static int handle_slash(char *line) {
             }
         }
     }
-    else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { memory_flush(); cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); typed_clear(); g_prev_request_first = -1; tools_reset_permissions(); tools_checkpoint_clear(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
+    else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { memory_flush(); cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); typed_clear(); tools_todos_set(NULL); g_prev_request_first = -1; tools_reset_permissions(); tools_checkpoint_clear(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
     else if (!strcmp(cmd, "/compact")) { if (cmd_compact()) session_save(); }
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);

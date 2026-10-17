@@ -548,6 +548,9 @@ typedef enum { TOOL_OK = 0, TOOL_DENIED = 1, TOOL_ERROR = 2 } tool_status;
 extern const char *SEARCH_URL_DEFAULT;   /* web_search engine template, %s = the query */
 cJSON *tools_definitions(void);   /* array of tool defs (Ollama/OpenAI format), caller owns */
 /* Executes tool. Returns status; writes result text into out. */
+cJSON *tools_todos_get(void);          /* the task list the model keeps with todo_write, or NULL */
+void   tools_todos_set(cJSON *list);   /* replaces it (takes the list); NULL clears it */
+void   tools_todo_render(sbuf *out);   /* the list as text: a header with the count, then a line a task */
 tool_status tools_execute(const char *name, cJSON *args, sbuf *out);
 void tools_reset_permissions(void);       /* forget the "always this session" answers */
 bool tools_exit_asked(void);              /* the model called the exit tool: end the program after this turn */

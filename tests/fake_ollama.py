@@ -366,6 +366,12 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "write_file", "arguments": {"path": "hello.py", "content": "def greet(name):  # say hi\n    return 'hi ' + name\n"}}}])
         yield chunk(model, done=True)
         return
+    if "TOOL_TODO" in text:   # a task list: one task done, one in progress, one to do
+        yield chunk(model, tool_calls=[{"function": {"name": "todo_write", "arguments": {"todos": [
+            {"content": "read the code", "status": "completed"}, {"content": "make the change", "status": "in_progress"},
+            {"content": "run the tests", "status": "pending"}]}}}])
+        yield chunk(model, done=True)
+        return
     if "TOOL_WRITE" in text:
         yield chunk(model, tool_calls=[{"function": {"name": "write_file", "arguments": {"path": "made.txt", "content": "made by fake\n"}}}])
         yield chunk(model, done=True)
