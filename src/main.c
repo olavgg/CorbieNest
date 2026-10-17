@@ -81,6 +81,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/init", "have the model write AGENTS.md for this project" },
     { "/cost", "tokens, model calls and time of this session" },
     { "/usage", "tokens per model, the advisor's too, and the estimated cost of the hosted ones" },
+    { "/gzip", "gzipped request bodies: which providers take them; probe NAME [MODEL] checks one (two small calls)" },
     { "/banner", "the Corbie Nest box again, as a window: close it with its X or Esc" },
     { "/diff", "the working-tree diff, without sending it to the model" },
     { "/rewind", "go back to an earlier request: files, conversation or both" },
@@ -114,6 +115,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/advisor ctx", "auto:the main window, within the advisor's bounds" },
     { "/advisor window", "15:the default, a quarter of an hour|off:never: the limit holds for the whole request" },
     { "/usage", "price:what a model costs per million tokens — MODEL IN OUT, or MODEL default" },
+    { "/gzip", "probe:check a provider takes gzipped bodies (PROVIDER [MODEL]; two small calls)|on:gzip on for a provider|off:gzip off for a provider" },
     { "/skills", "reload:read the SKILL.md files again|new:scaffold a skill: /skills new NAME" },
     { "/system", "clear:remove the extra instructions" },
     { "/keepalive", "default:the server's own|30m:half an hour|-1:forever|0:unload right away" },
@@ -3146,6 +3148,7 @@ typedef struct {
     char commit[64];             /* /goal: the commit of its work, which is what it is kept by */
     double metric; bool scored;  /* /goal: what the metric said of it */
     int verdict; char why[200];  /* /goal: its GOAL: line */
+    char *plain; bool gz, gz_retry;   /* a model call of the provider: its plain body (kept for a restart), whether this job went gzipped, and whether this job is the plain retry of a refusal */
 } orch_worker;
 typedef struct {
     const char *request;         /* as the user typed it */
@@ -3182,7 +3185,9 @@ static void worker_call(orch_run *r, int i) {
         const provider_def *p = provider_find(worker_model(w), NULL);
         body = provider_turn_request(w->msgs, r->tools);   /* reads ollama_call; the headers are built here, the thread reads nothing */
         bool ok = body && p && provider_call_headers(worker_model(w), hdrs, &keep, why, sizeof why);
-        w->job = ok ? http_job_start(provider_base_url(p), provider_chat_path(p), body, hdrs) : NULL;
+        free(w->plain); w->plain = ok ? xstrdup(body) : NULL;
+        w->job = ok ? provider_turn_start(p, body, hdrs, true, &w->gz) : NULL;
+        w->gz_retry = false;
         if (ok) sb_free(&keep);
     } else {
         body = ollama_chat_request(w->msgs, r->tools);
@@ -3333,11 +3338,31 @@ static void goal_finish(orch_run *r, int i) {
 }
 
 /* the worker's model call has come back: run the tools it asked for and call again, or take its report to the review */
+/* A gzipped call the server refused: the same body plain, as a job of its own (not an attempt of its own) */
+static bool worker_restart_plain(orch_worker *w) {
+    const provider_def *p = provider_find(worker_model(w), NULL);
+    const char *hdrs[4]; sbuf keep; sb_init(&keep); char why[512] = "";
+    if (!p || !w->plain || !provider_call_headers(worker_model(w), hdrs, &keep, why, sizeof why)) { sb_free(&keep); return false; }
+    w->job = provider_turn_start(p, w->plain, hdrs, false, &w->gz);
+    w->gz_retry = w->job != NULL;
+    sb_free(&keep);
+    return w->job != NULL;
+}
+
 static void worker_step(orch_run *r, int i) {
     orch_worker *w = &r->w[i];
     sbuf body; sb_init(&body); http_result res;
     int rc = http_job_finish(w->job, &body, &res);
     w->job = NULL;
+    if (rc == 0 && w->gz && gzip_refused(res.status, body.data)) {
+        sb_free(&body);
+        if (worker_restart_plain(w)) return;   /* the job on its way is collected by the loop, as the first was */
+        printf("    " C_RED "[%d] ⎿ the model call could not be sent again without gzip" C_RESET "\n", i + 1);
+        task_end(w, T_FAILED, "failed: the model call could not be sent again");
+        return;
+    }
+    if (w->gz_retry && rc == 0 && res.status >= 200 && res.status <= 299) { const provider_def *p = provider_find(worker_model(w), NULL); if (p) provider_gzip_refused(p); }
+    w->gz_retry = false;
     ratelimit_set(worker_model(w), &res.rl);   /* (a worker's call is a call of its own model: the main one unless /goal named another) */
     chat_stats st; char err[512] = "";
     cJSON *reply = rc == 0 ? (worker_remote(w) ? provider_turn_reply(worker_model(w), body.data, res.status, &st, err, sizeof err)
@@ -3662,7 +3687,7 @@ static int orchestrate_run(const char *arg, bool plan) {
                 if (!task_ok(w) && w->objection.len) { sb_puts(&report, "\n\nThe orchestrator's objection:\n"); sb_put_cut(&report, w->objection.data, 2048); }
                 sb_putc(&report, '\n');
                 if (w->msgs) cJSON_Delete(w->msgs);
-                free(w->role_model);
+                free(w->role_model); free(w->plain);
                 sb_free(&w->out); sb_free(&w->objection);
             }
             for (int i = nr; i < ntcap; i++) { orch_worker *w = &run.w[i]; sb_free(&w->out); sb_free(&w->objection); }
@@ -4156,6 +4181,68 @@ static void cmd_models(void) {
 
 static cJSON *model_list_get(int slot, const provider_def *p, const char **why);
 static int provider_slot_of(const provider_def *p) { int slot = 1; while (provider_at(slot - 1) != p) slot++; return slot; }
+
+/* /gzip: which providers' request bodies go gzipped (a body over 4 KB, to a provider that takes it).
+ * /gzip probe NAME [MODEL] checks it with two small calls (plain, then gzipped) and saves what the server said;
+ * /gzip NAME on|off sets it by hand. Ollama is never gzipped: it is this machine's server. */
+static void cmd_gzip(const char *arg) {
+    char buf[256] = "";
+    if (arg) snprintf(buf, sizeof buf, "%s", arg);
+    char *w[3] = { NULL, NULL, NULL }; int nw = 0;
+    for (char *s = buf; nw < 3;) {
+        while (*s == ' ') s++;
+        if (!*s) break;
+        w[nw++] = s;
+        while (*s && *s != ' ') s++;
+        if (*s) *s++ = 0;
+    }
+    if (nw == 0) {
+        printf(C_BOLD "gzip request bodies" C_RESET C_DIM "  (a body over 4 KB; Ollama is never gzipped)" C_RESET "\n");
+        if (!gzip_available()) printf(C_DIM "  this build has no zlib (ZLIB=0): nothing is gzipped" C_RESET "\n");
+        for (int i = 0; provider_at(i); i++) {
+            const provider_def *p = provider_at(i);
+            bool on = false, saved = gzip_get(p->name, &on);
+            const char *state = !saved ? "not probed" : on ? "on" : "off";
+            if (saved && on && gzip_available() && !provider_gzip_wanted(p)) state = "on (refused this session)";
+            else if (saved && on && !gzip_available()) state = "on (no zlib in this build)";
+            const char *key = getenv(p->key_env);
+            printf("  %-12s %-14s %s%s" C_RESET "  %s %s\n", p->name, p->label, saved && on ? C_GREEN : C_DIM, state,
+                   p->key_env, key && *key ? "set" : "not set");
+        }
+        printf(C_DIM "  /gzip probe NAME [MODEL] checks one (two small calls); /gzip NAME on|off sets it" C_RESET "\n");
+        return;
+    }
+    if (!strcmp(w[0], "probe")) {
+        if (nw < 2) { printf(C_DIM "  /gzip probe NAME [MODEL]" C_RESET "\n"); return; }
+        const provider_def *p = NULL;
+        for (int i = 0; (p = provider_at(i)) != NULL; i++) if (!strcmp(p->name, w[1])) break;
+        if (!p) { printf(C_RED "✗ no provider named %s (/advisor lists them)" C_RESET "\n", w[1]); return; }
+        const char *model = nw == 3 ? w[2] : p->example;
+        if (!model) { printf(C_RED "✗ %s needs a model to probe with: /gzip probe %s MODEL" C_RESET "\n", p->name, p->name); return; }
+        if (http_busy()) { printf(C_RED "✗ a request is in flight: /gzip probe when it is done" C_RESET "\n"); return; }
+        char advisor[200]; snprintf(advisor, sizeof advisor, "%s:%s", p->name, model);
+        printf(C_DIM "  probing %s with %s: two calls of one token each" C_RESET "\n", p->name, model);
+        char said[512] = "";
+        int v = provider_gzip_probe(advisor, said, sizeof said);
+        if (v < 0) { printf(C_YELLOW "  %s: %s — nothing saved" C_RESET "\n", p->name, said); return; }
+        gzip_set(p->name, v == 1);
+        config_save();
+        printf("  %s: %s — gzip %s for %s, saved\n", p->name, said, v == 1 ? C_GREEN "on" C_RESET : "off", p->name);
+        return;
+    }
+    if (nw == 2 && (!strcmp(w[1], "on") || !strcmp(w[1], "off"))) {
+        const provider_def *p = NULL;
+        for (int i = 0; (p = provider_at(i)) != NULL; i++) if (!strcmp(p->name, w[0])) break;
+        if (!p) { printf(C_RED "✗ no provider named %s (/advisor lists them)" C_RESET "\n", w[0]); return; }
+        bool on = !strcmp(w[1], "on");
+        gzip_set(p->name, on);
+        config_save();
+        printf("  gzip %s for %s, saved%s\n", on ? "on" : "off", p->name,
+               on && !gzip_available() ? " (this build has no zlib: nothing is compressed)" : on ? " — a refusal still falls back to plain" : "");
+        return;
+    }
+    printf(C_DIM "  /gzip — the list · /gzip probe NAME [MODEL] · /gzip NAME on|off" C_RESET "\n");
+}
 
 /* `/model add ...` and `/model remove ...`: a word, so a model named "add" would still be `/model add:tag` */
 static bool host_command(const char *arg) {
@@ -4654,6 +4741,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/sandbox")) cmd_sandbox(arg);
     else if (!strcmp(cmd, "/cost")) cmd_cost();
     else if (!strcmp(cmd, "/usage")) cmd_usage(arg);
+    else if (!strcmp(cmd, "/gzip")) cmd_gzip(arg);
     else if (!strcmp(cmd, "/banner")) cmd_banner();
     else if (!strcmp(cmd, "/diff")) cmd_diff(arg);
     else if (!strcmp(cmd, "/rewind")) return cmd_rewind();

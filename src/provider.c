@@ -919,6 +919,95 @@ cJSON *provider_list_models(const provider_def *p, int wait_ms, char *err, size_
     return arr;
 }
 
+/* ---------- gzip request bodies ----------
+ * A body goes gzipped to a provider that has been seen to take it (gzip.NAME=1, set by /gzip probe), and only
+ * when it is big enough to gain from it. A refusal is answered with the plain body; a plain call that then
+ * succeeds turns gzip off for that provider for the rest of the session. The config is not written by a
+ * request: only /gzip probe and /gzip NAME on|off save it. */
+#define GZIP_MIN_BYTES 4096
+#define GZIP_SESSION_MAX 24
+static char g_gz_refused[GZIP_SESSION_MAX][64];
+static int  g_n_gz_refused = 0;
+
+static bool gzip_refused_here(const char *name) {
+    for (int i = 0; i < g_n_gz_refused; i++) if (!strcmp(g_gz_refused[i], name)) return true;
+    return false;
+}
+
+bool provider_gzip_wanted(const provider_def *p) {
+    bool on = false;
+    return p && gzip_available() && gzip_get(p->name, &on) && on && !gzip_refused_here(p->name);
+}
+
+void provider_gzip_refused(const provider_def *p) {
+    if (!gzip_refused_here(p->name) && g_n_gz_refused < GZIP_SESSION_MAX) snprintf(g_gz_refused[g_n_gz_refused++], sizeof g_gz_refused[0], "%s", p->name);
+    printf(C_DIM "  %s does not take gzipped request bodies: plain from now on, this session (/gzip probe %s saves that)" C_RESET "\n", p->label, p->name);
+}
+
+/* the bytes that go on the wire for a body: gzipped when the provider takes it and the body is big enough, or
+ * when forced (the probe). False = send the plain body, and *z is NULL. */
+static bool wire_gzip(const provider_def *p, const char *plain, bool force, char **z, size_t *zlen) {
+    *z = NULL; *zlen = 0;
+    size_t n = strlen(plain);
+    if (!force && (n < GZIP_MIN_BYTES || !provider_gzip_wanted(p))) return false;
+    *z = gzip_body(plain, n, zlen);
+    return *z != NULL;
+}
+
+/* /gzip probe: one small call with the plain body and one gzipped (forced, so the probe is the same whatever
+ * the size), each asking for one token. Returns gzip_probe_verdict(): 1 accepted, 0 refused, -1 no answer to go by;
+ * `said` is one line for the user. */
+int provider_gzip_probe(const char *advisor, char *said, size_t n) {
+    const char *model = ""; const provider_def *p = provider_find(advisor, &model);
+    if (!p) { snprintf(said, n, "'%s' is not a hosted model", advisor ? advisor : ""); return -1; }
+    if (!gzip_available()) { snprintf(said, n, "this build has no zlib (ZLIB=0): nothing to compress with"); return -1; }
+    const char *hdrs[4]; sbuf keep; char err[512] = "";
+    if (!provider_call_headers(advisor, hdrs, &keep, err, sizeof err)) { snprintf(said, n, "%s", err); return -1; }
+    provider_request rq; memset(&rq, 0, sizeof rq);
+    rq.system = ""; rq.user = "hi"; rq.max_tokens = 1;
+    model_info mi; memset(&mi, 0, sizeof mi);
+    char *body = provider_request_body(advisor, &mi, &rq);
+    size_t blen = strlen(body), zlen = 0;
+    char *zbody = gzip_body(body, blen, &zlen);
+    if (!zbody) { snprintf(said, n, "could not compress the probe"); free(body); sb_free(&keep); return -1; }
+    const char *path = provider_chat_path(p);
+    sbuf plain_out, gz_out; sb_init(&plain_out); sb_init(&gz_out);
+    http_result pr, gr; memset(&pr, 0, sizeof pr); memset(&gr, 0, sizeof gr);
+    http_headers = hdrs; http_interrupt_fd = -1; http_idle = NULL;
+    int rc1 = http_request_bytes(provider_base_url(p), "POST", path, body, blen, false, &plain_out, NULL, NULL, &pr);
+    int rc2 = rc1 == 0 ? http_request_bytes(provider_base_url(p), "POST", path, zbody, zlen, true, &gz_out, NULL, NULL, &gr) : -1;
+    http_headers = NULL;
+    int v = -1;
+    if (rc1 != 0) snprintf(said, n, "the plain call failed: %s", pr.err);
+    else if (rc2 != 0) snprintf(said, n, "the gzipped call failed: %s", gr.err);
+    else {
+        v = gzip_probe_verdict(pr.status, gr.status, gz_out.data);
+        if (v == 1) snprintf(said, n, "accepted (plain %d, gzipped %d)", pr.status, gr.status);
+        else if (v == 0) {
+            char detail[200] = "";
+            error_detail(gz_out.data ? gz_out.data : "", detail, sizeof detail);
+            snprintf(said, n, "refused the gzipped body (%d)%s%s", gr.status, detail[0] ? ": " : "", detail);
+        } else {
+            char detail[200] = "";
+            error_detail(gz_out.data ? gz_out.data : "", detail, sizeof detail);
+            snprintf(said, n, "no conclusion: plain %d, gzipped %d%s%s", pr.status, gr.status, detail[0] ? ": " : "", detail);
+        }
+    }
+    free(zbody); free(body); sb_free(&keep); sb_free(&plain_out); sb_free(&gz_out);
+    return v;
+}
+
+/* a worker's call, started on a thread: its body gzipped when the provider takes it and allow_gzip is set.
+ * *gzipped says whether it went gzipped (the caller restarts it plain if the server refuses that). */
+http_job *provider_turn_start(const provider_def *p, const char *plain, const char *const *hdrs, bool allow_gzip, bool *gzipped) {
+    char *z = NULL; size_t zl = 0;
+    bool gz = allow_gzip && wire_gzip(p, plain, false, &z, &zl);
+    http_job *j = http_job_start_bytes(provider_base_url(p), provider_chat_path(p), gz ? z : plain, gz ? zl : strlen(plain), gz, hdrs);
+    free(z);
+    *gzipped = gz && j;
+    return j;
+}
+
 char *provider_chat(const char *advisor, const model_info *mi, const provider_request *rq, chat_stats *st, bool *aborted, char *err, size_t n) {
     *aborted = false; err[0] = 0;
     memset(st, 0, sizeof *st);
@@ -939,7 +1028,15 @@ char *provider_chat(const char *advisor, const model_info *mi, const provider_re
     if (rq->idle_ms > 0) http_idle_timeout_ms = rq->idle_ms;
     term_busy(rq->busy ? rq->busy : "consulting");
     sbuf out; sb_init(&out); http_result res;
-    int rc = http_request(provider_base_url(p), "POST", p->style == PROVIDER_MESSAGES ? "/v1/messages" : "/chat/completions", body, &out, NULL, NULL, &res);
+    const char *path = p->style == PROVIDER_MESSAGES ? "/v1/messages" : "/chat/completions";
+    char *zbody; size_t zlen; bool gz = wire_gzip(p, body, false, &zbody, &zlen);
+    int rc = http_request_bytes(provider_base_url(p), "POST", path, gz ? zbody : body, gz ? zlen : strlen(body), gz, &out, NULL, NULL, &res);
+    if (gz && rc == 0 && !res.aborted && gzip_refused(res.status, out.data)) {   /* refused: the same call plain, once */
+        sb_free(&out); sb_init(&out);
+        rc = http_request_bytes(provider_base_url(p), "POST", path, body, strlen(body), false, &out, NULL, NULL, &res);
+        if (rc == 0 && !res.aborted && res.status >= 200 && res.status <= 299) provider_gzip_refused(p);
+    }
+    free(zbody);
     term_busy(NULL);
     http_idle_timeout_ms = idle_was;
     http_headers = NULL; http_idle = NULL; http_interrupt_fd = -1;
@@ -1183,6 +1280,17 @@ static int turn_line(const char *line, size_t len, void *ud) {
     return 0;
 }
 
+/* A streamed turn the server refused as a gzipped body, before anything was shown: it starts again from nothing.
+ * The stats and the start time stay; the rest of the context is as a new turn's. */
+static void turn_restart(turn_ctx *c) {
+    turn_spin_clear(c);
+    cJSON_Delete(c->blocks); sb_free(&c->data);
+    chat_stats *st = c->stats; struct timeval t0 = c->t0;
+    memset(c, 0, sizeof *c);
+    c->stats = st; c->t0 = t0; c->index = -1;
+    md_init(&c->md); sb_init(&c->data); c->blocks = cJSON_CreateArray();
+}
+
 cJSON *provider_turn(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted) {
     *aborted = false;
     ollama_error[0] = 0;
@@ -1219,7 +1327,14 @@ cJSON *provider_turn(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abo
     http_result res;
     int idle_was = http_idle_timeout_ms;
     if (ollama_call.idle_ms > 0) http_idle_timeout_ms = ollama_call.idle_ms;
-    int rc = http_request(provider_base_url(p), "POST", "/v1/messages", body, NULL, turn_line, &c, &res);
+    char *zbody; size_t zlen; bool gz = wire_gzip(p, body, false, &zbody, &zlen);
+    int rc = http_request_bytes(provider_base_url(p), "POST", "/v1/messages", gz ? zbody : body, gz ? zlen : strlen(body), gz, NULL, turn_line, &c, &res);
+    if (gz && rc == 0 && !res.aborted && gzip_refused(res.status, c.error) && !c.got_content && !c.think_tokens && !c.out_chunks) {
+        turn_restart(&c);   /* nothing was shown: the same call plain, once */
+        rc = http_request_bytes(provider_base_url(p), "POST", "/v1/messages", body, strlen(body), false, NULL, turn_line, &c, &res);
+        if (rc == 0 && !res.aborted && res.status >= 200 && res.status <= 299) provider_gzip_refused(p);
+    }
+    free(zbody);
     http_idle_timeout_ms = idle_was;
     http_headers = NULL; http_idle = NULL; http_interrupt_fd = -1;
     term_busy(NULL);
