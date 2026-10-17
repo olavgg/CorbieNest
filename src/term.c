@@ -174,6 +174,7 @@ static int g_queue_n;                       /* messages queued while busy (see t
 static int  g_view_top = -1;                /* scrolled back: the first row shown (see "scrolling back"); -1 = the live view */
 static bool g_view_stale = false;           /* ... and its window has to be painted again (the geometry changed) */
 static char *g_ov_text = NULL;              /* the overlay's text (term_overlay_show): a centred window over the conversation; NULL = none */
+static int g_ov_geo[4] = { -1, -1, -1, -1 };   /* the box last painted: top, left, height, width (-1: none), see modal_paint() */
 /* the banner's modal (term_banner_show): the box's lines, drawn as they are, with the close button at (g_bn_xr, g_bn_xc) */
 static bool g_banner_on = false;
 static sbuf *g_bn = NULL;
@@ -1336,6 +1337,7 @@ static void banner_box(sbuf *o, const bool *only) {
     }
 }
 static void overlay_box(sbuf *o) {
+    g_ov_geo[0] = -1;
     if (!g_ov_text) return;
     if (g_banner_on) { banner_box(o, NULL); return; }
     int region = fs_region(), cols = g_fs_cols > 0 ? g_fs_cols : term_width();
@@ -1371,6 +1373,7 @@ static void overlay_box(sbuf *o) {
     int maxh = region - 2, show = R > maxh ? maxh - 1 : R;   /* the last row says the rest is cut */
     int bh = show + 2 + (R > maxh ? 1 : 0), bw = W + 4;
     int top = (region - bh) / 2 + 1, left = (cols - bw) / 2 + 1; if (left < 1) left = 1;
+    g_ov_geo[0] = top; g_ov_geo[1] = left; g_ov_geo[2] = bh; g_ov_geo[3] = bw;
     sb_printf(o, "\x1b[%d;%dH" C_DIM "┌", top, left);
     for (int i = 0; i < bw - 2; i++) sb_puts(o, "─");
     sb_puts(o, "┐" C_RESET);
@@ -1536,6 +1539,45 @@ void term_banner_hide(void) {
 }
 bool term_banner_open(void) { return g_ui_nc ? nc_banner_open() : g_banner_on; }
 
+/* a box's text, each line cut or padded to `width` cells: the box keeps its size while what is in it changes */
+static void box_pad(sbuf *o, int width) {
+    sbuf p; sb_init(&p);
+    const char *s = o->data ? o->data : "";
+    while (*s) {
+        const char *e = strchr(s, '\n');
+        size_t len = e ? (size_t)(e - s) : strlen(s);
+        int w = vis_width_n(s, len);
+        if (w > width) { len = vis_offset(s, len, width); w = width; }
+        sb_append(&p, s, len); sb_puts(&p, C_RESET);
+        for (; w < width; w++) sb_putc(&p, ' ');
+        sb_putc(&p, '\n');
+        s = e ? e + 1 : s + len;
+    }
+    sb_free(o); *o = p;
+}
+/* The picker's modal (select_impl): the same box, with the picker's text again on each key. The box is painted
+ * over the live screen, which is not repainted for it: a key only paints the box. Only a box that moved or changed
+ * size (a resize, a new width) repaints the conversation under it, which is what clears the old box; the first
+ * paint is the box alone too, so its text is written as it is (a repaint is not: it sits between ?7l and ?7h). */
+static void modal_paint(const char *text, bool first) {
+    fflush(stdout);   /* what was printed before the box is on the screen before it */
+    free(g_ov_text); g_ov_text = xstrdup(text);
+    int old[4]; memcpy(old, g_ov_geo, sizeof old);
+    bool was = g_sb_pause; sb_pause(true);
+    sbuf o; sb_init(&o);
+    overlay_box(&o);   /* the box as it is now: this sets g_ov_geo */
+    if (g_ov_geo[0] > 0 && (first || !memcmp(old, g_ov_geo, sizeof old))) {
+        fwrite(o.data, 1, o.len, stdout);
+    } else {
+        sb_free(&o); sb_init(&o);
+        conv_repaint(&o);
+        fwrite(o.data, 1, o.len, stdout);
+        term_status_refresh();   /* (the repaint took the chrome with it) */
+    }
+    fflush(stdout); sb_free(&o);
+    sb_pause(was);
+}
+
 bool term_overlay_show(const char *text) {
     if (g_ui_nc) { if (!text) return false; nc_overlay_set(text); return true; }   /* the notcurses UI draws it as a modal too */
     if (!g_fs || !g_sb_active || !text) return false;
@@ -1547,7 +1589,7 @@ bool term_overlay_show(const char *text) {
 void term_overlay_close(void) {
     if (g_ui_nc) { nc_overlay_set(NULL); return; }
     if (!g_ov_text) return;
-    free(g_ov_text); g_ov_text = NULL; g_banner_on = false;
+    free(g_ov_text); g_ov_text = NULL; g_banner_on = false; g_ov_geo[0] = -1;
     bool was = g_sb_pause; sb_pause(true);
     if (!layout_sync()) { sbuf o; sb_init(&o); conv_repaint(&o); fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o); }
     sb_pause(was);
@@ -3361,9 +3403,36 @@ static int select_impl(const char *title, const char **items, const char **descs
     int max_show = 12;
     int top = 0;
     int result = -1;
+    /* on the full-screen ANSI screen the menu is a modal over the conversation (the same box as /usage's overlay),
+     * so it does not depend on counting the lines it drew: a menu printed under the conversation misdrew when the
+     * lines above it wrapped or the window was short. Anything else keeps the menu inline. */
+    bool modal = g_fs && g_sb_active && !g_ov_text;
+    static const char HINT[] = "type to filter · ↑/↓ move · enter select · esc cancel";
+    /* a modal's box keeps one size while the menu changes under the filter: every line is padded to bodyw (the widest
+     * row, the title or the hint, at most the window's width less the overlay's margin), and it has max_show rows
+     * whatever the filter leaves. Both are worked out on every pass, after the layout, so a resize sizes the box too. */
+    int bodyw = 0, labw = 44;
+    bool first = true;   /* the box's first paint goes over the live screen as it is */
     view_leave();     /* a menu is drawn on the live screen */
     sb_pause(true);   /* transient: not conversation content */
     for (;;) {
+        if (modal) {
+            layout_sync();
+            int limit = (g_fs_cols > 0 ? g_fs_cols : term_width()) - 8;
+            int dmax = 0;   /* the widest description: the row is "* " + label + " " + description */
+            for (int i = 0; i < n; i++) { int dw = descs && descs[i] ? vis_width(descs[i]) : 0; if (dw > dmax) dmax = dw; }
+            bodyw = vis_width(title); if (vis_width(HINT) > bodyw) bodyw = vis_width(HINT);
+            if (2 + 44 + 1 + dmax > bodyw) bodyw = 2 + 44 + 1 + dmax;
+            if (bodyw < 40) bodyw = 40;
+            if (bodyw > limit) bodyw = limit;
+            int room = bodyw - 2;   /* the label column: 44 cells, or what is left of the row once the description has its width */
+            labw = room - 3 - dmax;
+            if (labw > 44) labw = 44;
+            if (labw < (room / 2 < 16 ? room / 2 : 16)) labw = room / 2 < 16 ? room / 2 : 16;
+            int rows = fs_region() - 7;   /* the title, the filter, the rows, the count, the hint and the box's own two */
+            max_show = rows < 3 ? 3 : rows > 12 ? 12 : rows;
+            if (max_show > n) max_show = n;
+        }
         /* filter */
         nvis = 0;
         for (int i = 0; i < n; i++) if (!flen || strcasestr(items[i], filter)) vis[nvis++] = i;
@@ -3374,27 +3443,32 @@ static int select_impl(const char *title, const char **items, const char **descs
         if (selpos < top) top = selpos;
         if (selpos >= top + max_show) top = selpos - max_show + 1;
         /* draw */
-        if (layout_sync()) drawn = 0;   /* repainted: the cursor is back where the menu starts */
+        if (!modal && layout_sync()) drawn = 0;   /* repainted: the cursor is back where the menu starts (a modal was laid out above) */
         sbuf o; sb_init(&o);
-        if (drawn) sb_printf(&o, "\x1b[%dA", drawn);
-        sb_puts(&o, "\r\x1b[J");
+        if (!modal) {
+            if (drawn) sb_printf(&o, "\x1b[%dA", drawn);
+            sb_puts(&o, "\r\x1b[J");
+        }
         int lines = 0;
         int w = term_width();
+        int mw = (g_fs_cols > 0 ? g_fs_cols : w) - 8;   /* a modal's lines fit the box the overlay makes of them: cols - 8 at most */
         /* one row, whatever the width: a title that wraps is still counted as one, and the redraw
          * then climbs a row too few — a stale row per key, and the transcript drawn over afterwards */
-        static const char HINT[] = "type to filter · ↑/↓ move · enter select · esc cancel";
         int tw = vis_width(title);
-        if (tw > w - 1) sb_printf(&o, C_BOLD "%.*s…" C_RESET "\n", (int)vis_offset(title, strlen(title), w > 2 ? w - 2 : 0), title);
+        if (modal) { sbuf t; sb_init(&t); cells_cut(&t, title, mw); sb_printf(&o, C_BOLD "%s" C_RESET "\n", t.data ? t.data : ""); sb_free(&t); }
+        else if (tw > w - 1) sb_printf(&o, C_BOLD "%.*s…" C_RESET "\n", (int)vis_offset(title, strlen(title), w > 2 ? w - 2 : 0), title);
         else if (tw + 2 + vis_width(HINT) > w - 1) sb_printf(&o, C_BOLD "%s" C_RESET "\n", title);
         else sb_printf(&o, C_BOLD "%s" C_RESET "  " C_DIM "%s" C_RESET "\n", title, HINT);
         lines++;
         sb_printf(&o, "  " C_DIM "filter:" C_RESET " %s" C_DIM "▏" C_RESET "\n", filter); lines++;
+        int shown = 0;   /* rows drawn */
         for (int i = top; i < nvis && i < top + max_show; i++) {
             int idx = vis[i];
             bool is_sel = (i == selpos);
             /* the label column is 44 cells, or half the row when the row is narrow; the description takes the rest. The row
              * is cut by display width (a byte cut garbles a UTF-8 letter), with the … the cut shows. */
-            int room = w - 4, namew = room >= 88 ? 44 : room / 2;
+            int room = modal ? bodyw - 2 : w - 4, namew = room >= 88 ? 44 : room / 2;
+            if (modal) namew = labw;   /* one label column for the whole menu: the descriptions keep their width */
             sbuf txt; sb_init(&txt); sb_puts(&txt, idx == current ? "* " : "  ");
             sbuf nm; sb_init(&nm); cells_cut(&nm, items[idx], namew);
             sb_puts(&txt, nm.data ? nm.data : "");
@@ -3404,12 +3478,22 @@ static int select_impl(const char *title, const char **items, const char **descs
             sbuf row; sb_init(&row); cells_cut(&row, txt.data ? txt.data : "", room);
             sb_printf(&o, "%s%s %s" C_RESET "\n", is_sel ? C_ORANGE "❯" : " ", is_sel ? C_BOLD : "", row.data ? row.data : ""); lines++;
             sb_free(&row); sb_free(&nm); sb_free(&txt);
+            shown++;
         }
-        if (nvis == 0) { sb_puts(&o, C_DIM "  (no matches)" C_RESET "\n"); lines++; }
-        if (nvis > max_show) { sb_printf(&o, C_DIM "  … %d of %d shown" C_RESET "\n", max_show < nvis ? max_show : nvis, nvis); lines++; }
-        drawn = lines;
-        chrome_append(&o);
-        fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o);
+        if (nvis == 0) { sb_puts(&o, C_DIM "  (no matches)" C_RESET "\n"); lines++; shown++; }
+        if (modal) {   /* the same rows whatever the filter leaves; then the count (blank when all are shown); then the hint */
+            for (; shown < max_show; shown++) sb_puts(&o, "\n");
+            if (nvis > max_show) sb_printf(&o, C_DIM "  … %d of %d shown" C_RESET "\n", max_show, nvis); else sb_puts(&o, "\n");
+            sbuf h; sb_init(&h); cells_cut(&h, HINT, mw);
+            sb_printf(&o, C_DIM "%s" C_RESET "\n", h.data ? h.data : ""); sb_free(&h);
+            box_pad(&o, bodyw);
+            modal_paint(o.data, first); first = false;
+        } else {
+            if (nvis > max_show) { sb_printf(&o, C_DIM "  … %d of %d shown" C_RESET "\n", max_show < nvis ? max_show : nvis, nvis); lines++; }
+            drawn = lines;
+            chrome_append(&o); fwrite(o.data, 1, o.len, stdout); fflush(stdout);
+        }
+        sb_free(&o);
 
         int k = read_key();
         if (k == -2) continue;
@@ -3426,8 +3510,8 @@ static int select_impl(const char *title, const char **items, const char **descs
         if (k >= 32 && k < 127 && flen < (int)sizeof filter - 1) { filter[flen++] = (char)k; filter[flen] = 0; continue; }
     }
     /* clear menu */
-    if (drawn) printf("\x1b[%dA", drawn);
-    printf("\r\x1b[J");
+    if (modal) term_overlay_close();   /* the conversation under the box is painted back */
+    else { if (drawn) printf("\x1b[%dA", drawn); printf("\r\x1b[J"); }
     term_status_refresh();
     fflush(stdout);
     sb_pause(false);

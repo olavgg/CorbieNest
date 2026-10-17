@@ -1643,6 +1643,7 @@ s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2); s.expect("Ctrl-D t
 s.send("/advisor\r"); check(s.expect("ollama signin") and s.expect("anthropic:claude-opus-5") and s.expect("ANTHROPIC_API_KEY"), "/advisor says how a cloud and a hosted model are set up")
 check(s.expect("/advisor guidance LEVEL") and s.expect("when the work is hard · 3 per request · current") and s.expect("brought in, unasked, when tool calls keep failing") and s.expect("/advisor effort LEVEL"), "and what guidance and effort do")
 check(s.expect("Select advisor"), "/advisor opens a picker"); check(s.expect("No advisor"), "with 'No advisor' first")
+check(seen(s, "┌") and seen(s, "│ Select advisor"), "the picker is a box over the conversation on the full screen, not a list printed under the lines above it")
 s.send("\x1b"); check(s.expect("advisor unchanged: none"), "Esc leaves it")
 s.send("/advisor fake-bi"); s.send("g"); seen(s, "fake-big:latest", 5)
 _w = since_send(s)   # a repaint of the old transcript comes first; the list is drawn after each field row that changes it
