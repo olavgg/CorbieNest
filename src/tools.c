@@ -614,6 +614,20 @@ static void preview_lines(const char *text, int max_lines, const char *color, co
     if (total > lines) printf("  " C_DIM "… (%d more lines)" C_RESET "\n", total - lines);
 }
 
+/* a file's content folded away (a write that runs unasked): the head is the first line and how many more there are, the
+ * body opens with a click, as a command's does (term_fold_begin); without folds it is the first lines, as preview_lines */
+static void preview_folded(const char *text, const char *lang) {
+    int total = 0;
+    for (const char *p = text; *p; p++) if (*p == '\n') total++;
+    if (text && *text && text[strlen(text) - 1] != '\n') total++;   /* a last line with no newline is a line too */
+    if (total <= 1) { preview_lines(text, 12, C_GREEN, lang); return; }
+    size_t first = strcspn(text, "\n");
+    char head[320]; snprintf(head, sizeof head, "%.*s", (int)(first > 200 ? 200 : first), text);
+    char line[360]; snprintf(line, sizeof line, "  " C_DIM TERM_FOLD_CLOSED " %s" C_RESET C_DIM "  (+%d lines)" C_RESET, head, total - 1);
+    if (term_fold_begin(line)) { preview_lines(text, total, C_GREEN, lang); term_fold_end(); }
+    else preview_lines(text, 12, C_GREEN, lang);
+}
+
 enum { CONF_EDIT = CONF_EDIT_K, CONF_BASH = CONF_BASH_K, CONF_FETCH = CONF_FETCH_K, CONF_MCP = CONF_MCP_K };
 /* Would confirm() ask? The same early returns, without the output: a command that will be asked
  * about is never folded away (the user approves what they can see). Keep in step with confirm_body(). */
@@ -749,7 +763,11 @@ static tool_status t_write_file(cJSON *args, sbuf *out) {
     bool exists = is_file(p);
     printf("  " C_DIM "%s %s (%zu bytes)" C_RESET "\n", exists ? "overwrite" : "create", path, strlen(content));
     const char *dot = strrchr(path, '.'), *slash = strrchr(path, '/');
-    preview_lines(content, 12, C_GREEN, dot && (!slash || dot > slash) ? dot + 1 : NULL);
+    const char *lang = dot && (!slash || dot > slash) ? dot + 1 : NULL;
+    /* A write the user is asked about shows its first lines as before: they approve what they see. A write that
+     * goes through without a question is folded like a command that runs unasked (the head says how much). */
+    if (!confirm_will_ask(CONF_EDIT, &g_always_write, path)) preview_folded(content, lang);
+    else preview_lines(content, 12, C_GREEN, lang);
     char *reason = NULL;
     if (!confirm(exists ? "Overwrite this file?" : "Create this file?", CONF_EDIT, &g_always_write, path, &reason)) {
         sb_printf(out, "User denied writing %s.%s%s", path, reason ? " Reason: " : "", reason ? reason : "");

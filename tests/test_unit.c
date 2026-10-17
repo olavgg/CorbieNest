@@ -171,6 +171,41 @@ static void test_text_tool_calls(void) {
 /* ---------- tools ---------- */
 static void test_tools_body(void *ud);
 static void test_tools(void) { char *o = capture(test_tools_body, NULL); CHECK(strstr(o, "Run this command?") != NULL); free(o); }
+
+/* write_file's preview: a write that runs unasked is folded (its head says how many lines, the body is a fold),
+ * and a write the user is asked about shows its first lines as before, unfolded */
+static void write_preview_body(void *ud) {
+    const char *which = ud;
+    char dir[] = "/tmp/crowtest_wp_XXXXXX";
+    CHECK(mkdtemp(dir) != NULL);
+    char old[4096]; CHECK(getcwd(old, sizeof old) != NULL);
+    CHECK(chdir(dir) == 0);
+    sbuf body; sb_init(&body);
+    for (int i = 0; i < 30; i++) sb_printf(&body, "line %d of the file\n", i);
+    cJSON *a = cJSON_CreateObject();
+    cJSON_AddStringToObject(a, "path", "long.txt");
+    cJSON_AddStringToObject(a, "content", body.data);
+    sbuf out; sb_init(&out);
+    if (!strcmp(which, "unasked")) { g_cfg.mode = MODE_AUTO; g_cfg.interactive = false; }
+    else { g_cfg.mode = MODE_MANUAL; g_cfg.interactive = true; }
+    tools_execute("write_file", a, &out);
+    cJSON_Delete(a); sb_free(&out); sb_free(&body);
+    CHECK(chdir(old) == 0);
+    g_cfg.mode = MODE_AUTO; g_cfg.interactive = false;
+}
+static void test_write_preview(void) {
+    /* no full screen here (the unit build has none), so term_fold_begin is false and the preview keeps its lines: a
+     * fold is a screen feature and is checked in the pty. What the unit build can prove is the decision: an asked
+     * write never folds, and an unasked one shows the same first line either way. */
+    char *o = capture(write_preview_body, (void *)"unasked");
+    CHECK(strstr(o, "line 0 of the file") != NULL);
+    CHECK(strstr(o, TERM_FOLD_CLOSED) == NULL);                 /* no screen: no fold, as term_fold_begin says */
+    free(o);
+    char *q = capture(write_preview_body, (void *)"asked");
+    CHECK(strstr(q, TERM_FOLD_CLOSED) == NULL);                 /* asked: never folded */
+    CHECK(strstr(q, "line 0 of the file") != NULL);
+    free(q);
+}
 static void test_tools_body(void *ud) {
     (void)ud;
     char dir[] = "/tmp/crowtest_dir_XXXXXX";
@@ -2080,7 +2115,7 @@ int main(void) {
     g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 10; g_cfg.interactive = false;
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "sbuf", test_sbuf }, { "util", test_util }, { "cmd head", test_cmd_head }, { "markdown", test_md }, { "highlight", test_highlight }, { "git branch", test_gitbranch },
-        { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
+        { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
         { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
