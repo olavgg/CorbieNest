@@ -305,6 +305,15 @@ static void test_tools_body(void *ud) {
     CHECK(perm_rule_verdict("fetch docs.x.org", "fetch", "https://docs.x.org/a") == VERDICT_ALLOW);
     CHECK(perm_rule_verdict(NULL, "bash", "ls") == VERDICT_NONE && perm_rule_verdict("deny bash", "bash", "ls") == VERDICT_NONE);
 
+    /* hooks: which line is an event's hook, for which tool, and its command */
+    const char *hc = NULL;
+    CHECK(hook_match("pre bash echo hi", "pre", "bash", &hc) && !strcmp(hc, "echo hi"));
+    CHECK(hook_match("pre bash* make", "pre", "bashful", NULL) && hook_match("pre * exit 2", "pre", "fetch", NULL));
+    CHECK(!hook_match("pre edit x", "pre", "bash", NULL) && !hook_match("post bash x", "pre", "bash", NULL) && !hook_match("prebash x", "pre", "bash", NULL));
+    CHECK(!hook_match("pre bash", "pre", "bash", NULL) && !hook_match("pre bash ", "pre", "bash", NULL));   /* no command */
+    CHECK(hook_match("start make", "start", NULL, &hc) && !strcmp(hc, "make") && !hook_match("stop x", "start", NULL, NULL));
+    CHECK(hook_match("post edit f", "post", "edit", NULL) && !hook_match(NULL, "pre", "bash", NULL));
+
     /* tool definitions are well-formed */
     cJSON *defs = tools_definitions();
     CHECK(cJSON_GetArraySize(defs) == 9);   /* the seven, todo_write, and exit */

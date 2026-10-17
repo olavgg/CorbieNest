@@ -95,6 +95,7 @@ without thinking about them: the status bar, the field, and the strip.
 | `/effort [LEVEL\|default]` | how hard **this model** thinks, in the levels it has — see [Effort](#effort). No argument opens a picker of them; `default` leaves it to the model. Kept per model, shown next to the model's name in the status bar. Given while the model works, it applies when the turn ends |
 | `/advisor [MODEL\|off]`, `/advisor guidance [LEVEL]`, `/advisor effort [LEVEL]`, `/advisor window MINUTES\|off`, `/advisor ctx N\|auto` (given while the model works: `ctx` applies at the next consultation, `guidance` and `window` when the turn ends) | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud or hosted model is set by name: `/advisor gpt-oss:120b-cloud`, `/advisor anthropic:claude-opus-5`). `guidance` says how much the agent leans on it (`light`, `normal`, `strong`, `max`), `effort` how hard it thinks |
 | `/subagent [MODEL\|default]`, `/subagent effort [LEVEL\|default]` | the model the sub-agents (`task`) run on. Default: the model doing the work. Another one is checked with its server first (a local model, Ollama's cloud, or a hosted `anthropic:`/`xai:`/`openai:` model) and then kept in the config as `subagent=`. `effort` sets how hard that model thinks, in its own levels (kept per model, as `/effort` does; the same model as the one doing the work shares its effort). Given with a model, it waits for the turn to end, like `/model`. See [Sub-agents](#sub-agents) |
+| `/hooks [add pre\|post TOOL COMMAND \| add start\|stop COMMAND \| remove N \| clear]` | the project's hooks: shell commands before or after a tool call, at start and at the end of a request. See [Hooks](#hooks) |
 | `/permissions [add …\|remove N\|clear]` | the project's saved rules: "always allow" ones, and the guard rules `deny` and `ask` (see [Guard rules](#guard-rules-deny-and-ask)). Kept in the config directory, `permissions/`, keyed by the project's path — a file in the project itself is never read |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
@@ -283,6 +284,46 @@ does, whatever the mode. They are `/permissions add deny|ask TOOL PATTERN`:
   permissions. A sandbox for `bash` is on the list.
 - The rules are in the same per-project file as the allow rules; `/permissions` lists them as
   "deny bash matching …" and "ask bash matching …", and `remove N` works on them too.
+
+## Hooks
+
+A hook is a shell command that runs at a point of the work, set by you for the project: it can
+look at a tool call before it runs and stop it, look at its result, or run when corbienest starts
+or a request ends. They are kept in the config directory, like the permission rules, and never read
+from the project: a cloned repository cannot put commands in front of you.
+
+```
+/hooks add pre bash <command>      before a bash call, for every bash call
+/hooks add post edit_file <command>
+/hooks add start <command>         when corbienest starts (at a terminal)
+/hooks add stop <command>          when a request ends
+/hooks                             the list; /hooks remove N; /hooks clear
+```
+
+- **pre TOOL COMMAND** runs before a tool call. TOOL is a tool name or a glob (`*` for all, `bash*`).
+  The hook reads the event on its standard input. **Exit 2 stops the call**: what the hook printed
+  is the reason the model is given, and the call is not run. A timeout (60 s), an interrupt, or a
+  hook that cannot run also stops it, as a precaution. Any other exit lets the call through.
+- **post TOOL COMMAND** runs after the call. What it prints is added to the result, marked as a
+  hook's note, so the model sees it (a linter's output, say).
+- **start COMMAND** and **stop COMMAND** run when corbienest starts and when a request ends; what
+  they print is shown. The start hooks run at a terminal only, not for `-p` or a pipe; the stop
+  hooks run after every request, `-p` included.
+
+The event is JSON on the hook's standard input: `{"event":"pre","tool":"bash","input":{"command":"…"},"cwd":"…"}`
+(a post hook also has `"result"`). A hook that wants to block a `bash` call only when the command
+matches, for example:
+
+```
+/hooks add pre bash sh -c 'grep -q "rm -rf" && { echo "no rm -rf here"; exit 2; }; exit 0'
+```
+
+- Hooks run for the model's tool calls, including those of sub-agents. The `!` lines you type are
+  not hooked.
+- A hook runs with your permissions, like any command you type: it is a command you chose to keep.
+  A hook cannot allow what a guard rule denies: the hooks run first, and the guard rules are checked
+  when the tool asks for its confirmation, so `deny` and `ask` still apply after a hook has passed the call.
+- Hooks are guardrails, not a sandbox, the same as the permission rules.
 
 ## Tools the model can call
 

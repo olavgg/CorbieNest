@@ -551,6 +551,14 @@ cJSON *tools_definitions(void);   /* array of tool defs (Ollama/OpenAI format), 
 enum { VERDICT_NONE = 0, VERDICT_ALLOW = 1, VERDICT_ASK = 2, VERDICT_DENY = 3 };   /* what a project rule says about a target */
 bool glob_match(const char *pat, const char *s);   /* * and ** match any text (a / too), ? one character; the whole string */
 int  perm_rule_verdict(const char *rule, const char *tool, const char *target);   /* one saved rule on a target of "bash", "edit" or "fetch" */
+bool  hook_match(const char *line, const char *event, const char *tool, const char **cmd);   /* a hook line of this event (and tool, for pre/post): its command */
+void  tools_hooks_load(void);          /* the project's hooks (the config directory's hooks/ file) */
+int   tools_hooks_count(void);
+const char *tools_hooks_get(int i);
+bool  tools_hooks_add(const char *line);
+bool  tools_hooks_remove(int i);
+void  tools_hooks_clear(void);
+void  tools_hook_event(const char *event);   /* "start" or "stop": runs the hooks of that event and shows what they print */
 cJSON *tools_todos_get(void);          /* the task list the model keeps with todo_write, or NULL */
 void   tools_todos_set(cJSON *list);   /* replaces it (takes the list); NULL clears it */
 void   tools_todo_render(sbuf *out);   /* the list as text: a header with the count, then a line a task */

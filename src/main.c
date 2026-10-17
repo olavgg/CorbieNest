@@ -72,6 +72,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/skills", "list the skills · reload · new NAME" },
     { "/memory", "the project memory: on, off, clear, update, every N, idle N" },
     { "/resume", "continue an earlier session" },
+    { "/hooks", "shell commands for this project: before or after a tool call, at start and at the end of a request" },
     { "/permissions", "the project's saved rules: always-allow ones, and deny/ask guards on a tool and a pattern: add, remove, clear" },
     { "/init", "have the model write AGENTS.md for this project" },
     { "/cost", "tokens, model calls and time of this session" },
@@ -97,6 +98,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/web engine", "default:back to the built-in engine" },
     { "/memory", "on:keep the project memory up to date|off:stop updating it|update:run the pending update now|clear:remove the memory file|every:update every N requests|idle:update after N seconds idle at the prompt" },
     { "/memory idle", "off:wait for the next update or the exit instead" },
+    { "/hooks", "add:a hook line: pre|post TOOL COMMAND, start|stop COMMAND|remove:remove hook N|clear:remove them all" },
     { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST, or deny|ask TOOL PATTERN|remove:remove rule N|clear:remove them all" },
     { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host|deny:stop a tool on a pattern (* any text)|ask:ask before a tool on a pattern" },
     { "/advisor", "off:no advisor|guidance:how much the agent leans on it|effort:how hard it thinks|window:minutes after which a long request gets its consultations again|ctx:its context window" },
@@ -1086,6 +1088,33 @@ static int cmd_rewind(void) {
 }
 
 /* ---------- /permissions ---------- */
+/* /hooks: the project's hooks, as tools.c keeps them (see there for what a line means) */
+static void cmd_hooks(const char *arg) {
+    if (arg && !strncmp(arg, "add ", 4)) {
+        const char *r = arg + 4; while (*r == ' ') r++;
+        const char *sp = strchr(r, ' ');
+        size_t el = sp ? (size_t)(sp - r) : strlen(r);
+        bool ev = (el == 3 && !strncmp(r, "pre", 3)) || (el == 4 && !strncmp(r, "post", 4));
+        bool ok = ev ? (sp && *(sp + 1) && strchr(sp + 1, ' ') && *(strchr(sp + 1, ' ') + 1))
+                     : ((el == 5 && !strncmp(r, "start", 5)) || (el == 4 && !strncmp(r, "stop", 4))) && sp && *(sp + 1);
+        if (!ok) { printf("usage: /hooks add pre TOOL COMMAND | post TOOL COMMAND | start COMMAND | stop COMMAND\n"); return; }
+        printf(tools_hooks_add(r) ? C_GREEN "✓ hook added: %s" C_RESET "\n" : C_DIM "already there: %s" C_RESET "\n", r);
+        return;
+    }
+    if (arg && !strncmp(arg, "remove ", 7)) {
+        int i = atoi(arg + 7);
+        if (tools_hooks_remove(i - 1)) printf(C_GREEN "✓ removed hook %d" C_RESET "\n", i); else printf(C_RED "no hook %d" C_RESET "\n", i);
+        return;
+    }
+    if (arg && !strcmp(arg, "clear")) { tools_hooks_clear(); printf(C_GREEN "✓ project hooks cleared" C_RESET "\n"); return; }
+    if (arg && *arg) { printf("usage: /hooks [add pre|post TOOL COMMAND | add start|stop COMMAND | remove N | clear]\n"); return; }
+    int n = tools_hooks_count();
+    printf(C_BOLD "project hooks" C_RESET C_DIM " (kept in %s/hooks — they run shell commands, so only what you add here runs)" C_RESET "\n", config_dir());
+    if (!n) printf(C_DIM "  none — e.g. /hooks add pre bash echo \"use make\" >&2; exit 2 (exit 2 stops the call)" C_RESET "\n");
+    for (int i = 0; i < n; i++) printf("  %2d. %s\n", i + 1, tools_hooks_get(i));
+    if (n) printf(C_DIM "  /hooks remove N · /hooks clear" C_RESET "\n");
+}
+
 static void cmd_permissions(const char *arg) {
     if (arg && !strncmp(arg, "add ", 4)) {
         const char *r = arg + 4; while (*r == ' ') r++;
@@ -2586,7 +2615,14 @@ static bool reply_is_empty(cJSON *reply) {
 
 /* Returns true if the user interrupted the turn. */
 static bool g_turn_failed = false;   /* the last turn ended on an error (no reply from the model): -p exits 1 */
+static bool run_turn_body(void);
+/* a request is over: the stop hooks run, once the turn has ended however it ended */
 static bool run_turn(void) {
+    bool aborted = run_turn_body();
+    tools_hook_event("stop");
+    return aborted;
+}
+static bool run_turn_body(void) {
     g_turn_failed = false;
     if (!model_set()) {   /* no model yet: say why, and take the message back out of the conversation */
         g_turn_failed = true;
@@ -4339,6 +4375,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/compact")) { if (cmd_compact()) session_save(); }
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
+    else if (!strcmp(cmd, "/hooks")) cmd_hooks(arg);
     else if (!strcmp(cmd, "/cost")) cmd_cost();
     else if (!strcmp(cmd, "/usage")) cmd_usage(arg);
     else if (!strcmp(cmd, "/banner")) cmd_banner();
@@ -4453,7 +4490,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/cd")) {
         char *d = expand_home(arg ? arg : "~");
         memory_flush();   /* the memory file belongs to the directory we are leaving */
-        if (chdir(d) == 0) { if (getcwd(g_cwd, sizeof g_cwd)) {} load_project_instructions(); load_memory(); tools_permissions_load(); skills_load(); printf(C_GREEN "✓ %s" C_RESET "\n", g_cwd); }
+        if (chdir(d) == 0) { if (getcwd(g_cwd, sizeof g_cwd)) {} load_project_instructions(); load_memory(); tools_permissions_load(); tools_hooks_load(); skills_load(); printf(C_GREEN "✓ %s" C_RESET "\n", g_cwd); }
         else printf(C_RED "✗ cd %s: %s" C_RESET "\n", d, strerror(errno));
         free(d);
     }
@@ -5479,7 +5516,9 @@ int main(int argc, char **argv) {
     load_project_instructions();
     load_memory();
     tools_permissions_load();
+    tools_hooks_load();
     skills_load();
+    if (g_cfg.interactive && !oneshot && !bench_runs) tools_hook_event("start");   /* the start hooks: at a terminal only */
     bool quiet_caps = oneshot != NULL || bench_runs;
     if (g_cfg.model && !*g_cfg.model) { free(g_cfg.model); g_cfg.model = NULL; }   /* an empty model= in the config is no model */
     refresh_model_caps(quiet_caps);

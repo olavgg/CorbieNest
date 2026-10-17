@@ -1299,9 +1299,187 @@ static tool_status t_advisor(cJSON *args, sbuf *out) {
 }
 
 /* ---------- dispatch ---------- */
+/* ---------- hooks ----------
+ * A hook is a shell command the user keeps for this project, in the config directory's hooks/ file (kept like the
+ * permission rules: never read from the project tree, where a cloned repository could put commands). One per line:
+ *   pre TOOL COMMAND    before a tool call. TOOL is the tool's name or a glob (* for all). Exit 2 stops the call, and
+ *                       what the hook printed is the reason the model is given; a timeout, an interrupt or a hook that
+ *                       could not run stops it too. Any other exit lets it run.
+ *   post TOOL COMMAND   after a tool call; what it prints is added to the result, as a note for the model.
+ *   start COMMAND       when corbienest starts; stop COMMAND when a request ends. What they print is shown.
+ * A hook reads the event as JSON on its standard input: {"event", "tool", "input", "result", "cwd"}. Hooks run for the
+ * model's tool calls; the user's own !lines are not hooked. */
+#define HOOK_MAX 64
+#define HOOK_TIMEOUT 60
+static char *g_hook[HOOK_MAX]; static int g_hook_n = 0;
+
+static const char *hook_path(void) {
+    static char path[1200];
+    char cwd[1024]; if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, "?");
+    unsigned long long h = 1469598103934665603ULL;   /* FNV-1a, the same name as the project's permission rules */
+    for (const char *p = cwd; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+    snprintf(path, sizeof path, "%s/hooks/%016llx.hooks", config_dir(), h);
+    return path;
+}
+void tools_hooks_load(void) {
+    for (int i = 0; i < g_hook_n; i++) free(g_hook[i]);
+    g_hook_n = 0;
+    size_t n; char *d = read_whole_file(hook_path(), &n, 64 * 1024);
+    if (!d) return;
+    char *save = NULL;
+    for (char *l = strtok_r(d, "\n", &save); l && g_hook_n < HOOK_MAX; l = strtok_r(NULL, "\n", &save)) {
+        while (*l == ' ' || *l == '\t') l++;
+        size_t k = strlen(l); while (k && (l[k-1] == ' ' || l[k-1] == '\r' || l[k-1] == '\t')) l[--k] = 0;
+        if (!*l || *l == '#') continue;
+        g_hook[g_hook_n++] = xstrdup(l);
+    }
+    free(d);
+}
+static void hooks_save(void) {
+    if (!g_hook_n) { unlink(hook_path()); return; }
+    sbuf b; sb_init(&b);
+    sb_puts(&b, "# corbienest hooks for this project — one per line: pre TOOL COMMAND, post TOOL COMMAND, start COMMAND, stop COMMAND (see /hooks)\n");
+    for (int i = 0; i < g_hook_n; i++) sb_printf(&b, "%s\n", g_hook[i]);
+    char dir[1100]; snprintf(dir, sizeof dir, "%s/hooks", config_dir());
+    mkdir_p(dir);
+    write_whole_file_atomic(hook_path(), b.data, b.len);
+    sb_free(&b);
+}
+int tools_hooks_count(void) { return g_hook_n; }
+const char *tools_hooks_get(int i) { return i >= 0 && i < g_hook_n ? g_hook[i] : NULL; }
+bool tools_hooks_add(const char *line) {
+    for (int i = 0; i < g_hook_n; i++) if (!strcmp(g_hook[i], line)) return false;
+    if (g_hook_n >= HOOK_MAX) return false;
+    g_hook[g_hook_n++] = xstrdup(line);
+    hooks_save();
+    return true;
+}
+bool tools_hooks_remove(int i) {
+    if (i < 0 || i >= g_hook_n) return false;
+    free(g_hook[i]); memmove(g_hook + i, g_hook + i + 1, sizeof(char*) * (size_t)(g_hook_n - i - 1)); g_hook_n--;
+    hooks_save();
+    return true;
+}
+void tools_hooks_clear(void) { for (int i = 0; i < g_hook_n; i++) free(g_hook[i]); g_hook_n = 0; unlink(hook_path()); }
+
+/* Is this hook line an `event` hook (for `tool`, when it is a pre or post hook)? *cmd is its command. */
+bool hook_match(const char *line, const char *event, const char *tool, const char **cmd) {
+    if (!line || !event) return false;
+    size_t el = strlen(event);
+    if (strncmp(line, event, el) || line[el] != ' ') return false;
+    const char *r = line + el + 1;
+    if (!strcmp(event, "pre") || !strcmp(event, "post")) {
+        const char *sp = strchr(r, ' ');
+        if (!sp) return false;
+        if (tool) {
+            char pat[128]; size_t pl = (size_t)(sp - r);
+            if (pl >= sizeof pat) return false;
+            memcpy(pat, r, pl); pat[pl] = 0;
+            if (!glob_match(pat, tool)) return false;
+        }
+        r = sp + 1; while (*r == ' ') r++;
+    }
+    if (!*r) return false;
+    if (cmd) *cmd = r;
+    return true;
+}
+
+/* Runs a hook's command with the event on its standard input. Returns the exit code, or run_shell's (124 timed out,
+ * 130 interrupted, -1 could not run); what it printed goes to out. */
+static int hook_run(const char *cmd, cJSON *ev, sbuf *out, bool *interrupted) {
+    char *txt = cJSON_PrintUnformatted(ev);
+    const char *tmpdir = getenv("TMPDIR");
+    char tmp[1100]; snprintf(tmp, sizeof tmp, "%s/corbienest_hook_XXXXXX", tmpdir && *tmpdir ? tmpdir : "/tmp");
+    int fd = mkstemp(tmp);
+    if (fd < 0) { free(txt); *interrupted = false; return -1; }
+    size_t off = 0, len = strlen(txt);
+    while (off < len) { ssize_t w = write(fd, txt + off, len - off); if (w <= 0) break; off += (size_t)w; }
+    close(fd); free(txt);
+    char *q = shell_escape(tmp);
+    sbuf full; sb_init(&full);
+    sb_printf(&full, "( %s\n) < %s", cmd, q);   /* the newline keeps a comment at the end of cmd from eating the ) */
+    int rc = run_shell(full.data, HOOK_TIMEOUT, out, interrupted, OUT_CAP * 2, "running a hook", "hook");
+    sb_free(&full); free(q);
+    unlink(tmp);
+    return rc;
+}
+/* The event as the hook reads it. `result` is cut to a bounded size. */
+static cJSON *hook_event(const char *event, const char *tool, cJSON *input, const char *result) {
+    cJSON *e = cJSON_CreateObject();
+    cJSON_AddStringToObject(e, "event", event);
+    if (tool) cJSON_AddStringToObject(e, "tool", tool);
+    if (input) cJSON_AddItemToObject(e, "input", cJSON_Duplicate(input, 1));
+    if (result) { char *r = xstrndup(result, 8192); cJSON_AddStringToObject(e, "result", r); free(r); }
+    char cwd[1024]; if (getcwd(cwd, sizeof cwd)) cJSON_AddStringToObject(e, "cwd", cwd);
+    return e;
+}
+static void hook_say(const char *text, const char *color) {
+    if (!text || !*text) return;
+    const char *nl = strchr(text, '\n');
+    printf("  %s%.*s" C_RESET "\n", color, (int)(nl ? (size_t)(nl - text) : strlen(text)), text);
+}
+/* Before a tool call: true if a hook stops it, and why goes to `why`. */
+static bool hook_pre(const char *tool, cJSON *input, sbuf *why) {
+    for (int i = 0; i < g_hook_n; i++) {
+        const char *cmd;
+        if (!hook_match(g_hook[i], "pre", tool, &cmd)) continue;
+        cJSON *e = hook_event("pre", tool, input, NULL);
+        sbuf out; sb_init(&out); bool intr = false;
+        int rc = hook_run(cmd, e, &out, &intr);
+        cJSON_Delete(e);
+        const char *said = out.data && *out.data ? out.data : "";
+        if (rc == 0) { sb_free(&out); continue; }
+        if (rc == 2 || rc == 124 || rc == 130 || rc == -1) {
+            if (rc == 2) sb_printf(why, "blocked by a hook (%s): %s", cmd, *said ? said : "no reason given");
+            else sb_printf(why, "blocked: the hook (%s) %s", cmd, rc == 124 ? "timed out" : rc == 130 ? "was interrupted" : "could not run");
+            printf("  " C_YELLOW "hook" C_RESET " " C_RED "stopped %s" C_RESET "\n", tool);
+            hook_say(why->data, C_DIM);
+            sb_free(&out);
+            return true;
+        }
+        printf("  " C_DIM "hook exited %d: %s" C_RESET "\n", rc, cmd);
+        sb_free(&out);
+    }
+    return false;
+}
+/* After a tool call: what the hooks print is added to its result, for the model. */
+static void hook_post(const char *tool, cJSON *input, sbuf *result) {
+    for (int i = 0; i < g_hook_n; i++) {
+        const char *cmd;
+        if (!hook_match(g_hook[i], "post", tool, &cmd)) continue;
+        cJSON *e = hook_event("post", tool, input, result->data ? result->data : "");
+        sbuf out; sb_init(&out); bool intr = false;
+        int rc = hook_run(cmd, e, &out, &intr);
+        cJSON_Delete(e);
+        if (out.len) sb_printf(result, "\n[hook %s: exit %d]\n%s", cmd, rc, out.data);
+        else if (rc != 0) sb_printf(result, "\n[hook %s: exit %d]\n", cmd, rc);
+        sb_free(&out);
+    }
+}
+/* The start and stop events: the hooks run, and what they print is shown. */
+void tools_hook_event(const char *event) {
+    for (int i = 0; i < g_hook_n; i++) {
+        const char *cmd;
+        if (!hook_match(g_hook[i], event, NULL, &cmd)) continue;
+        cJSON *e = hook_event(event, NULL, NULL, NULL);
+        sbuf out; sb_init(&out); bool intr = false;
+        int rc = hook_run(cmd, e, &out, &intr);
+        cJSON_Delete(e);
+        if (out.len) { sb_putc(&out, '\n'); for (char *l = out.data; *l; ) { char *nl = strchr(l, '\n'); if (!nl) break; *nl = 0; printf("  " C_DIM "%s" C_RESET "\n", l); l = nl + 1; } }
+        if (rc != 0) printf("  " C_DIM "hook %s exited %d" C_RESET "\n", cmd, rc);
+        sb_free(&out);
+    }
+}
+
 tool_status tools_execute(const char *name, cJSON *args, sbuf *out) {
     cJSON *tmp = NULL;
     if (!args || !cJSON_IsObject(args)) { tmp = cJSON_CreateObject(); args = tmp; }
+    bool hooked = !tools_no_confirm && g_hook_n > 0;   /* the model's calls; the user's own !lines are not hooked */
+    if (hooked) {
+        sbuf why; sb_init(&why);
+        if (hook_pre(name, args, &why)) { sb_clear(out); sb_puts(out, why.data); sb_free(&why); if (tmp) cJSON_Delete(tmp); return TOOL_DENIED; }
+        sb_free(&why);
+    }
     tool_status st;
     if (!strcmp(name, "read_file")) st = t_read_file(args, out);
     else if (!strcmp(name, "write_file")) st = t_write_file(args, out);
@@ -1316,6 +1494,7 @@ tool_status tools_execute(const char *name, cJSON *args, sbuf *out) {
     else if (!strcmp(name, "todo_write")) st = t_todo_write(args, out);
     else if (!strcmp(name, "exit")) st = t_exit(out);
     else { sb_printf(out, "error: unknown tool '%s'. Available tools: %s", name, tools_summary_line()); st = TOOL_ERROR; }
+    if (hooked) hook_post(name, args, out);
     if (tmp) cJSON_Delete(tmp);
     /* what a tool returned goes to the terminal and into the request: a binary file's bytes are not UTF-8 */
     if (out->data && !utf8_ok(out->data, out->len)) { char *fx = utf8_fix(out->data); sb_clear(out); sb_puts(out, fx); free(fx); }
