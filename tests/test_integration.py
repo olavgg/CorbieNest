@@ -1644,7 +1644,10 @@ s.send("/advisor\r"); check(s.expect("ollama signin") and s.expect("anthropic:cl
 check(s.expect("/advisor guidance LEVEL") and s.expect("when the work is hard · 3 per request · current") and s.expect("brought in, unasked, when tool calls keep failing") and s.expect("/advisor effort LEVEL"), "and what guidance and effort do")
 check(s.expect("Select advisor"), "/advisor opens a picker"); check(s.expect("No advisor"), "with 'No advisor' first")
 s.send("\x1b"); check(s.expect("advisor unchanged: none"), "Esc leaves it")
-s.send("/advisor fake-bi"); s.send("g"); view = listed()
+s.send("/advisor fake-bi"); s.send("g"); seen(s, "fake-big:latest", 5)
+_w = since_send(s)   # a repaint of the old transcript comes first; the list is drawn after each field row that changes it
+_segs = [g for g in re.split(r"(?=❯ /advisor )", _w) if "tab complete" in g]
+view = _segs[-1] if _segs else ""
 check("fake-big:latest" in view and "fake-chat" not in view, f"the installed models are suggested as a name is typed: {view!r}")
 s.send("\t\r"); check(s.expect("advisor: fake-big:latest"), "Tab completes the name, Enter sets it")
 s.send("/advisor "); s.send("o"); s.expect("(no such text)", 2); view = since()   # the list is drawn under the field: read it, then everything since the key
