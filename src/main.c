@@ -2715,62 +2715,19 @@ static bool run_turn_body(void);
  * line for each request. What the run prints for people goes to /dev/null, as in json mode. */
 static int g_stream_fd = -1;    /* the real stdout, while stream-json is on */
 static int g_stream_seen = 0;   /* messages of g_messages already written */
-/* the ids of tool calls not yet answered, in order: a call the model's API gave no id (Ollama) gets one, and its result
- * takes the oldest unanswered one */
-static char *g_stream_pend[256]; static int g_stream_npend = 0;
-static void stream_pend_clear(void) { for (int i = 0; i < g_stream_npend; i++) free(g_stream_pend[i]); g_stream_npend = 0; }
-static void stream_line(cJSON *o) {
+static stream_st g_stream;      /* the tool calls not yet answered (stream.c) */
+static void stream_flush(void) {
+    if (g_stream_fd < 0) return;
+    sbuf b; sb_init(&b);
+    stream_messages(&g_stream, g_messages, g_stream_seen, g_session_id, &b);
+    g_stream_seen = cJSON_GetArraySize(g_messages);
+    if (b.len) { ssize_t w = write(g_stream_fd, b.data, b.len); (void)w; }
+    sb_free(&b);
+}
+static void stream_line(cJSON *o) {   /* the result line, written where the others are */
     char *t = cJSON_PrintUnformatted(o);
     if (g_stream_fd >= 0 && t) { if (write(g_stream_fd, t, strlen(t)) < 0 || write(g_stream_fd, "\n", 1) < 0) {} }
     free(t); cJSON_Delete(o);
-}
-static void stream_flush(void) {
-    if (g_stream_fd < 0) return;
-    int n = cJSON_GetArraySize(g_messages);
-    for (; g_stream_seen < n; g_stream_seen++) {
-        cJSON *m = cJSON_GetArrayItem(g_messages, g_stream_seen);
-        cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
-        const char *role = cJSON_IsString(r) ? r->valuestring : "";
-        cJSON *o = cJSON_CreateObject(), *msg = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "session_id", g_session_id);
-        cJSON_AddStringToObject(msg, "role", "user");
-        if (!strcmp(role, "user") && cJSON_IsString(c)) {
-            cJSON_AddStringToObject(o, "type", "user"); cJSON_AddStringToObject(msg, "content", c->valuestring);
-        } else if (!strcmp(role, "assistant")) {
-            cJSON_AddStringToObject(o, "type", "assistant"); cJSON_AddStringToObject(msg, "role", "assistant");
-            cJSON *blocks = cJSON_AddArrayToObject(msg, "content");
-            if (cJSON_IsString(c) && c->valuestring[0]) { cJSON *t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "text"); cJSON_AddStringToObject(t, "text", c->valuestring); cJSON_AddItemToArray(blocks, t); }
-            cJSON *call, *calls = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
-            cJSON_ArrayForEach(call, calls) {
-                cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function"), *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
-                cJSON *input = cJSON_IsString(args) ? cJSON_Parse(args->valuestring) : cJSON_Duplicate(args, 1);
-                if (!input) input = cJSON_CreateObject();
-                char gen[48]; const char *cid = tool_call_id(call);
-                if (!cid || !*cid) { snprintf(gen, sizeof gen, "toolu_%d_%d", g_stream_seen, g_stream_npend); cid = gen; }
-                if (g_stream_npend < 256) g_stream_pend[g_stream_npend++] = xstrdup(cid);
-                cJSON *t = cJSON_CreateObject();
-                cJSON_AddStringToObject(t, "type", "tool_use"); cJSON_AddStringToObject(t, "id", cid);
-                cJSON_AddStringToObject(t, "name", call_name(call)); cJSON_AddItemToObject(t, "input", input);
-                cJSON_AddItemToArray(blocks, t);
-            }
-        } else if (!strcmp(role, "tool")) {
-            cJSON *tc = cJSON_GetObjectItemCaseSensitive(m, "content"), *tid = cJSON_GetObjectItemCaseSensitive(m, "tool_call_id");
-            cJSON *block = cJSON_CreateObject(), *blocks = cJSON_AddArrayToObject(msg, "content");
-            cJSON_AddStringToObject(o, "type", "user");
-            cJSON_AddStringToObject(block, "type", "tool_result");
-            char *own = NULL;   /* the id of the oldest call not yet answered, when the result names none */
-            if (!(cJSON_IsString(tid) && tid->valuestring[0]) && g_stream_npend > 0) {
-                own = g_stream_pend[0];
-                memmove(g_stream_pend, g_stream_pend + 1, sizeof(char*) * (size_t)(--g_stream_npend));
-            }
-            cJSON_AddStringToObject(block, "tool_use_id", own ? own : cJSON_IsString(tid) ? tid->valuestring : "");
-            free(own);
-            cJSON_AddStringToObject(block, "content", cJSON_IsString(tc) ? tc->valuestring : "");
-            cJSON_AddItemToArray(blocks, block);
-        } else { cJSON_Delete(o); cJSON_Delete(msg); continue; }   /* a system message is not part of the stream */
-        cJSON_AddItemToObject(o, "message", msg);
-        stream_line(o);
-    }
 }
 
 /* a request is over: the stop hooks run, once the turn has ended however it ended */
@@ -5515,24 +5472,6 @@ static int bench_ctx(int num_ctx, int runs, const char *prompt, cJSON *jrow) {
     return aborted ? 130 : done == runs ? 0 : 1;
 }
 
-/* The text of one input line of --input-format stream-json: {"type":"user","message":{"role":"user","content":...}}, with
- * content a string or a list of text blocks. NULL (and a message on stderr) for anything else. Malloc'd. */
-static char *stream_input_text(const char *line) {
-    cJSON *o = cJSON_Parse(line);
-    if (!o) { fprintf(stderr, "corbienest: a stream-json input line is not JSON: %.80s\n", line); return NULL; }
-    cJSON *m = cJSON_GetObjectItemCaseSensitive(o, "message");
-    cJSON *c = cJSON_GetObjectItemCaseSensitive(m ? m : o, "content");
-    char *text = NULL;
-    if (cJSON_IsString(c)) text = xstrdup(c->valuestring);
-    else if (cJSON_IsArray(c)) {
-        sbuf b; sb_init(&b);
-        cJSON *blk;
-        cJSON_ArrayForEach(blk, c) { cJSON *t = cJSON_GetObjectItemCaseSensitive(blk, "text"); if (cJSON_IsString(t)) sb_printf(&b, "%s%s", b.len ? "\n" : "", t->valuestring); }
-        text = sb_detach(&b);
-    }
-    cJSON_Delete(o);
-    return text;
-}
 /* one request of the stream: the prompt (a skill or text, as -p takes it), its turn, its result line. Returns 1 if it failed. */
 static int stream_prompt(const char *text) {
     const skill_t *sk = NULL;
@@ -5589,7 +5528,7 @@ static int stream_run(const char *prompt, bool input) {
     stream_line(o);
     int failed = 0;
     g_stream_seen = cJSON_GetArraySize(g_messages);
-    stream_pend_clear();
+    stream_reset(&g_stream);
     if (prompt) failed |= stream_prompt(prompt);
     if (input) {
         char *line = NULL; size_t cap = 0; ssize_t n;

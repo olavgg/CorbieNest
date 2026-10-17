@@ -545,6 +545,13 @@ void md_finish(md_state *m);
 
 /* ---------- tools.h ---------- */
 typedef enum { TOOL_OK = 0, TOOL_DENIED = 1, TOOL_ERROR = 2 } tool_status;
+/* ---------- stream.c: stream-json lines ---------- */
+#define STREAM_PEND_MAX 256
+typedef struct { char *pend[STREAM_PEND_MAX]; int npend; } stream_st;   /* tool calls not yet answered, oldest first */
+void stream_reset(stream_st *st);
+void stream_messages(stream_st *st, cJSON *msgs, int from, const char *session_id, sbuf *out);
+char *stream_input_text(const char *line);   /* the text of one stream-json input line (malloc'd), or NULL */
+
 /* ---------- agents.c: sub-agent files (task with agent=NAME) ---------- */
 typedef struct { char *name, *description, *tools, *model, *body, *path; } agent_t;
 int   agents_load(void);                    /* the agent files of this project and of the user; returns how many */

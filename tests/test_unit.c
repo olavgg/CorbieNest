@@ -402,6 +402,34 @@ static void test_tools_body(void *ud) {
         free(sc);
     }
 
+    /* stream-json: one line per message, tool calls and results matched, system messages left out; input lines parsed */
+    {
+        cJSON *msgs = cJSON_Parse("["
+            "{\"role\":\"user\",\"content\":\"hello\"},"
+            "{\"role\":\"system\",\"content\":\"not in the stream\"},"
+            "{\"role\":\"assistant\",\"content\":\"Running it.\",\"tool_calls\":[{\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]},"
+            "{\"role\":\"tool\",\"tool_name\":\"bash\",\"content\":\"a.c\"},"
+            "{\"role\":\"tool\",\"tool_call_id\":\"call_x\",\"content\":\"named\"}]");
+        stream_st st; memset(&st, 0, sizeof st);
+        sbuf o; sb_init(&o);
+        stream_messages(&st, msgs, 0, "sid", &o);
+        int lines = 0; for (char *p = o.data; p && *p; p++) if (*p == '\n') lines++;
+        CHECK(lines == 4);   /* the system message is not one of them */
+        CHECK(strstr(o.data, "{\"session_id\":\"sid\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}"));
+        CHECK(strstr(o.data, "\"type\":\"tool_use\",\"id\":\"toolu_2_0\",\"name\":\"bash\",\"input\":{\"command\":\"ls\"}"));
+        CHECK(strstr(o.data, "\"tool_use_id\":\"toolu_2_0\",\"content\":\"a.c\""));   /* the oldest call not answered */
+        CHECK(strstr(o.data, "\"tool_use_id\":\"call_x\",\"content\":\"named\""));
+        CHECK(st.npend == 0);
+        /* a second flush from message 4 on writes nothing new, and the state carries over */
+        sb_clear(&o); stream_messages(&st, msgs, 5, "sid", &o); CHECK(o.len == 0);
+        sb_free(&o); stream_reset(&st); cJSON_Delete(msgs);
+        char *t1 = stream_input_text("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"plain\"}}");
+        char *t2 = stream_input_text("{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"one\"},{\"type\":\"image\"},{\"type\":\"text\",\"text\":\"two\"}]}}");
+        CHECK(t1 && !strcmp(t1, "plain") && t2 && !strcmp(t2, "one\ntwo"));
+        CHECK(stream_input_text("not json") == NULL);
+        free(t1); free(t2);
+    }
+
     /* tool definitions are well-formed */
     cJSON *defs = tools_definitions();
     CHECK(cJSON_GetArraySize(defs) == 10);   /* the seven, bash_job, todo_write, and exit */
