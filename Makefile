@@ -21,6 +21,22 @@ SAN_STAMP := .sanitize-$(or $(SAN),none)
 NC_DIR   := vendor/notcurses
 NC_LIBS  := -lunistring -ltinfo -lz -lm
 NC_PROBE := printf '%s\n' '\#include <curses.h>' '\#include <term.h>' '\#include <zlib.h>' '\#include <unigbrk.h>' 'int main(void) { return 0; }' | $(CC) -x c - -o /dev/null $(NC_LIBS) >/dev/null 2>&1 && echo 1 || echo 0
+# zlib is optional too: gzip request bodies (util.c gzip_body, WITH_ZLIB) need it. ZLIB=auto (the default) builds
+# with it when zlib.h and -lz are there; ZLIB=0 leaves it out; ZLIB=1 insists on it.
+ZLIB_PROBE := printf '%s\n' '\#include <zlib.h>' 'int main(void) { return 0; }' | $(CC) $(BREW_CPPFLAGS) -x c - -o /dev/null $(BREW_LDFLAGS) -lz >/dev/null 2>&1 && echo 1 || echo 0
+ZLIB ?= auto
+ifeq ($(ZLIB),auto)
+ZLIB := $(shell $(ZLIB_PROBE))
+endif
+ifeq ($(ZLIB),1)
+ifneq ($(shell $(ZLIB_PROBE)),1)
+$(error ZLIB=1 but zlib.h or -lz is missing: install zlib1g-dev)
+endif
+ZLIB_DEFS := -DWITH_ZLIB
+LDLIBS    += -lz
+else
+ZLIB_DEFS :=
+endif
 NOTCURSES ?= auto
 ifeq ($(NOTCURSES),auto)
 NOTCURSES := $(shell $(NC_PROBE))
@@ -62,8 +78,14 @@ $(SAN_STAMP):
 	rm -f .sanitize-*
 	touch $@
 
-src/%.o: src/%.c src/common.h $(NC_STAMP) $(SAN_STAMP)
-	$(CC) $(CFLAGS) $(NC_DEFS) -c -o $@ $<
+# A stamp per setting, as for NOTCURSES: switching ZLIB rebuilds the objects that read WITH_ZLIB.
+ZLIB_STAMP := .zlib-$(ZLIB)
+$(ZLIB_STAMP):
+	rm -f .zlib-*
+	touch $@
+
+src/%.o: src/%.c src/common.h $(NC_STAMP) $(SAN_STAMP) $(ZLIB_STAMP)
+	$(CC) $(CFLAGS) $(NC_DEFS) $(ZLIB_DEFS) -c -o $@ $<
 
 # The vendored core'"'"'s own warnings are upstream'"'"'s: the two kinds it has (-Wclobbered in unixsig.c,
 # -Wdiscarded-qualifiers in notcurses.c) are left out for it alone, so -Wall -Wextra -Werror still
@@ -84,7 +106,7 @@ $(NC_DIR)/src/%.o: $(NC_DIR)/src/%.c $(NC_GEN) $(SAN_STAMP)
 RELEASE_CFLAGS ?= -O2 -std=gnu11 -Wall -Wextra -DNDEBUG
 release:
 	$(MAKE) clean
-	$(MAKE) corbienest CFLAGS="$(RELEASE_CFLAGS)" NOTCURSES=$(NOTCURSES)
+	$(MAKE) corbienest CFLAGS="$(RELEASE_CFLAGS)" NOTCURSES=$(NOTCURSES) ZLIB=$(ZLIB)
 	strip corbienest
 
 install: corbienest
@@ -94,7 +116,7 @@ install: corbienest
 LIBOBJ := $(filter-out src/main.o,$(OBJ)) $(NC_OBJ)
 
 tests/test_unit: tests/test_unit.c $(LIBOBJ) src/common.h
-	$(CC) $(CFLAGS) $(NC_DEFS) -o $@ tests/test_unit.c $(LIBOBJ) $(LDLIBS)
+	$(CC) $(CFLAGS) $(NC_DEFS) $(ZLIB_DEFS) -o $@ tests/test_unit.c $(LIBOBJ) $(LDLIBS)
 
 # `make test` is the unit tests: what a change has to pass, and what needs nothing but the build.
 # The integration tests drive the program through a pty (and tmux), which is timing a hosted CI
@@ -123,7 +145,7 @@ test-tsan:
 	$(MAKE) SAN=thread test-unit
 
 clean:
-	rm -f $(OBJ) $(NC_SRC:.c=.o) corbienest tests/test_unit .notcurses-* .sanitize-*
+	rm -f $(OBJ) $(NC_SRC:.c=.o) corbienest tests/test_unit .notcurses-* .sanitize-* .zlib-*
 	rm -rf build
 
 .PHONY: install clean test test-unit test-integration test-asan test-ubsan test-tsan release
