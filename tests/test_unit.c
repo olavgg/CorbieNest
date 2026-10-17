@@ -357,6 +357,22 @@ static void test_tools_body(void *ud) {
         tools_bg_kill_all();
     }
 
+    /* MCP: the names the model sees, the text of a result, and the mcp permission rule (pure: no server is started) */
+    {
+        char *n1 = mcp_tool_name("fake", "echo"), *n2 = mcp_tool_name("my srv", "a.b c"), *n3 = mcp_tool_name("s", "tool_with_a_very_long_name_that_goes_on_and_on_and_on_past_sixty_four");
+        CHECK(!strcmp(n1, "mcp__fake__echo") && !strcmp(n2, "mcp__my_srv__a_b_c"));
+        CHECK(strlen(n3) == 64 && mcp_is_tool(n3) && strchr(n3, '_') && strcmp(n3, mcp_tool_name("s", "tool_with_a_very_long_name_that_goes_on_and_on_and_on_past_sixty_five")));
+        free(n1); free(n2); free(n3);
+        cJSON *res = cJSON_Parse("{\"content\":[{\"type\":\"text\",\"text\":\"a\"},{\"type\":\"image\",\"data\":\"x\"},{\"type\":\"text\",\"text\":\"b\"}]}");
+        char *txt = mcp_content_text(res);
+        CHECK(txt && !strcmp(txt, "a\n[image]\nb"));
+        free(txt); cJSON_Delete(res);
+        CHECK(perm_rule_verdict("mcp mcp__fake__echo", "mcp", "mcp__fake__echo") == VERDICT_ALLOW);
+        CHECK(perm_rule_verdict("mcp mcp__fake__echo", "mcp", "mcp__fake__shout") == VERDICT_NONE);
+        CHECK(perm_rule_verdict("deny mcp mcp__fake__*", "mcp", "mcp__fake__shout") == VERDICT_DENY);
+        CHECK(perm_rule_verdict("ask mcp mcp__*", "mcp", "mcp__x__y") == VERDICT_ASK && perm_rule_verdict("deny bash rm *", "mcp", "rm") == VERDICT_NONE);
+    }
+
     /* tool definitions are well-formed */
     cJSON *defs = tools_definitions();
     CHECK(cJSON_GetArraySize(defs) == 10);   /* the seven, bash_job, todo_write, and exit */

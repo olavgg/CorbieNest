@@ -366,6 +366,14 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "write_file", "arguments": {"path": "hello.py", "content": "def greet(name):  # say hi\n    return 'hi ' + name\n"}}}])
         yield chunk(model, done=True)
         return
+    if "TOOL_MCP_FAIL" in text:   # the MCP test server's shout tool, which answers isError
+        yield chunk(model, tool_calls=[{"function": {"name": "mcp__fake__shout", "arguments": {}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_MCP" in text:   # a call of the MCP test server's echo tool (tests/fake_mcp.py)
+        yield chunk(model, tool_calls=[{"function": {"name": "mcp__fake__echo", "arguments": {"message": "from-model"}}}])
+        yield chunk(model, done=True)
+        return
     if "TOOL_BG" in text:   # a background command, which has to end with corbienest (sleep 317 is the marker)
         yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "sleep 317", "run_in_background": True}}}])
         yield chunk(model, done=True)

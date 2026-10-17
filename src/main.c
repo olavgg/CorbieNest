@@ -73,6 +73,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/memory", "the project memory: on, off, clear, update, every N, idle N" },
     { "/resume", "continue an earlier session" },
     { "/hooks", "shell commands for this project: before or after a tool call, at start and at the end of a request" },
+    { "/mcp", "MCP servers: tools from external programs over stdio (add, remove, reconnect; /mcp alone lists them)" },
     { "/permissions", "the project's saved rules: always-allow ones, and deny/ask guards on a tool and a pattern: add, remove, clear" },
     { "/init", "have the model write AGENTS.md for this project" },
     { "/cost", "tokens, model calls and time of this session" },
@@ -99,6 +100,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/memory", "on:keep the project memory up to date|off:stop updating it|update:run the pending update now|clear:remove the memory file|every:update every N requests|idle:update after N seconds idle at the prompt" },
     { "/memory idle", "off:wait for the next update or the exit instead" },
     { "/hooks", "add:a hook line: pre|post TOOL COMMAND, start|stop COMMAND|remove:remove hook N|clear:remove them all" },
+    { "/mcp", "add:a server: [-g] NAME COMMAND [ARGS…] (-g for every project)|remove:remove a server by name|reconnect:start them again" },
     { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST, or deny|ask TOOL PATTERN|remove:remove rule N|clear:remove them all" },
     { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host|deny:stop a tool on a pattern (* any text)|ask:ask before a tool on a pattern" },
     { "/advisor", "off:no advisor|guidance:how much the agent leans on it|effort:how hard it thinks|window:minutes after which a long request gets its consultations again|ctx:its context window" },
@@ -167,6 +169,8 @@ static void account(const chat_stats *st) { account_as(g_cfg.model, st); }
 static double g_bytes_per_token = 3.5;   /* calibrated below; only the starting guess */
 static size_t g_sys_bytes = 0;           /* system prompt as last built (messages_with_system) */
 static size_t g_tools_bytes = 0;         /* tool definitions as JSON (measured once) */
+/* the tool list again: the built-in tools and the MCP servers' (the model sees a change at its next call) */
+static void tools_rebuild(void) { cJSON_Delete(g_tools); g_tools = tools_definitions(); mcp_add_tools(g_tools); g_tools_bytes = 0; }
 static size_t g_measured_bytes = 0;      /* prompt bytes of the last measured call */
 
 /* bytes of a conversation as sent (content plus the tool-call JSON; the template's own tags and
@@ -1088,6 +1092,29 @@ static int cmd_rewind(void) {
 }
 
 /* ---------- /permissions ---------- */
+/* /mcp: the servers (mcp.c keeps them and talks to them). The arguments of add are split on spaces: no quoting. */
+static void cmd_mcp(const char *arg) {
+    if (arg && (!strncmp(arg, "add ", 4) || !strcmp(arg, "add"))) {
+        char *w = xstrdup(arg + 3);
+        char *tok[64]; int nt = 0; bool global = false;
+        for (char *t = strtok(w, " "); t && nt < 64; t = strtok(NULL, " ")) { if (nt == 0 && !strcmp(t, "-g")) { global = true; continue; } tok[nt++] = t; }
+        if (nt < 2) { printf("usage: /mcp add [-g] NAME COMMAND [ARGS…]\n"); free(w); return; }
+        if (!mcp_config_add(tok[0], tok[1], tok + 2, nt - 2, global)) printf(C_DIM "%s is already a server here" C_RESET "\n", tok[0]);
+        else { printf(C_GREEN "✓ MCP server %s added (%s)" C_RESET "\n", tok[0], global ? "every project" : "this project"); mcp_load(); tools_rebuild(); }
+        free(w);
+        return;
+    }
+    if (arg && !strncmp(arg, "remove ", 7)) {
+        const char *name = arg + 7; while (*name == ' ') name++;
+        if (mcp_config_remove(name, false) || mcp_config_remove(name, true)) { printf(C_GREEN "✓ MCP server %s removed" C_RESET "\n", name); mcp_load(); tools_rebuild(); }
+        else printf(C_RED "no MCP server %s" C_RESET "\n", name);
+        return;
+    }
+    if (arg && !strncmp(arg, "reconnect", 9)) { printf(C_DIM "starting the MCP servers again…" C_RESET "\n"); mcp_load(); tools_rebuild(); mcp_list(); return; }
+    if (arg && *arg) { printf("usage: /mcp [add [-g] NAME COMMAND [ARGS…] | remove NAME | reconnect]\n"); return; }
+    mcp_list();
+}
+
 /* /hooks: the project's hooks, as tools.c keeps them (see there for what a line means) */
 static void cmd_hooks(const char *arg) {
     if (arg && !strncmp(arg, "add ", 4)) {
@@ -1640,6 +1667,9 @@ static void tool_arg_summary(const char *name, cJSON *args, char *out, size_t n)
             snprintf(out + cut, n - cut, "…");
         }
     }
+    else if (mcp_is_tool(name) && cJSON_IsObject(args) && args->child) {   /* a server's tool: its arguments, compact */
+        char *j = cJSON_PrintUnformatted(args); snprintf(out, n, "%.80s", j ? j : ""); free(j);
+    }
     else out[0] = 0;
     if (!strcmp(name, "grep") && v) {
         cJSON *p = cJSON_GetObjectItemCaseSensitive(args, "path");
@@ -1722,7 +1752,7 @@ static cJSON *tools_for_mode(void) {
         cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
         cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
         const char *name = cJSON_IsString(nm) ? nm->valuestring : "";
-        if (!strcmp(name, "write_file") || !strcmp(name, "edit_file")) continue;
+        if (!strcmp(name, "write_file") || !strcmp(name, "edit_file") || mcp_is_tool(name)) continue;   /* plan mode: a server's side effects are unknown */
         cJSON_AddItemReferenceToArray(arr, t);
     }
     return arr;
@@ -2408,7 +2438,7 @@ static void advisor_caveat(void) {
 }
 
 /* the tool list is built once and the running turn holds it: rebuild it so the model sees (or stops seeing) the advisor */
-static void advisor_tools_changed(void) { cJSON_Delete(g_tools); g_tools = tools_definitions(); g_tools_bytes = 0; }
+static void advisor_tools_changed(void) { tools_rebuild(); }
 
 static void advisor_set(const char *model) {
     if (!model) {
@@ -3502,7 +3532,7 @@ static int orchestrate_run(const char *arg, bool plan) {
             cJSON *t;
             cJSON_ArrayForEach(t, g_tools) {
                 cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function"), *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
-                if (cJSON_IsString(nm) && strcmp(nm->valuestring, "task") && strcmp(nm->valuestring, "advisor")) cJSON_AddItemReferenceToArray(run.tools, t);
+                if (cJSON_IsString(nm) && strcmp(nm->valuestring, "task") && strcmp(nm->valuestring, "advisor") && !mcp_is_tool(nm->valuestring)) cJSON_AddItemReferenceToArray(run.tools, t);
             }
             if (plan) orch_layers(&run, nt, maxpar, &report);
             else orch_schedule(&run, maxpar);
@@ -3699,7 +3729,7 @@ static int cmd_goal(const char *arg) {
         cJSON *t;
         cJSON_ArrayForEach(t, g_tools) {
             cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function"), *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
-            if (cJSON_IsString(nm) && strcmp(nm->valuestring, "task") && strcmp(nm->valuestring, "advisor")) cJSON_AddItemReferenceToArray(run.tools, t);
+            if (cJSON_IsString(nm) && strcmp(nm->valuestring, "task") && strcmp(nm->valuestring, "advisor") && !mcp_is_tool(nm->valuestring)) cJSON_AddItemReferenceToArray(run.tools, t);
         }
         orch_schedule(&run, K);
         if (run.aborted) aborted = true;
@@ -4406,7 +4436,8 @@ static void cmd_ui(const char *arg) {
     printf(C_DIM "restarting on the %s screen, in this session…" C_RESET "\n", arg);
     fflush(stdout);
     term_restore();
-    tools_bg_kill_all();   /* exec runs no atexit: the jobs are stopped here, the new process does not know them */
+    tools_bg_kill_all();   /* exec runs no atexit: the jobs and the servers are stopped here, the new process starts them again */
+    mcp_shutdown();
     execv("/proc/self/exe", na);
     /* only reached when the restart failed: the session is saved, and the program is still running */
     fprintf(stderr, "corbienest: could not restart (%s); still on the old screen — restart it with --resume %s\n", strerror(errno), g_session_id);
@@ -4443,6 +4474,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
     else if (!strcmp(cmd, "/hooks")) cmd_hooks(arg);
+    else if (!strcmp(cmd, "/mcp")) cmd_mcp(arg);
     else if (!strcmp(cmd, "/cost")) cmd_cost();
     else if (!strcmp(cmd, "/usage")) cmd_usage(arg);
     else if (!strcmp(cmd, "/banner")) cmd_banner();
@@ -4515,7 +4547,7 @@ static int handle_slash(char *line) {
             bool want = !strcmp(arg, "on");
             if (want != g_cfg.web) {   /* the tool list is built once at startup: rebuild it so the model sees the change */
                 g_cfg.web = want;
-                cJSON_Delete(g_tools); g_tools = tools_definitions(); g_tools_bytes = 0;
+                tools_rebuild();
                 config_save();
             }
             printf(C_GREEN "✓ web_search/web_fetch %s" C_RESET "\n", g_cfg.web ? "on" : "off");
@@ -5483,10 +5515,12 @@ static int stream_run(const char *prompt, bool input) {
     cJSON_AddStringToObject(o, "session_id", g_session_id);
     cJSON_AddStringToObject(o, "model", g_cfg.model ? g_cfg.model : "");
     cJSON_AddStringToObject(o, "cwd", g_cwd);
-    cJSON *t; cJSON_ArrayForEach(t, g_tools) {
+    cJSON *offered = tools_for_mode(), *t;   /* the tools this mode offers the model: the same list as a request's */
+    cJSON_ArrayForEach(t, offered) {
         cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function"), *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
         if (cJSON_IsString(nm)) cJSON_AddItemToArray(tools, cJSON_CreateString(nm->valuestring));
     }
+    if (offered && offered != g_tools) cJSON_Delete(offered);
     stream_line(o);
     int failed = 0;
     g_stream_seen = cJSON_GetArraySize(g_messages);
@@ -5668,6 +5702,7 @@ int main(int argc, char **argv) {
     term_init();
     g_messages = cJSON_CreateArray(); typed_clear();
     g_tools = tools_definitions();
+    if (!bench_runs) { mcp_init(); mcp_load(); mcp_add_tools(g_tools); }   /* the servers' tools, before the first request */
     tools_subagent = run_subagent;
     tools_advisor = run_advisor;
     term_run_while_busy = run_slash_while_busy;

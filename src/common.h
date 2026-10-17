@@ -544,6 +544,22 @@ void md_finish(md_state *m);
 
 /* ---------- tools.h ---------- */
 typedef enum { TOOL_OK = 0, TOOL_DENIED = 1, TOOL_ERROR = 2 } tool_status;
+/* ---------- mcp.c: Model Context Protocol servers over stdio ---------- */
+void  mcp_init(void);                      /* registers the cleanup (atexit) once */
+void  mcp_load(void);                      /* reads the project's and the user's servers and starts them (again: /mcp) */
+void  mcp_shutdown(void);                  /* stops every server's process group */
+void  mcp_kill_signal(void);               /* the same, async-signal-safe, for the SIGTERM/SIGHUP handler */
+void  mcp_add_tools(cJSON *arr);           /* the connected servers' tools, appended to a tools array */
+tool_status mcp_call(const char *exposed, cJSON *args, sbuf *out);
+bool  mcp_is_tool(const char *name);       /* a tool name that belongs to a server */
+char *mcp_tool_name(const char *server, const char *tool);   /* the name the model sees (malloc'd) */
+char *mcp_content_text(cJSON *result);     /* the text of a result (malloc'd) */
+void  mcp_list(void);                      /* /mcp */
+int   mcp_count(void);
+const char *mcp_server_name(int i);
+bool  mcp_config_add(const char *name, const char *command, char **args, int nargs, bool global);
+bool  mcp_config_remove(const char *name, bool global);
+
 
 extern const char *SEARCH_URL_DEFAULT;   /* web_search engine template, %s = the query */
 cJSON *tools_definitions(void);   /* array of tool defs (Ollama/OpenAI format), caller owns */

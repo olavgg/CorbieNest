@@ -97,6 +97,7 @@ without thinking about them: the status bar, the field, and the strip.
 | `/advisor [MODEL\|off]`, `/advisor guidance [LEVEL]`, `/advisor effort [LEVEL]`, `/advisor window MINUTES\|off`, `/advisor ctx N\|auto` (given while the model works: `ctx` applies at the next consultation, `guidance` and `window` when the turn ends) | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud or hosted model is set by name: `/advisor gpt-oss:120b-cloud`, `/advisor anthropic:claude-opus-5`). `guidance` says how much the agent leans on it (`light`, `normal`, `strong`, `max`), `effort` how hard it thinks |
 | `/subagent [MODEL\|default]`, `/subagent effort [LEVEL\|default]` | the model the sub-agents (`task`) run on. Default: the model doing the work. Another one is checked with its server first (a local model, Ollama's cloud, or a hosted `anthropic:`/`xai:`/`openai:` model) and then kept in the config as `subagent=`. `effort` sets how hard that model thinks, in its own levels (kept per model, as `/effort` does; the same model as the one doing the work shares its effort). Given with a model, it waits for the turn to end, like `/model`. See [Sub-agents](#sub-agents) |
 | `/hooks [add pre\|post TOOL COMMAND \| add start\|stop COMMAND \| remove N \| clear]` | the project's hooks: shell commands before or after a tool call, at start and at the end of a request. See [Hooks](#hooks) |
+| `/mcp [add [-g] NAME COMMAND [ARGS…] \| remove NAME \| reconnect]` | external programs that offer tools, over the Model Context Protocol (stdio). See [MCP servers](#mcp-servers) |
 | `/permissions [add …\|remove N\|clear]` | the project's saved rules: "always allow" ones, and the guard rules `deny` and `ask` (see [Guard rules](#guard-rules-deny-and-ask)). Kept in the config directory, `permissions/`, keyed by the project's path — a file in the project itself is never read |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
@@ -374,6 +375,44 @@ printf '%s\n' '{"type":"user","message":{"role":"user","content":"list the TODOs
 
 Permission prompts cannot be answered in this mode, so a tool that needs one is refused unless
 `--yolo` or the project's rules allow it.
+
+## MCP servers
+
+A Model Context Protocol server is a program that offers tools: a database, an issue tracker, a
+documentation index. corbienest starts the ones you name, asks them what they offer, and gives the
+model their tools next to its own, as `mcp__SERVER__TOOL`.
+
+```
+/mcp add docs npx -y @example/docs-mcp --root docs     start a server for this project
+/mcp add -g tracker uvx tracker-mcp                    the same, for every project
+/mcp                                                   the list: where each is kept, and what it came to
+/mcp reconnect                                         start them all again
+/mcp remove docs
+```
+
+- **Where they are kept.** In the config directory, `mcp/<project>.json` for this project and
+  `mcp/global.json` for every project (`-g`): never in the project tree, since a cloned repository
+  must not start programs. A name in both is the project's. The file is a JSON object,
+  `{"servers":{"NAME":{"command":"…","args":["…"],"env":{"KEY":"value"}}}}`, which you can edit by hand.
+- **How they run.** The command and its arguments are started as written, with no shell, in their
+  own process group, with your environment plus the server's `env` (which replaces the same keys).
+  `/mcp add` splits its arguments on spaces, so an argument with a space needs the file.
+- **Connecting.** At start-up, and by `/mcp reconnect`, every server is started and asked for its
+  tools (five seconds each to answer; the list pages are followed). `/mcp` shows each as
+  `connected: N tools`, or why it is not connected.
+- **Calls.** Each call is shown and approved like a shell command: its prompt offers "always allow
+  this tool in this project", which saves `mcp NAME` as an allow rule, and the project's
+  `deny mcp PATTERN` and `ask mcp PATTERN` guards match the tool's full name (for example
+  `deny mcp mcp__docs__*`). Non-interactively a call is refused unless `--yolo` or a rule allows it.
+  A call that takes more than two minutes is stopped; Esc stops it and sends the server a cancel.
+- **Results.** The text blocks of a result are the tool's output; images and other kinds are named
+  (`[image]`). A result the server marks as an error is an error for the model.
+- **Not offered** in plan mode (a server's side effects are unknown to corbienest), to sub-agents,
+  or to `/orchestrate` workers.
+- **A server that dies** is reported as an error for the calls that reach it, and `/mcp reconnect`
+  starts it again. Its process is stopped when corbienest exits, or before `/ui` restarts it.
+- **Not yet**: servers over HTTP or SSE (stdio only), resources and prompts (only tools), and quoting
+  in `/mcp add`.
 
 ## Tools the model can call
 
@@ -1031,6 +1070,7 @@ src/tools.c    the tools + permission-mode checks + shell runner
 src/ollama.c   /api/chat streaming, tool-call accumulation, /api/tags, /api/show (capabilities, effort levels)
 src/provider.c the hosted APIs the advisor can consult: xAI, OpenAI (Chat Completions), Anthropic (Messages)
 src/skills.c   SKILL.md discovery/parsing, /NAME expansion, scaffolding
+src/mcp.c      MCP servers over stdio: spawn, JSON-RPC, the tools they offer, their calls
 src/main.c     REPL, slash commands, system prompt, agent loop, sub-agents, the advisor
 tests/         unit tests, fake Ollama server, pty integration tests
 ```

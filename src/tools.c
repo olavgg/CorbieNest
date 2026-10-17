@@ -23,6 +23,7 @@
 #define CONF_EDIT_K 0
 #define CONF_BASH_K 1
 #define CONF_FETCH_K 2
+#define CONF_MCP_K 3
 /* Everything a tool returns lands in the model's context and is re-sent on every following
  * round, so the caps are deliberately modest; the model is told to page with offset/limit. */
 #define READ_FILE_MAX (4 * 1024 * 1024)  /* bytes of a file we look at (offset/limit page inside this) */
@@ -33,9 +34,9 @@
 #define WEB_MAX    (2u * 1024 * 1024)    /* refuse to download more of a page than this */
 #define MAX_ENTRIES 400
 
-static bool g_always_write = false, g_always_edit = false, g_always_bash = false, g_always_fetch = false;
+static bool g_always_write = false, g_always_edit = false, g_always_bash = false, g_always_fetch = false, g_always_mcp = false;
 bool tools_no_confirm = false;   /* set by the caller for user-typed "!cmd": no prompt, no plan-mode veto */
-void tools_reset_permissions(void) { g_always_write = g_always_edit = g_always_bash = g_always_fetch = false; }
+void tools_reset_permissions(void) { g_always_write = g_always_edit = g_always_bash = g_always_fetch = g_always_mcp = false; }
 const char *tools_summary_line(void) {
     static char b[160];
     snprintf(b, sizeof b, "read_file, write_file, edit_file, list_dir, grep, bash, bash_job, todo_write, %stask%s", g_cfg.web ? "web_search, web_fetch, " : "", g_cfg.advisor ? ", advisor" : "");
@@ -227,6 +228,7 @@ int perm_rule_verdict(const char *rule, const char *tool, const char *target) {
         return hit ? (deny ? VERDICT_DENY : VERDICT_ASK) : VERDICT_NONE;
     }
     if (!strcmp(tool, "edit")) return !strcmp(rule, "edit") ? VERDICT_ALLOW : VERDICT_NONE;
+    if (!strcmp(tool, "mcp")) return !strncmp(rule, "mcp ", 4) && !strcmp(rule + 4, target) ? VERDICT_ALLOW : VERDICT_NONE;
     if (!strcmp(tool, "bash")) return bash_rule_matches(rule, target) ? VERDICT_ALLOW : VERDICT_NONE;
     if (!strcmp(tool, "fetch")) return fetch_rule_matches(rule, target) ? VERDICT_ALLOW : VERDICT_NONE;
     return VERDICT_NONE;
@@ -234,7 +236,7 @@ int perm_rule_verdict(const char *rule, const char *tool, const char *target) {
 
 /* The verdict of all the project's rules on a target: deny beats ask beats allow. *rule is the rule that decided it. */
 static int perm_verdict(int kind, const char *target, const char **rule) {
-    const char *tool = kind == CONF_EDIT_K ? "edit" : kind == CONF_BASH_K ? "bash" : "fetch";
+    const char *tool = kind == CONF_EDIT_K ? "edit" : kind == CONF_BASH_K ? "bash" : kind == CONF_MCP_K ? "mcp" : "fetch";
     int best = VERDICT_NONE;
     *rule = NULL;
     for (int i = 0; i < g_perm_n; i++) {
@@ -611,7 +613,7 @@ static void preview_lines(const char *text, int max_lines, const char *color, co
     if (total > lines) printf("  " C_DIM "… (%d more lines)" C_RESET "\n", total - lines);
 }
 
-enum { CONF_EDIT = CONF_EDIT_K, CONF_BASH = CONF_BASH_K, CONF_FETCH = CONF_FETCH_K };
+enum { CONF_EDIT = CONF_EDIT_K, CONF_BASH = CONF_BASH_K, CONF_FETCH = CONF_FETCH_K, CONF_MCP = CONF_MCP_K };
 /* Would confirm() ask? The same early returns, without the output: a command that will be asked
  * about is never folded away (the user approves what they can see). Keep in step with confirm_body(). */
 static bool confirm_will_ask(int kind, bool *always_flag, const char *cmd) {
@@ -673,10 +675,12 @@ static int confirm_body(const char *what, int kind, bool *always_flag, const cha
         return 0;
     }
     const char *always = kind == CONF_BASH  ? "Yes, and don't ask again for shell commands this session"
+                       : kind == CONF_MCP ? "Yes, and don't ask again for this server's tools this session"
                        : kind == CONF_FETCH ? "Yes, and don't ask again for web fetches this session"
                                             : "Yes, and don't ask again for file edits this session";
     char newrule[256] = "", plabel[320] = "";
     if (kind == CONF_BASH) { bash_rule_for(target, newrule, sizeof newrule); if (newrule[0]) snprintf(plabel, sizeof plabel, "Yes, and always allow `%s …` in this project", newrule + 5); }
+    else if (kind == CONF_MCP) { snprintf(newrule, sizeof newrule, "mcp %s", target); snprintf(plabel, sizeof plabel, "Yes, and always allow %s in this project", target); }
     else if (kind == CONF_FETCH) { fetch_rule_for(target, newrule, sizeof newrule); if (newrule[0]) snprintf(plabel, sizeof plabel, "Yes, and always allow fetching from %s in this project", newrule + 6); }
     else { snprintf(newrule, sizeof newrule, "edit"); snprintf(plabel, sizeof plabel, "Yes, and always allow file edits in this project"); }
     term_confirm_quiet = kind == CONF_BASH;
@@ -1001,6 +1005,7 @@ void tools_bg_kill_all(void) {
 }
 static void bg_on_signal(int sig) {
     bg_signal_all(SIGKILL);
+    mcp_kill_signal();
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -1102,6 +1107,16 @@ static tool_status t_bash_job(cJSON *args, sbuf *out) {
     return TOOL_ERROR;
 }
 
+/* A call of a server's tool: the user approves it like a shell command (allow rule: "mcp NAME", the always option
+ * saves it), and the project's deny and ask guards apply to the tool's name. */
+static tool_status t_mcp(const char *name, cJSON *args, sbuf *out) {
+    char *reason = NULL;
+    if (!confirm("Call this MCP tool?", CONF_MCP, &g_always_mcp, name, &reason)) {
+        if (reason) sb_printf(out, "%s was not run: %s", name, reason); else sb_printf(out, "User denied calling %s.", name);
+        free(reason); return TOOL_DENIED;
+    }
+    return mcp_call(name, args, out);
+}
 static tool_status t_bash(cJSON *args, sbuf *out) {
     const char *cmd = jstr(args, "command", NULL);
     if (!cmd || !*cmd) { sb_puts(out, "error: missing 'command'"); return TOOL_ERROR; }
@@ -1655,6 +1670,7 @@ tool_status tools_execute(const char *name, cJSON *args, sbuf *out) {
     else if (!strcmp(name, "advisor")) st = t_advisor(args, out);
     else if (!strcmp(name, "todo_write")) st = t_todo_write(args, out);
     else if (!strcmp(name, "bash_job")) st = t_bash_job(args, out);
+    else if (mcp_is_tool(name)) st = t_mcp(name, args, out);
     else if (!strcmp(name, "exit")) st = t_exit(out);
     else { sb_printf(out, "error: unknown tool '%s'. Available tools: %s", name, tools_summary_line()); st = TOOL_ERROR; }
     if (hooked) hook_post(name, args, out);
