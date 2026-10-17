@@ -987,7 +987,7 @@ s.send("/ctx max\r"); check(s.expect("context window: 64k"), "/ctx max uses the 
 s.send("/ctx 128k\r"); check(s.expect("larger than the model's trained length"), "warning beyond model max")
 s.send("/ctx bogus\r"); check(s.expect("bad size"), "bad size rejected")
 s.send("/ctx\r"); check(s.expect("Context window (fake-coder:latest supports up to 64k)"), "picker title shows model max")
-check("32k" in s.text() and "model maximum" in s.text() and "server default" in s.text(), f"picker entries: {s.text()[-400:]!r}")
+check(all(seen(s, p) for p in ("32k", "model maximum", "server default")), f"picker entries: {since_send(s)[-400:]!r}")   # the picker is drawn after the title: wait for each entry
 s.send("\x1b"); check(s.expect("context window unchanged"), "esc leaves it")
 s.send("/ctx\r"); s.expect("Context window"); s.send("32k"); time.sleep(0.2); s.send("\r")
 check(s.expect("context window: 32k (num_ctx 32768)"), "picked 32k from the menu")
