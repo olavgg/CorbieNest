@@ -1114,6 +1114,8 @@ by hand and tick *integration*, or run `make test-integration` locally). Run `ma
   what is sent as `think` for every combination of `/think`, `/effort` and kind of call,
   where an advisor consultation runs and what it is shown at each guidance level, and what goes
   to and comes back from the hosted APIs (request bodies, answers, refusals, errors).
+- `tests/test_unit.c` also covers the newer features as pure functions: the permission rule matcher (glob, deny, ask, allow, chained commands), hook line matching, background-job output reading and killing (real processes), stream-json lines and input lines, the MCP tool names and result text, the sub-agent tool list and model aliases, the bwrap command's quoting, and the task list checks.
+- `tests/test_integration.py` — its last sections test the features of the last rounds, each with its own config and project directory: a guard rule under `--yolo` and an ask without a terminal, hooks (a gate, a post note, the stdin event, a stop note), a background command stopped when the run ends, stream-json on stdout and on stdin, todo_write, an MCP server (its call, its banner, a guard, no process left), a sub-agent file's role and tools, the sandbox (skipped when bwrap is missing), `/resume` replaying the conversation with the typed line in the ↑ history, and the slash commands for the rules, hooks, sandbox and agents.
 - `tests/test_integration.py` — runs the real binary against `tests/fake_ollama.py`,
   a tiny scripted Ollama stand-in (no model needed): one-shot mode, the full tool loop
   with results fed back, `--yolo`, XML tool-call recovery, `@file`, errors, and — through a

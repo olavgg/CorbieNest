@@ -600,7 +600,7 @@ sf.send("\x15")   # ctrl-u back to one row
 check(sf.expect("❯ "), "cleared")
 raw = sf.out.decode("utf-8", "replace")[-4000:]
 check(re.search(r"\x1b\[1;16r", raw) is not None, "the region grew back")
-check(re.search(r"\x1b\[15;1H\x1b\[2K", raw) and re.search(r"\x1b\[16;1H\x1b\[2K", raw),
+check(re.search(r"\x1b\[15;1H", raw) and re.search(r"\x1b\[16;1H", raw),   # painted again: the bottom rows are padded with spaces, not erased
       f"the rows the field gave back are painted again from the transcript, not left showing its old text: {raw[-300:]!r}")
 sf.mark = len(sf.out)
 fcntl.ioctl(sf.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
@@ -622,8 +622,10 @@ sp.send("\x1b[200~" + "\n".join("pasted line %d" % i for i in range(1, 4)) + "\x
 check(sp.expect("pasted line 3"), "the paste lands in the field, newlines and all")
 sp.send("\r"); check(sp.expect("Echo: pasted line 1"), "the whole paste is sent as one message")
 check(requests()[-1]["messages"][-1]["content"].count("pasted line 3") == 1, "sent once, not twice")
+time.sleep(1.5)   # the rows are painted again after the reply has shown: give the repaint its time
 raw = sp.out.decode("utf-8", "replace")[-6000:]
-missing = [r for r in range(14, 16) if not re.search(r"\x1b\[%d;1H\x1b\[2K" % r, raw)]
+# a row is painted again by moving to it and writing it (the bottom rows are padded with spaces, not erased, since the window background)
+missing = [r for r in range(14, 16) if not re.search(r"\x1b\[%d;1H" % r, raw)]
 check(not missing, f"every row the field gave back is painted again from the transcript, so the paste does not stay below the reply: rows {missing} left dirty")
 sp.close()
 
@@ -858,7 +860,7 @@ check(s.expect("session two"), "earlier sessions listed, this directory")
 s.send("one"); check(s.expect("session one"), "the oldest session is past the list: typing its name in the picker's filter finds it")   # the picker shows the latest rows; it filters as you type
 s.send("\x1b"); check(s.expect("cancelled"), "esc cancels")
 s.send("/resume " + sid + "\r"); check(s.expect("resumed session " + sid), "/resume ID loads it")
-check(s.expect("last reply:") and s.expect("Echo: three"), "recap shows the last reply")
+check(s.expect("Echo: three"), "the conversation is shown again after the recap: its last reply too")
 s.send("four\r"); check(s.expect("Echo: four"), "continues")
 msgs = requests()[-1]["messages"]
 check([m["content"] for m in msgs if m["role"] == "user"] == ["session one", "and two", "three", "four"], "resumed history sent")
@@ -882,7 +884,8 @@ print("test interactive: /cost")
 s.send("/cost\r"); check(s.expect("session cost"), "/cost header")
 check(s.expect("model calls") and re.search(r"model calls   \d+  \(\d+ requests", s.text()) is not None, f"calls and requests counted: {s.text()[-400:]!r}")
 check(re.search(r"tokens        [\d.]+k?  \(↑", s.text()) is not None, "token totals shown")
-check(re.search(r"wall time     \d", s.text()) is not None and "tok/s" in s.text(), "wall time and tok/s shown")
+seen(s, "wall time", 10)   # the last lines of the report are painted after the first ones
+check(re.search(r"wall time     \d", s.text()) is not None and "tok/s" in s.text(), f"wall time and tok/s shown: {s.text()[-300:]!r}")
 
 print("test interactive: /diff")
 s.send("/diff\r"); check(s.expect("not inside a git repository"), "/diff outside git")
@@ -2092,7 +2095,8 @@ most = json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"]
 check(most == 2, f"the two model calls were under way at the same time: {most}")
 check(took < 6.2, f"so the two slow tasks took the time of one, not of two (3.2 s each): {took:.1f}s")
 out3 = since_send(s)
-check(out3.index("⤷ worker 3/3") > out3.index("reviews task 2/3") and out3.index("⤷ worker 3/3") > out3.index("reviews task 1/3"), "the task that waits for both starts when both are accepted")
+_w3, _r2, _r1 = out3.find("⤷ worker 3/3"), out3.find("reviews task 2/3"), out3.find("reviews task 1/3")   # find, not index: a repainted line is missing, and the check fails rather than the suite stopping
+check(_w3 >= 0 and _r2 >= 0 and _r1 >= 0 and _w3 > _r2 and _w3 > _r1, "the task that waits for both starts when both are accepted")
 w3 = [r for r in requests() if r["model"] == "fake-coder:latest" and len(r["messages"]) > 1 and "# Your task (3 of 3)" in r["messages"][1]["content"]]
 check(w3 and "## Task 1: first slow thing — accepted" in w3[0]["messages"][1]["content"] and "## Task 2: second slow thing — accepted" in w3[0]["messages"][1]["content"], "and is told what the two did")
 check(open(MADE).read() == "made by fake\n", "its file is written")
@@ -2274,6 +2278,159 @@ check(w2 and "# The contract (what all the tasks share)" in w2[0]["messages"][1]
 check(w3 and "# The contract" in w3[0]["messages"][1]["content"] and "# Your role" not in w3[0]["messages"][0]["content"], "and the default worker gets the contract, but no role")
 rp.close()
 shutil.rmtree(RP, ignore_errors=True); shutil.rmtree(RCFG, ignore_errors=True)
+
+# ---------- the features of the last rounds: each section has its own config and project directory ----------
+import glob as _glob
+def proj_key(path):   # the name corbienest gives a project's rules, hooks and MCP servers (FNV-1a of its real path)
+    h = 1469598103934665603
+    for c in os.path.realpath(path).encode(): h ^= c; h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return f"{h:016x}"
+def feat(name):
+    cfg = tempfile.mkdtemp(prefix=f"crow_{name}_cfg_"); proj = tempfile.mkdtemp(prefix=f"crow_{name}_proj_")
+    os.makedirs(os.path.join(cfg, "corbienest"))
+    open(os.path.join(cfg, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\n")
+    return cfg, proj, dict(ENV, XDG_CONFIG_HOME=cfg)
+def in_proj(proj, args, env, stdin=b""):
+    p = subprocess.run([BIN] + args, cwd=proj, env=env, input=stdin, capture_output=True, timeout=120)
+    return clean(p.stdout.decode("utf-8", "replace")), clean(p.stderr.decode("utf-8", "replace")), p.returncode
+def put(cfg, sub, name, text):   # a file in the config directory's per-project folder
+    d = os.path.join(cfg, "corbienest", sub); os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, name), "w").write(text)
+def procs(pat):   # the processes whose command line has pat, not the grep itself
+    o = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout
+    return [l for l in o.splitlines() if pat in l and "ps -eo" not in l and "grep" not in l]
+
+print("test feature: a guard rule stops a tool under --yolo; an ask is refused without a terminal")
+cfg, proj, env = feat("guard")
+put(cfg, "permissions", proj_key(proj) + ".rules", "deny bash echo *\n")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_BASH please"], env)
+check("denied (project rule: deny bash echo *)" in out and "⎿  hello-from-tool" not in out, f"deny stops the call under --yolo: {out[-300:]!r}")
+put(cfg, "permissions", proj_key(proj) + ".rules", "ask bash echo *\n")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_BASH please"], env)
+check("no one to ask" in out and "⎿  hello-from-tool" not in out, f"an ask is refused when nobody can answer: {out[-300:]!r}")
+put(cfg, "permissions", proj_key(proj) + ".rules", "bash echo\n")
+out, err, rc = in_proj(proj, ["-p", "TOOL_BASH please"], env)
+check("⎿  hello-from-tool" in out, f"an allow rule still lets the call through: {out[-200:]!r}")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: hooks gate a call (exit 2), add a post note, and run at the end of a request")
+cfg, proj, env = feat("hooks")
+put(cfg, "hooks", proj_key(proj) + ".hooks",
+    "pre bash cat > evt.json; grep -q BLOCKME evt.json && { echo blocked-by-gate; exit 2; }; exit 0\n"
+    "post bash echo post-note-here\n"
+    "stop echo stop-note-here\n")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_BASH please"], env)
+check("post-note-here" in out and "stop-note-here" in out, f"post and stop hooks ran: {out[-300:]!r}")
+evt = open(os.path.join(proj, "evt.json")).read() if os.path.exists(os.path.join(proj, "evt.json")) else ""
+check('"event":"pre"' in evt and '"tool":"bash"' in evt and '"command":"echo hello-from-tool"' in evt, f"the event reached the hook on stdin: {evt[:200]!r}")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_SHELL echo BLOCKME"], env)
+check("blocked-by-gate" in out and "hook stopped bash" in out, f"a pre hook that exits 2 stops the call: {out[-300:]!r}")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: a background command runs on after the call and is stopped when corbienest exits")
+cfg, proj, env = feat("bg")
+before = len(procs("sleep 317"))
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_BG please"], env)
+check("started background job bg" in out, f"the job is started and announced: {out[-200:]!r}")
+check(len(procs("sleep 317")) == before, "the job is gone when the run ends")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: stream-json: one JSON object per line on stdout, tool calls matched to results")
+cfg, proj, env = feat("stream")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_BASH please", "--output-format", "stream-json"], env)
+lines = [l for l in out.splitlines() if l.strip()]
+objs = []
+for l in lines:
+    try: objs.append(json.loads(l))
+    except Exception: objs.append(None)
+check(objs and all(o is not None for o in objs), f"every stdout line is JSON: {lines[:2]!r}")
+check(objs and objs[0].get("type") == "system" and objs[-1].get("type") == "result", "a system line first, a result line last")
+uses = [b for o in objs if o for b in (o.get("message", {}).get("content") or []) if isinstance(b, dict) and b.get("type") == "tool_use"]
+res = [b for o in objs if o for b in (o.get("message", {}).get("content") or []) if isinstance(b, dict) and b.get("type") == "tool_result"]
+check(uses and res and uses[0]["id"] == res[0]["tool_use_id"] and uses[0]["name"] == "bash", f"the tool call and its result carry the same id: {uses[:1]} {res[:1]}")
+out, err, rc = in_proj(proj, ["--yolo", "--output-format", "stream-json", "--input-format", "stream-json"], env,
+                       stdin=b'{"type":"user","message":{"role":"user","content":"first"}}\n{"type":"user","message":{"role":"user","content":[{"type":"text","text":"second"}]}}\n')
+results = [json.loads(l) for l in out.splitlines() if l.startswith("{") and '"type":"result"' in l]
+check(len(results) == 2 and all(r.get("subtype") == "success" for r in results), f"two requests on stdin, one result line each: {len(results)}")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: todo_write keeps a task list and shows it whole")
+cfg, proj, env = feat("todo")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_TODO please"], env)
+check("Tasks (1 of 3 done)" in out and "☑ read the code" in out and "◐ make the change" in out and "☐ run the tests" in out,
+      f"the list is shown: {out[-300:]!r}")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: an MCP server's tool is offered, called, and guarded; the server stops with the run")
+cfg, proj, env = feat("mcp")
+mcp_py = os.path.join(HERE, "fake_mcp.py")
+put(cfg, "mcp", proj_key(proj) + ".json", json.dumps({"servers": {"fake": {"command": "python3", "args": [mcp_py]}}}))
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_MCP please"], env)
+check("echo: from-model" in out, f"the server's tool answers the call: {out[-300:]!r}")
+check("fake-mcp: starting" not in out, "the server's banner line does not reach the screen")
+put(cfg, "permissions", proj_key(proj) + ".rules", "deny mcp mcp__fake__echo\n")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_MCP please"], env)
+check("was not run" in out and "echo: from-model" not in out, f"a deny rule on the tool's name stops it: {out[-300:]!r}")
+check(not procs("fake_mcp.py"), "no server is left running after the run")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: a sub-agent file's role and tools reach the sub-agent, and nothing more")
+cfg, proj, env = feat("agents")
+os.makedirs(os.path.join(proj, ".corbienest", "agents"))
+open(os.path.join(proj, ".corbienest", "agents", "reviewer.md"), "w").write(
+    "---\nname: reviewer\ndescription: Reviews made.txt, read-only\ntools: read_file, grep, Write\n---\nROLE_MARK_XYZ: review and report.\n")
+n0 = len(requests())
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_AGENT please"], env)
+sub = [r for r in requests()[n0:] if any("Your role" in (m.get("content") or "") for m in r.get("messages", []))]
+check(sub and "ROLE_MARK_XYZ" in sub[-1]["messages"][0]["content"], "the role is in the sub-agent's instructions")
+check(sub and sorted(t["function"]["name"] for t in sub[-1].get("tools", [])) == ["grep", "read_file"],
+      f"only the allowed tools are offered (Write is not a sub-agent tool): {[t['function']['name'] for t in sub[-1].get('tools', [])] if sub else None}")
+n1 = len(requests())
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_AGENT_NOSUCH please"], env)
+check("no sub-agent named nosuch" in out or "no sub-agent named nosuch" in json.dumps(requests()[n1:]), "an unknown agent name is an error for the model")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: the sandbox keeps writes to the project (when bwrap is installed)")
+if shutil.which("bwrap") and subprocess.run(["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"], capture_output=True).returncode == 0:
+    cfg, proj, env = feat("sandbox")
+    outside = tempfile.mkdtemp(prefix="crow_outside_")
+    open(os.path.join(cfg, "corbienest", "config"), "a").write("sandbox=bwrap\n")
+    out, err, rc = in_proj(proj, ["--yolo", "-p", f"TOOL_SHELL touch ./inproj.txt && echo PROJ_OK; touch {outside}/x 2>/dev/null; echo OUTSIDE_RC=$?"], env)
+    check("PROJ_OK" in out and "OUTSIDE_RC=1" in out, f"the project is writable, the rest is not: {out[-300:]!r}")
+    shutil.rmtree(outside, ignore_errors=True); shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+else:
+    print("  (bwrap is not installed or cannot start: this section is skipped)")
+
+print("test feature: /resume shows the conversation again, and its typed lines are in the ↑ history")
+cfg, proj, env = feat("resume")
+out, err, rc = in_proj(proj, ["-p", "hello replay"], env)
+sids = [os.path.basename(p)[:-5] for p in _glob.glob(os.path.join(cfg, "corbienest", "sessions", "*.json"))]
+sess = Session(["--resume", sids[0]] if sids else [], cwd=proj, env=env)
+check(sess.expect("Echo: hello replay"), "the earlier reply is shown again")
+check(sess.expect("› hello replay"), "the typed line is shown as the user sent it")
+sess.send("\x1b[A", wait=0.6)
+check(seen(sess, "hello replay", 8), "the ↑ key recalls the typed line from the session")
+sess.close()
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: the slash commands for the rules, hooks, MCP servers, agents and the sandbox answer")
+cfg, proj, env = feat("slash")
+sess = Session([], cwd=proj, env=env)
+sess.expect("Ctrl-D to quit")
+def slash(line):   # the input field takes a fast line as it is typed; Esc closes the suggestion list before Enter
+    sess.mark = len(sess.out)
+    for ch in line: os.write(sess.fd, ch.encode()); time.sleep(0.03)
+    time.sleep(0.6); os.write(sess.fd, b"\x1b"); time.sleep(0.4); os.write(sess.fd, b"\r")
+slash("/permissions add deny bash rm *")
+check(seen(sess, "✓ added: deny bash rm *", 8), "/permissions add accepts a guard rule")
+slash("/hooks add pre bash echo gate")
+check(seen(sess, "hook added", 8), "/hooks add takes a pre hook")
+slash("/sandbox")
+check(seen(sess, "sandbox off", 8), "/sandbox shows that it is off")
+slash("/agents")
+check(seen(sess, "no sub-agent files", 8), "/agents says there are none")
+sess.close()
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
 
 shutil.rmtree(WORK, ignore_errors=True); shutil.rmtree(CFG, ignore_errors=True)
 print(f"{passed} checks passed, {failed} failed")
