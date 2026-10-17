@@ -123,9 +123,11 @@ static int ctrl_c_pending(void) {
 /* What every request sets on its handle, whoever runs it: the URL, the headers (returned, to be
  * freed when the transfer is over), the protocols, the proxy and CA rules, the body. It reads the
  * environment, so it is called on the main thread — also for a request a thread then performs. */
-static struct curl_slist *easy_setup(CURL *h, const char *url, const char *method, const char *body, const char *const *extra, char *errbuf) {
+static struct curl_slist *easy_setup(CURL *h, const char *url, const char *method, const char *body, size_t body_len, bool gzipped,
+                                     const char *const *extra, char *errbuf) {
     struct curl_slist *hdrs = curl_slist_append(NULL, "Accept: application/json");
     if (body) hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+    if (body && gzipped) hdrs = curl_slist_append(hdrs, "Content-Encoding: gzip");
     hdrs = curl_slist_append(hdrs, "Expect:");              /* no 100-continue round trip for a big brief */
     /* a server that serves one connection at a time (a test's) is not held up; over TLS the
      * connection may be HTTP/2, where the header is not allowed (FORBID_REUSE closes it anyway) */
@@ -156,7 +158,7 @@ static struct curl_slist *easy_setup(CURL *h, const char *url, const char *metho
     if (ca && *ca) curl_easy_setopt(h, CURLOPT_CAINFO, ca);
     if (body || !strcmp(method, "POST")) {
         curl_easy_setopt(h, CURLOPT_POSTFIELDS, body ? body : "");
-        curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, (long)(body ? strlen(body) : 0));
+        curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)(body ? body_len : 0));
     }
     if (strcmp(method, "GET") && strcmp(method, "POST")) curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
     else if (!strcmp(method, "GET") && !body) curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
@@ -172,6 +174,12 @@ bool http_busy(void) { return g_http_depth > 0; }
 int http_request(const char *base_url, const char *method, const char *path,
                  const char *body, sbuf *out, http_line_cb line_cb, void *ud,
                  http_result *res) {
+    return http_request_bytes(base_url, method, path, body, body ? strlen(body) : 0, false, out, line_cb, ud, res);
+}
+
+int http_request_bytes(const char *base_url, const char *method, const char *path,
+                       const char *body, size_t body_len, bool gzipped, sbuf *out, http_line_cb line_cb, void *ud,
+                       http_result *res) {
     memset(res, 0, sizeof *res);
     if (!curl_ready()) { snprintf(res->err, sizeof res->err, "libcurl could not be initialised"); return -1; }
     CURL *h = curl_easy_init();
@@ -183,7 +191,7 @@ int http_request(const char *base_url, const char *method, const char *path,
     xfer x; memset(&x, 0, sizeof x);
     x.sink.cb = line_cb; x.sink.ud = ud; x.sink.out = out; sb_init(&x.sink.linebuf);
 
-    struct curl_slist *hdrs = easy_setup(h, url, method, body, http_headers, errbuf);
+    struct curl_slist *hdrs = easy_setup(h, url, method, body, body_len, gzipped, http_headers, errbuf);
     curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, on_body);
     curl_easy_setopt(h, CURLOPT_WRITEDATA, &x);
     curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, on_header);
@@ -255,7 +263,7 @@ int http_request(const char *base_url, const char *method, const char *path,
 struct http_job {
     pthread_t thread;
     CURL *h; struct curl_slist *hdrs;
-    char *url, *body; char errbuf[CURL_ERROR_SIZE];
+    char *url, *body; size_t body_len; char errbuf[CURL_ERROR_SIZE];
     char *data; size_t len, cap;      /* the answer */
     atomic_bool cancel, done;
     CURLcode cc;
@@ -288,13 +296,22 @@ static void *job_run(void *ud) {
 }
 
 http_job *http_job_start(const char *base_url, const char *path, const char *body, const char *const *headers) {
+    return http_job_start_bytes(base_url, path, body, body ? strlen(body) : 0, false, headers);
+}
+
+http_job *http_job_start_bytes(const char *base_url, const char *path, const char *body, size_t body_len, bool gzipped, const char *const *headers) {
     if (!curl_ready()) return NULL;
     http_job *j = calloc(1, sizeof *j);
     if (!j) return NULL;
     j->h = curl_easy_init();
     if (!j->h) { free(j); return NULL; }
-    j->url = http_url(base_url, path); j->body = xstrdup(body ? body : "");
-    j->hdrs = easy_setup(j->h, j->url, "POST", j->body, headers, j->errbuf);
+    j->url = http_url(base_url, path);
+    j->body_len = body ? body_len : 0;
+    j->body = malloc(j->body_len + 1);   /* a copy: a gzipped body has NULs, so it is not a string */
+    if (!j->body) { curl_easy_cleanup(j->h); free(j->url); free(j); return NULL; }
+    if (j->body_len) memcpy(j->body, body, j->body_len);
+    j->body[j->body_len] = 0;
+    j->hdrs = easy_setup(j->h, j->url, "POST", j->body, j->body_len, gzipped, headers, j->errbuf);
     curl_easy_setopt(j->h, CURLOPT_WRITEFUNCTION, job_body);
     curl_easy_setopt(j->h, CURLOPT_WRITEDATA, j);
     curl_easy_setopt(j->h, CURLOPT_HEADERFUNCTION, job_header);

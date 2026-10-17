@@ -232,6 +232,7 @@ bool  model_is_cloud(const char *name);           /* NAME:cloud / NAME-cloud */
 
 /* ---------- global config ---------- */
 typedef struct { char *model; double in, out; } price_entry;   /* USD per million tokens, set with /usage price */
+typedef struct { char *name; bool on; } gzip_entry;   /* whether a provider's request bodies go gzipped (/gzip); saved as gzip.NAME=1|0 */
 typedef struct { char *model, *level; } effort_entry;   /* level: "off", "on", or one of the model's named levels */
 
 typedef struct {
@@ -246,6 +247,8 @@ typedef struct {
     int   n_efforts;
     price_entry *prices;   /* what a model costs where the built-in list does not know or is out of date; saved as price.<model>=<in>/<out> */
     int   n_prices;
+    gzip_entry *gzips;     /* per provider: gzip request bodies on (1) or off (0), see gzip_get(); saved as gzip.NAME=1|0 */
+    int   n_gzips;
     char *advisor;       /* the stronger model the agent may consult through the advisor tool (/advisor); NULL = none */
     int   advisor_ctx;   /* num_ctx of an advisor call; 0 = auto (see advisor_plan_for()) */
     char *subagent;      /* the model sub-agents (task) run on; NULL or the main model = the model doing the work (/subagent) */
@@ -338,10 +341,16 @@ extern const char *const *http_headers;   /* extra request headers ("Name: value
 int http_request(const char *base_url, const char *method, const char *path,
                  const char *body, sbuf *out, http_line_cb line_cb, void *ud,
                  http_result *res);
+/* the same with the body as bytes: body_len is its length (a gzipped body has NULs), gzipped says it is
+ * gzip-compressed already and goes with Content-Encoding: gzip. The buffer must live until it returns. */
+int http_request_bytes(const char *base_url, const char *method, const char *path,
+                       const char *body, size_t body_len, bool gzipped, sbuf *out, http_line_cb line_cb, void *ud,
+                       http_result *res);
 /* A POST that a thread of its own performs — the model call of one of several workers. Started
  * and collected on the main thread; see http.c for what the thread may touch (its own handle). */
 typedef struct http_job http_job;
 http_job *http_job_start(const char *base_url, const char *path, const char *body, const char *const *headers);   /* headers NULL = none; NULL return = it could not be started */
+http_job *http_job_start_bytes(const char *base_url, const char *path, const char *body, size_t body_len, bool gzipped, const char *const *headers);   /* the body is copied */
 bool      http_job_done(http_job *j);
 void      http_job_cancel(http_job *j);                               /* it ends soon after, as aborted */
 int       http_job_finish(http_job *j, sbuf *out, http_result *res);  /* waits for it and frees it; returns as http_request() does */
@@ -774,6 +783,13 @@ void price_set(const char *model, double in, double out);   /* in < 0 = forget i
  * stop thinking, qwen3.8 has off/low/medium/high, most others are on or off. "off" and "on" are
  * the booleans; anything else is a level name, sent as it is. No entry = leave it to the model. */
 const char *effort_get(const char *model);                     /* NULL = nothing saved for it */
+/* gzip request bodies (zlib, WITH_ZLIB; ZLIB=0 leaves it out, and then gzip_available() is false) */
+bool  gzip_available(void);
+char *gzip_body(const char *in, size_t n, size_t *out_n);   /* the gzip of in (a new buffer, not NUL-terminated), NULL if it cannot */
+bool  gzip_refused(int status, const char *answer);          /* the server could not take a gzipped body: 415, or a 400 that says so */
+int   gzip_probe_verdict(int plain_status, int gz_status, const char *gz_answer);   /* 1 accepted, 0 refused, -1 no answer to go by (the plain call did not succeed, or the gzipped one failed another way) */
+bool  gzip_get(const char *name, bool *on);                  /* the saved setting for a provider; false = none saved */
+void  gzip_set(const char *name, bool on);                   /* saves it in the config (config_save writes it) */
 void        effort_set(const char *model, const char *level);  /* NULL = forget it (does not save the config) */
 bool        effort_name_ok(const char *s);                     /* fit to store and to send: a-z 0-9 - _ */
 /* Can this model be set to `level`? 1 yes, 0 no, -1 it cannot be known: the model thinks but
@@ -861,6 +877,12 @@ bool  provider_host_url_ok(const char *url, char *err, size_t n);   /* the URL r
 bool  provider_name_ok(const char *name, char *err, size_t n);      /* the name rule above, alone (also not a built-in) */
 int   provider_host_count(void);
 const char *provider_chat_path(const provider_def *p);   /* "/chat/completions" or "/v1/messages" */
+/* gzip request bodies (provider.c): the setting says the server takes them; a refusal is answered plain and
+ * turns it off for the session (provider_gzip_refused); the probe is /gzip probe. */
+bool  provider_gzip_wanted(const provider_def *p);
+void  provider_gzip_refused(const provider_def *p);
+int   provider_gzip_probe(const char *advisor, char *said, size_t n);
+http_job *provider_turn_start(const provider_def *p, const char *plain, const char *const *hdrs, bool allow_gzip, bool *gzipped);
 /* The headers of one call (the key). False when it cannot be made: not a hosted model, no key,
  * or a base URL that would send the key in the clear. The strings live in *keep. */
 bool  provider_call_headers(const char *model, const char *hdrs[4], sbuf *keep, char *err, size_t n);

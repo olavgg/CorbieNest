@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -13,6 +14,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <pwd.h>
+#ifdef WITH_ZLIB
+#include <zlib.h>
+#endif
 
 config_t g_cfg;
 session_stats g_session;
@@ -411,6 +415,7 @@ void config_load(void) {
         else if (!strcmp(k, "think")) g_cfg.think = atoi(v);
         else if (!strcmp(k, "think_level")) { free(legacy_level); legacy_level = *v ? xstrdup(v) : NULL; }
         else if (!strncmp(k, "effort.", 7)) { if (k[7] && effort_name_ok(v)) effort_set(k + 7, v); }
+        else if (!strncmp(k, "gzip.", 5)) { if (k[5] && (!strcmp(v, "0") || !strcmp(v, "1"))) gzip_set(k + 5, !strcmp(v, "1")); }
         else if (!strncmp(k, "price.", 6)) { double pi, po; if (k[6] && sscanf(v, "%lf/%lf", &pi, &po) == 2 && pi >= 0 && po >= 0) price_set(k + 6, pi, po); }
         else if (!strncmp(k, "host.", 5)) {   /* host.NAME=URL|KEY_ENV (/model add); a host that no longer passes the rules is said and skipped */
             char buf[1024]; snprintf(buf, sizeof buf, "%s", v);
@@ -464,6 +469,7 @@ void config_save(void) {
     sb_printf(&b, "think=%d\n", g_cfg.think);
     for (int i = 0; i < g_cfg.n_efforts; i++) sb_printf(&b, "effort.%s=%s\n", g_cfg.efforts[i].model, g_cfg.efforts[i].level);
     for (int i = 0; i < g_cfg.n_prices; i++) sb_printf(&b, "price.%s=%g/%g\n", g_cfg.prices[i].model, g_cfg.prices[i].in, g_cfg.prices[i].out);
+    for (int i = 0; i < g_cfg.n_gzips; i++) sb_printf(&b, "gzip.%s=%d\n", g_cfg.gzips[i].name, g_cfg.gzips[i].on ? 1 : 0);
     for (int i = 0; provider_at(i); i++) if (provider_at(i)->host) sb_printf(&b, "host.%s=%s|%s\n", provider_at(i)->name, provider_at(i)->url, provider_at(i)->key_env);
     if (g_cfg.advisor) sb_printf(&b, "advisor=%s\n", g_cfg.advisor);
     if (g_cfg.advisor_ctx > 0) sb_printf(&b, "advisor_ctx=%d\n", g_cfg.advisor_ctx);
@@ -807,6 +813,73 @@ void price_set(const char *model, double in, double out) {
         g_cfg.prices = xrealloc(g_cfg.prices, sizeof *g_cfg.prices * (size_t)(g_cfg.n_prices + 1));
         g_cfg.prices[g_cfg.n_prices++] = (price_entry){ key, in, out };
     } else { g_cfg.prices[i].in = in; g_cfg.prices[i].out = out; free(key); }
+}
+
+/* ---------- gzip request bodies ----------
+ * A body is gzipped only where the server has been seen to take it (the per-provider setting, probed
+ * by /gzip probe); a refusal falls back to the plain body (provider.c). The compression itself needs
+ * zlib, built in with WITH_ZLIB; without it gzip_available() is false and nothing is compressed. */
+#ifdef WITH_ZLIB
+bool gzip_available(void) { return true; }
+
+char *gzip_body(const char *in, size_t n, size_t *out_n) {
+    if (n > UINT_MAX / 2) return NULL;
+    z_stream z; memset(&z, 0, sizeof z);
+    /* windowBits 15 + 16: the gzip wrapper (RFC 1952), not zlib's own, which is what Content-Encoding: gzip means */
+    if (deflateInit2(&z, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) return NULL;
+    size_t cap = deflateBound(&z, (uLong)n) + 64;
+    unsigned char *out = malloc(cap);
+    if (!out) { deflateEnd(&z); return NULL; }
+    z.next_in = (Bytef *)in; z.avail_in = (uInt)n;
+    z.next_out = out; z.avail_out = (uInt)cap;
+    int rc = deflate(&z, Z_FINISH);
+    size_t produced = cap - z.avail_out;
+    deflateEnd(&z);
+    if (rc != Z_STREAM_END) { free(out); return NULL; }
+    *out_n = produced;
+    return (char *)out;
+}
+#else
+bool gzip_available(void) { return false; }
+char *gzip_body(const char *in, size_t n, size_t *out_n) { (void)in; (void)n; (void)out_n; return NULL; }
+#endif
+
+/* A server that cannot read a gzipped body says so with 415, or with a 400 whose message names the
+ * encoding or the JSON it could not read. Any other 400 (a bad parameter, a long context) is not
+ * one: it would be answered the same way plain. */
+bool gzip_refused(int status, const char *answer) {
+    if (status == 415) return true;
+    if (status != 400 || !answer) return false;
+    static const char *WORDS[] = { "encod", "gzip", "decompress", "valid json", "not json", "parse", NULL };
+    for (int i = 0; WORDS[i]; i++) if (strcasestr(answer, WORDS[i])) return true;
+    return false;
+}
+
+int gzip_probe_verdict(int plain_status, int gz_status, const char *gz_answer) {
+    if (plain_status < 200 || plain_status > 299) return -1;   /* without a working plain call there is nothing to compare with */
+    if (gz_status >= 200 && gz_status <= 299) return 1;
+    if (gzip_refused(gz_status, gz_answer)) return 0;
+    return -1;
+}
+
+static gzip_entry *gzip_find(const char *name) {
+    for (int i = 0; i < g_cfg.n_gzips; i++) if (!strcasecmp(g_cfg.gzips[i].name, name)) return &g_cfg.gzips[i];
+    return NULL;
+}
+
+bool gzip_get(const char *name, bool *on) {
+    gzip_entry *e = gzip_find(name);
+    if (!e) return false;
+    *on = e->on;
+    return true;
+}
+
+void gzip_set(const char *name, bool on) {
+    if (!name || !*name) return;
+    gzip_entry *e = gzip_find(name);
+    if (e) { e->on = on; return; }
+    g_cfg.gzips = xrealloc(g_cfg.gzips, sizeof *g_cfg.gzips * (size_t)(g_cfg.n_gzips + 1));
+    g_cfg.gzips[g_cfg.n_gzips++] = (gzip_entry){ xstrdup(name), on };
 }
 
 const char *effort_get(const char *model) {
