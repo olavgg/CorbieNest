@@ -394,6 +394,14 @@ static void test_tools_body(void *ud) {
         free(ag.model); ag.model = NULL; CHECK(agent_model_override(&ag) == NULL);
     }
 
+    /* sandbox: the bwrap command quotes the directory and the command as one word each */
+    {
+        char *sc = sandbox_command("/p q", "echo 'a'");
+        CHECK(sc && strstr(sc, "--bind '/p q' '/p q'") && strstr(sc, "--chdir '/p q'") && strstr(sc, "--ro-bind / /"));
+        CHECK(sc && strstr(sc, "-- /bin/sh -c 'echo '") && strstr(sc, "'\\''a'"));   /* the quote inside is escaped */
+        free(sc);
+    }
+
     /* tool definitions are well-formed */
     cJSON *defs = tools_definitions();
     CHECK(cJSON_GetArraySize(defs) == 10);   /* the seven, bash_job, todo_write, and exit */

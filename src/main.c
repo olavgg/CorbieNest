@@ -75,6 +75,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/hooks", "shell commands for this project: before or after a tool call, at start and at the end of a request" },
     { "/mcp", "MCP servers: tools from external programs over stdio (add, remove, reconnect; /mcp alone lists them)" },
     { "/agents", "sub-agent files: roles the main agent starts by name with task (reload; /agents alone lists them)" },
+    { "/sandbox", "the model's shell commands in bubblewrap: the project writable, the rest read-only (on, off; alone shows it)" },
     { "/permissions", "the project's saved rules: always-allow ones, and deny/ask guards on a tool and a pattern: add, remove, clear" },
     { "/init", "have the model write AGENTS.md for this project" },
     { "/cost", "tokens, model calls and time of this session" },
@@ -102,6 +103,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/memory idle", "off:wait for the next update or the exit instead" },
     { "/hooks", "add:a hook line: pre|post TOOL COMMAND, start|stop COMMAND|remove:remove hook N|clear:remove them all" },
     { "/agents", "reload:read the agent files again" },
+    { "/sandbox", "on:run the model's shell commands in bwrap|off:run them without it" },
     { "/mcp", "add:a server: [-g] NAME COMMAND [ARGS…] (-g for every project)|remove:remove a server by name|reconnect:start them again" },
     { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST, or deny|ask TOOL PATTERN|remove:remove rule N|clear:remove them all" },
     { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host|deny:stop a tool on a pattern (* any text)|ask:ask before a tool on a pattern" },
@@ -1094,6 +1096,24 @@ static int cmd_rewind(void) {
 }
 
 /* ---------- /permissions ---------- */
+/* /sandbox: the model's shell commands in bubblewrap (tools.c: what it does) */
+static void cmd_sandbox(const char *arg) {
+    if (!arg || !*arg) {
+        if (!g_cfg.sandbox) { printf(C_DIM "sandbox off · /sandbox on runs the model's shell commands in bwrap (the project writable, the rest read-only)" C_RESET "\n"); return; }
+        if (sandbox_available()) printf(C_GREEN "sandbox on" C_RESET C_DIM " — %s" C_RESET "\n", sandbox_why());
+        else printf(C_YELLOW "sandbox on, but not usable here" C_RESET C_DIM " — %s; the commands run without it" C_RESET "\n", sandbox_why());
+        return;
+    }
+    if (!strcmp(arg, "on") || !strcmp(arg, "bwrap")) {
+        g_cfg.sandbox = true; config_save();
+        printf(C_GREEN "✓ sandbox on" C_RESET "\n");
+        if (!sandbox_available()) printf(C_YELLOW "  but not usable here: %s" C_RESET "\n", sandbox_why());
+        return;
+    }
+    if (!strcmp(arg, "off")) { g_cfg.sandbox = false; config_save(); printf(C_GREEN "✓ sandbox off" C_RESET "\n"); return; }
+    printf("usage: /sandbox [on|off]\n");
+}
+
 /* /agents: the sub-agent files this project and the user have (agents.c reads them) */
 static void cmd_agents(const char *arg) {
     if (arg && !strcmp(arg, "reload")) { printf(C_GREEN "✓ %d sub-agent%s" C_RESET "\n", agents_load(), agents_count() == 1 ? "" : "s"); return; }
@@ -4519,6 +4539,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/hooks")) cmd_hooks(arg);
     else if (!strcmp(cmd, "/mcp")) cmd_mcp(arg);
     else if (!strcmp(cmd, "/agents")) cmd_agents(arg);
+    else if (!strcmp(cmd, "/sandbox")) cmd_sandbox(arg);
     else if (!strcmp(cmd, "/cost")) cmd_cost();
     else if (!strcmp(cmd, "/usage")) cmd_usage(arg);
     else if (!strcmp(cmd, "/banner")) cmd_banner();

@@ -306,6 +306,11 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "advisor", "arguments": {"question": "Why does the needle test fail, and where should I look first?"}}}])
         yield chunk(model, done=True)
         return
+    if "TOOL_SHELL" in text:   # a bash call of the rest of the message (the sandbox checks)
+        cmd = text.split("TOOL_SHELL", 1)[1].strip().split("\n")[0]
+        yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": cmd}}}])
+        yield chunk(model, done=True)
+        return
     if "TOOL_AGENT_CC" in text:   # the Claude Code file cc.md (Read, Grep; model: sonnet)
         yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "cc review", "agent": "cc", "prompt": "Look at made.txt."}}}])
         yield chunk(model, done=True)

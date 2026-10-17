@@ -99,6 +99,7 @@ without thinking about them: the status bar, the field, and the strip.
 | `/hooks [add pre\|post TOOL COMMAND \| add start\|stop COMMAND \| remove N \| clear]` | the project's hooks: shell commands before or after a tool call, at start and at the end of a request. See [Hooks](#hooks) |
 | `/mcp [add [-g] NAME COMMAND [ARGS…] \| remove NAME \| reconnect]` | external programs that offer tools, over the Model Context Protocol (stdio). See [MCP servers](#mcp-servers) |
 | `/agents [reload]` | the sub-agent files of this project and yours: roles the main agent starts by name with `task` (see [Sub-agent files](#sub-agent-files)) |
+| `/sandbox [on\|off]` | the model's shell commands in bubblewrap: the project directory writable, the rest read-only, a private `/tmp`, the network as it is. Off by default (`sandbox=bwrap` in the config). See [Sandbox](#sandbox) |
 | `/permissions [add …\|remove N\|clear]` | the project's saved rules: "always allow" ones, and the guard rules `deny` and `ask` (see [Guard rules](#guard-rules-deny-and-ask)). Kept in the config directory, `permissions/`, keyed by the project's path — a file in the project itself is never read |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
@@ -456,6 +457,40 @@ You review code. For each bug give the file, the line and the fix, and nothing e
 - **`/agents`** lists the agents with their tools, model and file. `/agents reload` reads them again.
   The main agent's system prompt names them, rebuilt with every request, so a reload is seen at the
   next one.
+
+## Sandbox
+
+`/sandbox on` (or `sandbox=bwrap` in the config) runs the model's shell commands in
+[bubblewrap](https://github.com/containers/bubblewrap), a program that gives a process its own view of
+the filesystem. Off by default.
+
+- **What the commands see.** The whole filesystem read-only, your home directory included. The
+  project directory is writable (the one you started corbienest in), and so is a private `/tmp` that
+  is empty and gone when the command ends. The network is the same as yours.
+- **What it stops.** A command that writes outside the project fails with the program's own
+  "permission denied" or "read-only file system". The config directory is read-only too, so the model
+  cannot edit your rules, hooks or MCP servers from a command.
+- **What it does not stop.** Reading: a command can still read anything you can read, `~/.ssh`
+  included. Network: a command can still send what it reads. The sandbox limits writes and the
+  filesystem's view, not what a process may do otherwise; the permission rules and the hooks still
+  decide what runs at all.
+- **What it breaks.** A tool that keeps a cache outside the project (`~/.cache`, `~/.npm`, a Go or
+  Cargo build cache in your home) cannot write it, and fails or runs slower. Give it a cache directory
+  inside the project, or run it with `!` (which is not sandboxed).
+- **Which commands.** The model's `bash` calls, its background commands and those of its sub-agents.
+  Not your own `!` lines (you are the user), not hooks, not MCP servers.
+- **If it cannot start.** `bwrap` missing, or user namespaces refused (some hardened kernels and
+  containers), is said once, before the command runs, with the reason; the commands then run without
+  the sandbox, and `/sandbox` shows that it is not usable here. The check is one trial run, asked
+  once.
+- **Requirements.** `bubblewrap` installed (`apt install bubblewrap`) and unprivileged user namespaces
+  allowed. Nothing else: no new dependency in corbienest.
+
+```
+/sandbox on          the model's commands are sandboxed from now on, saved in the config
+/sandbox             shows whether it is on and usable here
+/sandbox off
+```
 
 ## Tools the model can call
 
@@ -1007,7 +1042,7 @@ goal, and keeps the one the metric scores best.
 
 ## Config
 
-Settings changed with `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N`, `/subagent` are saved to
+Settings changed with `/sandbox`, `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N`, `/subagent` are saved to
 `~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`, the sub-agents' model as `subagent=`, the colour theme as `theme=`, and the command that builds the project between the layers of `/plan` as `build=`, which is set by hand in that file). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, `CORBIENEST_TRACE` (a file to record the session's drawing into, see below), and for a hosted model or advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
 
 ## Colours

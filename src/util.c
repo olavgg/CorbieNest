@@ -428,6 +428,7 @@ void config_load(void) {
         else if (!strcmp(k, "mode")) { int m = mode_parse(v); if (m >= 0) g_cfg.mode = m; }
         else if (!strcmp(k, "memory")) g_cfg.memory = atoi(v) != 0;
         else if (!strcmp(k, "web")) g_cfg.web = atoi(v) != 0;
+        else if (!strcmp(k, "sandbox")) g_cfg.sandbox = !strcmp(v, "bwrap") || atoi(v) != 0;
         else if (!strcmp(k, "search_url")) { free(g_cfg.search_url); g_cfg.search_url = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "max_iters")) { int n = atoi(v); if (n > 0) g_cfg.max_iters = n; }
         else if (!strcmp(k, "memory_every")) { int n = atoi(v); if (n > 0) g_cfg.memory_every = n; }
@@ -468,6 +469,7 @@ void config_save(void) {
     sb_printf(&b, "max_iters=%d\n", g_cfg.max_iters);
     sb_printf(&b, "memory=%d\n", g_cfg.memory ? 1 : 0);
     sb_printf(&b, "web=%d\n", g_cfg.web ? 1 : 0);
+    sb_printf(&b, "sandbox=%s\n", g_cfg.sandbox ? "bwrap" : "off");
     if (g_cfg.search_url) sb_printf(&b, "search_url=%s\n", g_cfg.search_url);
     sb_printf(&b, "memory_every=%d\n", g_cfg.memory_every);
     sb_printf(&b, "memory_idle=%d\n", g_cfg.memory_idle);

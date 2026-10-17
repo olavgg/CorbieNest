@@ -1118,6 +1118,52 @@ static tool_status t_mcp(const char *name, cJSON *args, sbuf *out) {
     }
     return mcp_call(name, args, out);
 }
+/* ---------- sandbox (sandbox=bwrap) ----------
+ * The model's shell commands run in bubblewrap when the config says so: the whole filesystem read-only, the project
+ * directory writable, a private /tmp, and the network as it is. The user's own !lines, the hooks and the MCP servers
+ * are not in it. A sandbox that cannot start here is said so, and the commands run without it. */
+static void put_word(sbuf *b, const char *s) {   /* a string as one shell word, appended to b */
+    sb_putc(b, '\'');
+    for (; *s; s++) { if (*s == '\'') sb_puts(b, "'\\''"); else sb_putc(b, *s); }
+    sb_putc(b, '\'');
+}
+char *sandbox_command(const char *cwd, const char *cmd) {
+    sbuf b; sb_init(&b);
+    sb_puts(&b, "bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --die-with-parent --new-session --bind ");
+    put_word(&b, cwd); sb_putc(&b, ' '); put_word(&b, cwd);
+    sb_puts(&b, " --chdir "); put_word(&b, cwd);
+    sb_puts(&b, " -- /bin/sh -c "); put_word(&b, cmd);
+    return sb_detach(&b);
+}
+static int g_sandbox_state = 0;      /* 0 not asked, 1 usable, -1 not usable */
+static char g_sandbox_why[600];
+bool sandbox_available(void) {
+    if (g_sandbox_state) return g_sandbox_state > 0;
+    char path[1200];
+    bool found = false;
+    const char *pe = getenv("PATH"); if (!pe) pe = "/usr/bin:/bin";
+    for (const char *p = pe; *p && !found; ) {
+        const char *e = strchr(p, ':'); size_t n = e ? (size_t)(e - p) : strlen(p);
+        snprintf(path, sizeof path, "%.*s/bwrap", (int)n, *p ? p : ".");
+        if (!access(path, X_OK)) found = true;
+        p = e ? e + 1 : p + n;
+    }
+    if (!found) { snprintf(g_sandbox_why, sizeof g_sandbox_why, "bwrap is not installed (apt install bubblewrap)"); g_sandbox_state = -1; return false; }
+    char trial[1400], err[1400] = "";
+    char tmpl[] = "/tmp/corbienest_sbx_XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd >= 0) close(fd);
+    snprintf(trial, sizeof trial, "bwrap --ro-bind / / --dev /dev --proc /proc --die-with-parent --new-session true >%s 2>&1", fd >= 0 ? tmpl : "/dev/null");
+    int rc = system(trial);
+    if (fd >= 0) { FILE *f = fopen(tmpl, "r"); if (f) { size_t n = fread(err, 1, sizeof err - 1, f); err[n] = 0; fclose(f); } unlink(tmpl); }
+    if (rc == 0) { snprintf(g_sandbox_why, sizeof g_sandbox_why, "bwrap: the project directory writable, the rest read-only, a private /tmp, network allowed"); g_sandbox_state = 1; return true; }
+    char *nl = strchr(err, '\n'); if (nl) *nl = 0;
+    snprintf(g_sandbox_why, sizeof g_sandbox_why, "bwrap cannot start here (%s; user namespaces may be disabled)", err[0] ? err : "exit status not 0");
+    g_sandbox_state = -1;
+    return false;
+}
+const char *sandbox_why(void) { return g_sandbox_why; }
+
 static tool_status t_bash(cJSON *args, sbuf *out) {
     const char *cmd = jstr(args, "command", NULL);
     if (!cmd || !*cmd) { sb_puts(out, "error: missing 'command'"); return TOOL_ERROR; }
@@ -1136,10 +1182,20 @@ static tool_status t_bash(cJSON *args, sbuf *out) {
         sb_printf(out, "User denied running the command.%s%s", reason ? " Reason: " : "", reason ? reason : "");
         free(reason); return TOOL_DENIED;
     }
-    if (bg) return bg_start(cmd, out);
+    /* the model's commands go through bwrap when the config says so (not the user's own !lines) */
+    char *sbx = NULL; const char *run = cmd;
+    if (g_cfg.sandbox && !tools_no_confirm) {
+        char cwd[PATH_MAX];
+        if (!sandbox_available()) {   /* said once, then the commands run without it */
+            static bool said = false;
+            if (!said) { said = true; printf("  " C_YELLOW "sandbox off" C_RESET C_DIM " — %s" C_RESET "\n", g_sandbox_why); }
+        } else if (getcwd(cwd, sizeof cwd)) { sbx = sandbox_command(cwd, cmd); run = sbx; }
+    }
+    if (bg) { tool_status st = bg_start(run, out); free(sbx); return st; }
     sbuf o; sb_init(&o);
     bool intr = false;
-    int rc = run_shell(cmd, timeout, &o, &intr, OUT_CAP * 2, "running command", "running");
+    int rc = run_shell(run, timeout, &o, &intr, OUT_CAP * 2, "running command", "running");
+    free(sbx);
     cap_output(&o, OUT_CAP);
     if (rc == 124) sb_printf(out, "(command timed out after %ds and was killed)\n", timeout);
     if (intr) sb_puts(out, "(command interrupted by user with Ctrl-C)\n");
