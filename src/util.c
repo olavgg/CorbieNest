@@ -815,6 +815,27 @@ void price_set(const char *model, double in, double out) {
     } else { g_cfg.prices[i].in = in; g_cfg.prices[i].out = out; free(key); }
 }
 
+/* base64, RFC 4648 with '=' padding; the input may hold any bytes, NULs included */
+char *base64_encode(const char *in, size_t n) {
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char *out = malloc(((n + 2) / 3) * 4 + 1);
+    if (!out) return NULL;
+    size_t o = 0, i = 0;
+    for (; i + 3 <= n; i += 3) {
+        unsigned v = ((unsigned char)in[i] << 16) | ((unsigned char)in[i + 1] << 8) | (unsigned char)in[i + 2];
+        out[o++] = T[v >> 18]; out[o++] = T[(v >> 12) & 63]; out[o++] = T[(v >> 6) & 63]; out[o++] = T[v & 63];
+    }
+    if (n - i == 1) {
+        unsigned v = (unsigned char)in[i] << 16;
+        out[o++] = T[v >> 18]; out[o++] = T[(v >> 12) & 63]; out[o++] = '='; out[o++] = '=';
+    } else if (n - i == 2) {
+        unsigned v = ((unsigned char)in[i] << 16) | ((unsigned char)in[i + 1] << 8);
+        out[o++] = T[v >> 18]; out[o++] = T[(v >> 12) & 63]; out[o++] = T[(v >> 6) & 63]; out[o++] = '=';
+    }
+    out[o] = 0;
+    return out;
+}
+
 /* ---------- gzip request bodies ----------
  * A body is gzipped only where the server has been seen to take it (the per-provider setting, probed
  * by /gzip probe); a refusal falls back to the plain body (provider.c). The compression itself needs

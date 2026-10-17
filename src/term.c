@@ -172,6 +172,12 @@ static int  g_busy_frame = 0;
 static struct timeval g_busy_t;             /* last spinner advance (throttle) */
 static int g_queue_n;                       /* messages queued while busy (see term_queue_*) */
 static int  g_view_top = -1;                /* scrolled back: the first row shown (see "scrolling back"); -1 = the live view */
+/* the mouse highlight on the conversation (see "mouse selection" below): a point is a scrollback line and a byte index */
+typedef struct { int line; int idx; } ansi_pt;
+static bool g_sel_on = false;        /* a highlight is on the conversation */
+static bool g_sel_down = false;      /* the button is held: a gesture is in progress */
+static bool g_sel_moved = false;     /* the gesture has moved since the press */
+static ansi_pt g_sel_a, g_sel_b;     /* where the gesture began and where it is now */
 static bool g_view_stale = false;           /* ... and its window has to be painted again (the geometry changed) */
 static char *g_ov_text = NULL;              /* the overlay's text (term_overlay_show): a centred window over the conversation; NULL = none */
 static int g_ov_geo[4] = { -1, -1, -1, -1 };   /* the box last painted: top, left, height, width (-1: none), see modal_paint() */
@@ -811,9 +817,10 @@ void term_busy_tick(void) {
  * prompt history instead of scrolling anything, and tmux with its own mouse on keeps the wheel
  * for its copy mode — of a screen that has no history. Asked, both hand the wheel over as what it
  * is (read_key: K_WHEEL_*), and the arrows stay the input field's. The price is the usual one
- * for a full-screen program: selecting text with the mouse needs Shift held down. */
-#define MOUSE_ON  "\x1b[?1000h\x1b[?1006h"
-#define MOUSE_OFF "\x1b[?1006l\x1b[?1000l"
+ * for a full-screen program. A drag selects the conversation's text (button-event tracking, ?1002h, reports
+ * the moves while the button is held); a click on a fold's head still toggles it. Shift still gives the terminal's own selection. */
+#define MOUSE_ON  "\x1b[?1000h\x1b[?1002h\x1b[?1006h"
+#define MOUSE_OFF "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
 /* DECSCUSR: a blinking block for the cursor the output and the editor share, and the terminal's own
  * style back on the way out (0 = the default) */
 #define CURSOR_BLINK   "\x1b[?25h\x1b[1 q"
@@ -1303,6 +1310,44 @@ void term_sgr_track(sbuf *st, const char *d, size_t len) {
  * blank). Each row starts with the colours in effect where its text starts, which is the same
  * screen as printing the transcript straight through. When `mark` is a row, the colours in effect
  * at its start go to `at_mark` (the cursor's row is printed again after this). */
+/* one row's text, with the part of it that is highlighted in reverse video. `t` is the row's escaped text (the
+ * line's bytes from `off`, `len` long): the highlight is the bytes between the two points, in the scrollback's
+ * coordinates (a line index and a byte index into the line). */
+static void sel_row_paint(sbuf *o, const char *t, int len, int line, int off) {
+    int a = 0, b = 0;
+    if (g_sel_on && !g_sel_down) {
+        ansi_pt lo = g_sel_a, hi = g_sel_b;
+        if (lo.line > hi.line || (lo.line == hi.line && lo.idx > hi.idx)) { ansi_pt q = lo; lo = hi; hi = q; }
+        if (line >= lo.line && line <= hi.line) {
+            int from = line == lo.line ? lo.idx : 0;
+            int to = line == hi.line ? hi.idx : (int)strlen(term_sb_line(line));
+            a = from - off; b = to - off;
+            if (a < 0) a = 0;
+            if (b > len) b = len;
+        }
+    }
+    if (b <= a) { sb_append(o, t, (size_t)len); return; }
+    sb_append(o, t, (size_t)a);
+    sb_puts(o, "[7m");          /* reverse video: the highlighted text */
+    sb_append(o, t + a, (size_t)(b - a));
+    sb_puts(o, "[27m");         /* back to normal, the colours the row carried are re-applied by the next SGR */
+    sb_append(o, t + b, (size_t)(len - b));
+}
+
+/* a change to the highlight repaints the conversation at once (the view when scrolled back, the live screen otherwise) */
+static void repaint_conv_soon(void) {
+    if (g_view_top >= 0) view_paint();
+    else if (g_sb_active && !g_ov_text) {   /* the live screen: painted as the rest of the conversation is */
+        sbuf o; sb_init(&o);
+        sb_printf(&o, "[1;%dr", fs_region());
+        conv_repaint(&o);
+        bool was = g_sb_pause; sb_pause(true);
+        fwrite(o.data, 1, o.len, stdout); fflush(stdout);
+        sb_pause(was);
+        sb_free(&o);
+    }
+}
+
 static void paint_rows(sbuf *o, const sb_row *r, int n, int from, int count, int mark, sbuf *at_mark) {
     sbuf st; sb_init(&st);
     for (int idx = 0; idx < n && idx < from + count; idx++) {
@@ -1311,7 +1356,8 @@ static void paint_rows(sbuf *o, const sb_row *r, int n, int from, int count, int
         if (idx >= from) {
             sb_printf(o, "\x1b[%d;1H" C_RESET "\x1b[2K", idx - from + 1);   /* a reset first: the erase takes the ground it is left with */
             sb_puts(o, C_RESET); sb_append(o, st.data, st.len);
-            sb_append(o, t, r[idx].len); sb_puts(o, C_RESET);
+            sel_row_paint(o, t, r[idx].len, r[idx].line, r[idx].off);
+            sb_puts(o, C_RESET);
         }
         term_sgr_track(&st, t, r[idx].len);
     }
@@ -2060,7 +2106,119 @@ static int read_byte_timeout(int ms) {
 /* A mouse report as a key: button code and row (1-based). Only the wheel means anything here,
  * and only over the conversation — over the input field and the bar it does nothing, their keys
  * are the keyboard's. Clicks, releases and drags are reported too (there is no wheel-only mode). */
+/* ---------- mouse selection on the conversation ----------
+ * A press on a conversation row starts a gesture; a drag (the button held, reported with bit 32) extends it; the
+ * release decides: a press that did not move is a click (a fold's head, as before), one that moved is a selection,
+ * which stays highlighted until a key is pressed. Ctrl+C with a highlight copies it (OSC 52 for the terminal's
+ * clipboard, and pbcopy where it is there). The text is read from the scrollback, so the highlight and the copy
+ * are the same text whatever the screen shows. A point is a scrollback line and a byte index into its visible
+ * text (escape sequences are not counted). */
+
+/* the visible bytes of an escaped line: the index of the byte in `line` that the visible index `vis` lands on */
+static int vis_to_raw(const char *line, int vis) {
+    int seen = 0;
+    const char *p = line;
+    while (*p) {
+        if (*p == 0x1b) {   /* a CSI sequence: skipped whole */
+            const char *q = p + 1;
+            if (*q == '[') { q++; while (*q && !((*q >= '@' && *q <= '~'))) q++; if (*q) q++; }
+            else if (*q) q++;
+            p = q; continue;
+        }
+        if (seen == vis) return (int)(p - line);
+        seen++; p++;
+        while (((unsigned char)*p & 0xC0) == 0x80) { p++; }   /* a UTF-8 continuation byte belongs to its character */
+    }
+    return (int)(p - line);
+}
+
+/* the scrollback position under a screen row and column (the conversation's rows as the screen shows them); false
+ * where there is no conversation row (the field, the bar, a menu) */
+static bool conv_point(int row, int col, ansi_pt *out) {
+    if (!g_fs || !g_sb_active || row < 1 || row > fs_region()) return false;
+    int n; sb_row *r = sb_rows(g_fs_cols, &n);
+    int cur = 0, ccol = 0;
+    int first = conv_first(r, n, fs_region(), g_fs_cols > 0 ? g_fs_cols : 1, &cur, &ccol);
+    if (g_view_top >= 0) first = g_view_top;   /* scrolled back: the window is the viewer's */
+    int idx = first + row - 1;
+    bool ok = idx >= 0 && idx < n;
+    if (ok) {
+        out->line = r[idx].line;
+        const char *text = term_sb_line(out->line);
+        int want = col > 0 ? col - 1 : 0;   /* the column counts the row's visible characters */
+        int raw = r[idx].off, rowend = r[idx].off + r[idx].len, got = 0;
+        while (raw < rowend && text[raw] && got < want) {   /* step over whole characters, escapes included */
+            int step = vis_to_raw(text + raw, 1);
+            if (step <= 0) step = 1;
+            raw += step; got++;
+        }
+        out->idx = raw;
+    }
+    free(r);
+    return ok;
+}
+
+/* the highlight's text, from a to b (a before b in the scrollback), as plain text: the visible bytes */
+static char *sel_text(ansi_pt a, ansi_pt b) {
+    if (a.line > b.line || (a.line == b.line && a.idx > b.idx)) { ansi_pt t = a; a = b; b = t; }
+    sbuf out; sb_init(&out);
+    for (int i = a.line; i <= b.line && i < term_sb_nlines(); i++) {
+        const char *ln = term_sb_line(i);
+        int from = i == a.line ? a.idx : 0;
+        int to = i == b.line ? b.idx : (int)strlen(ln);
+        for (int k = 0; ln[k] && k < to; ) {
+            if (ln[k] == 0x1b) {
+                int e = k + 1;
+                if (ln[e] == '[') { e++; while (ln[e] && !(ln[e] >= '@' && ln[e] <= '~')) e++; if (ln[e]) e++; }
+                else if (ln[e]) e++;
+                k = e; continue;
+            }
+            if (k >= from) sb_putc(&out, ln[k]);
+            k++;
+        }
+        if (i != b.line) sb_putc(&out, '\n');
+    }
+    return sb_detach(&out);
+}
+
+static void sel_copy(void) {
+    if (!g_sel_on) return;
+    char *t = sel_text(g_sel_a, g_sel_b);
+    if (!t || !*t) { free(t); return; }
+    size_t n = strlen(t);
+    char *enc = base64_encode(t, n);
+    if (enc) {
+        fflush(stdout);
+        printf("\x1b]52;c;%s\x07", enc);   /* the terminal's clipboard (OSC 52) */
+        fflush(stdout);
+        free(enc);
+    }
+    if (access("/usr/bin/pbcopy", X_OK) == 0) {   /* and the macOS clipboard, for terminals that ignore OSC 52 */
+        FILE *f = popen("/usr/bin/pbcopy", "w");
+        if (f) { fwrite(t, 1, n, f); pclose(f); }
+    }
+    free(t);
+}
+
+static void sel_clear(void) { g_sel_on = false; g_sel_down = false; g_sel_moved = false; }
+
 static int mouse_key(int cb, int row, int col) {
+    if (g_fs && g_sb_active && !g_ov_text) {   /* the conversation's own gesture: a press, a drag (bit 32) */
+        int btn = cb & 0xE3;
+        if (btn == 0) {   /* a left press on a conversation row: its point starts the gesture (a click if it does not move) */
+            ansi_pt p;
+            if (conv_point(row, col, &p)) { g_sel_a = g_sel_b = p; g_sel_down = true; g_sel_moved = false; g_sel_on = false; }
+            else sel_clear();
+        } else if (btn == 32 && g_sel_down) {   /* the drag: the same button held, a new cell */
+            ansi_pt p;
+            if (conv_point(row, col, &p)) {
+                if (p.line != g_sel_a.line || p.idx != g_sel_a.idx) g_sel_moved = true;
+                g_sel_b = p;
+                if (g_sel_moved) g_sel_on = true;
+                repaint_conv_soon();
+            }
+        }
+    }
     if ((cb & 0xE3) == 0 && g_banner_on && row == g_bn_xr && col >= g_bn_xc0 && col <= g_bn_xc1) return K_BANNER_X;   /* the banner's close button */
     g_click_row = (cb & 0xE3) == 0 && g_fs && row >= 1 && row <= fs_region() ? row : 0;   /* the left button, pressed, not dragged: whoever reads the key may act on it (fold_click) */
     g_click_frow = (cb & 0xE3) == 0 && g_fs && row > fs_region() ? row : 0; g_click_fcol = col;   /* ... or in the field below it (paste_click) */
@@ -2074,7 +2232,11 @@ static int csi_key(const char *params, int fin) {
     if (params[0] == '<') {   /* SGR mouse report: <button;column;row, M = pressed, m = released */
         int cb = 0, x = 0, y = 0;
         if ((fin != 'M' && fin != 'm') || sscanf(params + 1, "%d;%d;%d", &cb, &x, &y) != 3) return K_ESC;
-        if (fin == 'm') { g_click_row = g_click_frow = 0; return K_MOUSE; }
+        if (fin == 'm') {
+            if (g_sel_down) { g_sel_down = false; if (g_sel_moved) { g_sel_on = true; g_click_row = g_click_frow = 0; repaint_conv_soon(); return K_MOUSE; } }
+            g_click_row = g_click_frow = 0;
+            return K_MOUSE;
+        }
         return mouse_key(cb, y, x);
     }
     switch (fin) {
@@ -2121,7 +2283,21 @@ static int stdin_wait(void) {
 
 /* Reads one key. Printable bytes returned as-is (0..255); specials as K_*.
  * Returns -1 on EOF/error, -2 when the window was resized (the caller redraws). */
+static int read_key_raw(void);
+/* the keys, with the mouse highlight: Ctrl+C copies a highlight (and is not an interrupt); a key ends it; a mouse
+ * report does not, so the highlight stays while the mouse moves */
 static int read_key(void) {
+    for (;;) {
+        int k = read_key_raw();
+        if (k == 3 && g_sel_on) { sel_copy(); continue; }   /* Ctrl+C: copied, the highlight stays */
+        if (k >= 0 && k != K_MOUSE && k != K_WHEEL_UP && k != K_WHEEL_DOWN && g_sel_on) {
+            g_sel_on = false; repaint_conv_soon();          /* any other key ends the highlight */
+        }
+        return k;
+    }
+}
+
+static int read_key_raw(void) {
     unsigned char c;
     int t = ta_get();
     if (t >= 0) c = (unsigned char)t;
