@@ -2616,9 +2616,74 @@ static bool reply_is_empty(cJSON *reply) {
 /* Returns true if the user interrupted the turn. */
 static bool g_turn_failed = false;   /* the last turn ended on an error (no reply from the model): -p exits 1 */
 static bool run_turn_body(void);
+/* ---------- stream-json: the conversation as JSON lines, as it happens ----------
+ * --output-format stream-json writes one JSON object per line to the real stdout: a system line first, then each message
+ * of the conversation as it is added (the prompt, each model reply with its tool calls, each tool result), then a result
+ * line for each request. What the run prints for people goes to /dev/null, as in json mode. */
+static int g_stream_fd = -1;    /* the real stdout, while stream-json is on */
+static int g_stream_seen = 0;   /* messages of g_messages already written */
+/* the ids of tool calls not yet answered, in order: a call the model's API gave no id (Ollama) gets one, and its result
+ * takes the oldest unanswered one */
+static char *g_stream_pend[256]; static int g_stream_npend = 0;
+static void stream_pend_clear(void) { for (int i = 0; i < g_stream_npend; i++) free(g_stream_pend[i]); g_stream_npend = 0; }
+static void stream_line(cJSON *o) {
+    char *t = cJSON_PrintUnformatted(o);
+    if (g_stream_fd >= 0 && t) { if (write(g_stream_fd, t, strlen(t)) < 0 || write(g_stream_fd, "\n", 1) < 0) {} }
+    free(t); cJSON_Delete(o);
+}
+static void stream_flush(void) {
+    if (g_stream_fd < 0) return;
+    int n = cJSON_GetArraySize(g_messages);
+    for (; g_stream_seen < n; g_stream_seen++) {
+        cJSON *m = cJSON_GetArrayItem(g_messages, g_stream_seen);
+        cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+        const char *role = cJSON_IsString(r) ? r->valuestring : "";
+        cJSON *o = cJSON_CreateObject(), *msg = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "session_id", g_session_id);
+        cJSON_AddStringToObject(msg, "role", "user");
+        if (!strcmp(role, "user") && cJSON_IsString(c)) {
+            cJSON_AddStringToObject(o, "type", "user"); cJSON_AddStringToObject(msg, "content", c->valuestring);
+        } else if (!strcmp(role, "assistant")) {
+            cJSON_AddStringToObject(o, "type", "assistant"); cJSON_AddStringToObject(msg, "role", "assistant");
+            cJSON *blocks = cJSON_AddArrayToObject(msg, "content");
+            if (cJSON_IsString(c) && c->valuestring[0]) { cJSON *t = cJSON_CreateObject(); cJSON_AddStringToObject(t, "type", "text"); cJSON_AddStringToObject(t, "text", c->valuestring); cJSON_AddItemToArray(blocks, t); }
+            cJSON *call, *calls = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+            cJSON_ArrayForEach(call, calls) {
+                cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function"), *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+                cJSON *input = cJSON_IsString(args) ? cJSON_Parse(args->valuestring) : cJSON_Duplicate(args, 1);
+                if (!input) input = cJSON_CreateObject();
+                char gen[48]; const char *cid = tool_call_id(call);
+                if (!cid || !*cid) { snprintf(gen, sizeof gen, "toolu_%d_%d", g_stream_seen, g_stream_npend); cid = gen; }
+                if (g_stream_npend < 256) g_stream_pend[g_stream_npend++] = xstrdup(cid);
+                cJSON *t = cJSON_CreateObject();
+                cJSON_AddStringToObject(t, "type", "tool_use"); cJSON_AddStringToObject(t, "id", cid);
+                cJSON_AddStringToObject(t, "name", call_name(call)); cJSON_AddItemToObject(t, "input", input);
+                cJSON_AddItemToArray(blocks, t);
+            }
+        } else if (!strcmp(role, "tool")) {
+            cJSON *tc = cJSON_GetObjectItemCaseSensitive(m, "content"), *tid = cJSON_GetObjectItemCaseSensitive(m, "tool_call_id");
+            cJSON *block = cJSON_CreateObject(), *blocks = cJSON_AddArrayToObject(msg, "content");
+            cJSON_AddStringToObject(o, "type", "user");
+            cJSON_AddStringToObject(block, "type", "tool_result");
+            char *own = NULL;   /* the id of the oldest call not yet answered, when the result names none */
+            if (!(cJSON_IsString(tid) && tid->valuestring[0]) && g_stream_npend > 0) {
+                own = g_stream_pend[0];
+                memmove(g_stream_pend, g_stream_pend + 1, sizeof(char*) * (size_t)(--g_stream_npend));
+            }
+            cJSON_AddStringToObject(block, "tool_use_id", own ? own : cJSON_IsString(tid) ? tid->valuestring : "");
+            free(own);
+            cJSON_AddStringToObject(block, "content", cJSON_IsString(tc) ? tc->valuestring : "");
+            cJSON_AddItemToArray(blocks, block);
+        } else { cJSON_Delete(o); cJSON_Delete(msg); continue; }   /* a system message is not part of the stream */
+        cJSON_AddItemToObject(o, "message", msg);
+        stream_line(o);
+    }
+}
+
 /* a request is over: the stop hooks run, once the turn has ended however it ended */
 static bool run_turn(void) {
     bool aborted = run_turn_body();
+    stream_flush();
     tools_hook_event("stop");
     return aborted;
 }
@@ -2669,6 +2734,7 @@ static bool run_turn_body(void) {
             return aborted;
         }
         cJSON_AddItemToArray(g_messages, reply);
+        stream_flush();
         cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
         if (aborted || !calls || cJSON_GetArraySize(calls) == 0) {
             /* Nothing to show and nothing to run would end the request in silence, and the user
@@ -2735,7 +2801,7 @@ static bool run_turn_body(void) {
                 int v = advisor_check(name, args, &out);
                 if (v != ADVICE_NONE) {
                     printf("  ⎿  " C_YELLOW "held back — the advisor sees a problem with it" C_RESET "\n");
-                    cJSON_AddItemToArray(g_messages, tool_result_message(name, tool_call_id(call), out.data));
+                    cJSON_AddItemToArray(g_messages, tool_result_message(name, tool_call_id(call), out.data)); stream_flush();
                     sb_free(&out);
                     if (parsed) cJSON_Delete(parsed);
                     continue;
@@ -2751,7 +2817,7 @@ static bool run_turn_body(void) {
             else if (!strcmp(name, "todo_write") && !bashline) print_task_lines(res);
             else print_result_folded(res, (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8, bashline ? lead : NULL);
             if (tool_result_failed(name, res, ts == TOOL_ERROR)) failed = true;
-            cJSON_AddItemToArray(g_messages, tool_result_message(name, tool_call_id(call), res));
+            cJSON_AddItemToArray(g_messages, tool_result_message(name, tool_call_id(call), res)); stream_flush();
             sb_free(&out);
             if (parsed) cJSON_Delete(parsed);
         }
@@ -5352,6 +5418,94 @@ static int bench_ctx(int num_ctx, int runs, const char *prompt, cJSON *jrow) {
     return aborted ? 130 : done == runs ? 0 : 1;
 }
 
+/* The text of one input line of --input-format stream-json: {"type":"user","message":{"role":"user","content":...}}, with
+ * content a string or a list of text blocks. NULL (and a message on stderr) for anything else. Malloc'd. */
+static char *stream_input_text(const char *line) {
+    cJSON *o = cJSON_Parse(line);
+    if (!o) { fprintf(stderr, "corbienest: a stream-json input line is not JSON: %.80s\n", line); return NULL; }
+    cJSON *m = cJSON_GetObjectItemCaseSensitive(o, "message");
+    cJSON *c = cJSON_GetObjectItemCaseSensitive(m ? m : o, "content");
+    char *text = NULL;
+    if (cJSON_IsString(c)) text = xstrdup(c->valuestring);
+    else if (cJSON_IsArray(c)) {
+        sbuf b; sb_init(&b);
+        cJSON *blk;
+        cJSON_ArrayForEach(blk, c) { cJSON *t = cJSON_GetObjectItemCaseSensitive(blk, "text"); if (cJSON_IsString(t)) sb_printf(&b, "%s%s", b.len ? "\n" : "", t->valuestring); }
+        text = sb_detach(&b);
+    }
+    cJSON_Delete(o);
+    return text;
+}
+/* one request of the stream: the prompt (a skill or text, as -p takes it), its turn, its result line. Returns 1 if it failed. */
+static int stream_prompt(const char *text) {
+    const skill_t *sk = NULL;
+    if (text[0] == '/') { char *nm = xstrndup(text, strcspn(text, " ")); sk = skill_find(nm); free(nm); }
+    char *msg;
+    if (sk) { const char *a = strchr(text, ' '); char *pr = skill_expand(sk, a ? a + 1 : ""); msg = expand_mentions(pr); free(pr); }
+    else msg = expand_mentions(text);
+    int first = begin_request();
+    typed_note(text, msg);
+    add_message("user", msg); free(msg);
+    stream_flush();
+    time_t t0 = time(NULL);
+    bool aborted = run_turn();
+    session_save();
+    memory_note(first, aborted);
+    const char *last = "";
+    for (int i = cJSON_GetArraySize(g_messages) - 1; i >= 0; i--) {
+        cJSON *m = cJSON_GetArrayItem(g_messages, i);
+        cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+        if (cJSON_IsString(r) && !strcmp(r->valuestring, "assistant")) { if (cJSON_IsString(c)) last = c->valuestring; break; }
+    }
+    cJSON *o = cJSON_CreateObject(), *u = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "result");
+    cJSON_AddStringToObject(o, "subtype", aborted ? "interrupted" : g_turn_failed ? "error" : "success");
+    cJSON_AddBoolToObject(o, "is_error", aborted || g_turn_failed);
+    cJSON_AddStringToObject(o, "result", last);
+    cJSON_AddStringToObject(o, "session_id", g_session_id);
+    cJSON_AddStringToObject(o, "model", g_cfg.model ? g_cfg.model : "");
+    cJSON_AddNumberToObject(o, "num_turns", g_session.turns);
+    cJSON_AddNumberToObject(o, "duration_s", difftime(time(NULL), t0));
+    cJSON_AddNumberToObject(u, "input_tokens", (double)g_session.prompt_tokens);
+    cJSON_AddNumberToObject(u, "output_tokens", (double)g_session.eval_tokens);
+    cJSON_AddItemToObject(o, "usage", u);
+    cJSON_AddNumberToObject(o, "model_calls", g_session.calls);
+    cJSON_AddNumberToObject(o, "tool_calls", g_session.tool_calls);
+    stream_line(o);
+    return aborted || g_turn_failed;
+}
+/* --output-format stream-json: the system line, the prompt (if one was given) and every line of stdin (with
+ * --input-format stream-json), one request each. Returns 1 if a request failed. */
+static int stream_run(const char *prompt, bool input) {
+    cJSON *o = cJSON_CreateObject(), *tools = cJSON_AddArrayToObject(o, "tools");
+    cJSON_AddStringToObject(o, "type", "system");
+    cJSON_AddStringToObject(o, "subtype", "init");
+    cJSON_AddStringToObject(o, "session_id", g_session_id);
+    cJSON_AddStringToObject(o, "model", g_cfg.model ? g_cfg.model : "");
+    cJSON_AddStringToObject(o, "cwd", g_cwd);
+    cJSON *t; cJSON_ArrayForEach(t, g_tools) {
+        cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function"), *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+        if (cJSON_IsString(nm)) cJSON_AddItemToArray(tools, cJSON_CreateString(nm->valuestring));
+    }
+    stream_line(o);
+    int failed = 0;
+    g_stream_seen = cJSON_GetArraySize(g_messages);
+    stream_pend_clear();
+    if (prompt) failed |= stream_prompt(prompt);
+    if (input) {
+        char *line = NULL; size_t cap = 0; ssize_t n;
+        while ((n = getline(&line, &cap, stdin)) >= 0) {
+            while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
+            if (!*line) continue;
+            char *text = stream_input_text(line);
+            if (text && *text) failed |= stream_prompt(text);
+            free(text);
+        }
+        free(line);
+    }
+    return failed;
+}
+
 static int run_benchmark(int runs, const char *prompt, bool ctx_given, bool json_out, int json_fd) {
     if (!prompt) prompt = BENCH_PROMPT;
     if (runs < 1) runs = 1;
@@ -5400,7 +5554,8 @@ static void usage(void) {
            "      --keep-alive DUR keep the model loaded between requests (default 30m; -1 forever, 0 unload, default = server's)\n"
            "  -s, --system TEXT    extra system instructions\n"
            "  -p, --prompt TEXT    non-interactive: run one prompt and exit (implies tools need --yolo)\n"
-           "      --output-format text|json   with -p: print the reply as text (default) or one JSON object\n"
+           "      --output-format text|json|stream-json   with -p: the reply as text (default), one JSON object, or JSON lines as it happens\n"
+           "      --input-format text|stream-json   with stream-json output: read requests as JSON lines from stdin\n"
            "                       {result, session_id, model, prompt_tokens, eval_tokens, model_calls, tool_calls, advisor_calls, duration_s}\n"
            "  -y, --yolo           auto-approve tool calls (same as --mode auto)\n"
            "      --mode NAME      permission mode: manual, accept-edits, plan, auto\n"
@@ -5468,7 +5623,7 @@ int main(int argc, char **argv) {
     const char *env_model = getenv("CORBIENEST_MODEL");
     if (env_model && *env_model) { free(g_cfg.model); g_cfg.model = xstrdup(env_model); }
 
-    const char *oneshot = NULL, *resume_id = NULL, *cli_effort = NULL, *ui_arg = NULL; bool resume_latest = false, json_out = false, ctx_given = false; int bench_runs = 0;
+    const char *oneshot = NULL, *resume_id = NULL, *cli_effort = NULL, *ui_arg = NULL; bool stream_out = false, stream_in = false; bool resume_latest = false, json_out = false, ctx_given = false; int bench_runs = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         #define NEEDARG() (i + 1 < argc ? argv[++i] : (usage(), exit(2), (char*)NULL))
@@ -5483,7 +5638,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--no-memory")) g_cfg.memory = false;
         else if (!strcmp(a, "--no-web")) g_cfg.web = false;
         else if (!strcmp(a, "--continue")) resume_latest = true;
-        else if (!strcmp(a, "--output-format")) { const char *f = NEEDARG(); if (!strcmp(f, "json")) json_out = true; else if (strcmp(f, "text")) { fprintf(stderr, "unknown output format %s (text|json)\n", f); return 2; } }
+        else if (!strcmp(a, "--output-format")) { const char *f = NEEDARG(); if (!strcmp(f, "json")) json_out = true; else if (!strcmp(f, "stream-json")) stream_out = true; else if (strcmp(f, "text")) { fprintf(stderr, "unknown output format %s (text|json|stream-json)\n", f); return 2; } }
+        else if (!strcmp(a, "--input-format")) { const char *f = NEEDARG(); if (!strcmp(f, "stream-json")) stream_in = true; else if (strcmp(f, "text")) { fprintf(stderr, "unknown input format %s (text|stream-json)\n", f); return 2; } }
         else if (!strcmp(a, "-r") || !strcmp(a, "--resume")) { resume_id = (i + 1 < argc && argv[i+1][0] != '-') ? argv[++i] : ""; }
         else if (!strcmp(a, "--keep-alive")) { const char *kv = NEEDARG(); free(g_cfg.keep_alive); g_cfg.keep_alive = strcmp(kv, "default") ? xstrdup(kv) : NULL; }
         else if (!strcmp(a, "--think")) g_cfg.think = 1;
@@ -5562,6 +5718,20 @@ int main(int argc, char **argv) {
     }
 
     if (json_out && !oneshot) { fprintf(stderr, "corbienest: --output-format json needs -p PROMPT\n"); return 2; }
+    if (stream_in && !stream_out) { fprintf(stderr, "corbienest: --input-format stream-json needs --output-format stream-json\n"); return 2; }
+    if (stream_out && !oneshot && !stream_in) { fprintf(stderr, "corbienest: --output-format stream-json needs -p PROMPT or --input-format stream-json\n"); return 2; }
+    if (stream_out && json_out) { fprintf(stderr, "corbienest: choose one output format\n"); return 2; }
+    if (stream_out) {   /* the JSON lines go to the real stdout; what the run prints for people does not */
+        fflush(stdout);
+        int sfd = dup(STDOUT_FILENO);
+        if (!freopen("/dev/null", "w", stdout)) { fprintf(stderr, "corbienest: cannot redirect stdout\n"); return 1; }
+        g_cfg.color = false;
+        g_stream_fd = sfd;
+        int rc = stream_run(oneshot, stream_in);
+        g_stream_fd = -1;
+        term_restore();
+        return rc;
+    }
     int json_fd = -1;
     if (json_out) {   /* everything the run prints goes to /dev/null; the JSON goes to the real stdout */
         fflush(stdout);

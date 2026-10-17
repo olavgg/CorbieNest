@@ -12,7 +12,8 @@ corbienest [options] [-p PROMPT]
   -c, --ctx N          context window (num_ctx, default 32768; accepts 64k, 128k, default)
   -s, --system TEXT    extra system instructions
   -p, --prompt TEXT    non-interactive: run one prompt and exit (add --yolo to allow tools)
-      --output-format text|json   with -p: plain reply (default) or one JSON object
+      --output-format text|json|stream-json   with -p: plain reply (default), one JSON object, or JSON lines as it happens
+      --input-format text|stream-json   with stream-json output: requests read as JSON lines from stdin, one request each
                        {result, session_id, model, prompt_tokens, eval_tokens, model_calls, tool_calls, advisor_calls, duration_s}
   -y, --yolo           auto-approve tool calls (same as --mode auto)
       --mode NAME      permission mode: manual, accept-edits, plan, auto
@@ -345,6 +346,34 @@ whether the job is still running or what its exit code was. `bash_job` with `act
   (a node server under `npm run dev`, say) can survive that.
 - A sub-agent cannot start a background command: its conversation ends with its report, and nothing
   would read the job.
+
+## Scripts: stream-json
+
+`-p` with `--output-format json` gives one object when the run ends. `--output-format stream-json`
+gives JSON lines while it runs, one object per line on stdout; what corbienest prints for people is
+dropped, so the stream is only JSON. The lines are:
+
+- `{"type":"system","subtype":"init","session_id","model","cwd","tools":[…]}` first;
+- `{"type":"user","message":{"role":"user","content":"…"}}` for the prompt;
+- `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"…"},{"type":"tool_use","id","name","input"}]}}`
+  for each model reply, with its tool calls;
+- `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id","content"}]}}`
+  for each tool result;
+- `{"type":"result","subtype":"success"|"error"|"interrupted","is_error","result","session_id","num_turns","duration_s","usage":{"input_tokens","output_tokens"},"model_calls","tool_calls"}`
+  when the request ends.
+
+A tool call the API gave no id (Ollama) gets one (`toolu_N_K`), and its result carries the same id.
+`--input-format stream-json` reads requests from stdin, one JSON line each (`{"type":"user","message":{"role":"user","content":…}}`,
+the content a string or a list of text blocks), and runs them in order; the session is the same
+across them. Each request ends with its own result line. The `-p` prompt, if given, runs first.
+
+```
+printf '%s\n' '{"type":"user","message":{"role":"user","content":"list the TODOs"}}' \
+  | corbienest --output-format stream-json --input-format stream-json --mode plan
+```
+
+Permission prompts cannot be answered in this mode, so a tool that needs one is refused unless
+`--yolo` or the project's rules allow it.
 
 ## Tools the model can call
 
