@@ -590,6 +590,8 @@ static void cmd_memory(const char *arg) {
 #define SESSIONS_KEEP 100
 static void print_result_preview(const char *text, int lines);
 static void print_result_folded(const char *text, int preview_lines, const char *lead);
+static void echo_queued(const char *text);
+static void tool_arg_summary(const char *name, cJSON *args, char *out, size_t n);
 
 static const char *sessions_dir(void) {
     static char d[1200];
@@ -642,6 +644,22 @@ static void session_new_id(void) {
     snprintf(g_session_id, sizeof g_session_id, "%s-%d", ts, (int)getpid());
 }
 
+/* What the user typed for each message they sent: the line as typed (its ↑ history entry) and the message as it was
+ * sent (after @mentions). A resumed session's history and its replay come from this: the other user messages are the
+ * app's own (a compacted summary, an advisor's note), and are neither. */
+typedef struct { char *raw, *msg; } typed_t;
+static typed_t *g_typed; static int g_typed_n, g_typed_cap;
+static bool g_typed_known = true;   /* false for a session saved before this record existed: every user message is replayed */
+static void typed_note(const char *raw, const char *msg) {
+    if (g_typed_n == g_typed_cap) { g_typed_cap = g_typed_cap ? g_typed_cap * 2 : 16; g_typed = xrealloc(g_typed, sizeof *g_typed * (size_t)g_typed_cap); }
+    g_typed[g_typed_n].raw = xstrdup(raw ? raw : ""); g_typed[g_typed_n].msg = xstrdup(msg ? msg : "");
+    g_typed_n++;
+}
+static void typed_clear(void) {
+    for (int i = 0; i < g_typed_n; i++) { free(g_typed[i].raw); free(g_typed[i].msg); }
+    g_typed_n = 0; g_typed_known = true;
+}
+
 static void session_save(void) {
     if (!g_messages || cJSON_GetArraySize(g_messages) == 0) return;
     if (!g_session_id[0]) session_new_id();
@@ -663,6 +681,12 @@ static void session_save(void) {
         if (g_usage[i].cr) cJSON_AddNumberToObject(u, "cr", (double)g_usage[i].cr);
         if (g_usage[i].cw) cJSON_AddNumberToObject(u, "cw", (double)g_usage[i].cw);
         cJSON_AddItemToArray(us, u);
+    }
+    cJSON *ty = cJSON_AddArrayToObject(o, "typed");   /* see typed_note() */
+    for (int i = 0; i < g_typed_n; i++) {
+        cJSON *t = cJSON_CreateObject();
+        cJSON_AddStringToObject(t, "raw", g_typed[i].raw); cJSON_AddStringToObject(t, "msg", g_typed[i].msg);
+        cJSON_AddItemToArray(ty, t);
     }
     cJSON_AddItemReferenceToObject(o, "messages", g_messages);
     char *txt = cJSON_PrintUnformatted(o);
@@ -713,6 +737,55 @@ static session_info *sessions_list(bool only_cwd, int *count) {
 }
 static void sessions_free(session_info *v, int n) { for (int i = 0; i < n; i++) { free(v[i].title); free(v[i].cwd); free(v[i].model); } free(v); }
 
+/* The conversation of a resumed session, printed as it was shown: what the user typed, the replies (as the markdown
+ * printer shows them), each tool call's header and its folded result. Only the last REPLAY_MAX messages; the rest are
+ * in the model's history all the same. A user message is shown only when it is one the user typed (typed_note()),
+ * unless the session has no such record. */
+#define REPLAY_MAX 200
+static void replay_conversation(void) {
+    int n = cJSON_GetArraySize(g_messages), from = n > REPLAY_MAX ? n - REPLAY_MAX : 0;
+    if (from) printf(C_DIM "  … %d earlier message%s not shown" C_RESET "\n", from, from == 1 ? "" : "s");
+    int tp = 0;   /* the typed entries are in the order they were sent: a user message is looked for from the last one found */
+    for (int i = from; i < n; i++) {
+        cJSON *m = cJSON_GetArrayItem(g_messages, i);
+        cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+        const char *role = cJSON_IsString(r) ? r->valuestring : "", *text = cJSON_IsString(c) ? c->valuestring : NULL;
+        if (!strcmp(role, "user")) {
+            if (!text) continue;
+            if (!g_typed_known) { echo_queued(text); continue; }
+            int k = tp; while (k < g_typed_n && strcmp(g_typed[k].msg, text)) k++;
+            if (k == g_typed_n) continue;   /* the app's own note, not something the user typed */
+            tp = k + 1;
+            echo_queued(g_typed[k].raw);
+        } else if (!strcmp(role, "assistant")) {
+            if (text) while (*text == '\n' || *text == ' ') text++;
+            if (text && *text) {
+                fputs(C_ORANGE "●" C_RESET " ", stdout);
+                md_state md; md_init(&md); md.col = 2;
+                md_feed(&md, text, strlen(text)); md_finish(&md);
+            }
+            cJSON *call;
+            cJSON_ArrayForEach(call, cJSON_GetObjectItemCaseSensitive(m, "tool_calls")) {
+                cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
+                cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL, *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+                const char *name = cJSON_IsString(nm) ? nm->valuestring : "?";
+                cJSON *parsed = NULL;
+                if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
+                char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
+                printf(C_GREEN "●" C_RESET " " C_BOLD "%s" C_RESET, name);
+                if (summ[0]) printf(C_DIM "(%s)" C_RESET, summ);
+                printf("\n");
+                if (parsed) cJSON_Delete(parsed);
+            }
+        } else if (!strcmp(role, "tool")) {
+            cJSON *tn = cJSON_GetObjectItemCaseSensitive(m, "tool_name");
+            const char *name = cJSON_IsString(tn) ? tn->valuestring : "";
+            print_result_folded(text ? text : "", (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8, NULL);
+        }
+    }
+    if (n > from) printf(C_DIM "  — end of the earlier conversation —" C_RESET "\n");
+}
+
 /* Load a session into g_messages; returns false if not found / unreadable. */
 static bool session_load(const char *id) {
     char path[1400]; session_path(id, path, sizeof path);
@@ -724,6 +797,10 @@ static bool session_load(const char *id) {
     if (!cJSON_IsArray(msgs)) { if (msgs) cJSON_Delete(msgs); cJSON_Delete(o); return false; }
     memory_flush();
     cJSON_Delete(g_messages); g_messages = msgs; g_prev_request_first = -1;
+    typed_clear();
+    cJSON *ty = cJSON_GetObjectItemCaseSensitive(o, "typed");
+    g_typed_known = cJSON_IsArray(ty);
+    if (g_typed_known) { cJSON *t; cJSON_ArrayForEach(t, ty) { cJSON *r = cJSON_GetObjectItemCaseSensitive(t, "raw"), *mm = cJSON_GetObjectItemCaseSensitive(t, "msg"); if (cJSON_IsString(r) && cJSON_IsString(mm)) typed_note(r->valuestring, mm->valuestring); } }
     tools_reset_permissions(); tools_checkpoint_clear();
     snprintf(g_session_id, sizeof g_session_id, "%s", id);
     cJSON *pt = cJSON_GetObjectItemCaseSensitive(o, "prompt_tokens"), *et = cJSON_GetObjectItemCaseSensitive(o, "eval_tokens");
@@ -747,14 +824,9 @@ static bool session_load(const char *id) {
     printf(C_GREEN "✓ resumed session %s" C_RESET C_DIM " · %d message%s · %s%s%s" C_RESET "\n", id, n, n == 1 ? "" : "s", title,
            cJSON_IsString(cwd) && strcmp(cwd->valuestring, g_cwd) ? " · started in " : "", cJSON_IsString(cwd) && strcmp(cwd->valuestring, g_cwd) ? cwd->valuestring : "");
     free(title);
-    for (int i = n - 1; i >= 0; i--) {
-        cJSON *m = cJSON_GetArrayItem(g_messages, i);
-        cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
-        if (cJSON_IsString(r) && !strcmp(r->valuestring, "assistant") && cJSON_IsString(c) && c->valuestring[0]) {
-            printf(C_DIM "  last reply:" C_RESET "\n");
-            print_result_preview(c->valuestring, 6);
-            break;
-        }
+    if (g_cfg.interactive) {   /* a one-shot run (-p, a pipe) prints its answer and leaves the ↑ history alone */
+        if (g_typed_known) { for (int i = 0; i < g_typed_n; i++) if (g_typed[i].raw[0] && !hist_contains(g_typed[i].raw)) hist_add(g_typed[i].raw); hist_save(); }
+        replay_conversation();
     }
     cJSON_Delete(o);
     term_status_refresh();
@@ -2430,6 +2502,7 @@ static int inject_queued(void) {
     while ((text = term_queue_pop_plain())) {
         echo_queued(text);
         char *msg = expand_mentions(text);
+        typed_note(text, msg);
         add_message("user", msg);
         free(msg); free(text); n++;
     }
@@ -3208,6 +3281,7 @@ static int orchestrate_run(const char *arg, bool plan) {
     char *before = cJSON_GetArraySize(g_messages) ? transcript_text(g_messages, -1, budget / 4) : NULL;
     char *request = expand_mentions(arg);
     int first = begin_request();
+    { sbuf raw; sb_init(&raw); sb_printf(&raw, "%s %s", cmd, arg); typed_note(raw.data, request); sb_free(&raw); }
     add_message("user", request);
     struct utsname un; uname(&un);
     sbuf brief; sb_init(&brief);
@@ -3643,6 +3717,7 @@ static int cmd_init(void) {
     if (existing) sb_printf(&b, "\nNote: a %s already exists in this directory. Read it first and improve it in place (keep what is right, fix what is wrong, fill the gaps) — write AGENTS.md only if you would otherwise clobber a hand-written %s.\n", existing, existing);
     printf(C_DIM "  /init: analysing the project and writing AGENTS.md…" C_RESET "\n");
     int first = begin_request();
+    typed_note("/init", b.data);
     add_message("user", b.data); sb_free(&b);
     bool aborted = run_turn();
     session_save();
@@ -4222,7 +4297,7 @@ static int handle_slash(char *line) {
             }
         }
     }
-    else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { memory_flush(); cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); g_prev_request_first = -1; tools_reset_permissions(); tools_checkpoint_clear(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
+    else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { memory_flush(); cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); typed_clear(); g_prev_request_first = -1; tools_reset_permissions(); tools_checkpoint_clear(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
     else if (!strcmp(cmd, "/compact")) { if (cmd_compact()) session_save(); }
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
@@ -4353,6 +4428,7 @@ static int handle_slash(char *line) {
         char *prompt = skill_expand(sk, arg);
         char *msg = expand_mentions(prompt);
         int first = begin_request();
+        { sbuf raw; sb_init(&raw); sb_printf(&raw, "/%s%s%s", sk->name, arg && *arg ? " " : "", arg ? arg : ""); typed_note(raw.data, msg); sb_free(&raw); }
         add_message("user", msg);
         free(msg); free(prompt);
         bool aborted = run_turn();
@@ -4456,6 +4532,7 @@ static void handle_bang(const char *cmd) {
     print_result_preview(out.data ? out.data : "", 40);
     sbuf m; sb_init(&m);
     sb_printf(&m, "I ran this shell command myself:\n$ %s\n\nOutput:\n%s", cmd, out.data ? out.data : "");
+    { sbuf raw; sb_init(&raw); sb_printf(&raw, "!%s", cmd); typed_note(raw.data, m.data); sb_free(&raw); }
     add_message("user", m.data);
     add_message("assistant", "Noted the command output.");
     sb_free(&m); sb_free(&out); cJSON_Delete(a);
@@ -5080,6 +5157,7 @@ static int process_input(char *line) {
     }
     char *msg = expand_mentions(s);
     int first = begin_request();
+    typed_note(s, msg);
     add_message("user", msg);
     free(msg);
     tools_exit_clear();
@@ -5355,7 +5433,7 @@ int main(int argc, char **argv) {
         else fprintf(stderr, "corbienest: this build has no notcurses screen (notcurses was not installed when it was built); using the ANSI one\n");
     }
     term_init();
-    g_messages = cJSON_CreateArray();
+    g_messages = cJSON_CreateArray(); typed_clear();
     g_tools = tools_definitions();
     tools_subagent = run_subagent;
     tools_advisor = run_advisor;
@@ -5420,6 +5498,7 @@ int main(int argc, char **argv) {
         if (sk) { const char *a = strchr(oneshot, ' '); char *pr = skill_expand(sk, a ? a + 1 : ""); msg = expand_mentions(pr); free(pr); }
         else msg = expand_mentions(oneshot);
         int first = begin_request();
+        typed_note(oneshot, msg);
         add_message("user", msg); free(msg);
         time_t t0 = time(NULL);
         bool aborted = run_turn();

@@ -109,7 +109,7 @@ without thinking about them: the status bar, the field, and the strip.
 | `/temp X`, `/host URL` | tuning |
 | `/keepalive [DUR]` | how long Ollama keeps the model loaded after a request (default `30m`, so it is not reloaded from disk mid-session; `-1` = forever, `0` = unload right away, `default` = the server's 5 minutes) |
 | `/save [file]` | save transcript as markdown |
-| `/resume [ID\|all]` | pick an earlier session to continue (this directory; `all` for every directory), or load one by ID |
+| `/resume [ID\|all]` | pick an earlier session to continue (this directory; `all` for every directory), or load one by ID. Its conversation is shown again as it was, and the lines you typed in it go into the ↑ history |
 | `/history [N]` | show the last N queries (default 20; the latest 100 are kept across sessions, ↑/↓ recalls them) |
 | `/cd DIR`, `/pwd` | change working directory |
 | `/quit` | exit (also Ctrl-D, and a typed `exit`). The model can end the program too: when you say you are leaving ("bye", "that's all"), it replies with a goodbye and calls its `exit` tool, and the program ends after that reply |
@@ -432,7 +432,7 @@ you made it, so it carries on with the job instead of stopping to ask what to do
 Every conversation is saved after each request to `~/.config/corbienest/sessions/<id>.json`
 (the latest 100 are kept). `corbienest --continue` picks up the most recent session started in
 the current directory, `--resume` opens a picker (or `--resume ID`), and `/resume` does the same
-from inside a session — the recap shows the first request and the last reply. `/clear` starts a
+from inside a session. The recap is followed by the conversation as it was: the last 200 messages, what you typed, the replies, and each tool result folded as it is live. The lines you typed go into the ↑ history (the ones already there are not added again). A one-shot run (`-p`) prints none of this and leaves the history alone. A session saved before this change has no record of what was typed, so every user message is shown and nothing goes into the history. `/clear` starts a
 new session; `/status` shows the current id, which is also printed when you quit.
 
 ## Project memory

@@ -365,6 +365,7 @@ void term_busy_tick(void);
 void hist_load(void);
 void hist_save(void);
 void hist_add(const char *line);
+bool hist_contains(const char *line);   /* a line is somewhere in the history (not only the latest) */
 int  hist_count(void);
 const char *hist_get(int i);   /* 0 = oldest kept … hist_count()-1 = most recent */
 

@@ -2258,6 +2258,11 @@ void hist_add(const char *line) {
     if (g_hist_pending < g_hist_n) g_hist_pending++;
 }
 
+bool hist_contains(const char *line) {
+    for (int i = 0; i < g_hist_n; i++) if (!strcmp(g_hist[i], line)) return true;
+    return false;
+}
+
 void hist_load(void) {
     size_t n; char *d = read_whole_file(hist_path(), &n, 4 << 20);
     if (!d) return;
