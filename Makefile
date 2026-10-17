@@ -3,6 +3,15 @@ CFLAGS  ?= -O2 -g -Wall -Wextra -std=gnu11
 LDLIBS  += -lcjson -lcurl -pthread
 PREFIX  ?= /usr/local
 
+# SAN=address, undefined or thread builds with that sanitizer (AddressSanitizer, UndefinedBehaviorSanitizer,
+# ThreadSanitizer). Every object is built with it, and the sanitizer's reports are fatal (-fno-sanitize-recover).
+# A stamp per setting rebuilds the objects when SAN changes, as for NOTCURSES. See test-asan, test-ubsan, test-tsan.
+SAN ?=
+ifneq ($(SAN),)
+CFLAGS += -fsanitize=$(SAN) -fno-sanitize-recover=all -fno-omit-frame-pointer
+endif
+SAN_STAMP := .sanitize-$(or $(SAN),none)
+
 # The notcurses frontend (src/term_nc.c) and the notcurses core it runs on (vendor/notcurses, a copy of
 # notcurses 3.0.17 with the tmux 3.4+ DA1 fix of PR #2926; see vendor/notcurses/README.md) are built
 # when the libraries the core needs are there: libunistring (headers and library), zlib and terminfo
@@ -49,7 +58,11 @@ $(NC_STAMP):
 	rm -f .notcurses-*
 	touch $@
 
-src/%.o: src/%.c src/common.h $(NC_STAMP)
+$(SAN_STAMP):
+	rm -f .sanitize-*
+	touch $@
+
+src/%.o: src/%.c src/common.h $(NC_STAMP) $(SAN_STAMP)
 	$(CC) $(CFLAGS) $(NC_DEFS) -c -o $@ $<
 
 # The vendored core'"'"'s own warnings are upstream'"'"'s: the two kinds it has (-Wclobbered in unixsig.c,
@@ -64,7 +77,7 @@ build/notcurses/builddef.h: $(NC_DIR)/tools/builddef.h.in Makefile
 	@mkdir -p build/notcurses
 	sed -e 's|@CMAKE_INSTALL_FULL_DATADIR@|$(PREFIX)/share|' -e '/cmakedefine/d' $< > $@
 
-$(NC_DIR)/src/%.o: $(NC_DIR)/src/%.c $(NC_GEN)
+$(NC_DIR)/src/%.o: $(NC_DIR)/src/%.c $(NC_GEN) $(SAN_STAMP)
 	$(CC) $(CFLAGS) $(NC_VFLAGS) -c -o $@ $<
 
 # Optimized, stripped binary without debug info (a clean rebuild so no -g objects sneak in).
@@ -95,8 +108,22 @@ test-unit: tests/test_unit
 test-integration: corbienest
 	python3 tests/test_integration.py
 
+# The unit suite under each sanitizer: AddressSanitizer (memory errors; leaks where the platform reports them),
+# UndefinedBehaviorSanitizer (undefined behaviour, fatal), ThreadSanitizer (data races: the http job threads and
+# the notcurses input thread). Each one builds its own objects, so the next plain `make` builds them again.
+# On Apple's toolchain as of clang 17 / macOS 26, test-asan hangs at start-up and test-tsan segfaults even for a
+# trivial program; test-ubsan runs there. The other two need a Linux machine.
+test-asan:
+	$(MAKE) SAN=address test-unit
+
+test-ubsan:
+	$(MAKE) SAN=undefined test-unit
+
+test-tsan:
+	$(MAKE) SAN=thread test-unit
+
 clean:
-	rm -f $(OBJ) $(NC_SRC:.c=.o) corbienest tests/test_unit .notcurses-*
+	rm -f $(OBJ) $(NC_SRC:.c=.o) corbienest tests/test_unit .notcurses-* .sanitize-*
 	rm -rf build
 
-.PHONY: install clean test test-unit test-integration release
+.PHONY: install clean test test-unit test-integration test-asan test-ubsan test-tsan release
