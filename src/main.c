@@ -273,7 +273,8 @@ static int elide_old_tool_results(int upto, int *first) {
  * it is saved with the session, and a resumed session that has none is treated as changed. */
 static char *g_think_fp;
 static void note_thinking_dropped(int n);
-static void bind_thinking(void);
+static void guard_thinking(void);
+static void drop_edited_thinking(cJSON *msgs, int first_elided);
 
 /* /ctx given while a request is in flight: the running turn keeps the window it started with (Ollama
  * reloads the model for a new num_ctx, and the calls of this turn would each pay for it). begin_request()
@@ -306,11 +307,16 @@ static int begin_request(void) {
     /* a conversation that came from a stopped request (or a session saved by one) may hold calls without
      * results and text the server refuses: mend it before the next request goes out */
     int mended = messages_repair(g_messages);
-    if (mended) printf(C_GRAY "⋯ mended the conversation: %d fix%s (unanswered tool calls, invalid UTF-8)" C_RESET "\n", mended, mended == 1 ? "" : "es");
-    bind_thinking();   /* before the history is edited: a changed prompt or tool list invalidates every saved block */
+    if (mended) {
+        printf(C_GRAY "⋯ mended the conversation: %d fix%s (unanswered tool calls, invalid UTF-8)" C_RESET "\n", mended, mended == 1 ? "" : "es");
+        /* a repaired message sits in front of whatever was signed after it */
+        note_thinking_dropped(messages_drop_thinking(g_messages, 0));
+    }
     int first = cJSON_GetArraySize(g_messages), first_elided = -1;
     if (g_prev_request_first >= 0 && g_prev_request_first <= first) elide_old_tool_results(g_prev_request_first, &first_elided);
-    if (first_elided >= 0) note_thinking_dropped(messages_drop_thinking(g_messages, first_elided + 1));
+    guard_thinking();   /* a changed prompt or tool list invalidates every saved block */
+    drop_edited_thinking(g_messages, first_elided);   /* and so does a tool result rewritten above */
+
     g_prev_request_first = first;
     g_advisor_uses = 0; g_advisor_since = time(NULL); g_advisor_reviewed = g_advisor_checked = g_advisor_stepped_in = false;
     g_fail_rounds = 0;
@@ -1839,7 +1845,15 @@ static char *think_fingerprint(const char *sys, cJSON *tools) {
     char buf[32]; snprintf(buf, sizeof buf, "%016llx", (unsigned long long)h);
     return xstrdup(buf);
 }
-static void bind_thinking(void) {
+/* `first_elided` is a tool result just rewritten (-1 when this call rewrote nothing). Thinking signed
+ * over the old text, and every block after it, cannot be sent. A block that records its own prefix
+ * (think_bind) is checked too, so an edit made on an earlier call is still caught. */
+static void drop_edited_thinking(cJSON *msgs, int first_elided) {
+    int cut = messages_thinking_cut(msgs);
+    if (first_elided >= 0 && (cut < 0 || first_elided + 1 < cut)) cut = first_elided + 1;
+    if (cut >= 0) note_thinking_dropped(messages_drop_thinking(msgs, cut));
+}
+static void guard_thinking(void) {
     if (!model_messages(g_cfg.model)) return;
     char *sys = build_system_prompt();
     cJSON *tools = tools_for_mode();
@@ -2087,7 +2101,7 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
             (double)(sp_bytes + tools_bytes() + conv_bytes(msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0)) {
             int first = -1;
             elide_tool_results(msgs, round_first, &first);
-            if (first >= 0) note_thinking_dropped(messages_drop_thinking(msgs, first + 1));
+            drop_edited_thinking(msgs, first);
         }
         chat_stats st; bool aborted = false;
         if (rec) rec->rounds = tool_rounds + 1;
@@ -2102,6 +2116,7 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
         term_status_refresh();
         if (!reply) { sb_puts(out, aborted ? "error: sub-agent interrupted by the user" : "error: sub-agent model call failed"); interrupted = aborted; break; }
         cJSON_AddItemToArray(msgs, reply);
+        messages_note_thinking(msgs, cJSON_GetArraySize(msgs) - 1);
         cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
         cJSON *content = cJSON_GetObjectItemCaseSensitive(reply, "content");
         if (aborted) { sb_puts(out, "error: sub-agent interrupted by the user"); interrupted = true; break; }
@@ -2749,9 +2764,11 @@ static const char *pending_request(void) {
  * enough. `keep_from` is the first message of that round. Returns true when it compacted —
  * the conversation was replaced, so every index into it is stale. */
 static bool shrink_context(int keep_from) {
-    /* a thinking block still in the history is signed over these messages: editing one in front of
-     * it makes the provider refuse the block. Elision waits until the blocks have been set aside. */
-    if (!messages_has_thinking(g_messages, 0)) elide_old_tool_results(keep_from, NULL);
+    /* Eliding rewrites tool results the later thinking blocks were signed over. Drop those blocks
+     * before the next call; keeping them is what makes a long tool run die with an invalid signature. */
+    int first = -1;
+    elide_old_tool_results(keep_from, &first);
+    drop_edited_thinking(g_messages, first);
     return maybe_auto_compact(true, pending_request());
 }
 
@@ -2817,6 +2834,7 @@ static bool run_turn_body(void) {
     g_session.turns++;
     for (;;) {
         if (shrink_context(round_first >= 0 ? round_first : cJSON_GetArraySize(g_messages))) round_first = -1;
+        guard_thinking();   /* the prompt is rebuilt every call: a change mid-run (mode, memory, the date) invalidates the blocks */
         cJSON *msgs = messages_with_system();
         cJSON *tools = tools_for_mode();
         size_t sent = prompt_bytes();
@@ -2848,7 +2866,7 @@ static bool run_turn_body(void) {
                 shrinks++;
                 printf(C_YELLOW "⚠ the conversation no longer fits in %s of context — shrinking it and retrying" C_RESET "\n", fmt_ctx(g_cfg.num_ctx));
                 int first = -1, n = elide_tool_results(g_messages, cJSON_GetArraySize(g_messages), &first);
-                if (n) note_thinking_dropped(messages_drop_thinking(g_messages, first + 1));
+                drop_edited_thinking(g_messages, first);
                 if (n || compact_conversation(true, pending_request())) { round_first = -1; continue; }
             }
             /* On failure, keep the conversation as is; the user can retry. */
@@ -2856,6 +2874,7 @@ static bool run_turn_body(void) {
             return aborted;
         }
         cJSON_AddItemToArray(g_messages, reply);
+        messages_note_thinking(g_messages, cJSON_GetArraySize(g_messages) - 1);   /* the prefix this reply's thinking was signed against */
         stream_flush();
         cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
         if (aborted || !calls || cJSON_GetArraySize(calls) == 0) {
@@ -3153,7 +3172,7 @@ static void worker_call(orch_run *r, int i) {
         (double)(w->sp_bytes + tools_bytes() + conv_bytes(w->msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0)) {
         int first = -1;
         elide_tool_results(w->msgs, w->round_first, &first);
-        if (first >= 0) note_thinking_dropped(messages_drop_thinking(w->msgs, first + 1));
+        drop_edited_thinking(w->msgs, first);
     }
     ollama_call.followup = w->rounds > 0 || w->attempt > 1;   /* think=auto: think about the task once, not after every tool result */
     if (w->model) { ollama_call.model = w->model; ollama_call.info = w->has_info ? &w->info : NULL; }
@@ -3329,6 +3348,7 @@ static void worker_step(orch_run *r, int i) {
     account(&st);
     term_status_refresh();
     cJSON_AddItemToArray(w->msgs, reply);
+    messages_note_thinking(w->msgs, cJSON_GetArraySize(w->msgs) - 1);
     cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls"), *content = cJSON_GetObjectItemCaseSensitive(reply, "content"), *call;
     if (!calls || cJSON_GetArraySize(calls) == 0) {
         sb_clear(&w->out); sb_puts(&w->out, cJSON_IsString(content) && content->valuestring[0] ? content->valuestring : "(it returned an empty report)");

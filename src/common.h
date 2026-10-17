@@ -170,6 +170,12 @@ int    messages_repair(cJSON *msgs);
  * Returns how many blocks were removed. messages_has_thinking says whether any remain from `from` on. */
 int    messages_drop_thinking(cJSON *msgs, int from);
 bool   messages_has_thinking(cJSON *msgs, int from);
+/* The prefix a thinking block was signed against, recorded on that assistant message as `think_bind`
+ * when the reply is stored. messages_thinking_cut is the first message whose block no longer matches
+ * (a tool result was rewritten, a call was inserted), or -1 when every recorded block still does.
+ * A block with no think_bind is left alone: a session saved before this was recorded cannot say. */
+void   messages_note_thinking(cJSON *msgs, int index);
+int    messages_thinking_cut(cJSON *msgs);
 
 /* The advisor (/advisor): where a consultation runs and what it is shown — see util.c. */
 #define ADVISOR_CTX_AUTO     16384        /* its window unless /advisor ctx says otherwise (and never more than the main one) */

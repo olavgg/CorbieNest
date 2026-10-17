@@ -284,10 +284,30 @@ static cJSON *args_object(cJSON *args) {
     }
     return cJSON_CreateObject();
 }
+static bool block_is_thinking(cJSON *b) {
+    cJSON *ty = cJSON_GetObjectItemCaseSensitive(b, "type");
+    return cJSON_IsString(ty) && (!strcmp(ty->valuestring, "thinking") || !strcmp(ty->valuestring, "redacted_thinking"));
+}
 static void cache_break(cJSON *block) {
-    if (!block || cJSON_GetObjectItemCaseSensitive(block, "cache_control")) return;
+    if (!block || block_is_thinking(block) || cJSON_GetObjectItemCaseSensitive(block, "cache_control")) return;
     cJSON *cc = cJSON_AddObjectToObject(block, "cache_control");
     cJSON_AddStringToObject(cc, "type", "ephemeral");
+}
+/* cache_control on a thinking block is a modified block, which the API refuses. The break goes on the
+ * last block that is not one. */
+static void cache_break_last(cJSON *content) {
+    if (!cJSON_IsArray(content)) return;
+    for (int k = cJSON_GetArraySize(content) - 1; k >= 0; k--) {
+        cJSON *b = cJSON_GetArrayItem(content, k);
+        if (block_is_thinking(b)) continue;
+        cache_break(b);
+        return;
+    }
+}
+static void blocks_strip_thinking(cJSON *blocks) {
+    if (!cJSON_IsArray(blocks)) return;
+    for (int k = cJSON_GetArraySize(blocks) - 1; k >= 0; k--)
+        if (block_is_thinking(cJSON_GetArrayItem(blocks, k))) cJSON_DeleteItemFromArray(blocks, k);
 }
 static cJSON *text_block(const char *s) {
     cJSON *b = cJSON_CreateObject();
@@ -405,6 +425,7 @@ char *provider_turn_body(const char *model_name, const model_info *mi, cJSON *me
     sbuf sys; sb_init(&sys);
     cJSON *out = cJSON_CreateArray(), *acc = NULL, *m;
     turn_call pend[TURN_CALLS]; int pn = 0, pi = 0;
+    bool strip = false;   /* a rewritten assistant message changes the prefix: no later thinking block may follow it */
     cJSON_ArrayForEach(m, messages) {
         const char *role = jrole(m);
         if (!strcmp(role, "system")) {
@@ -413,7 +434,13 @@ char *provider_turn_body(const char *model_name, const model_info *mi, cJSON *me
             sb_puts(&sys, jcontent(m));
         } else if (!strcmp(role, "assistant")) {
             user_flush(out, &acc); pi = 0;
+            cJSON *pc = cJSON_GetObjectItemCaseSensitive(m, "provider_content");
+            bool verbatim = blocks_sendable(pc, tools);
             cJSON *blocks = assistant_blocks(m, tools, pend, &pn);
+            if (!verbatim || strip) {          /* omitting some and keeping later ones is a gap, and that is refused */
+                if (verbatim) blocks_strip_thinking(blocks);
+                strip = true;
+            }
             if (cJSON_GetArraySize(blocks) == 0) { cJSON_Delete(blocks); continue; }
             cJSON *am = cJSON_CreateObject();
             cJSON_AddStringToObject(am, "role", "assistant");
@@ -456,8 +483,7 @@ char *provider_turn_body(const char *model_name, const model_info *mi, cJSON *me
     if (cJSON_GetArraySize(out) > 0) {
         cJSON *last = cJSON_GetArrayItem(out, cJSON_GetArraySize(out) - 1);
         cJSON *c = cJSON_GetObjectItemCaseSensitive(last, "content");
-        cJSON *b = cJSON_IsArray(c) && cJSON_GetArraySize(c) > 0 ? cJSON_GetArrayItem(c, cJSON_GetArraySize(c) - 1) : NULL;
-        cache_break(b);
+        cache_break_last(c);
     }
     cJSON_AddItemToObject(req, "messages", out);
     char *body = cJSON_PrintUnformatted(req);

@@ -1846,6 +1846,21 @@ check(len(broke) == 1 and "thinking" not in types and "redacted_thinking" not in
 saved = json.load(open(os.path.join(sdir, fix_id + ".json")))
 check(isinstance(saved.get("think_prefix"), str) and len(saved["think_prefix"]) == 16 and "sig-old" not in json.dumps(saved["messages"]),
       f"the session now records the prefix, without the old blocks: {saved.get('think_prefix')!r}")
+
+print("test a long tool run: eliding an old result sets aside the thinking signed over it, before the next call")
+cfg_before = open(CFG2_FILE).read()
+try:
+    n3 = len(preqs())
+    out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "-c", "8k", "-p", "THINK_LIVE please"], env=ENVK)
+    check(rc == 0 and "Live ok" in out and "set aside" in out and "✗" not in out and "Invalid" not in out,
+          f"the run continues, and the stale blocks are set aside without a refused call: {out[-500:]!r}")
+    sent = work_posts(anth_since(n3))
+    elided = [r for r in sent if "[earlier output elided" in json.dumps(r["body"])]
+    check(len(elided) == 1 and "sig-b" not in json.dumps(elided[0]["body"]) and "sig-a" in json.dumps(elided[0]["body"]),
+          f"the block from before the edit is kept, the one signed over the old result is not: "
+          f"{msg_block_types(elided[0]) if elided else [msg_block_types(r) for r in sent]}")
+finally:
+    open(CFG2_FILE, "w").write(cfg_before)
 n0 = len(preqs())
 out, rc = run(["-m", "anthropic:claude-fake-haiku", "--advisor", "anthropic:claude-opus-5", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
 check(rc == 0 and "Tool said: ADVICE:" in out, f"the advice came back as the tool result: {out[-400:]!r}")

@@ -1846,6 +1846,39 @@ static void test_wellformed(void) {
     CHECK(!messages_has_thinking(only, 0));
     cJSON_Delete(only);
     cJSON_Delete(th);
+
+    /* a block records the prefix it was signed against. Rewriting an earlier tool result cuts from
+     * the first block that saw the old text; the block before that result still matches. A block
+     * with no record is not guessed at. */
+    cJSON *live = cJSON_Parse(
+        "[{\"role\":\"user\",\"content\":\"go\"},"
+         "{\"role\":\"assistant\",\"content\":\"a\",\"provider_content\":["
+            "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"s1\"},{\"type\":\"text\",\"text\":\"a\"}]},"
+         "{\"role\":\"tool\",\"tool_name\":\"bash\",\"tool_call_id\":\"t\",\"content\":\"0123456789 the full output\"},"
+         "{\"role\":\"assistant\",\"content\":\"b\",\"provider_content\":["
+            "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"s2\"},{\"type\":\"text\",\"text\":\"b\"}]}]");
+    CHECK(live != NULL);
+    messages_note_thinking(live, 0);                                          /* a user message: nothing to record */
+    CHECK(!cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(live, 0), "think_bind"));
+    messages_note_thinking(live, 1);
+    messages_note_thinking(live, 3);
+    CHECK(cJSON_IsString(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(live, 1), "think_bind")));
+    CHECK(messages_thinking_cut(live) == -1);
+    cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(live, 2), "content"),
+                         "[earlier output elided to save context; bash returned 24 bytes]\n0123…");
+    CHECK(messages_thinking_cut(live) == 3);                                  /* s1 is before the edit, s2 is after it */
+    CHECK(messages_drop_thinking(live, 3) == 1);
+    CHECK(messages_thinking_cut(live) == -1);
+    CHECK(messages_has_thinking(live, 1) && !messages_has_thinking(live, 3));
+    CHECK(!cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(live, 3), "think_bind"));
+    cJSON_Delete(live);
+    cJSON *bare = cJSON_Parse(
+        "[{\"role\":\"tool\",\"content\":\"full\"},"
+         "{\"role\":\"assistant\",\"content\":\"a\",\"provider_content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"s\"}]}]");
+    cJSON_SetValuestring(cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(bare, 0), "content"), "changed");
+    CHECK(messages_thinking_cut(bare) == -1);                                 /* no think_bind: not this call's to decide */
+    CHECK(messages_thinking_cut(NULL) == -1);
+    cJSON_Delete(bare);
 }
 
 /* ---------- the notcurses frontend's pure half: SGR, the palette, the cells ---------- */

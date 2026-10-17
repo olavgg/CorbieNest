@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -1473,19 +1474,89 @@ int messages_drop_thinking(cJSON *msgs, int from) {
             dropped++;
         }
         if (cJSON_GetArraySize(pc) == 0) cJSON_DeleteItemFromObject(m, "provider_content");
+        cJSON_DeleteItemFromObject(m, "think_bind");   /* the signature it recorded is gone with the blocks */
     }
     return dropped;
 }
 
+static bool message_has_thinking(cJSON *m) {
+    cJSON *pc = cJSON_GetObjectItemCaseSensitive(m, "provider_content"), *b;
+    cJSON_ArrayForEach(b, pc) if (thinking_block(b)) return true;
+    return false;
+}
 bool messages_has_thinking(cJSON *msgs, int from) {
     if (!cJSON_IsArray(msgs) || from < 0) return false;
     int n = cJSON_GetArraySize(msgs);
-    for (int i = from; i < n; i++) {
-        cJSON *pc = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(msgs, i), "provider_content");
-        cJSON *b;
-        cJSON_ArrayForEach(b, pc) if (thinking_block(b)) return true;
-    }
+    for (int i = from; i < n; i++) if (message_has_thinking(cJSON_GetArrayItem(msgs, i))) return true;
     return false;
+}
+
+/* FNV-1a of one message, the fields the next call actually replays. think_bind itself is not part of it:
+ * recording the prefix must not change the prefix. */
+static uint64_t think_fnv(uint64_t h, const char *s) {
+    if (!s) return h;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) { h ^= *p; h *= 1099511628211ULL; }
+    return h;
+}
+static const char *msg_field(cJSON *m, const char *k) {
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(m, k);
+    return cJSON_IsString(v) ? v->valuestring : "";
+}
+static uint64_t think_hash_message(uint64_t h, cJSON *m) {
+    h = think_fnv(h, msg_field(m, "role"));
+    h = think_fnv(h, "\n");
+    h = think_fnv(h, msg_field(m, "content"));
+    h = think_fnv(h, "\n");
+    h = think_fnv(h, msg_field(m, "tool_name"));
+    h = think_fnv(h, "\n");
+    h = think_fnv(h, msg_field(m, "tool_call_id"));
+    h = think_fnv(h, "\n");
+    cJSON *tc = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+    char *t = tc ? cJSON_PrintUnformatted(tc) : NULL;
+    h = think_fnv(h, t ? t : "");
+    free(t);
+    h = think_fnv(h, "\n");
+    cJSON *pc = cJSON_GetObjectItemCaseSensitive(m, "provider_content");
+    char *p = pc ? cJSON_PrintUnformatted(pc) : NULL;
+    h = think_fnv(h, p ? p : "");
+    free(p);
+    return think_fnv(h, "\n");
+}
+static uint64_t think_prefix_hash(cJSON *msgs, int upto) {
+    uint64_t h = 14695981039346656037ULL;
+    int n = cJSON_IsArray(msgs) ? cJSON_GetArraySize(msgs) : 0;
+    if (upto > n) upto = n;
+    for (int i = 0; i < upto; i++) h = think_hash_message(h, cJSON_GetArrayItem(msgs, i));
+    return h;
+}
+static void think_bind_hex(uint64_t h, char *buf, size_t n) {
+    snprintf(buf, n, "%016llx", (unsigned long long)h);
+}
+void messages_note_thinking(cJSON *msgs, int index) {
+    if (!cJSON_IsArray(msgs) || index < 0 || index >= cJSON_GetArraySize(msgs)) return;
+    cJSON *m = cJSON_GetArrayItem(msgs, index);
+    if (!message_has_thinking(m)) return;
+    char buf[32];
+    think_bind_hex(think_prefix_hash(msgs, index), buf, sizeof buf);
+    cJSON *old = cJSON_GetObjectItemCaseSensitive(m, "think_bind");
+    if (cJSON_IsString(old)) cJSON_SetValuestring(old, buf);
+    else cJSON_AddStringToObject(m, "think_bind", buf);
+}
+int messages_thinking_cut(cJSON *msgs) {
+    if (!messages_has_thinking(msgs, 0)) return -1;
+    uint64_t h = 14695981039346656037ULL;
+    int n = cJSON_GetArraySize(msgs);
+    for (int i = 0; i < n; i++) {
+        cJSON *m = cJSON_GetArrayItem(msgs, i);
+        cJSON *b = cJSON_GetObjectItemCaseSensitive(m, "think_bind");
+        if (message_has_thinking(m) && cJSON_IsString(b) && b->valuestring[0]) {
+            char buf[32];
+            think_bind_hex(h, buf, sizeof buf);
+            if (strcmp(buf, b->valuestring)) return i;   /* this block and every later one: a gap is refused too */
+        }
+        h = think_hash_message(h, m);
+    }
+    return -1;
 }
 
 int messages_repair(cJSON *msgs) {

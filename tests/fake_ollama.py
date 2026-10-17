@@ -131,6 +131,19 @@ def _has_thinking(msgs):
         if any(isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking") for b in c): return True
     return False
 
+def _stale_thinking(msgs):
+    """A thinking block after a tool result this client has rewritten. The signature was for the original text."""
+    edited = False
+    for m in msgs or []:
+        c = m.get("content")
+        if not isinstance(c, list): continue
+        if edited and any(isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking") for b in c):
+            return True
+        for b in c:
+            if isinstance(b, dict) and b.get("type") == "tool_result" and isinstance(b.get("content"), str) and b["content"].startswith("[earlier output elided"):
+                edited = True
+    return False
+
 def _turn_blocks(req):
     """The same keywords as script(), as Messages content blocks. A tool_result is answered
     before the keyword that produced the call is seen again, or the model never stops."""
@@ -138,6 +151,14 @@ def _turn_blocks(req):
     if typed and "TOOL_LOOP" in typed[-1]:  # the user's own message asks for it: a call every time, until the loop guard stops it
         return [{"type": "tool_use", "id": "toolu_loop", "name": "bash", "input": {"command": "echo looping"}}], "tool_use"
     results = _tool_results(req)
+    if typed and "THINK_LIVE" in typed[-1]:   # a long tool run: each reply carries a signed thinking block, until the result is elided
+        if not results:
+            return [{"type": "thinking", "thinking": "", "signature": "sig-a"},
+                    {"type": "tool_use", "id": "toolu_live1", "name": "bash", "input": {"command": "printf '%8000s' x"}}], "tool_use"
+        if len(results) == 1:
+            return [{"type": "thinking", "thinking": "", "signature": "sig-b"},
+                    {"type": "tool_use", "id": "toolu_live2", "name": "bash", "input": {"command": "printf 'second-done\\n'"}}], "tool_use"
+        return [{"type": "text", "text": "Live ok"}], "end_turn"
     if typed and "TOOL_BINARY" in typed[-1] and not results:   # a command whose output is not UTF-8 (a binary file, a cut)
         return [{"type": "tool_use", "id": "toolu_bin", "name": "bash", "input": {"command": "printf 'bad \\377 byte'"}}], "tool_use"
     if results:
@@ -179,6 +200,18 @@ def _turn_events(model, blocks, stop, usage=None):
             events.append(("content_block_start", {"type": "content_block_start", "index": i, "content_block": start}))
             events.append(("content_block_delta", {"type": "content_block_delta", "index": i,
                            "delta": {"type": "input_json_delta", "partial_json": json.dumps(b["input"])}}))
+        elif b["type"] == "thinking":
+            events.append(("content_block_start", {"type": "content_block_start", "index": i,
+                           "content_block": {"type": "thinking", "thinking": "", "signature": ""}}))
+            if b.get("thinking"):
+                events.append(("content_block_delta", {"type": "content_block_delta", "index": i,
+                               "delta": {"type": "thinking_delta", "thinking": b["thinking"]}}))
+            if b.get("signature"):
+                events.append(("content_block_delta", {"type": "content_block_delta", "index": i,
+                               "delta": {"type": "signature_delta", "signature": b["signature"]}}))
+        elif b["type"] == "redacted_thinking":
+            events.append(("content_block_start", {"type": "content_block_start", "index": i,
+                           "content_block": {"type": "redacted_thinking", "data": b.get("data") or ""}}))
         else:
             events.append(("content_block_start", {"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}))
             events.append(("content_block_delta", {"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": b.get("text") or ""}}))
@@ -558,7 +591,7 @@ class H(BaseHTTPRequestHandler):
                 return bad(f"messages.{i + 1}: `tool_use` ids were found without `tool_result` blocks immediately after: {', '.join(missing)}. "
                            "Each `tool_use` block must have a corresponding `tool_result` block in the next message.")
         typed = [t for t in (_typed(m) for m in msgs) if t is not None]
-        if typed and "RESUME_BREAK" in typed[-1] and _has_thinking(msgs):
+        if _stale_thinking(msgs) or (typed and "RESUME_BREAK" in typed[-1] and _has_thinking(msgs)):
             return bad("messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. "
                        "Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\".")
         if _advisor_shape(req):
@@ -574,6 +607,8 @@ class H(BaseHTTPRequestHandler):
                                     "stop_reason": "max_tokens" if "CUTADVICE" in brief else "end_turn", "usage": usage})
         blocks, stop = _turn_blocks(req)
         cu = _cache_usage(req)
+        if any("THINK_LIVE" in (t or "") for t in typed):   # a real prompt size, so the client's context estimate will elide
+            cu = dict(cu, input_tokens=max(1, len(json.dumps(req)) // 4))
         if req.get("stream") is True: return self._sse(_turn_events(model, blocks, stop, cu))
         return self._json(200, {"type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": stop,
                                 "usage": dict({"input_tokens": 100, "output_tokens": 20}, **cu)})
