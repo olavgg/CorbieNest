@@ -16,6 +16,9 @@
 #include <stdint.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 static cJSON *g_messages = NULL;    /* conversation, without system prompt */
 static cJSON *g_tools = NULL;       /* tool definitions */
@@ -4655,6 +4658,20 @@ static void cmd_ui_theme(const char *name) {
     printf("theme: %s\n", name);
 }
 
+/* The running binary's path, for a restart (/ui). /proc/self/exe exists on Linux only: on macOS it does not, the
+ * exec failed, and the screen had already been given back. */
+static const char *self_exe_path(void) {
+    static char buf[4096];
+#if defined(__APPLE__)
+    uint32_t n = sizeof buf;
+    if (_NSGetExecutablePath(buf, &n) == 0) return buf;
+#else
+    ssize_t k = readlink("/proc/self/exe", buf, sizeof buf - 1);
+    if (k > 0) { buf[k] = 0; return buf; }
+#endif
+    return g_argv[0];   /* a relative or PATH name: exec finds it as it was started */
+}
+
 static void cmd_ui(const char *arg) {
     const char *now = g_cfg.ui ? "notcurses" : "ansi";
     if (arg && !strncmp(arg, "theme", 5) && (arg[5] == ' ' || !arg[5])) {
@@ -4699,10 +4716,12 @@ static void cmd_ui(const char *arg) {
     term_restore();
     tools_bg_kill_all();   /* exec runs no atexit: the jobs and the servers are stopped here, the new process starts them again */
     mcp_shutdown();
-    execv("/proc/self/exe", na);
-    /* only reached when the restart failed: the session is saved, and the program is still running */
-    fprintf(stderr, "corbienest: could not restart (%s); still on the old screen — restart it with --resume %s\n", strerror(errno), g_session_id);
-    if (g_ui_nc) term_fullscreen(true);   /* the notcurses screen was given back above: take it again */
+    execv(self_exe_path(), na);
+    /* only reached when the restart failed: the session is saved, and the program is still running. The screen
+     * was given back above, so the ANSI one takes the terminal again (a notcurses start on it would fail, and
+     * the flag must not say notcurses while there is none). */
+    fprintf(stderr, "corbienest: could not restart (%s); continuing on the ANSI screen — restart with --resume %s\n", strerror(errno), g_session_id);
+    if (g_ui_nc) { g_ui_nc = false; term_fullscreen(true); }
     free(na);
 }
 
