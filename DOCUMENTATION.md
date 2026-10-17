@@ -999,6 +999,33 @@ sent — it is not a parameter of the API, and it is clamped to the model's inpu
   `[::1]`): the key would cross the network unencrypted. `https_proxy`/`no_proxy` are honoured (never for this machine), and
   `CURL_CA_BUNDLE` or `SSL_CERT_FILE` names a private CA.
 
+### Your own hosts (`/model add`)
+
+Any OpenAI-compatible API can be added as a host, with no code change — OpenRouter has thousands
+of models behind one such API:
+
+```
+/model add openrouter https://openrouter.ai/api/v1 OPENROUTER_API_KEY
+/advisor openrouter:openai/gpt-5.2
+/model remove openrouter
+```
+
+- `HOST` is a name of lowercase letters, digits and `-` (2 to 24 characters). It is the prefix
+  (`HOST:MODEL`), so the model id may hold colons (`…:free`). A built-in provider's name or alias
+  is refused, and so is the name of an installed Ollama model (`qwen3` while `qwen3:8b` is
+  installed), since `qwen3:8b` would then be read as the host.
+- `URL` is the API's base: requests go to `URL/chat/completions` and the model list to
+  `URL/models`. Plain http is accepted only for this machine, as with the built-in providers.
+- `KEY_ENV` is the environment variable the key is read from at each call (default `NAME_API_KEY`:
+  `my-host` is `MY_HOST_API_KEY`). The key is never written to the config; the config keeps
+  `host.NAME=URL|KEY_ENV`.
+- A host is an advisor and a `/goal` worker, like xAI and OpenAI. It cannot be the model that
+  does the work: that stays a local model or `anthropic:`.
+- Adding the same name again replaces its URL and key variable. Hosts are limited to 16.
+- The model list is downloaded when the suggestions need it; a host that refuses the list says
+  why in the suggestions, as the built-in ones do. A host's OpenAI-specific request fields are
+  not verified against every server: a server that refuses one shows its error in the turn.
+
 ## Goals
 
 `/goal "METRIC" [min|max] [-n ROUNDS] [-k CANDIDATES] [-m MODEL,…] GOAL` races candidates at a

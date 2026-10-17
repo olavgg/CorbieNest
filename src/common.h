@@ -845,10 +845,21 @@ typedef struct {
     const char *key_env, *url_env, *url;   /* XAI_API_KEY, XAI_BASE_URL, the base URL otherwise */
     provider_style style;                  /* Chat Completions (xAI, OpenAI) or Anthropic's Messages API */
     const char *example, *known_as;        /* a model of theirs and what people call them ("Grok"), for /advisor's explanation and suggestions */
+    bool host;                             /* added by the user (/model add): an OpenAI-compatible endpoint; url_env is "" and example/known_as NULL */
 } provider_def;
-const provider_def *provider_at(int i);   /* the providers in turn, NULL past the last */
+#define PROVIDER_HOSTS_MAX 16   /* the hosts a user can add (/model add), after the built-in providers */
+const provider_def *provider_at(int i);   /* the providers in turn (built-in, then hosts), NULL past the last */
 const provider_def *provider_find(const char *advisor, const char **model);   /* NULL = a model on the Ollama server */
 const char *provider_base_url(const provider_def *p);
+/* Hosts (config: host.NAME=URL|KEY_ENV). A name is lowercase letters, digits and '-', 2 to 24 characters, not a
+ * built-in provider's name or alias; re-adding a name replaces its URL and key. key_env NULL or "" is NAME_API_KEY.
+ * The URL is https, or plain http to this machine only (the key would cross the network otherwise). The
+ * caller checks the name against the models installed on the Ollama server first. 0 or -1 with err. */
+int   provider_host_add(const char *name, const char *url, const char *key_env, char *err, size_t n);
+bool  provider_host_remove(const char *name);
+bool  provider_host_url_ok(const char *url, char *err, size_t n);   /* the URL rule above, alone */
+bool  provider_name_ok(const char *name, char *err, size_t n);      /* the name rule above, alone (also not a built-in) */
+int   provider_host_count(void);
 const char *provider_chat_path(const provider_def *p);   /* "/chat/completions" or "/v1/messages" */
 /* The headers of one call (the key). False when it cannot be made: not a hosted model, no key,
  * or a base URL that would send the key in the clear. The strings live in *keep. */

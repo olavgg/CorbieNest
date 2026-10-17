@@ -41,7 +41,7 @@ static int    g_fail_rounds = 0;                 /* rounds of tool calls in a ro
 /* The commands, each with the line the suggestions under the input field show for it. */
 static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/help", "commands, keys and input tricks" },
-    { "/model", "pick a model from a menu, or anthropic:NAME" },
+    { "/model", "pick a model from a menu, anthropic:NAME, or add HOST URL [KEY_ENV] / remove HOST" },
     { "/models", "list the models ollama has" },
     { "/clear", "start a new conversation" },
     { "/compact", "summarise the conversation to free context" },
@@ -2536,7 +2536,7 @@ static void advisor_howto(void) {
                  "    a hosted API            PROVIDER:MODEL — export its key before starting corbienest (it is never saved)\n" C_RESET);
     const provider_def *p;
     for (int i = 0; (p = provider_at(i)); i++) {
-        char name[96]; snprintf(name, sizeof name, "%s:%s", p->name, p->example);
+        char name[96]; snprintf(name, sizeof name, "%s:%s", p->name, p->example ? p->example : "MODEL");   /* a host added with /model add has no example */
         const char *key = getenv(p->key_env); bool set = key && *key;
         printf(C_DIM "      %-24s %-18s" C_RESET "%s%s" C_RESET "\n", name, p->key_env, set ? C_GREEN : C_DIM, set ? "set" : "not set");
     }
@@ -4157,6 +4157,65 @@ static void cmd_models(void) {
 static cJSON *model_list_get(int slot, const provider_def *p, const char **why);
 static int provider_slot_of(const provider_def *p) { int slot = 1; while (provider_at(slot - 1) != p) slot++; return slot; }
 
+/* `/model add ...` and `/model remove ...`: a word, so a model named "add" would still be `/model add:tag` */
+static bool host_command(const char *arg) {
+    return (!strncmp(arg, "add", 3) && (!arg[3] || arg[3] == ' ')) || (!strncmp(arg, "remove", 6) && (!arg[6] || arg[6] == ' '));
+}
+
+/* /model add HOST URL [KEY_ENV] and /model remove HOST. A host is an OpenAI-compatible API (Chat Completions at
+ * URL/chat/completions, its models at URL/models): an advisor, and a worker of /goal — as xAI and OpenAI are. The
+ * model doing the work stays a local one or anthropic:. Saved in the config as host.NAME=URL|KEY_ENV; the key is
+ * read from KEY_ENV at each call and never saved. A name must not be one an installed Ollama model already has
+ * (qwen3 when qwen3:8b is installed), because NAME:TAG would then be read as that host. */
+static void cmd_model_host(const char *arg) {
+    char buf[1024]; snprintf(buf, sizeof buf, "%s", arg);
+    char *w[4] = { NULL, NULL, NULL, NULL }; int nw = 0;
+    for (char *s = buf; nw < 4;) {
+        while (*s == ' ') s++;
+        if (!*s) break;
+        w[nw++] = s;
+        while (*s && *s != ' ') s++;
+        if (*s) *s++ = 0;
+    }
+    if (!strcmp(w[0], "remove")) {
+        if (nw != 2) { printf(C_DIM "  /model remove HOST — the hosts /advisor lists" C_RESET "\n"); return; }
+        if (!provider_host_remove(w[1])) { printf(C_RED "✗ no host named %s (/model add adds one)" C_RESET "\n", w[1]); return; }
+        config_save();
+        printf(C_GREEN "✓ removed host %s" C_RESET "\n", w[1]);
+        size_t hl = strlen(w[1]);
+        if (g_cfg.advisor && !strncasecmp(g_cfg.advisor, w[1], hl) && g_cfg.advisor[hl] == ':')
+            printf(C_DIM "  the advisor is still %s: /advisor to choose another" C_RESET "\n", g_cfg.advisor);
+        return;
+    }
+    if (nw < 3 || nw > 4) {
+        printf(C_DIM "  /model add HOST URL [KEY_ENV] — an OpenAI-compatible API, e.g.\n"
+                     "    /model add openrouter https://openrouter.ai/api/v1 OPENROUTER_API_KEY" C_RESET "\n");
+        return;
+    }
+    if (http_busy()) { printf(C_RED "✗ a request is in flight: /model add when it is done" C_RESET "\n"); return; }
+    char err[200] = "";
+    if (!provider_name_ok(w[1], err, sizeof err)) { printf(C_RED "✗ %s" C_RESET "\n", err); return; }
+    cJSON *list = ollama_list_models_quiet(MODEL_LIST_WAIT_MS);   /* NULL: the server is down, and the check is skipped */
+    size_t hl = strlen(w[1]);
+    for (int i = 0; list && i < cJSON_GetArraySize(list); i++) {
+        cJSON *nm = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(list, i), "name");
+        if (cJSON_IsString(nm) && !strncasecmp(nm->valuestring, w[1], hl) && nm->valuestring[hl] == ':') {
+            printf(C_RED "✗ %s is an installed model's name (%s): %s:TAG would be read as the host — choose another name" C_RESET "\n", w[1], nm->valuestring, w[1]);
+            cJSON_Delete(list);
+            return;
+        }
+    }
+    cJSON_Delete(list);
+    if (provider_host_add(w[1], w[2], nw == 4 ? w[3] : NULL, err, sizeof err) != 0) { printf(C_RED "✗ %s" C_RESET "\n", err); return; }
+    config_save();
+    const provider_def *p = NULL;
+    for (int i = 0; (p = provider_at(i)) != NULL; i++) if (p->host && !strcmp(p->name, w[1])) break;
+    if (!p) return;
+    const char *key = getenv(p->key_env);
+    printf(C_GREEN "✓ host %s: %s, key from %s (%s)" C_RESET "\n", p->name, p->url, p->key_env, key && *key ? "set" : "not set");
+    printf(C_DIM "  use it as /advisor %s:MODEL, or a /goal worker; %s must be exported before corbienest starts (it is never saved)" C_RESET "\n", p->name, p->key_env);
+}
+
 /* /model's picker: the Ollama server's models, then the hosted ones that can do the work (the Messages
  * providers, named "anthropic:ID"). xAI and OpenAI are advisors only and are not offered here. A list
  * that cannot be had says why, under the menu's place; the menu is empty only when both are. */
@@ -4570,6 +4629,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/models")) cmd_models();
     else if (!strcmp(cmd, "/model")) {
         if (!arg) cmd_model_picker();
+        else if (host_command(arg)) cmd_model_host(arg);
         else {
             char *prev = g_cfg.model;
             g_cfg.model = xstrdup(arg);
@@ -5163,7 +5223,7 @@ static void sug_add(term_sug **v, int *n, const char *text, const char *desc, bo
  * runs inside the poll of a live request as well, where a second request must not start: there
  * it gets what is already known. */
 #define MODEL_LIST_SECS 60
-#define MODEL_LISTS 8
+#define MODEL_LISTS (8 + PROVIDER_HOSTS_MAX)   /* the Ollama server, the built-in providers, and a slot for each host a user can add */
 #define MODEL_SUG_MAX 60
 static struct { cJSON *list; char *from; time_t at; char why[240]; } g_model_lists[MODEL_LISTS];   /* why: what kept a provider's list away */
 
@@ -5229,7 +5289,7 @@ static void suggest_advisor(const char *word, term_sug **items, int *n, bool wor
         char pre[48], desc[160]; snprintf(pre, sizeof pre, "%s:", p->name);
         if (strncasecmp(pre, word, wl) && (!p->alias || strncasecmp(p->alias, word, wl))) continue;
         const char *key = getenv(p->key_env);
-        snprintf(desc, sizeof desc, working ? "%s (%s) — the model that does the work · %s %s" : "%s (%s), a hosted API · %s %s", p->label, p->known_as, p->key_env, key && *key ? "set" : "not set");
+        snprintf(desc, sizeof desc, working ? "%s (%s) — the model that does the work · %s %s" : "%s (%s), a hosted API · %s %s", p->label, p->known_as ? p->known_as : "added with /model add", p->key_env, key && *key ? "set" : "not set");
         sug_add(items, n, pre, desc, true);
     }
     if (working) for (int i = 0; (p = provider_at(i)); i++) {   /* the hosted models that do the work: "anthropic:ID", found by what is typed of it */

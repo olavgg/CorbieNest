@@ -20,25 +20,36 @@
 #include <unistd.h>
 
 static const provider_def PROVIDERS[] = {
-    { "xai",       "grok",   "xAI",       "XAI_API_KEY",       "XAI_BASE_URL",       "https://api.x.ai/v1",       PROVIDER_CHAT_COMPLETIONS, "grok-4.7", "Grok" },
-    { "openai",    "chatgpt","OpenAI",    "OPENAI_API_KEY",    "OPENAI_BASE_URL",    "https://api.openai.com/v1", PROVIDER_CHAT_COMPLETIONS, "gpt-5.2", "ChatGPT" },
+    { "xai",       "grok",   "xAI",       "XAI_API_KEY",       "XAI_BASE_URL",       "https://api.x.ai/v1",       PROVIDER_CHAT_COMPLETIONS, "grok-4.7", "Grok", false },
+    { "openai",    "chatgpt","OpenAI",    "OPENAI_API_KEY",    "OPENAI_BASE_URL",    "https://api.openai.com/v1", PROVIDER_CHAT_COMPLETIONS, "gpt-5.2", "ChatGPT", false },
     /* no /v1 in the base: ANTHROPIC_BASE_URL is written that way for the SDKs (and Claude Code) */
-    { "anthropic", "claude", "Anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "https://api.anthropic.com", PROVIDER_MESSAGES,         "claude-opus-5", "Claude" },
+    { "anthropic", "claude", "Anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "https://api.anthropic.com", PROVIDER_MESSAGES,         "claude-opus-5", "Claude", false },
     /* verified against the vendors' docs (2026-10): DeepSeek's API is OpenAI-compatible at the root, Kimi's at /v1 */
-    { "deepseek",  "deepseek","DeepSeek","DEEPSEEK_API_KEY",  "DEEPSEEK_BASE_URL",  "https://api.deepseek.com",  PROVIDER_CHAT_COMPLETIONS, "deepseek-flash", "DeepSeek" },
-    { "kimi",      "moonshot","Kimi",    "MOONSHOT_API_KEY",  "MOONSHOT_BASE_URL",  "https://api.moonshot.ai/v1", PROVIDER_CHAT_COMPLETIONS, "kimi-k2.6", "Kimi" },
+    { "deepseek",  "deepseek","DeepSeek","DEEPSEEK_API_KEY",  "DEEPSEEK_BASE_URL",  "https://api.deepseek.com",  PROVIDER_CHAT_COMPLETIONS, "deepseek-flash", "DeepSeek", false },
+    { "kimi",      "moonshot","Kimi",    "MOONSHOT_API_KEY",  "MOONSHOT_BASE_URL",  "https://api.moonshot.ai/v1", PROVIDER_CHAT_COMPLETIONS, "kimi-k2.6", "Kimi", false },
 };
 
+/* The hosts the user added (/model add), after the built-in table. A fixed array: a pointer from provider_at
+ * or provider_find stays valid until that host is removed or replaced, and nothing else moves. */
+#define N_BUILTIN ((int)(sizeof PROVIDERS / sizeof *PROVIDERS))
+static provider_def g_hosts[PROVIDER_HOSTS_MAX];
+static int g_nhosts = 0;
+
+int provider_host_count(void) { return g_nhosts; }
+
 const provider_def *provider_at(int i) {
-    return i >= 0 && (size_t)i < sizeof PROVIDERS / sizeof *PROVIDERS ? &PROVIDERS[i] : NULL;
+    if (i < 0) return NULL;
+    if (i < N_BUILTIN) return &PROVIDERS[i];
+    if (i - N_BUILTIN < g_nhosts) return &g_hosts[i - N_BUILTIN];
+    return NULL;
 }
 
 const provider_def *provider_find(const char *advisor, const char **model) {
     const char *c = advisor ? strchr(advisor, ':') : NULL;
     if (!c || !c[1]) return NULL;
     size_t n = (size_t)(c - advisor);
-    for (size_t i = 0; i < sizeof PROVIDERS / sizeof *PROVIDERS; i++) {
-        const provider_def *p = &PROVIDERS[i];
+    for (int i = 0; provider_at(i); i++) {
+        const provider_def *p = provider_at(i);
         if ((strlen(p->name) == n && !strncasecmp(advisor, p->name, n)) || (p->alias && strlen(p->alias) == n && !strncasecmp(advisor, p->alias, n))) {
             if (model) *model = c + 1;
             return p;
@@ -48,8 +59,94 @@ const provider_def *provider_find(const char *advisor, const char **model) {
 }
 
 const char *provider_base_url(const provider_def *p) {
-    const char *u = getenv(p->url_env);
+    const char *u = p->url_env && *p->url_env ? getenv(p->url_env) : NULL;   /* a host has no environment variable for its URL */
     return u && *u ? u : p->url;
+}
+
+static void set_err(char *err, size_t n, const char *msg) { if (err && n) snprintf(err, n, "%s", msg); }
+
+bool provider_name_ok(const char *name, char *err, size_t n) {
+    size_t len = name ? strlen(name) : 0;
+    if (len < 2 || len > 24) { set_err(err, n, "a host name is 2 to 24 characters"); return false; }
+    if (name[0] < 'a' || name[0] > 'z') { set_err(err, n, "a host name starts with a letter"); return false; }
+    for (size_t i = 0; i < len; i++) {
+        char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) { set_err(err, n, "a host name is lowercase letters, digits and '-' only"); return false; }
+    }
+    for (int i = 0; i < N_BUILTIN; i++) {
+        const provider_def *p = &PROVIDERS[i];
+        if (!strcasecmp(name, p->name) || (p->alias && !strcasecmp(name, p->alias))) {
+            if (err && n) snprintf(err, n, "%s is a built-in provider's name", name);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool provider_host_url_ok(const char *url, char *err, size_t n) {
+    if (!url || !*url) { set_err(err, n, "the URL is empty"); return false; }
+    if (strchr(url, ' ') || strlen(url) >= 512) { set_err(err, n, "the URL has a space in it or is too long"); return false; }
+    if (strncasecmp(url, "https://", 8) && strncasecmp(url, "http://", 7)) { set_err(err, n, "the URL starts with https:// (or http:// for this machine)"); return false; }
+    char h[256] = "";
+    if (!url_hostname(url, h, sizeof h) || !*h) { set_err(err, n, "the URL has no host in it"); return false; }
+    if (url_cleartext(url) && !url_is_local(url)) {
+        if (err && n) snprintf(err, n, "%s is plain http to another machine: the key would cross the network unencrypted — use https://", h);
+        return false;
+    }
+    return true;
+}
+
+/* an environment variable name: letters, digits and '_', not starting with a digit */
+static bool env_name_ok(const char *s) {
+    size_t len = s ? strlen(s) : 0;
+    if (!len || len >= 64) return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        bool letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+        if (!letter && !(i > 0 && c >= '0' && c <= '9')) return false;
+    }
+    return true;
+}
+
+static void free_host(provider_def *h) {
+    free((void *)h->name); free((void *)h->label); free((void *)h->key_env); free((void *)h->url);
+    memset(h, 0, sizeof *h);
+}
+
+int provider_host_add(const char *name, const char *url, const char *key_env, char *err, size_t n) {
+    if (!provider_name_ok(name, err, n) || !provider_host_url_ok(url, err, n)) return -1;
+    char key[64];
+    if (key_env && *key_env) {
+        if (!env_name_ok(key_env)) { set_err(err, n, "the key variable is a name like OPENROUTER_API_KEY"); return -1; }
+        snprintf(key, sizeof key, "%s", key_env);
+    } else {   /* NAME_API_KEY: "my-host" is MY_HOST_API_KEY */
+        size_t k = 0;
+        for (size_t i = 0; name[i] && k < sizeof key - 9; i++) key[k++] = name[i] == '-' ? '_' : (char)(name[i] >= 'a' && name[i] <= 'z' ? name[i] - 32 : name[i]);
+        snprintf(key + k, sizeof key - k, "_API_KEY");
+    }
+    int slot = -1;
+    for (int i = 0; i < g_nhosts; i++) if (!strcasecmp(g_hosts[i].name, name)) slot = i;
+    if (slot >= 0) free_host(&g_hosts[slot]);   /* the same name again: its URL and key are replaced */
+    else {
+        if (g_nhosts >= PROVIDER_HOSTS_MAX) { if (err && n) snprintf(err, n, "at most %d hosts can be added", PROVIDER_HOSTS_MAX); return -1; }
+        slot = g_nhosts++;
+    }
+    provider_def *h = &g_hosts[slot];
+    h->name = xstrdup(name); h->label = xstrdup(name); h->key_env = xstrdup(key);
+    h->url_env = ""; h->url = xstrdup(url);
+    h->style = PROVIDER_CHAT_COMPLETIONS; h->example = NULL; h->known_as = NULL; h->host = true;
+    return 0;
+}
+
+bool provider_host_remove(const char *name) {
+    for (int i = 0; i < g_nhosts; i++) {
+        if (strcasecmp(g_hosts[i].name, name)) continue;
+        free_host(&g_hosts[i]);
+        for (int j = i; j + 1 < g_nhosts; j++) g_hosts[j] = g_hosts[j + 1];
+        memset(&g_hosts[--g_nhosts], 0, sizeof g_hosts[0]);
+        return true;
+    }
+    return false;
 }
 
 const char *provider_chat_path(const provider_def *p) {
@@ -747,7 +844,7 @@ static bool base_insecure(const provider_def *p, char *err, size_t n) {
     const char *u = provider_base_url(p);
     if (!url_cleartext(u) || url_is_local(u)) return false;
     char host[256] = ""; url_hostname(u, host, sizeof host);
-    snprintf(err, n, "%s is plain http to another machine (%s): the key in %s would cross the network unencrypted — use https://", p->url_env, host, p->key_env);
+    snprintf(err, n, "%s is plain http to another machine (%s): the key in %s would cross the network unencrypted — use https://", p->url_env && *p->url_env ? p->url_env : "the base URL", host, p->key_env);
     return true;
 }
 

@@ -1457,6 +1457,48 @@ static void test_orchestrate(void) {
     orch_tasks_free(t, n); sb_free(&many);
 }
 
+/* the hosts a user adds (/model add): the rules, the lookup by prefix, replacing and removing */
+static void test_hosts(void) {
+    char err[200] = "";
+    int nb = 0; while (provider_at(nb) && !provider_at(nb)->host) nb++;   /* the built-in table, before any host */
+    CHECK(nb == 5);
+    CHECK(provider_name_ok("openrouter", err, sizeof err) && provider_name_ok("my-host2", err, sizeof err));
+    CHECK(!provider_name_ok("a", err, sizeof err) && !provider_name_ok("Upper", err, sizeof err) && !provider_name_ok("1abc", err, sizeof err) && !provider_name_ok("my_host", err, sizeof err));
+    CHECK(!provider_name_ok("xai", err, sizeof err) && !provider_name_ok("grok", err, sizeof err) && !provider_name_ok("claude", err, sizeof err) && !provider_name_ok("moonshot", err, sizeof err));
+    CHECK(!provider_name_ok("abcdefghijklmnopqrstuvwxy", err, sizeof err));   /* 25 characters */
+    CHECK(!provider_name_ok("grok", err, sizeof err) && strstr(err, "built-in provider's name"));
+    CHECK(provider_host_url_ok("https://openrouter.ai/api/v1", err, sizeof err) && provider_host_url_ok("http://127.0.0.1:8080/v1", err, sizeof err) && provider_host_url_ok("http://localhost:1234/v1", err, sizeof err));
+    CHECK(!provider_host_url_ok("http://example.com/v1", err, sizeof err) && strstr(err, "plain http"));
+    CHECK(!provider_host_url_ok("example.com/v1", err, sizeof err) && !provider_host_url_ok("https://", err, sizeof err) && !provider_host_url_ok("https://a b.com", err, sizeof err) && !provider_host_url_ok("", err, sizeof err));
+
+    int before = provider_host_count();
+    CHECK(provider_host_add("openrouter", "https://openrouter.ai/api/v1", NULL, err, sizeof err) == 0);
+    const char *model = NULL;
+    const provider_def *p = provider_find("openrouter:openai/gpt-5.2", &model);
+    CHECK(p && p->host && p->style == PROVIDER_CHAT_COMPLETIONS && !p->example && !p->known_as && p->label);
+    CHECK_STR(model, "openai/gpt-5.2");
+    CHECK_STR(p->key_env, "OPENROUTER_API_KEY");
+    CHECK_STR(provider_base_url(p), "https://openrouter.ai/api/v1");
+    CHECK(provider_host_count() == before + 1 && provider_at(nb + before) && !strcmp(provider_at(nb + before)->name, "openrouter"));
+    p = provider_find("OpenRouter:x", &model); CHECK(p && p->host);   /* the prefix is matched as the built-ins' are */
+    p = provider_find("openrouter:meta-llama/llama-3.3-70b-instruct:free", &model);
+    CHECK_STR(model, "meta-llama/llama-3.3-70b-instruct:free");   /* split at the first colon */
+    CHECK(provider_host_add("my-host", "http://127.0.0.1:9/v1", NULL, err, sizeof err) == 0);
+    p = provider_find("my-host:x", NULL); CHECK(p && !strcmp(p->key_env, "MY_HOST_API_KEY"));   /* NAME_API_KEY */
+    CHECK(provider_host_add("bad-key", "https://x.example/v1", "1BAD", err, sizeof err) == -1 && !provider_find("bad-key:x", NULL));
+    CHECK(provider_host_add("xai", "https://x.example/v1", NULL, err, sizeof err) == -1);   /* a built-in's name */
+    CHECK(provider_host_add("plain", "http://example.com/v1", NULL, err, sizeof err) == -1 && strstr(err, "plain http"));
+    CHECK(provider_host_add("openrouter", "https://proxy.example/v1", "OR_KEY", err, sizeof err) == 0);   /* the same name replaces */
+    CHECK_STR(provider_base_url(provider_find("openrouter:x", NULL)), "https://proxy.example/v1");
+    CHECK_STR(provider_find("openrouter:x", NULL)->key_env, "OR_KEY");
+    CHECK(provider_host_count() == before + 2);
+    CHECK(provider_find("xai:grok-4.7", NULL) != NULL && provider_find("xai:grok-4.7", NULL)->host == false);
+    CHECK(provider_host_remove("my-host") && !provider_find("my-host:x", NULL));
+    CHECK(!provider_host_remove("my-host"));
+    CHECK(provider_host_remove("openrouter"));
+    CHECK(provider_host_count() == before && provider_at(nb + before) == NULL && !provider_find("openrouter:x", NULL));
+}
+
 static void test_provider(void) {
     const char *model = NULL;
     const provider_def *p = provider_find("xai:grok-4.7", &model);
@@ -2041,7 +2083,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
+        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

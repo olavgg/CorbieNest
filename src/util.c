@@ -412,6 +412,12 @@ void config_load(void) {
         else if (!strcmp(k, "think_level")) { free(legacy_level); legacy_level = *v ? xstrdup(v) : NULL; }
         else if (!strncmp(k, "effort.", 7)) { if (k[7] && effort_name_ok(v)) effort_set(k + 7, v); }
         else if (!strncmp(k, "price.", 6)) { double pi, po; if (k[6] && sscanf(v, "%lf/%lf", &pi, &po) == 2 && pi >= 0 && po >= 0) price_set(k + 6, pi, po); }
+        else if (!strncmp(k, "host.", 5)) {   /* host.NAME=URL|KEY_ENV (/model add); a host that no longer passes the rules is said and skipped */
+            char buf[1024]; snprintf(buf, sizeof buf, "%s", v);
+            char *bar = strchr(buf, '|'); if (bar) *bar++ = 0;
+            char err[160] = "";
+            if (provider_host_add(k + 5, buf, bar, err, sizeof err) != 0) fprintf(stderr, "corbienest: host %s in the config is not used: %s\n", k + 5, err);
+        }
         else if (!strcmp(k, "advisor")) { free(g_cfg.advisor); g_cfg.advisor = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "advisor_ctx")) { int n = atoi(v); if (n == 0 || n >= ADVISOR_CTX_MIN) g_cfg.advisor_ctx = n; }
         else if (!strcmp(k, "subagent")) { free(g_cfg.subagent); g_cfg.subagent = *v ? xstrdup(v) : NULL; }
@@ -458,6 +464,7 @@ void config_save(void) {
     sb_printf(&b, "think=%d\n", g_cfg.think);
     for (int i = 0; i < g_cfg.n_efforts; i++) sb_printf(&b, "effort.%s=%s\n", g_cfg.efforts[i].model, g_cfg.efforts[i].level);
     for (int i = 0; i < g_cfg.n_prices; i++) sb_printf(&b, "price.%s=%g/%g\n", g_cfg.prices[i].model, g_cfg.prices[i].in, g_cfg.prices[i].out);
+    for (int i = 0; provider_at(i); i++) if (provider_at(i)->host) sb_printf(&b, "host.%s=%s|%s\n", provider_at(i)->name, provider_at(i)->url, provider_at(i)->key_env);
     if (g_cfg.advisor) sb_printf(&b, "advisor=%s\n", g_cfg.advisor);
     if (g_cfg.advisor_ctx > 0) sb_printf(&b, "advisor_ctx=%d\n", g_cfg.advisor_ctx);
     if (g_cfg.subagent && *g_cfg.subagent) sb_printf(&b, "subagent=%s\n", g_cfg.subagent);
