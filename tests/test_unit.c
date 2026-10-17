@@ -1816,6 +1816,36 @@ static void test_wellformed(void) {
     CHECK(messages_repair(bad) == 0);
     cJSON_Delete(bad);
     cJSON_Delete(msgs);
+
+    /* messages_drop_thinking: a changed prefix drops thinking and redacted_thinking, and leaves the turn */
+    cJSON *th = cJSON_Parse(
+        "[{\"role\":\"assistant\",\"content\":\"a\",\"provider_content\":["
+            "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"s1\"},"
+            "{\"type\":\"text\",\"text\":\"a\"}]},"
+         "{\"role\":\"tool\",\"tool_name\":\"bash\",\"tool_call_id\":\"t\",\"content\":\"done\"},"
+         "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"t\",\"function\":{\"name\":\"bash\",\"arguments\":\"{}\"}}],"
+            "\"provider_content\":["
+            "{\"type\":\"redacted_thinking\",\"data\":\"x\"},"
+            "{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"s2\"},"
+            "{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"bash\",\"input\":{},\"caller\":{\"type\":\"direct\"}}]}]");
+    CHECK(th != NULL);
+    CHECK(messages_has_thinking(th, 0) && messages_has_thinking(th, 2) && !messages_has_thinking(th, 3));
+    CHECK(!messages_has_thinking(NULL, 0) && messages_drop_thinking(NULL, 0) == 0 && messages_drop_thinking(th, -1) == 0);
+    CHECK(messages_drop_thinking(th, 2) == 2);                                 /* the later turn only: redacted_thinking and thinking */
+    CHECK(messages_has_thinking(th, 0) && !messages_has_thinking(th, 2));      /* the earlier block stays: no gap is opened in front of it */
+    CHECK_STR(jstr_at(cJSON_GetArrayItem(th, 2), "provider_content.0.type"), "tool_use");
+    CHECK_STR(jstr_at(cJSON_GetArrayItem(th, 2), "provider_content.0.id"), "t");
+    CHECK_STR(jstr_at(cJSON_GetArrayItem(th, 2), "provider_content.0.caller.type"), "direct");
+    CHECK_STR(jstr_at(cJSON_GetArrayItem(th, 2), "tool_calls.0.id"), "t");     /* the call the conversation speaks stays too */
+    CHECK(messages_drop_thinking(th, 0) == 1);                                 /* the one block the first turn still held */
+    CHECK_STR(jstr_at(cJSON_GetArrayItem(th, 0), "provider_content.0.type"), "text");
+    CHECK(messages_drop_thinking(th, 0) == 0);
+    cJSON *only = cJSON_Parse("[{\"role\":\"assistant\",\"content\":\"\",\"provider_content\":[{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"s\"}]}]");
+    CHECK(messages_drop_thinking(only, 0) == 1);
+    CHECK(!cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(only, 0), "provider_content"));   /* an empty block list is not a reply */
+    CHECK(!messages_has_thinking(only, 0));
+    cJSON_Delete(only);
+    cJSON_Delete(th);
 }
 
 /* ---------- the notcurses frontend's pure half: SGR, the palette, the cells ---------- */

@@ -1791,6 +1791,61 @@ finally:
 print("test binary output: a tool result that is not UTF-8 reaches the model as a valid request")
 out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "-p", "TOOL_BINARY please"], env=ENVK)
 check(rc == 0 and "✗" not in out and "Tool said: bad" in out, f"the request went through, with the output mended: {out[-300:]!r}")
+
+def msg_block_types(post):
+    """content-block types on the wire, in order."""
+    out = []
+    for m in post["body"].get("messages") or []:
+        c = m.get("content")
+        if isinstance(c, list): out += [b.get("type") for b in c if isinstance(b, dict)]
+    return out
+
+print("test resume: thinking stays when its prefix still matches, and is set aside when the session cannot say so")
+sdir = os.path.join(CFG2, "corbienest", "sessions")
+os.makedirs(sdir, exist_ok=True)
+out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "-p", "plain hello"], env=ENVK)
+check(rc == 0 and "✗" not in out and "Echo:" in out and "set aside" not in out, f"a fresh turn keeps no stale blocks: {out[-200:]!r}")
+spath = max((os.path.join(sdir, f) for f in os.listdir(sdir) if f.endswith(".json")), key=os.path.getmtime)
+sess = json.load(open(spath))
+fp = sess.get("think_prefix")
+check(isinstance(fp, str) and len(fp) == 16 and all(c in "0123456789abcdef" for c in fp), f"the prefix the blocks were signed against is saved: {fp!r}")
+asst = sess["messages"][-1]
+pc = asst.get("provider_content") or [{"type": "text", "text": asst.get("content") or ""}]
+pc.insert(0, {"type": "redacted_thinking", "data": "hidden"})
+pc.insert(0, {"type": "thinking", "thinking": "", "signature": "sig-kept"})
+asst["provider_content"] = pc
+json.dump(sess, open(spath, "w"))
+n1 = len(preqs())
+out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "--resume", sess["id"], "-p", "and again"], env=ENVK)
+check(rc == 0 and "✗" not in out and "set aside" not in out and "Echo:" in out, f"the same prefix sends the blocks again: {out[-300:]!r}")
+kept = work_posts(anth_since(n1))
+check(len(kept) == 1 and "thinking" in msg_block_types(kept[0]) and "redacted_thinking" in msg_block_types(kept[0]) and "sig-kept" in json.dumps(kept[0]["body"]),
+      f"signed blocks survived the resume: {msg_block_types(kept[0]) if kept else None}")
+fix_id = "thinkfix"
+fix = {"id": fix_id, "cwd": WORK, "model": "anthropic:claude-fake-haiku", "updated": 1, "title": "old thinking",
+       "prompt_tokens": 1, "eval_tokens": 1, "usage": [], "typed": [{"raw": "look", "msg": "look"}],
+       "messages": [
+           {"role": "user", "content": "look"},
+           {"role": "assistant", "content": "Running it.",
+            "tool_calls": [{"id": "toolu_old", "function": {"name": "bash", "arguments": "{\"command\":\"echo hi\"}"}}],
+            "provider_content": [
+                {"type": "thinking", "thinking": "", "signature": "sig-old"},
+                {"type": "redacted_thinking", "data": "hidden"},
+                {"type": "text", "text": "Running it."},
+                {"type": "tool_use", "id": "toolu_old", "name": "bash", "input": {"command": "echo hi"}, "caller": {"type": "direct"}}]},
+           {"role": "tool", "tool_name": "bash", "tool_call_id": "toolu_old", "content": "hi"}]}
+json.dump(fix, open(os.path.join(sdir, fix_id + ".json"), "w"))
+n2 = len(preqs())
+out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "--resume", fix_id, "-p", "RESUME_BREAK please"], env=ENVK)
+check(rc == 0 and "set aside" in out and "✗" not in out and "Invalid" not in out and "Tool said:" in out,
+      f"a session with no saved prefix continues: {out[-400:]!r}")
+broke = work_posts(anth_since(n2))
+types = msg_block_types(broke[0]) if broke else []
+check(len(broke) == 1 and "thinking" not in types and "redacted_thinking" not in types and "tool_use" in types and "tool_result" in types and "sig-old" not in json.dumps(broke[0]["body"]),
+      f"the blocks were set aside before the call, and the tool round stayed paired: {types}")
+saved = json.load(open(os.path.join(sdir, fix_id + ".json")))
+check(isinstance(saved.get("think_prefix"), str) and len(saved["think_prefix"]) == 16 and "sig-old" not in json.dumps(saved["messages"]),
+      f"the session now records the prefix, without the old blocks: {saved.get('think_prefix')!r}")
 n0 = len(preqs())
 out, rc = run(["-m", "anthropic:claude-fake-haiku", "--advisor", "anthropic:claude-opus-5", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
 check(rc == 0 and "Tool said: ADVICE:" in out, f"the advice came back as the tool result: {out[-400:]!r}")

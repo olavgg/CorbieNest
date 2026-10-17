@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -235,9 +236,11 @@ static void ctx_measured(int prompt_tokens, size_t sent_bytes) {
 static const char ELIDE_MARK[] = "[earlier output elided to save context";
 static int g_prev_request_first = -1;   /* where the most recent finished request started */
 
-/* Replace every tool result before `upto` with its stub; returns how many were elided. */
-static int elide_tool_results(cJSON *msgs, int upto) {
+/* Replace every tool result before `upto` with its stub; returns how many were elided.
+ * *first, when given, is the index of the first one rewritten (-1 when nothing was). */
+static int elide_tool_results(cJSON *msgs, int upto, int *first) {
     int n = 0; size_t saved = 0;
+    if (first) *first = -1;
     for (int i = 0; i < upto && i < cJSON_GetArraySize(msgs); i++) {
         cJSON *m = cJSON_GetArrayItem(msgs, i);
         cJSON *role = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
@@ -251,17 +254,26 @@ static int elide_tool_results(cJSON *msgs, int upto) {
         sb_printf(&b, "%s; %s returned %zu bytes, call it again if you need the details]\n", ELIDE_MARK, cJSON_IsString(tn) ? tn->valuestring : "the tool", len);
         sb_append(&b, txt, keep); if (keep < len) sb_puts(&b, "…");
         cJSON_SetValuestring(c, b.data); sb_free(&b);
+        if (first && *first < 0) *first = i;
         n++; saved += len - keep;
     }
     if (n) printf(C_GRAY "⋯ elided %d old tool result%s (~%zu KB) to save context" C_RESET "\n", n, n == 1 ? "" : "s", saved / 1024);
     return n;
 }
 
-/* the conversation, when it is worth it */
-static int elide_old_tool_results(int upto) {
+/* the conversation, when it is worth it. *first is the first result rewritten, or -1. */
+static int elide_old_tool_results(int upto, int *first) {
+    if (first) *first = -1;
     if (g_cfg.num_ctx <= 0 || ctx_pct() < ELIDE_PCT) return 0;
-    return elide_tool_results(g_messages, upto);
+    return elide_tool_results(g_messages, upto, first);
 }
+
+/* A thinking block Claude signed is valid only while the system prompt, the tools and the messages
+ * before it are unchanged. The fingerprint is the first two (the messages are the history itself);
+ * it is saved with the session, and a resumed session that has none is treated as changed. */
+static char *g_think_fp;
+static void note_thinking_dropped(int n);
+static void bind_thinking(void);
 
 /* /ctx given while a request is in flight: the running turn keeps the window it started with (Ollama
  * reloads the model for a new num_ctx, and the calls of this turn would each pay for it). begin_request()
@@ -295,8 +307,10 @@ static int begin_request(void) {
      * results and text the server refuses: mend it before the next request goes out */
     int mended = messages_repair(g_messages);
     if (mended) printf(C_GRAY "⋯ mended the conversation: %d fix%s (unanswered tool calls, invalid UTF-8)" C_RESET "\n", mended, mended == 1 ? "" : "es");
-    int first = cJSON_GetArraySize(g_messages);
-    if (g_prev_request_first >= 0 && g_prev_request_first <= first) elide_old_tool_results(g_prev_request_first);
+    bind_thinking();   /* before the history is edited: a changed prompt or tool list invalidates every saved block */
+    int first = cJSON_GetArraySize(g_messages), first_elided = -1;
+    if (g_prev_request_first >= 0 && g_prev_request_first <= first) elide_old_tool_results(g_prev_request_first, &first_elided);
+    if (first_elided >= 0) note_thinking_dropped(messages_drop_thinking(g_messages, first_elided + 1));
     g_prev_request_first = first;
     g_advisor_uses = 0; g_advisor_since = time(NULL); g_advisor_reviewed = g_advisor_checked = g_advisor_stepped_in = false;
     g_fail_rounds = 0;
@@ -700,6 +714,7 @@ static void session_save(void) {
         cJSON_AddItemToArray(ty, t);
     }
     if (tools_todos_get()) cJSON_AddItemReferenceToObject(o, "todos", tools_todos_get());   /* the task list, if the model kept one */
+    if (g_think_fp) cJSON_AddStringToObject(o, "think_prefix", g_think_fp);   /* what the saved thinking blocks were signed against */
     cJSON_AddItemReferenceToObject(o, "messages", g_messages);
     char *txt = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
@@ -811,6 +826,9 @@ static bool session_load(const char *id) {
     memory_flush();
     cJSON_Delete(g_messages); g_messages = msgs; g_prev_request_first = -1;
     typed_clear();
+    free(g_think_fp); g_think_fp = NULL;
+    cJSON *tpf = cJSON_GetObjectItemCaseSensitive(o, "think_prefix");
+    if (cJSON_IsString(tpf) && tpf->valuestring[0]) g_think_fp = xstrdup(tpf->valuestring);
     cJSON *td = cJSON_DetachItemFromObjectCaseSensitive(o, "todos");
     tools_todos_set(cJSON_IsArray(td) ? td : NULL);
     if (td && !cJSON_IsArray(td)) cJSON_Delete(td);
@@ -1798,6 +1816,42 @@ static cJSON *tools_for_mode(void) {
     return arr;
 }
 
+static void note_thinking_dropped(int n) {
+    if (n <= 0) return;
+    printf(C_GRAY "⋯ set aside %d thinking block%s from the earlier conversation — the request they were bound to has changed, so this one can continue" C_RESET "\n",
+           n, n == 1 ? "" : "s");
+}
+
+/* FNV-1a over the system prompt and the tool list: the part of a thinking block's prefix that is
+ * not the message history. A difference means every saved block would be refused. */
+static uint64_t fnv_str(uint64_t h, const char *s) {
+    if (!s) return h;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) { h ^= *p; h *= 1099511628211ULL; }
+    return h;
+}
+static char *think_fingerprint(const char *sys, cJSON *tools) {
+    uint64_t h = 14695981039346656037ULL;
+    h = fnv_str(h, sys);
+    h = fnv_str(h, "\n");
+    char *t = tools ? cJSON_PrintUnformatted(tools) : NULL;
+    h = fnv_str(h, t ? t : "");
+    free(t);
+    char buf[32]; snprintf(buf, sizeof buf, "%016llx", (unsigned long long)h);
+    return xstrdup(buf);
+}
+static void bind_thinking(void) {
+    if (!model_messages(g_cfg.model)) return;
+    char *sys = build_system_prompt();
+    cJSON *tools = tools_for_mode();
+    char *fp = think_fingerprint(sys, tools);
+    free(sys);
+    if (tools && tools != g_tools) cJSON_Delete(tools);
+    if (!g_think_fp || strcmp(g_think_fp, fp)) {
+        note_thinking_dropped(messages_drop_thinking(g_messages, 0));
+        free(g_think_fp); g_think_fp = fp;
+    } else free(fp);
+}
+
 /* ---------- sub-agents (the `task` tool) ----------
  * A fresh, read-only agent loop: own message list, own short system prompt (plus the project
  * instructions), tools limited to read_file / list_dir / grep / bash, at most SUBAGENT_ITERS
@@ -2030,8 +2084,11 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
         /* the sub-agent has its own conversation and up to SUBAGENT_ITERS rounds of results in
          * it: keep it inside the window the same way, on bytes (nothing here is measured) */
         if (round_first > 0 && g_cfg.num_ctx > 0 &&
-            (double)(sp_bytes + tools_bytes() + conv_bytes(msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0))
-            elide_tool_results(msgs, round_first);
+            (double)(sp_bytes + tools_bytes() + conv_bytes(msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0)) {
+            int first = -1;
+            elide_tool_results(msgs, round_first, &first);
+            if (first >= 0) note_thinking_dropped(messages_drop_thinking(msgs, first + 1));
+        }
         chat_stats st; bool aborted = false;
         if (rec) rec->rounds = tool_rounds + 1;
         agent_act(rec, "waiting for the model");
@@ -2692,7 +2749,9 @@ static const char *pending_request(void) {
  * enough. `keep_from` is the first message of that round. Returns true when it compacted —
  * the conversation was replaced, so every index into it is stale. */
 static bool shrink_context(int keep_from) {
-    elide_old_tool_results(keep_from);
+    /* a thinking block still in the history is signed over these messages: editing one in front of
+     * it makes the provider refuse the block. Elision waits until the blocks have been set aside. */
+    if (!messages_has_thinking(g_messages, 0)) elide_old_tool_results(keep_from, NULL);
     return maybe_auto_compact(true, pending_request());
 }
 
@@ -2709,6 +2768,11 @@ static bool reply_is_empty(cJSON *reply) {
 /* Returns true if the user interrupted the turn. */
 static bool g_turn_failed = false;   /* the last turn ended on an error (no reply from the model): -p exits 1 */
 static bool run_turn_body(void);
+/* The provider refused a replayed thinking block: the signature no longer matches the conversation. */
+static bool thinking_block_error(const char *err) {
+    if (!err || !strstr(err, "thinking")) return false;
+    return strstr(err, "signature") || strstr(err, "cannot be modified") || strstr(err, "must contain thinking") || strstr(err, "redacted_thinking");
+}
 /* ---------- stream-json: the conversation as JSON lines, as it happens ----------
  * --output-format stream-json writes one JSON object per line to the real stdout: a system line first, then each message
  * of the conversation as it is added (the prompt, each model reply with its tool calls, each tool result), then a result
@@ -2748,7 +2812,7 @@ static bool run_turn_body(void) {
         if (role && cJSON_IsString(role) && !strcmp(role->valuestring, "user")) cJSON_DeleteItemFromArray(g_messages, (int)n - 1);
         return false;
     }
-    int iters = 0, shrinks = 0, empties = 0;
+    int iters = 0, shrinks = 0, empties = 0, think_retries = 0;
     int round_first = -1;   /* where this round's tool results start (-1 before the first round) */
     g_session.turns++;
     for (;;) {
@@ -2769,15 +2833,23 @@ static bool run_turn_body(void) {
         account(&st);
         term_status_refresh();
         if (!reply) {
+            /* The provider refused a replayed thinking block (its signature is for a different
+             * prefix). Drop every one and ask once more; the turns' text and tool calls stay. */
+            if (!aborted && think_retries < 1 && thinking_block_error(ollama_error)) {
+                int n = messages_drop_thinking(g_messages, 0);
+                if (n) { think_retries++; note_thinking_dropped(n); continue; }
+            }
             /* The prompt did not fit and Ollama dropped messages from the front until the user's
              * own request was gone (see "how full the context is"): the estimate was too low, so
              * shrink for real and retry rather than losing the turn — first by eliding every tool
-             * result, then, when there is nothing left to elide, by compacting. */
+             * result, then, when there is nothing left to elide, by compacting. Editing a result
+             * invalidates the thinking signed over it. */
             if (!aborted && shrinks < 2 && ollama_error[0] && (strstr(ollama_error, "no user query") || strstr(ollama_error, "prompt is too long") || strstr(ollama_error, "too many tokens") || strstr(ollama_error, "exceed context"))) {
                 shrinks++;
                 printf(C_YELLOW "⚠ the conversation no longer fits in %s of context — shrinking it and retrying" C_RESET "\n", fmt_ctx(g_cfg.num_ctx));
-                if (elide_tool_results(g_messages, cJSON_GetArraySize(g_messages))
-                    || compact_conversation(true, pending_request())) { round_first = -1; continue; }
+                int first = -1, n = elide_tool_results(g_messages, cJSON_GetArraySize(g_messages), &first);
+                if (n) note_thinking_dropped(messages_drop_thinking(g_messages, first + 1));
+                if (n || compact_conversation(true, pending_request())) { round_first = -1; continue; }
             }
             /* On failure, keep the conversation as is; the user can retry. */
             g_turn_failed = !aborted;
@@ -3078,8 +3150,11 @@ static void worker_call(orch_run *r, int i) {
     orch_worker *w = &r->w[i];
     /* its conversation is its own and nothing in it is measured: kept inside the window on bytes, as a sub-agent's is */
     if (w->round_first > 0 && g_cfg.num_ctx > 0 &&
-        (double)(w->sp_bytes + tools_bytes() + conv_bytes(w->msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0))
-        elide_tool_results(w->msgs, w->round_first);
+        (double)(w->sp_bytes + tools_bytes() + conv_bytes(w->msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0)) {
+        int first = -1;
+        elide_tool_results(w->msgs, w->round_first, &first);
+        if (first >= 0) note_thinking_dropped(messages_drop_thinking(w->msgs, first + 1));
+    }
     ollama_call.followup = w->rounds > 0 || w->attempt > 1;   /* think=auto: think about the task once, not after every tool result */
     if (w->model) { ollama_call.model = w->model; ollama_call.info = w->has_info ? &w->info : NULL; }
     char *body, why[512] = "";
@@ -4489,7 +4564,7 @@ static int handle_slash(char *line) {
             }
         }
     }
-    else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { memory_flush(); cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); typed_clear(); tools_todos_set(NULL); g_prev_request_first = -1; tools_reset_permissions(); tools_checkpoint_clear(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
+    else if (!strcmp(cmd, "/clear") || !strcmp(cmd, "/new")) { memory_flush(); cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); free(g_think_fp); g_think_fp = NULL; typed_clear(); tools_todos_set(NULL); g_prev_request_first = -1; tools_reset_permissions(); tools_checkpoint_clear(); g_session.last_prompt_tokens = 0; g_session_id[0] = 0; term_clear_screen(); printf(C_GREEN "✓ new conversation" C_RESET "\n"); }
     else if (!strcmp(cmd, "/compact")) { if (cmd_compact()) session_save(); }
     else if (!strcmp(cmd, "/resume")) cmd_resume(arg);
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);

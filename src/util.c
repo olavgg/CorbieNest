@@ -1455,6 +1455,39 @@ static const char *msg_role(cJSON *m) {
     return cJSON_IsString(r) ? r->valuestring : "";
 }
 
+static bool thinking_block(cJSON *b) {
+    cJSON *ty = cJSON_GetObjectItemCaseSensitive(b, "type");
+    return cJSON_IsString(ty) && (!strcmp(ty->valuestring, "thinking") || !strcmp(ty->valuestring, "redacted_thinking"));
+}
+
+int messages_drop_thinking(cJSON *msgs, int from) {
+    if (!cJSON_IsArray(msgs) || from < 0) return 0;
+    int dropped = 0, n = cJSON_GetArraySize(msgs);
+    for (int i = from; i < n; i++) {
+        cJSON *m = cJSON_GetArrayItem(msgs, i);
+        cJSON *pc = cJSON_GetObjectItemCaseSensitive(m, "provider_content");
+        if (!cJSON_IsArray(pc)) continue;
+        for (int k = cJSON_GetArraySize(pc) - 1; k >= 0; k--) {
+            if (!thinking_block(cJSON_GetArrayItem(pc, k))) continue;
+            cJSON_DeleteItemFromArray(pc, k);
+            dropped++;
+        }
+        if (cJSON_GetArraySize(pc) == 0) cJSON_DeleteItemFromObject(m, "provider_content");
+    }
+    return dropped;
+}
+
+bool messages_has_thinking(cJSON *msgs, int from) {
+    if (!cJSON_IsArray(msgs) || from < 0) return false;
+    int n = cJSON_GetArraySize(msgs);
+    for (int i = from; i < n; i++) {
+        cJSON *pc = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(msgs, i), "provider_content");
+        cJSON *b;
+        cJSON_ArrayForEach(b, pc) if (thinking_block(b)) return true;
+    }
+    return false;
+}
+
 int messages_repair(cJSON *msgs) {
     int fixed = 0;
     for (int i = 0; i < cJSON_GetArraySize(msgs); i++) {

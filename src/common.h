@@ -164,6 +164,12 @@ int    cmd_head(const char *cmd, int width, char *out, size_t n);   /* a shell c
  * calls without one, and the server refuses the next request); invalid UTF-8 in content is fixed. Returns
  * how many were fixed. The conversation's own repair, run when a request starts. */
 int    messages_repair(cJSON *msgs);
+/* A thinking block is valid only for the system prompt, tools and messages it was signed with. Once any of
+ * those has changed, replaying it is refused ("Invalid signature in thinking block"). Drop thinking and
+ * redacted_thinking from provider_content at index `from` on — the turns' text and tool calls stay.
+ * Returns how many blocks were removed. messages_has_thinking says whether any remain from `from` on. */
+int    messages_drop_thinking(cJSON *msgs, int from);
+bool   messages_has_thinking(cJSON *msgs, int from);
 
 /* The advisor (/advisor): where a consultation runs and what it is shown — see util.c. */
 #define ADVISOR_CTX_AUTO     16384        /* its window unless /advisor ctx says otherwise (and never more than the main one) */

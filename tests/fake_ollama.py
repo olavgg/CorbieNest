@@ -123,6 +123,14 @@ def _tool_results(req):
             out += [b.get("content") or "" for b in c if isinstance(b, dict) and b.get("type") == "tool_result"]
     return out
 
+def _has_thinking(msgs):
+    """A thinking or redacted_thinking block anywhere in the turn. The real API refuses one whose signature is for another prefix."""
+    for m in msgs or []:
+        c = m.get("content")
+        if not isinstance(c, list): continue
+        if any(isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking") for b in c): return True
+    return False
+
 def _turn_blocks(req):
     """The same keywords as script(), as Messages content blocks. A tool_result is answered
     before the keyword that produced the call is seen again, or the model never stops."""
@@ -549,6 +557,10 @@ class H(BaseHTTPRequestHandler):
             if missing:
                 return bad(f"messages.{i + 1}: `tool_use` ids were found without `tool_result` blocks immediately after: {', '.join(missing)}. "
                            "Each `tool_use` block must have a corresponding `tool_result` block in the next message.")
+        typed = [t for t in (_typed(m) for m in msgs) if t is not None]
+        if typed and "RESUME_BREAK" in typed[-1] and _has_thinking(msgs):
+            return bad("messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. "
+                       "Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\".")
         if _advisor_shape(req):
             brief = req["messages"][0]["content"]
             if "SLOWADVICE" in brief: time.sleep(3)
