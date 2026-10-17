@@ -139,18 +139,21 @@ class Session:
         self.send("\x1b", wait=0.3)
         self.mark = 0
     def expect(self, pat, t=15):
-        """Wait until `pat` appears in output produced since the last send()."""
+        """Wait until `pat` appears in output produced since the last send(). The output already read counts first:
+        a pattern read by an earlier call, or before the process exited, is found without another read."""
         end = time.time() + t
-        while time.time() < end:
+        def hit():
+            t = fresh(self.out[self.mark:].decode("utf-8", "replace"))
+            return pat in clean(t) or pat in transcript(t)   # the chrome is read on purpose too ("1 queued", the bar's effort)
+        while True:
+            if hit(): return True
+            if time.time() >= end: return False
             r, _, _ = select.select([self.fd], [], [], 0.1)
             if r:
                 try: d = os.read(self.fd, READ_MAX)
-                except OSError: return False
-                if not d: return False
+                except OSError: return hit()
+                if not d: return hit()
                 self.out += d
-            t = fresh(self.out[self.mark:].decode("utf-8", "replace"))
-            if pat in clean(t) or pat in transcript(t): return True   # the chrome is read on purpose too ("1 queued", the bar's effort)
-        return False
     def send(self, s, wait=0.15):
         self.mark = len(self.out)
         os.write(self.fd, s.encode() if isinstance(s, str) else s); time.sleep(wait)
