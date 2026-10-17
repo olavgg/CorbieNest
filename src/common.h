@@ -544,6 +544,17 @@ void md_finish(md_state *m);
 
 /* ---------- tools.h ---------- */
 typedef enum { TOOL_OK = 0, TOOL_DENIED = 1, TOOL_ERROR = 2 } tool_status;
+/* ---------- agents.c: sub-agent files (task with agent=NAME) ---------- */
+typedef struct { char *name, *description, *tools, *model, *body, *path; } agent_t;
+int   agents_load(void);                    /* the agent files of this project and of the user; returns how many */
+int   agents_count(void);
+const agent_t *agent_get(int i);
+const agent_t *agent_find(const char *name);
+bool  agent_allows(const agent_t *a, const char *tool);
+bool  agent_has_usable_tools(const agent_t *a);
+const char *agent_model_override(const agent_t *a);   /* the model the file names for its runs, or NULL for the sub-agents' */
+char *agents_prompt_section(void);          /* the main agent's prompt part that names them, malloc'd, or NULL */
+
 /* ---------- mcp.c: Model Context Protocol servers over stdio ---------- */
 void  mcp_init(void);                      /* registers the cleanup (atexit) once */
 void  mcp_load(void);                      /* reads the project's and the user's servers and starts them (again: /mcp) */
@@ -607,7 +618,7 @@ int  tools_checkpoint_restore(int turn);           /* put them back; returns fil
 void tools_checkpoint_clear(void);
 /* The `task` tool runs a sub-agent; main.c provides the implementation (it owns the agent
  * loop). Writes the report into out; returns 0 ok, nonzero error. */
-typedef int (*tools_subagent_fn)(const char *description, const char *prompt, sbuf *out);
+typedef int (*tools_subagent_fn)(const char *description, const char *prompt, const char *agent, sbuf *out);
 extern tools_subagent_fn tools_subagent;
 /* The `advisor` tool puts a question to a stronger model (/advisor); main.c provides it too, since
  * what the advisor is shown is the conversation. Writes the advice (or why there is none) into

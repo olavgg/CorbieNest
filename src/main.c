@@ -74,6 +74,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/resume", "continue an earlier session" },
     { "/hooks", "shell commands for this project: before or after a tool call, at start and at the end of a request" },
     { "/mcp", "MCP servers: tools from external programs over stdio (add, remove, reconnect; /mcp alone lists them)" },
+    { "/agents", "sub-agent files: roles the main agent starts by name with task (reload; /agents alone lists them)" },
     { "/permissions", "the project's saved rules: always-allow ones, and deny/ask guards on a tool and a pattern: add, remove, clear" },
     { "/init", "have the model write AGENTS.md for this project" },
     { "/cost", "tokens, model calls and time of this session" },
@@ -100,6 +101,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/memory", "on:keep the project memory up to date|off:stop updating it|update:run the pending update now|clear:remove the memory file|every:update every N requests|idle:update after N seconds idle at the prompt" },
     { "/memory idle", "off:wait for the next update or the exit instead" },
     { "/hooks", "add:a hook line: pre|post TOOL COMMAND, start|stop COMMAND|remove:remove hook N|clear:remove them all" },
+    { "/agents", "reload:read the agent files again" },
     { "/mcp", "add:a server: [-g] NAME COMMAND [ARGS…] (-g for every project)|remove:remove a server by name|reconnect:start them again" },
     { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST, or deny|ask TOOL PATTERN|remove:remove rule N|clear:remove them all" },
     { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host|deny:stop a tool on a pattern (* any text)|ask:ask before a tool on a pattern" },
@@ -1092,6 +1094,24 @@ static int cmd_rewind(void) {
 }
 
 /* ---------- /permissions ---------- */
+/* /agents: the sub-agent files this project and the user have (agents.c reads them) */
+static void cmd_agents(const char *arg) {
+    if (arg && !strcmp(arg, "reload")) { printf(C_GREEN "✓ %d sub-agent%s" C_RESET "\n", agents_load(), agents_count() == 1 ? "" : "s"); return; }
+    if (arg && *arg) { printf("usage: /agents [reload]\n"); return; }
+    if (!agents_count()) { printf(C_DIM "  no sub-agent files. Add NAME.md to .corbienest/agents/ (this project) or %s/agents/ (yours): frontmatter name, description, tools, model; the body is its role" C_RESET "\n", config_dir()); return; }
+    for (int i = 0; i < agents_count(); i++) {
+        const agent_t *a = agent_get(i);
+        printf("  %2d. " C_BOLD "%s" C_RESET " — %s\n", i + 1, a->name, a->description);
+        const char *mo = agent_model_override(a);
+        char mt[160];
+        if (mo) snprintf(mt, sizeof mt, "%s", mo);
+        else if (a->model && *a->model) snprintf(mt, sizeof mt, "the sub-agents' model (%s)", a->model);
+        else snprintf(mt, sizeof mt, "the sub-agents' model");
+        printf(C_DIM "      tools: %s%s · model: %s · %s" C_RESET "\n", a->tools && *a->tools ? a->tools : "all sub-agent tools",
+               agent_has_usable_tools(a) ? "" : " (none usable)", mt, a->path);
+    }
+}
+
 /* /mcp: the servers (mcp.c keeps them and talks to them). The arguments of add are split on spaces: no quoting. */
 static void cmd_mcp(const char *arg) {
     if (arg && (!strncmp(arg, "add ", 4) || !strcmp(arg, "add"))) {
@@ -1289,7 +1309,7 @@ static char *build_system_prompt(void) {
             "The user has put you in plan mode. Explore the codebase with read_file, list_dir, grep and read-only shell commands, "
             "then present a concrete implementation plan as text: which files to change and how, the order of steps, and any risks or open questions. "
             "Do NOT modify files in this mode — write_file and edit_file are unavailable. When the plan is approved the user will switch modes and ask you to implement it.\n");
-    if (g_model_tools && !g_cfg.no_tools) { char *sk = skills_prompt_section(); if (sk) { sb_puts(&b, sk); free(sk); } }
+    if (g_model_tools && !g_cfg.no_tools) { char *sk = skills_prompt_section(); if (sk) { sb_puts(&b, sk); free(sk); } char *ag = agents_prompt_section(); if (ag) { sb_puts(&b, ag); free(ag); } }
     if (g_cfg.system_prompt && *g_cfg.system_prompt) sb_printf(&b, "\n# Additional instructions from the user\n%s\n", g_cfg.system_prompt);
     if (g_project_instructions) sb_puts(&b, g_project_instructions);
     if (g_memory) sb_printf(&b, "\n\n# Project memory (from " MEMORY_PATH ")\n"
@@ -1776,8 +1796,7 @@ static const char *subagent_model(void) {
     return g_cfg.subagent && *g_cfg.subagent && !model_same(g_cfg.subagent, g_cfg.model) ? g_cfg.subagent : NULL;
 }
 /* what that model can be set to, asked of its server once. False: it cannot be used (g_subagent_err says why). */
-static bool subagent_info(void) {
-    const char *m = subagent_model();
+static bool subagent_info_for(const char *m) {
     if (!m) return true;
     if (g_subagent_info_for && !strcmp(g_subagent_info_for, m)) return true;
     free(g_subagent_info_for); g_subagent_info_for = NULL;
@@ -1793,6 +1812,7 @@ static bool subagent_info(void) {
     g_subagent_info_for = xstrdup(m);
     return true;
 }
+static bool subagent_info(void) { return subagent_info_for(subagent_model()); }
 
 /* ---------- sub-agents: the log of each run (← on an empty prompt line) ----------
  * Every run keeps what it did as plain text: its task, each tool call and the head of its
@@ -1921,13 +1941,35 @@ static void agents_menu(void) {
     free(items); free(descs);
 }
 
-static int run_subagent(const char *description, const char *prompt, sbuf *out) {
-    printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", description);
-    const char *sm = subagent_model();
+static int run_subagent_as(const char *description, const char *prompt, const agent_t *ag, const char *model, sbuf *out);
+/* task: a general sub-agent, or the one a file names (agents.c): its tools and role, and its model when it names one. The
+ * model is a parameter of the run, not a setting: /subagent and the config are not touched. */
+static int run_subagent(const char *description, const char *prompt, const char *agent_name, sbuf *out) {
+    const agent_t *ag = NULL;
+    if (agent_name && *agent_name) {
+        ag = agent_find(agent_name);
+        if (!ag) {
+            sb_printf(out, "error: no sub-agent named %s. The ones defined for this project:", agent_name);
+            for (int i = 0; i < agents_count(); i++) sb_printf(out, " %s", agent_get(i)->name);
+            if (!agents_count()) sb_puts(out, " none");
+            sb_puts(out, ". Start one of these, or do the task yourself.");
+            return 1;
+        }
+        if (!agent_has_usable_tools(ag)) {
+            sb_printf(out, "error: sub-agent %s has no tools a sub-agent can use (its tools: %s). Fix its file, or do the task yourself.", ag->name, ag->tools);
+            return 1;
+        }
+    }
+    return run_subagent_as(description, prompt, ag, ag ? agent_model_override(ag) : NULL, out);
+}
+static int run_subagent_as(const char *description, const char *prompt, const agent_t *ag, const char *model, sbuf *out) {
+    if (ag) printf("  " C_CYAN "⤷ sub-agent %s" C_RESET " " C_BOLD "%s" C_RESET "\n", ag->name, description);
+    else printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", description);
+    const char *sm = model ? (model_same(model, g_cfg.model) ? NULL : model) : subagent_model();
     subagent_rec *rec = agent_begin(description, sm);
     agent_say(rec, "task: "); agent_say(rec, prompt); agent_say(rec, "\n");
     if (sm) {
-        if (!subagent_info()) {
+        if (!subagent_info_for(sm)) {
             sb_printf(out, "error: the sub-agents' model %s cannot be used: %s. Do the task with the tools yourself, or say what is missing.", sm, g_subagent_err);
             agent_say(rec, out->data); if (rec) rec->state = AG_FAILED;
             printf("    " C_RED "⎿ %s" C_RESET "\n", out->data);
@@ -1946,6 +1988,7 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
                    "Do the research thoroughly, then finish with ONE final message: a clear, complete report with concrete file paths, line numbers and code snippets where useful — "
                    "the main agent sees only that final message, nothing else you did. Do not ask questions; make reasonable assumptions and state them.",
                    g_cwd, g_cfg.web ? " and web_search/web_fetch for the documentation of external projects" : "");
+    if (ag) sb_printf(&sp, "\n\nYour role (from %s):\n%s", ag->path, ag->body);
     if (g_project_instructions) sb_puts(&sp, g_project_instructions);
     size_t sp_bytes = sp.len;
     cJSON_AddStringToObject(sys, "content", sp.data); sb_free(&sp);
@@ -1957,8 +2000,8 @@ static int run_subagent(const char *description, const char *prompt, sbuf *out) 
         cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
         cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
         const char *name = cJSON_IsString(nm) ? nm->valuestring : "";
-        if (!strcmp(name, "read_file") || !strcmp(name, "list_dir") || !strcmp(name, "grep") || !strcmp(name, "bash") ||
-            !strcmp(name, "web_fetch") || !strcmp(name, "web_search")) cJSON_AddItemReferenceToArray(tools, t);
+        if ((!strcmp(name, "read_file") || !strcmp(name, "list_dir") || !strcmp(name, "grep") || !strcmp(name, "bash") ||
+            !strcmp(name, "web_fetch") || !strcmp(name, "web_search")) && (!ag || agent_allows(ag, name))) cJSON_AddItemReferenceToArray(tools, t);
     }
     int rc = 1, tool_rounds = 0, round_first = -1;
     bool interrupted = false;     /* the user stopped it (Esc / Ctrl-C) */
@@ -4475,6 +4518,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/permissions")) cmd_permissions(arg);
     else if (!strcmp(cmd, "/hooks")) cmd_hooks(arg);
     else if (!strcmp(cmd, "/mcp")) cmd_mcp(arg);
+    else if (!strcmp(cmd, "/agents")) cmd_agents(arg);
     else if (!strcmp(cmd, "/cost")) cmd_cost();
     else if (!strcmp(cmd, "/usage")) cmd_usage(arg);
     else if (!strcmp(cmd, "/banner")) cmd_banner();
@@ -4589,7 +4633,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/cd")) {
         char *d = expand_home(arg ? arg : "~");
         memory_flush();   /* the memory file belongs to the directory we are leaving */
-        if (chdir(d) == 0) { if (getcwd(g_cwd, sizeof g_cwd)) {} load_project_instructions(); load_memory(); tools_permissions_load(); tools_hooks_load(); skills_load(); printf(C_GREEN "✓ %s" C_RESET "\n", g_cwd); }
+        if (chdir(d) == 0) { if (getcwd(g_cwd, sizeof g_cwd)) {} load_project_instructions(); load_memory(); tools_permissions_load(); tools_hooks_load(); skills_load(); agents_load(); printf(C_GREEN "✓ %s" C_RESET "\n", g_cwd); }
         else printf(C_RED "✗ cd %s: %s" C_RESET "\n", d, strerror(errno));
         free(d);
     }
@@ -5711,6 +5755,7 @@ int main(int argc, char **argv) {
     tools_permissions_load();
     tools_hooks_load();
     skills_load();
+    agents_load();
     if (g_cfg.interactive && !oneshot && !bench_runs) tools_hook_event("start");   /* the start hooks: at a terminal only */
     bool quiet_caps = oneshot != NULL || bench_runs;
     if (g_cfg.model && !*g_cfg.model) { free(g_cfg.model); g_cfg.model = NULL; }   /* an empty model= in the config is no model */

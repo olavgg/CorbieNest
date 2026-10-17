@@ -306,6 +306,18 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "advisor", "arguments": {"question": "Why does the needle test fail, and where should I look first?"}}}])
         yield chunk(model, done=True)
         return
+    if "TOOL_AGENT_CC" in text:   # the Claude Code file cc.md (Read, Grep; model: sonnet)
+        yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "cc review", "agent": "cc", "prompt": "Look at made.txt."}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_AGENT_NOSUCH" in text:   # an agent that is not defined
+        yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "nobody", "agent": "nosuch", "prompt": "Anything."}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_AGENT" in text:   # task with agent=reviewer (a sub-agent file of the test project)
+        yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "review the file", "agent": "reviewer", "prompt": "Review made.txt for bugs."}}}])
+        yield chunk(model, done=True)
+        return
     if "TOOL_TASK_SLEEP" in text:
         yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "slow research", "prompt": "SLEEP, then report."}}}])
         yield chunk(model, done=True)

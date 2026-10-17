@@ -373,6 +373,27 @@ static void test_tools_body(void *ud) {
         CHECK(perm_rule_verdict("ask mcp mcp__*", "mcp", "mcp__x__y") == VERDICT_ASK && perm_rule_verdict("deny bash rm *", "mcp", "rm") == VERDICT_NONE);
     }
 
+    /* sub-agent files: a tool list limits the tools; none means all (the frontmatter is read by agents_load) */
+    {
+        agent_t ag; memset(&ag, 0, sizeof ag);
+        ag.tools = xstrdup("read_file, grep");
+        CHECK(agent_allows(&ag, "read_file") && agent_allows(&ag, "grep") && !agent_allows(&ag, "bash") && !agent_allows(&ag, "read_fil"));
+        free(ag.tools); ag.tools = NULL;
+        CHECK(agent_allows(&ag, "bash") && agent_allows(&ag, "web_fetch"));
+        /* Claude Code's names for the same tools, and an agent whose list names none of ours */
+        ag.tools = xstrdup("Read, Grep");
+        CHECK(agent_allows(&ag, "read_file") && agent_allows(&ag, "grep") && !agent_allows(&ag, "bash") && agent_has_usable_tools(&ag));
+        free(ag.tools); ag.tools = xstrdup("Write, Edit");
+        CHECK(!agent_has_usable_tools(&ag));
+        free(ag.tools); ag.tools = NULL;
+        /* the model a file names: Claude Code's aliases mean the sub-agents' own model */
+        ag.model = xstrdup("sonnet"); CHECK(agent_model_override(&ag) == NULL);
+        free(ag.model); ag.model = xstrdup("haiku"); CHECK(agent_model_override(&ag) == NULL);
+        free(ag.model); ag.model = xstrdup("inherit"); CHECK(agent_model_override(&ag) == NULL);
+        free(ag.model); ag.model = xstrdup("qwen3:8b"); CHECK(agent_model_override(&ag) && !strcmp(agent_model_override(&ag), "qwen3:8b"));
+        free(ag.model); ag.model = NULL; CHECK(agent_model_override(&ag) == NULL);
+    }
+
     /* tool definitions are well-formed */
     cJSON *defs = tools_definitions();
     CHECK(cJSON_GetArraySize(defs) == 10);   /* the seven, bash_job, todo_write, and exit */

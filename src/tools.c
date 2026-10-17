@@ -537,6 +537,7 @@ cJSON *tools_definitions(void) {
 
     p = cJSON_CreateObject();
     prop(p, "description", "string", "A short (3-6 word) label for what the sub-agent does, shown to the user.");
+    prop(p, "agent", "string", "The name of a sub-agent defined for this project (listed in the system prompt): it runs with its own role and tools. Omit for a general sub-agent.");
     prop(p, "prompt", "string", "The complete task for the sub-agent. It starts with a fresh context and sees nothing of this conversation, so include every relevant detail: what to look for, where, and exactly what to report back.");
     cJSON_AddItemToArray(arr, mk_tool("task",
         "Delegate a self-contained research or exploration task to a sub-agent with its own fresh context. It can read files, list directories, grep and run read-only shell commands, but cannot modify files, and returns a text report. "
@@ -1404,7 +1405,7 @@ static tool_status t_task(cJSON *args, sbuf *out) {
     if (!tools_subagent) { sb_puts(out, "error: sub-agents are not available here"); return TOOL_ERROR; }
     if (g_in_subagent) { sb_puts(out, "error: a sub-agent cannot start another sub-agent; do the work yourself"); return TOOL_ERROR; }
     g_in_subagent = true;
-    int rc = tools_subagent(desc, prompt, out);
+    int rc = tools_subagent(desc, prompt, jstr(args, "agent", NULL), out);
     g_in_subagent = false;
     return rc == 0 ? TOOL_OK : TOOL_ERROR;
 }

@@ -98,6 +98,7 @@ without thinking about them: the status bar, the field, and the strip.
 | `/subagent [MODEL\|default]`, `/subagent effort [LEVEL\|default]` | the model the sub-agents (`task`) run on. Default: the model doing the work. Another one is checked with its server first (a local model, Ollama's cloud, or a hosted `anthropic:`/`xai:`/`openai:` model) and then kept in the config as `subagent=`. `effort` sets how hard that model thinks, in its own levels (kept per model, as `/effort` does; the same model as the one doing the work shares its effort). Given with a model, it waits for the turn to end, like `/model`. See [Sub-agents](#sub-agents) |
 | `/hooks [add pre\|post TOOL COMMAND \| add start\|stop COMMAND \| remove N \| clear]` | the project's hooks: shell commands before or after a tool call, at start and at the end of a request. See [Hooks](#hooks) |
 | `/mcp [add [-g] NAME COMMAND [ARGS…] \| remove NAME \| reconnect]` | external programs that offer tools, over the Model Context Protocol (stdio). See [MCP servers](#mcp-servers) |
+| `/agents [reload]` | the sub-agent files of this project and yours: roles the main agent starts by name with `task` (see [Sub-agent files](#sub-agent-files)) |
 | `/permissions [add …\|remove N\|clear]` | the project's saved rules: "always allow" ones, and the guard rules `deny` and `ask` (see [Guard rules](#guard-rules-deny-and-ask)). Kept in the config directory, `permissions/`, keyed by the project's path — a file in the project itself is never read |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
@@ -413,6 +414,48 @@ model their tools next to its own, as `mcp__SERVER__TOOL`.
   starts it again. Its process is stopped when corbienest exits, or before `/ui` restarts it.
 - **Not yet**: servers over HTTP or SSE (stdio only), resources and prompts (only tools), and quoting
   in `/mcp add`.
+
+## Sub-agent files
+
+A sub-agent (see [Sub-agents](#sub-agents)) starts with the same instructions each time. A file
+gives one a name, a role, and its own tools and model, and the main agent starts it with
+`task` and `agent=NAME`.
+
+```markdown
+---
+name: reviewer
+description: Reviews a diff for bugs, read-only
+tools: read_file, grep, bash
+model: anthropic:claude-haiku-5
+---
+You review code. For each bug give the file, the line and the fix, and nothing else.
+```
+
+- **Where they are read.** `.corbienest/agents/NAME.md` and `.claude/agents/NAME.md` in the project,
+  then `agents/NAME.md` in your config directory (for every project). The first file of a name is the
+  one used. Claude Code's folder works as it is.
+- **The frontmatter.** `name` (the file name, if left out), `description` (required: the main agent
+  reads it to choose), `tools` (a comma list; left out, the agent has every sub-agent tool), and
+  `model` (left out, or `inherit`, the sub-agents' model from `/subagent`). The body is the role,
+  added to the sub-agent's instructions.
+- **Claude Code files work as they are.** Its tool names are understood (`Read`, `Grep`, `Glob` and
+  `LS` for `list_dir`, `Bash`, `WebFetch`, `WebSearch`), and its model aliases `sonnet`, `opus` and
+  `haiku` mean the sub-agents' own model, since they are not models of your server. An agent whose
+  `tools` name none of the sub-agent tools is refused when it is started, and `/agents` marks it
+  `(none usable)`.
+- **An unknown name** (`task` with `agent=NAME` for no file) is an error returned to the main agent,
+  with the agents that do exist; nothing falls back to a general sub-agent by itself.
+- **What an agent cannot do.** It has only the sub-agent tools (`read_file`, `list_dir`, `grep`,
+  `bash`, `web_fetch`, `web_search`): a file can name fewer of them, never more. It cannot edit files,
+  start a sub-agent or ask the advisor. Its shell commands and fetches are confirmed and checked by the
+  rules and the hooks like anyone's. A file can change what an agent is asked to do, not what it is
+  allowed to do.
+- **A model of its own** is checked the way `/subagent` checks one, when the agent runs. It is a
+  parameter of that run: `/subagent` and the config are not changed, and its tokens are priced as that
+  model's.
+- **`/agents`** lists the agents with their tools, model and file. `/agents reload` reads them again.
+  The main agent's system prompt names them, rebuilt with every request, so a reload is seen at the
+  next one.
 
 ## Tools the model can call
 
