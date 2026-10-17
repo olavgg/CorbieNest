@@ -65,6 +65,86 @@ static void test_md(void) {
     free(o);
 }
 
+/* the text with its ANSI escapes taken out: what the reader sees, column for column */
+static char *plain_of(const char *s) {
+    sbuf b; sb_init(&b);
+    for (const char *p = s; *p; p++) {
+        if (*p == '\x1b' && p[1] == '[') { p += 2; while (*p && !((*p >= '@' && *p <= '~'))) p++; continue; }
+        sb_putc(&b, *p);
+    }
+    return sb_detach(&b);
+}
+static void test_highlight(void) {
+    /* the printer: a fence's language colours its keywords, strings, comments and numbers */
+    char *o = capture(md_run, "```python\ndef f(x):  # note\n    return 'a' + 10\n```\n");
+    CHECK(strstr(o, C_MAGENTA "def" C_RESET) != NULL && strstr(o, C_MAGENTA "return" C_RESET) != NULL);
+    CHECK(strstr(o, C_GRAY "# note" C_RESET) != NULL && strstr(o, C_GREEN "'a'" C_RESET) != NULL && strstr(o, C_YELLOW "10" C_RESET) != NULL);
+    char *pl = plain_of(o);
+    CHECK(strstr(pl, "def f(x):  # note") != NULL && strstr(pl, "    return 'a' + 10") != NULL);   /* the text is what it was */
+    free(pl); free(o);
+    o = capture(md_run, "```c\nint x");   /* a last line that never ends is still printed, highlighted */
+    CHECK(strstr(o, C_MAGENTA "int" C_RESET) != NULL && strstr(o, "x") != NULL);
+    free(o);
+    o = capture(md_run, "```\nx = 1  # plain\n```\n");   /* no language: no colour inside */
+    CHECK(strstr(o, C_MAGENTA) == NULL && strstr(o, C_GRAY "# plain") == NULL && strstr(o, "x = 1  # plain") != NULL);
+    free(o);
+    /* the function itself: each language's comments and strings, a string's escaped quote, an identifier in a word */
+    const char *cases[][3] = {
+        { "c", "int x = 10; // hi \"q\"", "int" },
+        { "js", "const s = \"a\\\"b\"; /* c */ let y = 2", "const" },
+        { "sh", "if [ -f x ]; then echo '#not' # yes", "if" },
+        { "json", "{\"k\": true, \"n\": null}", "true" },
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
+        sbuf h; sb_init(&h);
+        highlight_line(cases[i][0], cases[i][1], &h, C_CYAN);
+        CHECK(strstr(h.data, C_CYAN) != NULL && strstr(h.data, cases[i][2]) != NULL);
+        char *pl2 = plain_of(h.data);
+        CHECK(strcmp(pl2, cases[i][1]) == 0);
+        free(pl2); sb_free(&h);
+    }
+    sbuf h; sb_init(&h);
+    highlight_line("python", "value = 'it''s'  # end", &h, C_CYAN);
+    CHECK(strstr(h.data, C_GRAY "# end" C_RESET) != NULL && strstr(h.data, "'it'") != NULL);
+    sb_free(&h);
+    sbuf k; sb_init(&k);
+    highlight_line("c", "int classy = 2; defer_x = iffy", &k, C_CYAN);   /* keywords are whole words only */
+    CHECK(strstr(k.data, C_MAGENTA "int" C_RESET) != NULL && strstr(k.data, C_MAGENTA "classy") == NULL && strstr(k.data, C_MAGENTA "iffy") == NULL);
+    sb_free(&k);
+}
+
+/* ---------- the git branch of a directory (the status bar's location line) ---------- */
+static void write_text(const char *path, const char *text) {
+    FILE *f = fopen(path, "w"); if (f) { fputs(text, f); fclose(f); }
+}
+static void test_gitbranch(void) {
+    char root[] = "/tmp/crowtest_git_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char p[600], b[256];
+    /* a repository on a branch with a slash in its name, and a directory below it */
+    snprintf(p, sizeof p, "%s/repo", root); mkdir(p, 0700);
+    snprintf(p, sizeof p, "%s/repo/.git", root); mkdir(p, 0700);
+    snprintf(p, sizeof p, "%s/repo/.git/HEAD", root); write_text(p, "ref: refs/heads/feature/status\n");
+    snprintf(p, sizeof p, "%s/repo/src", root); mkdir(p, 0700);
+    snprintf(p, sizeof p, "%s/repo/src/deep", root); mkdir(p, 0700);
+    b[0] = 0;
+    CHECK(git_branch(p, b, sizeof b) == 1 && !strcmp(b, "feature/status"));   /* found above the directory itself */
+    snprintf(p, sizeof p, "%s/repo", root);
+    CHECK(git_branch(p, b, sizeof b) == 1 && !strcmp(b, "feature/status"));
+    /* a detached HEAD: the commit, seven digits */
+    snprintf(p, sizeof p, "%s/repo/.git/HEAD", root); write_text(p, "0123456789abcdef0123456789abcdef01234567\n");
+    snprintf(p, sizeof p, "%s/repo", root);
+    CHECK(git_branch(p, b, sizeof b) == 1 && !strcmp(b, "0123456"));
+    /* a linked worktree: .git is a file that names the git directory */
+    snprintf(p, sizeof p, "%s/wt", root); mkdir(p, 0700);
+    snprintf(p, sizeof p, "%s/wt/.git", root); write_text(p, "gitdir: /tmp/nonexistent-but-named\n");
+    CHECK(git_branch(p, b, sizeof b) == 0);   /* the directory named is not there: no branch, not a crash */
+    /* a directory outside any repository */
+    snprintf(p, sizeof p, "%s", root);
+    CHECK(git_branch(p, b, sizeof b) == 0);
+    CHECK(git_branch(NULL, b, sizeof b) == 0);
+}
+
 /* ---------- text tool call recovery ---------- */
 static void test_text_tool_calls(void) {
     cJSON *a = parse_text_tool_calls("blah\n<tool_call>\n<function=grep>\n<parameter=pattern>\nrange\n</parameter>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>");
@@ -142,6 +222,21 @@ static void test_tools_body(void *ud) {
     CHECK(tools_execute("grep", a, &out) == TOOL_OK); cJSON_Delete(a);
     CHECK(strstr(out.data, "No matches") != NULL); sb_clear(&out);
 
+    /* exit: the program is ended after the turn, and only the main agent may ask */
+    tools_exit_clear();
+    CHECK(tools_execute("exit", NULL, &out) == TOOL_OK && tools_exit_asked()); sb_clear(&out);
+    tools_exit_clear();
+    CHECK(!tools_exit_asked());
+    {
+        cJSON *defs = tools_definitions(); bool found = false; cJSON *t;
+        cJSON_ArrayForEach(t, defs) {
+            cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
+            cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+            if (cJSON_IsString(nm) && !strcmp(nm->valuestring, "exit")) found = true;
+        }
+        CHECK(found); cJSON_Delete(defs);
+    }
+
     /* bash: output + exit code, stderr merged, timeout */
     a = cJSON_CreateObject(); cJSON_AddStringToObject(a, "command", "echo out; echo err 1>&2; exit 3");
     CHECK(tools_execute("bash", a, &out) == TOOL_OK); cJSON_Delete(a);
@@ -171,9 +266,173 @@ static void test_tools_body(void *ud) {
     a = cJSON_CreateObject(); cJSON_AddStringToObject(a, "path", "bin.dat");
     CHECK(tools_execute("read_file", a, &out) == TOOL_ERROR); cJSON_Delete(a); CHECK(strstr(out.data, "binary") != NULL); sb_clear(&out);
 
+    /* todo_write: the list is checked, then kept (and an empty one clears it) */
+    cJSON *tl = cJSON_Parse("{\"todos\":[{\"content\":\"read\",\"status\":\"completed\"},{\"content\":\"edit\",\"status\":\"in_progress\"},{\"content\":\"test\",\"status\":\"pending\"}]}");
+    CHECK(tools_execute("todo_write", tl, &out) == TOOL_OK && tools_todos_get() && cJSON_GetArraySize(tools_todos_get()) == 3);
+    CHECK(strstr(out.data, "Tasks (1 of 3 done)") && strstr(out.data, "◐ edit")); sb_clear(&out); cJSON_Delete(tl);
+    tl = cJSON_Parse("{\"todos\":[{\"content\":\"a\",\"status\":\"in_progress\"},{\"content\":\"b\",\"status\":\"in_progress\"}]}");
+    CHECK(tools_execute("todo_write", tl, &out) == TOOL_ERROR && strstr(out.data, "only one task")); sb_clear(&out); cJSON_Delete(tl);
+    tl = cJSON_Parse("{\"todos\":[{\"content\":\"a\",\"status\":\"doing\"}]}");
+    CHECK(tools_execute("todo_write", tl, &out) == TOOL_ERROR && strstr(out.data, "status must be")); sb_clear(&out); cJSON_Delete(tl);
+    tl = cJSON_Parse("{\"todos\":\"x\"}");
+    CHECK(tools_execute("todo_write", tl, &out) == TOOL_ERROR && strstr(out.data, "must be an array")); sb_clear(&out); cJSON_Delete(tl);
+    tl = cJSON_Parse("{\"todos\":[{\"status\":\"pending\"}]}");
+    CHECK(tools_execute("todo_write", tl, &out) == TOOL_ERROR && strstr(out.data, "no content")); sb_clear(&out); cJSON_Delete(tl);
+    tl = cJSON_Parse("{\"todos\":[]}");
+    CHECK(tools_execute("todo_write", tl, &out) == TOOL_OK && strstr(out.data, "cleared") && tools_todos_get() && !cJSON_GetArraySize(tools_todos_get())); sb_clear(&out); cJSON_Delete(tl);
+    tools_todos_set(NULL);
+
+    /* permission rules: glob patterns, and deny beats ask beats allow (pure: nothing is written to the config) */
+    CHECK(glob_match("rm *", "rm -rf b") && !glob_match("rm *", "arm x") && glob_match("a?c", "abc") && !glob_match("a?c", "ac"));
+    CHECK(glob_match("*.env", "x/y/.env") && glob_match("*", "") && glob_match("", "") && !glob_match("", "a") && glob_match("a**b", "a/x/b"));
+    CHECK(!glob_match("*x*y", "axbyz") && glob_match("*x*y", "axxy") && !glob_match("rm *", "rmdir x"));
+    CHECK(perm_rule_verdict("deny bash rm *", "bash", "rm -rf b") == VERDICT_DENY);
+    CHECK(perm_rule_verdict("deny bash rm *", "bash", "cd a && rm -rf b") == VERDICT_DENY);   /* a part of a chain */
+    CHECK(perm_rule_verdict("deny bash rm *", "bash", "X=1 rm f") == VERDICT_DENY);           /* a leading assignment */
+    CHECK(perm_rule_verdict("deny bash rm *", "bash", "/bin/rm f") == VERDICT_DENY);          /* a path in front of the program */
+    CHECK(perm_rule_verdict("deny bash rm *", "bash", "ls $(rm x)") == VERDICT_ASK);          /* a subshell the rule cannot see into */
+    CHECK(perm_rule_verdict("deny bash rm *", "bash", "ls -la") == VERDICT_NONE);
+    CHECK(perm_rule_verdict("ask bash git push*", "bash", "git push origin") == VERDICT_ASK);
+    CHECK(perm_rule_verdict("bash git status", "bash", "git status -s") == VERDICT_ALLOW);   /* the old allow rules are as they were */
+    CHECK(perm_rule_verdict("bash git status", "bash", "git status; rm x") == VERDICT_NONE);
+    CHECK(perm_rule_verdict("deny bash rm", "edit", "x") == VERDICT_NONE);                    /* a rule is for its own tool */
+    CHECK(perm_rule_verdict("deny edit .env", "edit", ".env") == VERDICT_DENY);
+    CHECK(perm_rule_verdict("deny edit *.pem", "edit", "keys/a.pem") == VERDICT_DENY);
+    CHECK(perm_rule_verdict("deny edit .env", "edit", "a.env") == VERDICT_NONE);
+    CHECK(perm_rule_verdict("edit", "edit", "a.c") == VERDICT_ALLOW);
+    CHECK(perm_rule_verdict("deny fetch *.evil.com", "fetch", "https://x.evil.com/p") == VERDICT_DENY);   /* a host pattern */
+    CHECK(perm_rule_verdict("ask fetch https://docs.x.org/*", "fetch", "https://docs.x.org/a") == VERDICT_ASK);   /* a URL pattern */
+    CHECK(perm_rule_verdict("fetch docs.x.org", "fetch", "https://docs.x.org/a") == VERDICT_ALLOW);
+    CHECK(perm_rule_verdict(NULL, "bash", "ls") == VERDICT_NONE && perm_rule_verdict("deny bash", "bash", "ls") == VERDICT_NONE);
+
+    /* hooks: which line is an event's hook, for which tool, and its command */
+    const char *hc = NULL;
+    CHECK(hook_match("pre bash echo hi", "pre", "bash", &hc) && !strcmp(hc, "echo hi"));
+    CHECK(hook_match("pre bash* make", "pre", "bashful", NULL) && hook_match("pre * exit 2", "pre", "fetch", NULL));
+    CHECK(!hook_match("pre edit x", "pre", "bash", NULL) && !hook_match("post bash x", "pre", "bash", NULL) && !hook_match("prebash x", "pre", "bash", NULL));
+    CHECK(!hook_match("pre bash", "pre", "bash", NULL) && !hook_match("pre bash ", "pre", "bash", NULL));   /* no command */
+    CHECK(hook_match("start make", "start", NULL, &hc) && !strcmp(hc, "make") && !hook_match("stop x", "start", NULL, NULL));
+    CHECK(hook_match("post edit f", "post", "edit", NULL) && !hook_match(NULL, "pre", "bash", NULL));
+
+    /* background bash: output is read in pieces, a job is stopped and its group is gone (real processes; all stopped at the end) */
+    {
+        bool saved_nc = tools_no_confirm; tools_no_confirm = true;
+        cJSON *bj = cJSON_CreateObject();
+        cJSON_AddStringToObject(bj, "command", "echo a; sleep 0.3; echo b");
+        cJSON_AddBoolToObject(bj, "run_in_background", 1);
+        sbuf o; sb_init(&o);
+        CHECK(tools_execute("bash", bj, &o) == TOOL_OK && strstr(o.data, "started background job bg"));
+        char id[16] = ""; int pid = 0;
+        const char *ip = strstr(o.data, "job bg"); if (ip) sscanf(ip + 4, "%15[^ ]", id);
+        const char *pp = strstr(o.data, "(pid "); if (pp) pid = atoi(pp + 5);
+        cJSON_Delete(bj); sb_free(&o);
+        cJSON *jj = cJSON_CreateObject();
+        cJSON_AddStringToObject(jj, "job", id); cJSON_AddStringToObject(jj, "action", "output");
+        sbuf r; sb_init(&r);
+        tools_execute("bash_job", jj, &r);
+        CHECK(strstr(r.data, "[job ") && strstr(r.data, "running") && pid > 0);   /* still going: nothing has been read yet */
+        sb_clear(&r); usleep(700000);
+        tools_execute("bash_job", jj, &r);
+        CHECK(strstr(r.data, "b\n") && strstr(r.data, "exit code 0"));
+        sb_clear(&r);
+        tools_execute("bash_job", jj, &r);   /* the next read: only what is new */
+        CHECK(strstr(r.data, "no new output") && !strstr(r.data, "b\n"));
+        sb_clear(&r); cJSON_Delete(jj);
+        /* a long job, stopped: its group is gone afterwards */
+        cJSON *sj = cJSON_CreateObject();
+        cJSON_AddStringToObject(sj, "command", "sleep 30");
+        cJSON_AddBoolToObject(sj, "run_in_background", 1);
+        tools_execute("bash", sj, &r);
+        int pid2 = 0; char id2[16] = ""; const char *q = strstr(r.data, "job bg"); if (q) sscanf(q + 4, "%15[^ ]", id2);
+        const char *pq = strstr(r.data, "(pid "); if (pq) pid2 = atoi(pq + 5);
+        sb_clear(&r); cJSON_Delete(sj);
+        cJSON *kj = cJSON_CreateObject();
+        cJSON_AddStringToObject(kj, "job", id2); cJSON_AddStringToObject(kj, "action", "kill");
+        CHECK(tools_execute("bash_job", kj, &r) == TOOL_OK && strstr(r.data, "stopped"));
+        CHECK(pid2 > 0 && kill(-pid2, 0) == -1 && errno == ESRCH);   /* the group is gone */
+        sb_clear(&r);
+        CHECK(tools_execute("bash_job", kj, &r) == TOOL_ERROR && strstr(r.data, "no background job"));   /* and the job is forgotten */
+        cJSON_Delete(kj); sb_free(&r);
+        tools_no_confirm = saved_nc;
+        tools_bg_kill_all();
+    }
+
+    /* MCP: the names the model sees, the text of a result, and the mcp permission rule (pure: no server is started) */
+    {
+        char *n1 = mcp_tool_name("fake", "echo"), *n2 = mcp_tool_name("my srv", "a.b c"), *n3 = mcp_tool_name("s", "tool_with_a_very_long_name_that_goes_on_and_on_and_on_past_sixty_four");
+        CHECK(!strcmp(n1, "mcp__fake__echo") && !strcmp(n2, "mcp__my_srv__a_b_c"));
+        CHECK(strlen(n3) == 64 && mcp_is_tool(n3) && strchr(n3, '_') && strcmp(n3, mcp_tool_name("s", "tool_with_a_very_long_name_that_goes_on_and_on_and_on_past_sixty_five")));
+        free(n1); free(n2); free(n3);
+        cJSON *res = cJSON_Parse("{\"content\":[{\"type\":\"text\",\"text\":\"a\"},{\"type\":\"image\",\"data\":\"x\"},{\"type\":\"text\",\"text\":\"b\"}]}");
+        char *txt = mcp_content_text(res);
+        CHECK(txt && !strcmp(txt, "a\n[image]\nb"));
+        free(txt); cJSON_Delete(res);
+        CHECK(perm_rule_verdict("mcp mcp__fake__echo", "mcp", "mcp__fake__echo") == VERDICT_ALLOW);
+        CHECK(perm_rule_verdict("mcp mcp__fake__echo", "mcp", "mcp__fake__shout") == VERDICT_NONE);
+        CHECK(perm_rule_verdict("deny mcp mcp__fake__*", "mcp", "mcp__fake__shout") == VERDICT_DENY);
+        CHECK(perm_rule_verdict("ask mcp mcp__*", "mcp", "mcp__x__y") == VERDICT_ASK && perm_rule_verdict("deny bash rm *", "mcp", "rm") == VERDICT_NONE);
+    }
+
+    /* sub-agent files: a tool list limits the tools; none means all (the frontmatter is read by agents_load) */
+    {
+        agent_t ag; memset(&ag, 0, sizeof ag);
+        ag.tools = xstrdup("read_file, grep");
+        CHECK(agent_allows(&ag, "read_file") && agent_allows(&ag, "grep") && !agent_allows(&ag, "bash") && !agent_allows(&ag, "read_fil"));
+        free(ag.tools); ag.tools = NULL;
+        CHECK(agent_allows(&ag, "bash") && agent_allows(&ag, "web_fetch"));
+        /* Claude Code's names for the same tools, and an agent whose list names none of ours */
+        ag.tools = xstrdup("Read, Grep");
+        CHECK(agent_allows(&ag, "read_file") && agent_allows(&ag, "grep") && !agent_allows(&ag, "bash") && agent_has_usable_tools(&ag));
+        free(ag.tools); ag.tools = xstrdup("Write, Edit");
+        CHECK(!agent_has_usable_tools(&ag));
+        free(ag.tools); ag.tools = NULL;
+        /* the model a file names: Claude Code's aliases mean the sub-agents' own model */
+        ag.model = xstrdup("sonnet"); CHECK(agent_model_override(&ag) == NULL);
+        free(ag.model); ag.model = xstrdup("haiku"); CHECK(agent_model_override(&ag) == NULL);
+        free(ag.model); ag.model = xstrdup("inherit"); CHECK(agent_model_override(&ag) == NULL);
+        free(ag.model); ag.model = xstrdup("qwen3:8b"); CHECK(agent_model_override(&ag) && !strcmp(agent_model_override(&ag), "qwen3:8b"));
+        free(ag.model); ag.model = NULL; CHECK(agent_model_override(&ag) == NULL);
+    }
+
+    /* sandbox: the bwrap command quotes the directory and the command as one word each */
+    {
+        char *sc = sandbox_command("/p q", "echo 'a'");
+        CHECK(sc && strstr(sc, "--bind '/p q' '/p q'") && strstr(sc, "--chdir '/p q'") && strstr(sc, "--ro-bind / /"));
+        CHECK(sc && strstr(sc, "-- /bin/sh -c 'echo '") && strstr(sc, "'\\''a'"));   /* the quote inside is escaped */
+        free(sc);
+    }
+
+    /* stream-json: one line per message, tool calls and results matched, system messages left out; input lines parsed */
+    {
+        cJSON *msgs = cJSON_Parse("["
+            "{\"role\":\"user\",\"content\":\"hello\"},"
+            "{\"role\":\"system\",\"content\":\"not in the stream\"},"
+            "{\"role\":\"assistant\",\"content\":\"Running it.\",\"tool_calls\":[{\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]},"
+            "{\"role\":\"tool\",\"tool_name\":\"bash\",\"content\":\"a.c\"},"
+            "{\"role\":\"tool\",\"tool_call_id\":\"call_x\",\"content\":\"named\"}]");
+        stream_st st; memset(&st, 0, sizeof st);
+        sbuf o; sb_init(&o);
+        stream_messages(&st, msgs, 0, "sid", &o);
+        int lines = 0; for (char *p = o.data; p && *p; p++) if (*p == '\n') lines++;
+        CHECK(lines == 4);   /* the system message is not one of them */
+        CHECK(strstr(o.data, "{\"session_id\":\"sid\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}"));
+        CHECK(strstr(o.data, "\"type\":\"tool_use\",\"id\":\"toolu_2_0\",\"name\":\"bash\",\"input\":{\"command\":\"ls\"}"));
+        CHECK(strstr(o.data, "\"tool_use_id\":\"toolu_2_0\",\"content\":\"a.c\""));   /* the oldest call not answered */
+        CHECK(strstr(o.data, "\"tool_use_id\":\"call_x\",\"content\":\"named\""));
+        CHECK(st.npend == 0);
+        /* a second flush from message 4 on writes nothing new, and the state carries over */
+        sb_clear(&o); stream_messages(&st, msgs, 5, "sid", &o); CHECK(o.len == 0);
+        sb_free(&o); stream_reset(&st); cJSON_Delete(msgs);
+        char *t1 = stream_input_text("{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"plain\"}}");
+        char *t2 = stream_input_text("{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"one\"},{\"type\":\"image\"},{\"type\":\"text\",\"text\":\"two\"}]}}");
+        CHECK(t1 && !strcmp(t1, "plain") && t2 && !strcmp(t2, "one\ntwo"));
+        CHECK(stream_input_text("not json") == NULL);
+        free(t1); free(t2);
+    }
+
     /* tool definitions are well-formed */
     cJSON *defs = tools_definitions();
-    CHECK(cJSON_GetArraySize(defs) == 7);
+    CHECK(cJSON_GetArraySize(defs) == 10);   /* the seven, bash_job, todo_write, and exit */
     cJSON *t; cJSON_ArrayForEach(t, defs) {
         cJSON *f = cJSON_GetObjectItem(t, "function");
         CHECK(cJSON_IsString(cJSON_GetObjectItem(f, "name")));
@@ -338,6 +597,24 @@ static void test_util(void) {
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
 }
 
+/* ---------- a shell command's fold head ---------- */
+static void test_cmd_head(void) {
+    char out[64]; int more;
+    more = cmd_head("ls -la", 40, out, sizeof out); CHECK(more == 0); CHECK_STR(out, "ls -la");
+    more = cmd_head("ls\n", 40, out, sizeof out); CHECK(more == 0); CHECK_STR(out, "ls");          /* a trailing newline is no line */
+    more = cmd_head("a\nb", 40, out, sizeof out); CHECK(more == 1); CHECK_STR(out, "a");
+    more = cmd_head("a\nb\n", 40, out, sizeof out); CHECK(more == 1);
+    more = cmd_head("a\n\nb", 40, out, sizeof out); CHECK(more == 2);                        /* a blank line in the middle counts */
+    more = cmd_head("a\n\n\n", 40, out, sizeof out); CHECK(more == 0);                       /* trailing blank lines do not */
+    more = cmd_head("\n\n  set -e\n  make", 40, out, sizeof out); CHECK(more == 1); CHECK_STR(out, "set -e");   /* leading blanks go */
+    more = cmd_head("cat <<EOF\r\nx\r\nEOF", 40, out, sizeof out); CHECK(more == 2); CHECK_STR(out, "cat <<EOF");   /* no \r left */
+    more = cmd_head("echo\tx\x01y\nz", 40, out, sizeof out); CHECK_STR(out, "echo x y");   /* tab and controls become spaces */
+    more = cmd_head("abcdefghijklmnop\nz", 10, out, sizeof out); CHECK(more == 1); CHECK_STR(out, "abcdefghi\xe2\x80\xa6");   /* cut, with an ellipsis */
+    more = cmd_head("äöüäöüäöü\nz", 4, out, sizeof out); CHECK(more == 1); CHECK_STR(out, "äöü\xe2\x80\xa6");   /* cut on a character, counted in columns */
+    more = cmd_head("abc\nz", 3, out, sizeof out); CHECK_STR(out, "abc");                     /* exactly fits: no ellipsis */
+    char small[4]; more = cmd_head("abcdef\nz", 10, small, sizeof small); CHECK(more == 1); CHECK(strlen(small) < sizeof small);   /* a small buffer is never overrun */
+}
+
 /* ---------- URLs and HTML (web_fetch) ---------- */
 static void test_web(void) {
     CHECK(url_ok("https://www.postgresql.org/docs/17/runtime-config-client.html"));
@@ -497,17 +774,39 @@ static void test_queue(void) {
     t = term_queue_pop_plain(); CHECK_STR(t, "behind it"); free(t);
     CHECK(term_queue_count() == 2 && term_queue_pop_plain() == NULL);
     CHECK_STR(term_queue_peek(), "/save f.md");
+    /* a queued message waits; it is only taken out, never acted on in flight */
     term_queue_clear();
-    /* "new since the mark": what stops the work in flight. Only plain messages count, and
-       only ones queued after main.c last marked the queue seen. */
-    term_queue_mark(); CHECK(!term_queue_new());
-    term_queue_push("/status"); CHECK(!term_queue_new());
-    term_queue_push("look at this too"); CHECK(term_queue_new());
-    term_queue_mark(); CHECK(!term_queue_new());          /* still queued, but no longer new */
-    t = term_queue_pop_plain(); free(t);
-    CHECK(!term_queue_new());
-    term_queue_clear();
+    term_queue_push("look at this too"); CHECK(term_queue_count() == 1);
+    t = term_queue_pop_plain(); CHECK_STR(t, "look at this too"); free(t);
+    CHECK(term_queue_count() == 0);
     #undef KT
+    /* a wrapped row continues in the colours its line opened: the repaint re-sends them (term_sgr_track) */
+    { sbuf st; sb_init(&st);
+      term_sgr_track(&st, "\x1b[2mone two\x1b[0m", strlen("\x1b[2mone two\x1b[0m")); CHECK(st.len == 0);
+      term_sgr_track(&st, "\x1b[2mfirst", strlen("\x1b[2mfirst")); CHECK_STR(st.data, "\x1b[2m");
+      term_sgr_track(&st, "\x1b[38;5;132mx\x1b[m", strlen("\x1b[38;5;132mx\x1b[m")); CHECK(st.len == 0);
+      term_sgr_track(&st, "\x1b[1m\x1b[32mok", strlen("\x1b[1m\x1b[32mok")); CHECK_STR(st.data, "\x1b[1m\x1b[32m");
+      sb_free(&st); }
+    /* the rate limits of a response: its anthropic-ratelimit-* headers, per model (util.c) */
+    { ratelimit_info rl; memset(&rl, 0, sizeof rl);
+      const char *h1 = "anthropic-ratelimit-input-tokens-remaining: 1999000\r\n";
+      ratelimit_header(&rl, h1, strlen(h1)); CHECK(rl.have && rl.in_rem == 1999000 && rl.in_lim == 0);
+      const char *h2 = "Anthropic-RateLimit-Requests-Limit:  1000 \r\n";
+      ratelimit_header(&rl, h2, strlen(h2)); CHECK(rl.req_lim == 1000);
+      const char *h3 = "anthropic-ratelimit-output-tokens-limit: 400000\r\n";
+      ratelimit_header(&rl, h3, strlen(h3)); CHECK(rl.out_lim == 400000);
+      const char *h4 = "anthropic-ratelimit-input-tokens-reset: 2026-10-15T10:00:00Z\r\n";
+      ratelimit_header(&rl, h4, strlen(h4)); CHECK_STR(rl.reset, "2026-10-15T10:00:00Z");
+      const char *h5 = "anthropic-ratelimit-tokens-remaining: 5\r\n";   /* the aggregate is not one of the three */
+      ratelimit_header(&rl, h5, strlen(h5)); CHECK(rl.in_rem == 1999000);
+      const char *h6 = "content-type: application/json\r\n";
+      ratelimit_header(&rl, h6, strlen(h6)); CHECK(rl.out_rem == 0);
+      const char *h7 = "anthropic-ratelimit-requests-remaining: many\r\n";   /* not a number: ignored */
+      ratelimit_header(&rl, h7, strlen(h7)); CHECK(rl.req_rem == 0);
+      ratelimit_info none; memset(&none, 0, sizeof none);
+      ratelimit_set("claude-test-a", &none); CHECK(!ratelimit_get("claude-test-a", &rl));   /* nothing to keep */
+      ratelimit_set("claude-test-a", &rl); ratelimit_info back; CHECK(ratelimit_get("claude-test-a", &back) && back.in_rem == 1999000);
+      CHECK(!ratelimit_get("claude-test-b", &back)); }
     /* prompt history keeps the latest 100 queries */
     for (int i = 0; i < 150; i++) { char l[32]; snprintf(l, sizeof l, "query %d", i); hist_add(l); }
     CHECK(hist_count() == 100);
@@ -526,8 +825,15 @@ static void test_skills(void) {
     CHECK(write_whole_file(".corbienest/skills/rev/SKILL.md", body, strlen(body)) == 0);
     const char *flat = "No frontmatter here.\n";
     CHECK(write_whole_file(".corbienest/skills/plain.md", flat, strlen(flat)) == 0);
-    CHECK(skills_load() == 2);
+    CHECK(mkdir_p(".corbienest/skills/tester") == 0);   /* a role: its frontmatter names a model */
+    const char *role = "---\nname: tester\ndescription: Writes the tests\nmodel: qwen3-coder:30b\n---\nWrite the tests.\n";
+    CHECK(write_whole_file(".corbienest/skills/tester/SKILL.md", role, strlen(role)) == 0);
+    CHECK(skills_load() == 3);
     const skill_t *s = skill_find("/rev"); CHECK(s != NULL);
+    if (s) CHECK(s->model == NULL);   /* no model: inherit the one in use */
+    s = skill_find("tester"); CHECK(s != NULL);
+    if (s) { CHECK_STR(s->model, "qwen3-coder:30b"); CHECK_STR(s->body, "Write the tests.\n"); }
+    s = skill_find("/rev"); CHECK(s != NULL);
     if (s) {
         CHECK_STR(s->desc, "Review things"); CHECK_STR(s->body, "Review: $ARGUMENTS\nEnd.\n"); CHECK_STR(s->source, "project");
         char *e = skill_expand(s, "a.c b.c");
@@ -543,7 +849,7 @@ static void test_skills(void) {
     char path[512]; CHECK(skill_scaffold("new-one", path, sizeof path) == 0); CHECK(is_file(path));
     CHECK(skill_scaffold("new-one", path, sizeof path) == 1);
     CHECK(skill_scaffold("bad name!", path, sizeof path) == -1);
-    CHECK(skills_load() == 3);
+    CHECK(skills_load() == 4);   /* rev, plain, tester and the scaffolded one */
     char *sec = skills_prompt_section(); CHECK(sec && strstr(sec, "/new-one") && strstr(sec, "written in C")); free(sec);
     CHECK(chdir(old) == 0);
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
@@ -876,6 +1182,14 @@ static void test_advisor(void) {
     CHECK(!tool_result_failed("advisor", "error: the advisor has been consulted 6 times", true) && !tool_result_failed("bash", NULL, false));
     CHECK(advisor_guidance_parse("strong") == GUIDANCE_STRONG && advisor_guidance_parse("MAX") == GUIDANCE_MAX && advisor_guidance_parse("ultra") == -1);
     CHECK(ADVISOR_GUIDANCE[GUIDANCE_NORMAL].uses == 3 && !ADVISOR_GUIDANCE[GUIDANCE_NORMAL].review && ADVISOR_GUIDANCE[GUIDANCE_STRONG].review && ADVISOR_GUIDANCE[GUIDANCE_MAX].check_first_edit);
+    for (int i = 0; i < GUIDANCE_COUNT; i++) CHECK(ADVISOR_GUIDANCE[i].desc && *ADVISOR_GUIDANCE[i].desc && ADVISOR_GUIDANCE[i].name && *ADVISOR_GUIDANCE[i].name);
+    CHECK(!ADVISOR_GUIDANCE[GUIDANCE_NORMAL].check_first_edit && ADVISOR_GUIDANCE[GUIDANCE_NORMAL].step_in && !ADVISOR_GUIDANCE[GUIDANCE_LIGHT].step_in && !ADVISOR_GUIDANCE[GUIDANCE_LIGHT].review);
+    /* the review: strong only for a request that changed a lot, max for any change */
+    CHECK(ADVISOR_GUIDANCE[GUIDANCE_STRONG].review && !ADVISOR_GUIDANCE[GUIDANCE_STRONG].review_any && !ADVISOR_GUIDANCE[GUIDANCE_STRONG].check_first_edit);
+    CHECK(ADVISOR_GUIDANCE[GUIDANCE_MAX].review && ADVISOR_GUIDANCE[GUIDANCE_MAX].review_any && !ADVISOR_GUIDANCE[GUIDANCE_NORMAL].review_any);
+    CHECK(diff_changed_lines("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n") == 2);   /* the headers are not counted */
+    CHECK(diff_changed_lines("--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n-a\n-b\n+c\n d\n\\ No newline\n") == 3);
+    CHECK(diff_changed_lines("+one\n+two") == 2 && diff_changed_lines(NULL) == 0 && diff_changed_lines("") == 0);
     for (int i = 1; i < GUIDANCE_COUNT; i++) CHECK(ADVISOR_GUIDANCE[i].uses > ADVISOR_GUIDANCE[i - 1].uses && ADVISOR_GUIDANCE[i].words > ADVISOR_GUIDANCE[i - 1].words);
     g_cfg.advisor_guidance = old_guid;
 
@@ -986,6 +1300,101 @@ static cJSON *jget(cJSON *o, const char *path) {   /* "a.b.0.c" */
 }
 static const char *jstr_at(cJSON *o, const char *path) { cJSON *v = jget(o, path); return cJSON_IsString(v) ? v->valuestring : NULL; }
 
+/* a sub-agent's log: appended in order, and past the cap the front goes, whole lines only */
+static void test_agent_log(void) {
+    sbuf b; sb_init(&b);
+    agent_log_add(&b, "one\n", 100); agent_log_add(&b, "two\n", 100);
+    CHECK(!strcmp(b.data, "one\ntwo\n"));
+    sb_free(&b); sb_init(&b);
+    for (int i = 0; i < 50; i++) { char l[32]; snprintf(l, sizeof l, "line %02d\n", i); agent_log_add(&b, l, 120); }
+    CHECK(b.len <= 120);
+    CHECK(!strncmp(b.data, "… earlier lines dropped\n", 25));
+    CHECK(strstr(b.data, "line 49\n") != NULL && strstr(b.data, "line 00") == NULL);
+    CHECK(b.data[b.len - 1] == '\n');
+    const char *p = strchr(b.data, '\n') + 1;                     /* after the note: a whole line starts */
+    CHECK(!strncmp(p, "line ", 5));
+    sb_free(&b);
+    /* what a tool prints is plain text in the log: colour codes and carriage returns go */
+    sb_init(&b);
+    agent_log_add(&b, "\x1b[31mred\x1b[0m ok\r\n\tdone\x1b", 100);
+    CHECK(!strcmp(b.data, "red ok\n\tdone"));
+    sb_free(&b);
+}
+
+/* a pasted block in the prompt is a token; the text goes back in on submit, whole tokens only */
+static void test_paste(void) {
+    const char *in = "look [Pasted text #1 +3 lines] and [Pasted text #2 +2 lines]!";
+    size_t sp[4][2]; int ks[4], ns[4];
+    size_t n = paste_tokens(in, strlen(in), sp, ks, ns, 4);
+    CHECK(n == 2);
+    CHECK(n == 2 && sp[0][0] == 5 && sp[0][1] == 30 && ks[0] == 1 && ns[0] == 3);
+    CHECK(n == 2 && ks[1] == 2 && ns[1] == 2);
+    CHECK(paste_tokens("[Pasted text #1 +3 lines", 24, NULL, NULL, NULL, 4) == 0);   /* not finished */
+    CHECK(paste_tokens("[Pasted text #0 +3 lines]", 25, NULL, NULL, NULL, 4) == 0);  /* no paste 0 */
+    const char *texts[2] = { "a\nb\nc", "d\ne" }; int lines[2] = { 3, 2 };
+    char *o = paste_expand(in, strlen(in), texts, lines, 2);
+    CHECK(!strcmp(o, "look a\nb\nc and d\ne!"));
+    free(o);
+    o = paste_expand("[Pasted text #1 +4 lines] x", 27, texts, lines, 2);   /* a token whose count was edited: literal */
+    CHECK(!strcmp(o, "[Pasted text #1 +4 lines] x"));
+    free(o);
+    o = paste_expand("[Pasted text #9 +3 lines]", 25, texts, lines, 2);      /* a number with no paste: literal */
+    CHECK(!strcmp(o, "[Pasted text #9 +3 lines]"));
+    free(o);
+    const char *ten = "[Pasted text #1 +3 lines]";                       /* a token that ends the input */
+    o = paste_expand(ten, strlen(ten), texts, lines, 2);
+    CHECK(!strcmp(o, "a\nb\nc"));
+    free(o);
+    CHECK(paste_tokens(ten, strlen(ten), NULL, NULL, NULL, 4) == 1);
+    o = paste_expand("", 0, texts, lines, 2);
+    CHECK(o && !*o);
+    free(o);
+}
+
+static void test_goal(void) {
+    char err[160], why[200];
+    goal_spec g;
+    CHECK(goal_parse("\"./bench.sh\" ", &g, err, sizeof err) == false);   /* no goal after the metric */
+    CHECK(strstr(err, "no goal") != NULL);
+    CHECK(goal_parse("\"./bench.sh --fast\" min -n 2 -k 4 make it run in 10 ms", &g, err, sizeof err));
+    CHECK_STR(g.metric, "./bench.sh --fast"); CHECK(g.lower && g.rounds == 2 && g.cands == 4); CHECK_STR(g.task, "make it run in 10 ms");
+    goal_spec_free(&g);
+    CHECK(goal_parse("\"cat score\" -k 3 -n 5 max faster", &g, err, sizeof err));   /* options in any order, after the metric */
+    CHECK_STR(g.metric, "cat score"); CHECK(!g.lower && g.rounds == 5 && g.cands == 3); CHECK_STR(g.task, "faster");
+    goal_spec_free(&g);
+    CHECK(goal_parse("'wc -l x' do it", &g, err, sizeof err));   /* defaults: 3 rounds, 3 candidates, higher is better */
+    CHECK(g.rounds == 3 && g.cands == ORCH_WORKERS_DEFAULT && !g.lower); CHECK_STR(g.task, "do it");
+    goal_spec_free(&g);
+    CHECK(!goal_parse("\"unclosed", &g, err, sizeof err) && strstr(err, "closing"));
+    CHECK(!goal_parse("\"cat score\" -n 0 x", &g, err, sizeof err) && strstr(err, "-n"));
+    CHECK(!goal_parse("\"cat score\" -n 11 x", &g, err, sizeof err) && strstr(err, "-n"));
+    CHECK(!goal_parse("\"cat score\" -k 1 x", &g, err, sizeof err) && strstr(err, "-k"));
+    CHECK(!goal_parse("\"cat score\" -k many x", &g, err, sizeof err) && strstr(err, "number"));
+    CHECK(!goal_parse("   ", &g, err, sizeof err) && strstr(err, "metric"));
+    CHECK(goal_parse("\"make bench\" -m xai:grok-4.7,deepseek-chat,claude-opus-5 -k 3 faster", &g, err, sizeof err));
+    CHECK(g.nmodels == 3 && !strcmp(g.models[0], "xai:grok-4.7") && !strcmp(g.models[1], "deepseek-chat") && !strcmp(g.models[2], "claude-opus-5") && g.cands == 3);
+    CHECK_STR(g.task, "faster");
+    goal_spec_free(&g);
+    CHECK(!goal_parse("\"x\" -m a,,b go", &g, err, sizeof err) && strstr(err, "empty model"));
+    CHECK(!goal_parse("\"x\" -m go", &g, err, sizeof err) && strstr(err, "no goal"));   /* -m takes the next word as its list: no goal is left */
+    CHECK(!goal_parse("\"x\" -m", &g, err, sizeof err) && strstr(err, "-m needs"));
+    CHECK(!goal_parse("\"cat score\"   \n", &g, err, sizeof err) && strstr(err, "no goal"));
+    double v;
+    CHECK(goal_number("warming up\n1.5 s\n  42.25  \n\n", &v) && v == 42.25);
+    CHECK(goal_number("12", &v) && v == 12);
+    CHECK(goal_number("-3e2\r\n", &v) && v == -300);
+    CHECK(!goal_number("42 ms", &v));          /* a unit after the number is not a score */
+    CHECK(!goal_number("42\nno number here", &v));
+    CHECK(!goal_number("nan", &v) && !goal_number("inf", &v) && !goal_number("", &v) && !goal_number(NULL, &v));
+    CHECK(goal_better(2.0, 1.0, false) && !goal_better(1.0, 1.0, false) && goal_better(0.5, 1.0, true) && !goal_better(2.0, 1.0, true));
+    CHECK(goal_verdict("I made it faster.\n\nGOAL: REACHED\n", why, sizeof why) == GOAL_REACHED);
+    CHECK(goal_verdict("**GOAL: IMPOSSIBLE** faster than light is not a thing.", why, sizeof why) == GOAL_IMPOSSIBLE);
+    CHECK_STR(why, "faster than light is not a thing.");
+    CHECK(goal_verdict("GOAL: IMPOSSIBLE: the disk is full\nGOAL: REACHED", why, sizeof why) == GOAL_REACHED && why[0] == 0);   /* the last line wins */
+    CHECK(goal_verdict("the goal is not reached yet, GOAL: REACHED mentioned mid-line", why, sizeof why) == GOAL_NONE);
+    CHECK(goal_verdict("nothing about it", why, sizeof why) == GOAL_NONE && goal_verdict(NULL, NULL, 0) == GOAL_NONE);
+}
+
 static void test_orchestrate(void) {
     orch_task *t = NULL;
     int n = orch_parse_plan("Here is the plan.\n\nTASK 1: add the flag\nEdit src/a.c: add --dry.\nDONE WHEN: make passes\n\n"
@@ -1001,15 +1410,50 @@ static void test_orchestrate(void) {
     CHECK(t[4].after == 1u);                                             /* itself and a task that is not there do not count */
     CHECK_STR(t[2].body, "do c"); CHECK_STR(t[3].body, "do d after lunch");   /* the line is no part of the instructions; a sentence stays */
     orch_tasks_free(t, n);
+    /* LAYER: n (/plan): a task with none takes the layer before it, the first is in layer 1, and a layer never goes back */
+    n = orch_parse_plan("TASK 1: pom\nLAYER: 1\ndo pom\n\nTASK 2: entity\n**Layer:** 2\ndo entity\n\nTASK 3: repo\ndo repo\n\n"
+                        "TASK 4: service\nLAYER: 3\ndo service\n\nTASK 5: back\nLAYER: 2\ndo back\n\nTASK 6: x\nLAYER: 4\nAFTER: none\ndo x\n", &t);
+    CHECK(n == 6 && t[0].layer == 1 && t[1].layer == 2 && t[2].layer == 2 && t[3].layer == 3 && t[4].layer == 3 && t[5].layer == 4);
+    CHECK_STR(t[2].body, "do repo"); CHECK(t[5].after == 0);   /* the layer line is no part of the instructions; AFTER still reads */
+    orch_tasks_free(t, n);
+    n = orch_parse_plan("TASK 1: a\ndo a\n\nTASK 2: b\ndo b\n", &t);
+    CHECK(n == 2 && t[0].layer == 1 && t[1].layer == 1);   /* a plan with no layers is one layer */
+    orch_tasks_free(t, n);
+    n = orch_parse_plan("TASK 1: a\nLAYER: 2\ndo a\n\nTASK 2: b\nLAYER: x\ndo b\n", &t);
+    CHECK(n == 2 && t[0].layer == 2 && t[1].layer == 2);   /* a layer that is no number is not one: the layer before it stands */
+    orch_tasks_free(t, n);
     n = orch_parse_plan("TASK 1\nJust the instructions.\n\nTASK 2: —\n", &t);
     CHECK(n == 2); CHECK_STR(t[0].title, ""); CHECK_STR(t[0].body, "Just the instructions.");
     orch_tasks_free(t, n);
+    /* ROLE: and OWNS: belong to their task, not its instructions; CONTRACT: is the plan's, read before the first task */
+    char *contract = NULL;
+    n = orch_parse_plan_ex("Plan.\nCONTRACT: package com.x; entity Hours(id, project, hours)\n- Repo: HoursRepo with findByWeek\n\n"
+                           "TASK 1: entities\nROLE: entity\nOWNS: src/main/java/com/x/model/, src/test/java/com/x/model\ndo the entities\n\n"
+                           "TASK 2: service\nROLE: service\nOWNS: `src/main/java/com/x/service/HoursService.java`\nAFTER: 1\ndo the service\n\n"
+                           "TASK 3: plain\nROLE:\ndo it\n", &t, &contract);
+    CHECK(n == 3 && contract && strstr(contract, "entity Hours") && strstr(contract, "Repo: HoursRepo") && !strstr(contract, "TASK 1"));
+    CHECK_STR(t[0].role, "entity"); CHECK(t[0].nowns == 2 && !strcmp(t[0].owns[0], "src/main/java/com/x/model/") && !strcmp(t[0].owns[1], "src/test/java/com/x/model"));
+    CHECK_STR(t[1].role, "service"); CHECK(t[1].nowns == 1 && !strcmp(t[1].owns[0], "src/main/java/com/x/service/HoursService.java"));
+    CHECK(t[1].after == 1u && t[2].after == 2u && t[2].role == NULL && t[2].nowns == 0);   /* an empty ROLE: is no role */
+    CHECK_STR(t[1].body, "do the service");
+    free(contract); orch_tasks_free(t, n);
+    n = orch_parse_plan_ex("TASK 1: a\ndo a\n", &t, &contract);
+    CHECK(n == 1 && contract == NULL && t[0].role == NULL && t[0].owns == NULL);   /* a plan without the new lines parses as before */
+    orch_tasks_free(t, n);
+    /* OWNS: paths clash when they name one file, or a directory and what is in it; a prefix that is no directory does not */
+    CHECK(!owns_overlap_one("src/a", "src/ab") && !owns_overlap_one("pom.xml", "src/pom.xml"));
+    CHECK(owns_overlap_one("src/a", "src/a") && owns_overlap_one("src/main/java/x/", "src/main/java/x/service/S.java"));
+    CHECK(owns_overlap_one("./src/", "src/x") && owns_overlap_one("pom.xml/", "pom.xml"));
+    CHECK(owns_overlap_one(".", "anything/at/all") && owns_overlap_one("", "x"));   /* the whole project clashes with all */
+    char *la[] = { "x/a.java", "pom.xml" }, *lb[] = { "pom.xml" }, *lc[] = { "y/" };
+    CHECK(owns_overlap(la, 2, lb, 1) && !owns_overlap(la, 2, lc, 1) && !owns_overlap(la, 2, NULL, 0));
     CHECK(orch_parse_plan("I would rather talk first.\nThe task is unclear.", &t) == 0 && t == NULL);
     CHECK(orch_parse_plan("", &t) == 0 && orch_parse_plan(NULL, &t) == 0);
     sbuf many; sb_init(&many);
     for (int i = 1; i <= ORCH_MAX_TASKS + 3; i++) sb_printf(&many, "TASK %d: step %d\ndo %d\n", i, i, i);
     n = orch_parse_plan(many.data, &t);
-    CHECK(n == ORCH_MAX_TASKS); CHECK_STR(t[n - 1].body, "do 12");   /* no more than that, and the last one kept whole */
+    char last[32]; snprintf(last, sizeof last, "do %d", ORCH_MAX_TASKS);
+    CHECK(n == ORCH_MAX_TASKS); CHECK_STR(t[n - 1].body, last);   /* no more than that, and the last one kept whole */
     orch_tasks_free(t, n); sb_free(&many);
 }
 
@@ -1039,6 +1483,35 @@ static void test_provider(void) {
         CHECK(model_price("openai:gpt-5.9", &pi, &po) == 0 && model_price("openai:gpt-5-turbo", &pi, &po) == 0);   /* "gpt-5" says nothing about these */
         CHECK(model_price("xai:grok-4.7", &pi, &po) == 1 && pi == 2 && po == 6);
         CHECK(model_price("qwen3:32b", &pi, &po) == 0 && model_price("anthropic:claude-opus-5x", &pi, &po) == 0 && model_price(NULL, &pi, &po) == 0);
+        /* prompt caching: a read costs a fraction of the input, a write more; the reply's usage splits them out */
+        CHECK(model_cache_read_ratio("anthropic:claude-opus-5") == 0.10 && model_cache_read_ratio("claude:claude-sonnet-5-5") == 0.05);
+        CHECK(model_cache_read_ratio("claude:claude-fable-5-1-20260901") == 0.025 && model_cache_read_ratio("xai:grok-4.7") == 0.25);
+        /* OpenAI and xAI: their cached input at their own rate; a model with none is billed as input */
+        CHECK(model_cache_read_ratio("openai:gpt-5.5-2026-07-01") == 0.10 && model_cache_read_ratio("openai:gpt-4.1-mini") == 0.25);
+        CHECK(model_cache_read_ratio("openai:gpt-5.5-pro") == 1 && model_cache_read_ratio("xai:grok-4.5") == 0.15);
+        { int kn = 0; double c = usage_cost_usd("openai:gpt-5.5", 1000000, 1000000, 800000, 0, &kn);   /* 200k at $5 = 1.0, 800k cached at $0.50 = 0.4, 1M out at $30 = 30 */
+          CHECK(kn == 1 && c > 31.3999 && c < 31.4001); }
+        CHECK(model_cache_write_ratio("anthropic:claude-opus-5") == 1.25 && model_cache_write_ratio("openai:gpt-5") == 1);
+        { /* Opus 5 at $5 in / $25 out: 1M output, 100k plain input, 800k read, 100k written = 0.5 + 0.4 + 0.625 + 25 */
+            int kn = 0; double c = usage_cost_usd("anthropic:claude-opus-5", 1000000, 1000000, 800000, 100000, &kn);
+            CHECK(kn == 1 && c > 26.5249 && c < 26.5251);
+            CHECK(usage_cost_usd("qwen3:32b", 1000, 1000, 0, 0, &kn) == 0 && kn == 0);
+        }
+        {
+            chat_stats cst; char cerr[256];
+            cJSON *cr = provider_turn_reply("anthropic:claude-opus-5", "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"stop_reason\":\"end_turn\","
+                "\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":500,\"cache_creation_input_tokens\":40,\"output_tokens\":5}}", 200, &cst, cerr, sizeof cerr);
+            CHECK(cr != NULL && cst.prompt_tokens == 550 && cst.cache_read == 500 && cst.cache_write == 40 && cst.eval_tokens == 5);
+            cJSON_Delete(cr);
+        }
+        {
+            chat_stats ost; char oerr[256];
+            char *otxt = provider_parse_reply("openai:gpt-5.5", "{\"choices\":[{\"message\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],"
+                "\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":800}}}", 200, &ost, oerr, sizeof oerr);
+            CHECK(otxt && !strcmp(otxt, "hi"));
+            CHECK(ost.prompt_tokens == 1000 && ost.cache_read == 800 && ost.eval_tokens == 7);
+            free(otxt);
+        }
         price_set("grok:grok-4.7", 3, 9);
         CHECK(model_price("xai:grok-4.7", &pi, &po) == 2 && pi == 3 && po == 9);
         price_set("xai:grok-4.7", -1, -1);
@@ -1061,11 +1534,13 @@ static void test_provider(void) {
         "\"effort\":{\"supported\":true,\"low\":{\"supported\":true},\"medium\":{\"supported\":true},\"high\":{\"supported\":true},\"xhigh\":{\"supported\":true},\"max\":{\"supported\":true}}}}";
     provider_parse_model("anthropic:claude-opus-5", OPUS, &mi);
     CHECK(mi.context_length == 1000000 && mi.think_adaptive && !mi.think_budget && mi.n_think_levels == 5 && !mi.think_off && !strcmp(mi.think_default, "high"));
+    CHECK(mi.tools && mi.max_output == 128000);   /* the endpoint's max_tokens is the reply cap; tools are on for a Messages model */
     model_info opus = mi;
     const char *HAIKU = "{\"id\":\"claude-haiku-4-5\",\"max_input_tokens\":200000,\"capabilities\":{"
         "\"thinking\":{\"supported\":true,\"types\":{\"enabled\":{\"supported\":true},\"adaptive\":{\"supported\":false}}},\"effort\":{\"supported\":false}}}";
     provider_parse_model("anthropic:claude-haiku-4-5", HAIKU, &mi);
     CHECK(mi.think_budget && !mi.think_adaptive && mi.n_think_levels == 0 && mi.think_off && mi.think_on && !strcmp(mi.think_default, "off"));
+    CHECK(mi.tools && mi.max_output == 0);   /* this fixture names no max_tokens, so the cap stays the general one */
     model_info haiku = mi;
     provider_parse_model("anthropic:claude-x", "{\"id\":\"claude-x\"}", &mi);   /* a proxy that says nothing: nothing is sent that it might refuse */
     CHECK(!mi.thinking && !mi.think_adaptive);
@@ -1095,6 +1570,8 @@ static void test_provider(void) {
     CHECK(cJSON_GetNumberValue(jget(j, "max_tokens")) == 16000);
     CHECK_STR(jstr_at(j, "thinking.type"), "adaptive"); CHECK_STR(jstr_at(j, "output_config.effort"), "xhigh");
     CHECK_STR(jstr_at(j, "fallbacks"), "default"); CHECK(provider_fallbacks("anthropic:claude-opus-5"));
+    CHECK(provider_fallbacks("anthropic:claude-sonnet-5-5") && !provider_fallbacks("anthropic:claude-sonnet-5"));
+    CHECK(!provider_fallbacks("anthropic:claude-haiku-5-5") && !provider_fallbacks("ollama:qwen3:32b"));
     CHECK(!jget(j, "temperature") && !jget(j, "thinking.budget_tokens"));
     cJSON_Delete(j); free(body);
     rq.effort = NULL;
@@ -1172,6 +1649,324 @@ static void test_provider(void) {
     CHECK(provider_model_info("xai:grok-4.7", &mi, err, sizeof err) == -1 && strstr(err, "XAI_API_KEY is not set"));
     bool ab; t = provider_chat("xai:grok-4.7", &mi, &rq, &st, &ab, err, sizeof err);
     CHECK(!t && !ab && strstr(err, "XAI_API_KEY is not set"));
+
+    /* a working-model turn: the stored conversation stays user / assistant / tool; the wire is Messages */
+    cJSON *tools = cJSON_Parse("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"run\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}}},"
+                               "{\"type\":\"function\",\"function\":{\"name\":\"advisor\",\"description\":\"ask\",\"parameters\":{\"type\":\"object\"}}}]");
+    cJSON *msgs = cJSON_Parse("[{\"role\":\"system\",\"content\":\"SYS\"},{\"role\":\"user\",\"content\":\"do the thing\"},"
+                              "{\"role\":\"assistant\",\"content\":\"Running it.\",\"tool_calls\":[{\"id\":\"toolu_bash\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"echo hi\\\"}\"}}]},"
+                              "{\"role\":\"tool\",\"tool_name\":\"bash\",\"tool_call_id\":\"toolu_bash\",\"content\":\"hi\"},{\"role\":\"user\",\"content\":\"and now?\"}]");
+    body = provider_turn_body("anthropic:claude-haiku-4-5", &haiku, msgs, tools, 64000, NULL, false, -1, true);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "model"), "claude-haiku-4-5");
+    CHECK(cJSON_IsTrue(jget(j, "stream")) && cJSON_GetNumberValue(jget(j, "max_tokens")) == 64000);
+    CHECK(cJSON_IsArray(jget(j, "system")) && !jget(j, "thinking") && !jget(j, "output_config") && !jget(j, "fallbacks"));
+    CHECK_STR(jstr_at(j, "system.0.type"), "text"); CHECK_STR(jstr_at(j, "system.0.text"), "SYS");
+    CHECK_STR(jstr_at(j, "system.0.cache_control.type"), "ephemeral");
+    CHECK_STR(jstr_at(j, "tools.0.name"), "bash"); CHECK(jget(j, "tools.0.input_schema.properties.command") && !jget(j, "tools.0.function"));
+    CHECK(cJSON_GetArraySize(jget(j, "messages")) == 3);   /* the tool result and the next user line are one user message */
+    CHECK_STR(jstr_at(j, "messages.0.content.0.text"), "do the thing");
+    CHECK_STR(jstr_at(j, "messages.1.content.0.text"), "Running it.");
+    CHECK_STR(jstr_at(j, "messages.1.content.1.type"), "tool_use"); CHECK_STR(jstr_at(j, "messages.1.content.1.id"), "toolu_bash");
+    CHECK_STR(jstr_at(j, "messages.1.content.1.input.command"), "echo hi");
+    CHECK_STR(jstr_at(j, "messages.2.content.0.type"), "tool_result"); CHECK_STR(jstr_at(j, "messages.2.content.0.tool_use_id"), "toolu_bash");
+    CHECK_STR(jstr_at(j, "messages.2.content.0.content"), "hi"); CHECK_STR(jstr_at(j, "messages.2.content.1.text"), "and now?");
+    CHECK_STR(jstr_at(j, "messages.2.content.1.cache_control.type"), "ephemeral");
+    cJSON_Delete(j); free(body);
+
+    /* a reply with thinking is stored as blocks and sent back unchanged, cache breakpoint on the copy */
+    memset(&st, 0, sizeof st);
+    cJSON *msg = provider_turn_reply("anthropic:claude-haiku-4-5",
+        "{\"content\":[{\"type\":\"thinking\",\"thinking\":\"weighing\",\"signature\":\"sig\"},{\"type\":\"text\",\"text\":\"Running it.\"},"
+        "{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"bash\",\"input\":{\"command\":\"echo hi\"}}],\"stop_reason\":\"tool_use\","
+        "\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":7,\"output_tokens\":4}}",
+        200, &st, err, sizeof err);
+    CHECK_STR(jstr_at(msg, "role"), "assistant"); CHECK_STR(jstr_at(msg, "content"), "Running it.");
+    CHECK_STR(jstr_at(msg, "tool_calls.0.id"), "toolu_1"); CHECK_STR(jstr_at(msg, "tool_calls.0.function.name"), "bash");
+    CHECK_STR(jstr_at(msg, "tool_calls.0.function.arguments"), "{\"command\":\"echo hi\"}");
+    CHECK_STR(jstr_at(msg, "provider_content.0.type"), "thinking"); CHECK_STR(jstr_at(msg, "provider_content.0.thinking"), "weighing");
+    CHECK_STR(jstr_at(msg, "provider_content.0.signature"), "sig"); CHECK_STR(jstr_at(msg, "provider_content.2.id"), "toolu_1");
+    CHECK(st.prompt_tokens == 20 && st.eval_tokens == 4); CHECK_STR(st.done_reason, "stop");
+    cJSON *follow = cJSON_Parse("[{\"role\":\"user\",\"content\":\"go\"}]");
+    cJSON_AddItemToArray(follow, msg);
+    body = provider_turn_body("anthropic:claude-haiku-4-5", &haiku, follow, tools, 64000, NULL, false, -1, false);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "messages.1.content.0.type"), "thinking"); CHECK_STR(jstr_at(j, "messages.1.content.0.thinking"), "weighing");
+    CHECK_STR(jstr_at(j, "messages.1.content.0.signature"), "sig"); CHECK_STR(jstr_at(j, "messages.1.content.2.id"), "toolu_1");
+    CHECK_STR(jstr_at(j, "messages.1.content.2.cache_control.type"), "ephemeral");
+    CHECK(!jget(msg, "provider_content.0.cache_control") && !jget(msg, "provider_content.2.cache_control"));   /* the stored blocks are not the copy */
+    cJSON_Delete(j); free(body); cJSON_Delete(follow);
+
+    /* quiet: no thinking and no effort, even on a model that would otherwise send both. A real level still goes out when asked */
+    body = provider_turn_body("anthropic:claude-opus-5", &opus, msgs, NULL, 256, NULL, false, -1, false);
+    j = cJSON_Parse(body);
+    CHECK(cJSON_IsFalse(jget(j, "stream")) && !jget(j, "thinking") && !jget(j, "output_config"));
+    CHECK_STR(jstr_at(j, "fallbacks"), "default");   /* opus still asks for a fallback model; that is not thinking */
+    cJSON_Delete(j); free(body);
+    body = provider_turn_body("anthropic:claude-opus-5", &opus, msgs, NULL, 32000, "xhigh", true, -1, false);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "thinking.type"), "adaptive"); CHECK_STR(jstr_at(j, "output_config.effort"), "xhigh");
+    cJSON_Delete(j); free(body);
+    body = provider_turn_body("anthropic:claude-haiku-4-5", &haiku, msgs, NULL, 64000, NULL, true, -1, false);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "thinking.type"), "enabled"); CHECK(cJSON_GetNumberValue(jget(j, "thinking.budget_tokens")) == 32000);
+    CHECK(!jget(j, "output_config") && !jget(j, "fallbacks"));
+    cJSON_Delete(j); free(body);
+
+    /* a call the request is not offering (the advisor, once it was turned off) goes out as text, or the next call is a 400 */
+    cJSON *bash_only = cJSON_Parse("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"run\",\"parameters\":{\"type\":\"object\"}}}]");
+    cJSON *dem = cJSON_Parse("[{\"role\":\"user\",\"content\":\"ask\"},"
+                             "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_adv_1\",\"function\":{\"name\":\"advisor\",\"arguments\":{\"question\":\"why\"}}}]},"
+                             "{\"role\":\"tool\",\"tool_name\":\"advisor\",\"tool_call_id\":\"call_adv_1\",\"content\":\"advice text\"}]");
+    body = provider_turn_body("anthropic:claude-haiku-4-5", &haiku, dem, bash_only, 64000, NULL, false, -1, false);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "messages.1.content.0.type"), "text");
+    CHECK(jstr_at(j, "messages.1.content.0.text") && strstr(jstr_at(j, "messages.1.content.0.text"), "[called advisor]") && !jget(j, "messages.1.content.1"));
+    CHECK_STR(jstr_at(j, "messages.2.content.0.type"), "text");
+    CHECK(jstr_at(j, "messages.2.content.0.text") && strstr(jstr_at(j, "messages.2.content.0.text"), "[advisor result]\nadvice text"));
+    cJSON_Delete(j); free(body); cJSON_Delete(dem); cJSON_Delete(bash_only);
+
+    /* a refusal is the turn's answer. The advisor's parser still reports it as a failure and returns nothing */
+    memset(&st, 0, sizeof st);
+    const char *REF = "{\"content\":[],\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"cyber\"}}";
+    msg = provider_turn_reply("anthropic:claude-fable-5", REF, 200, &st, err, sizeof err);
+    CHECK(msg && strstr(jstr_at(msg, "content"), "claude-fable-5 declined to answer (refusal: cyber)") && !jget(msg, "tool_calls"));
+    CHECK_STR(st.done_reason, "stop");
+    cJSON_Delete(msg);
+    t = provider_parse_reply("anthropic:claude-fable-5", REF, 200, &st, err, sizeof err);
+    CHECK(!t && strstr(err, "declined") && strstr(err, "cyber"));
+    cJSON_Delete(msgs); cJSON_Delete(tools);
+}
+
+/* ---------- what a request body must satisfy: valid UTF-8, every call answered ---------- */
+static void test_wellformed(void) {
+    /* tail_incomplete: a chunk that ends inside an escape sequence or a UTF-8 character */
+    CHECK(!tail_incomplete("abc", 3));
+    CHECK(tail_incomplete("x\x1b[38;5", 7));                              /* CSI cut in the parameters */
+    CHECK(!tail_incomplete("x\x1b[0m", 6));                               /* CSI complete */
+    CHECK(tail_incomplete("\xe2\x94", 2));                                /* a 3-byte character cut short */
+    CHECK(!tail_incomplete("\xe2\x94\x80", 3));                          /* … complete */
+    CHECK(tail_incomplete("\x1b]8;;u", 6));                                /* OSC without its end */
+    CHECK(!tail_incomplete("\x1b]8;;u\x07", 7));                          /* … ended by BEL */
+    CHECK(tail_incomplete("a\x1b", 2));                                   /* a lone ESC */
+    CHECK(!tail_incomplete("a\x1b" "7", 3));                                 /* ESC 7 is two bytes */
+    CHECK(tail_incomplete("a\x1b(", 3));                                  /* ESC ( wants its final byte */
+    CHECK(!tail_incomplete("a\x1b(B", 4));
+    /* utf8_ok: good sequences pass, every kind of bad byte fails */
+    CHECK(utf8_ok("plain ascii", 11));
+    CHECK(utf8_ok("æøå €  𝄞", strlen("æøå €  𝄞")));                      /* 2-, 3- and 4-byte characters */
+    CHECK(!utf8_ok("a\xC3", 2));                                       /* a character cut short */
+    CHECK(!utf8_ok("\x80rest", 5));                                    /* a bare continuation byte */
+    CHECK(!utf8_ok("\xC0\xAF", 2));                                   /* overlong */
+    CHECK(!utf8_ok("\xED\xA0\x80", 3));                              /* UTF-16 surrogate */
+    CHECK(!utf8_ok("\xF4\x90\x80\x80", 4));                         /* above U+10FFFF */
+    CHECK(!utf8_ok("\xFF", 1));
+
+    /* utf8_fix: invalid bytes become U+FFFD, valid text is untouched */
+    char *f = utf8_fix("ok \xC3 mid \xE2\x82\xAC end \xFF");
+    CHECK_STR(f, "ok \xEF\xBF\xBD mid \xE2\x82\xAC end \xEF\xBF\xBD");
+    CHECK(utf8_ok(f, strlen(f)));
+    free(f);
+
+    /* utf8_cut: never splits a character, never longer than asked */
+    const char *u = "ab\xC3\xA6\xC3\xA6";                               /* ab, æ, æ: 6 bytes */
+    CHECK(utf8_cut(u, 6, 3) == 2);                                         /* 3 would end inside the first æ */
+    CHECK(utf8_cut(u, 6, 4) == 4);
+    CHECK(utf8_cut(u, 6, 9) == 6);
+
+    /* messages_repair: a stopped request's calls get their results */
+    const char *orphan =
+        "[{\"role\":\"user\",\"content\":\"go\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":["
+            "{\"id\":\"t1\",\"function\":{\"name\":\"bash\",\"arguments\":{}}},"
+            "{\"id\":\"t2\",\"function\":{\"name\":\"read_file\",\"arguments\":{}}}]},"
+        "{\"role\":\"tool\",\"tool_name\":\"bash\",\"tool_call_id\":\"t1\",\"content\":\"done\"},"
+        "{\"role\":\"user\",\"content\":\"continue\"}]";
+    cJSON *msgs = cJSON_Parse(orphan);
+    CHECK(msgs != NULL);
+    CHECK(messages_repair(msgs) == 1);                                     /* t2 only: t1 was answered */
+    CHECK(cJSON_GetArraySize(msgs) == 5);
+    cJSON *r = cJSON_GetArrayItem(msgs, 3);                                /* t2's result sits after the existing result */
+    CHECK_STR(jstr_at(r, "tool_call_id"), "t2");
+    CHECK_STR(jstr_at(r, "tool_name"), "read_file");
+    CHECK_STR(jstr_at(cJSON_GetArrayItem(msgs, 4), "role"), "user");          /* the user's message stays last */
+    CHECK(messages_repair(msgs) == 0);                                     /* a second pass finds nothing to mend */
+
+    /* a call answered by a later result of a *different* reply is not answered for this one */
+    cJSON *twice = cJSON_Parse(
+        "[{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"x\",\"function\":{\"name\":\"bash\"}}]},"
+        "{\"role\":\"user\",\"content\":\"hi\"},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"x\",\"content\":\"late\"}]");
+    CHECK(messages_repair(twice) == 1);
+    CHECK(cJSON_GetArraySize(twice) == 4);
+    CHECK(messages_repair(twice) == 0);                                    /* a conversation with every call answered: nothing added */
+    CHECK(cJSON_GetArraySize(twice) == 4);
+    CHECK_STR(jstr_at(cJSON_GetArrayItem(twice, 1), "tool_call_id"), "x");
+    cJSON_Delete(twice);
+
+    /* invalid UTF-8 already in the conversation (a saved session, an old cut) is mended in place */
+    cJSON *bad = cJSON_CreateArray();
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddStringToObject(m, "role", "tool");
+    cJSON_AddStringToObject(m, "content", "output \xE2\x82 cut");
+    cJSON_AddItemToArray(bad, m);
+    CHECK(messages_repair(bad) == 1);
+    CHECK(utf8_ok(jstr_at(m, "content"), strlen(jstr_at(m, "content"))));
+    CHECK_STR(jstr_at(m, "content"), "output \xEF\xBF\xBD\xEF\xBF\xBD cut");   /* E2 and 82: two bad bytes */
+    CHECK(messages_repair(bad) == 0);
+    cJSON_Delete(bad);
+    cJSON_Delete(msgs);
+}
+
+/* ---------- the notcurses frontend's pure half: SGR, the palette, the cells ---------- */
+static void test_nc_pure(void) {
+    nc_style st = { NC_DEFAULT, NC_DEFAULT, 0 };
+    /* SGR: colours, styles, resets */
+    CHECK(nc_sgr_parse("\x1b[31m", 5, &st) == 5 && st.fg == 0xbf616au);
+    CHECK(nc_sgr_parse("\x1b[1002m", 7, &st) == 7 && st.bg == 0x2c3445u);   /* the theme roles, as the notcurses screen draws them */
+    CHECK(nc_sgr_parse("\x1b[1001m", 7, &st) == 7 && st.fg == 0xefbcffu);
+    st.bg = NC_DEFAULT; st.fg = NC_DEFAULT;
+    CHECK(nc_sgr_parse("\x1b[1;3m", 6, &st) == 6 && (st.styles & NC_ST_BOLD) && (st.styles & NC_ST_ITALIC));
+    CHECK(nc_sgr_parse("\x1b[22m", 5, &st) == 5 && !(st.styles & NC_ST_BOLD));
+    CHECK(nc_sgr_parse("\x1b[38;5;208m", strlen("\x1b[38;5;208m"), &st) == strlen("\x1b[38;5;208m") && st.fg == g_theme->accent);   /* the theme's orange */
+    CHECK(nc_sgr_parse("\x1b[48;2;1;2;3m", strlen("\x1b[48;2;1;2;3m"), &st) == strlen("\x1b[48;2;1;2;3m") && st.bg == 0x010203u);
+    /* the location line's rose (256-colour 132, LOC_ROSE in term.c): the index maps to #af5f87, and no style comes with it */
+    st = (nc_style){ NC_DEFAULT, NC_DEFAULT, 0 };
+    CHECK(nc_sgr_parse("\x1b[38;5;132m", strlen("\x1b[38;5;132m"), &st) == strlen("\x1b[38;5;132m") && st.fg == 0xaf5f87u && st.styles == 0);
+    CHECK(nc_sgr_parse("\x1b[m", 3, &st) == 3 && st.fg == NC_DEFAULT && st.styles == 0);   /* ESC[m is a reset */
+    CHECK(nc_sgr_parse("\x1b[97m", 5, &st) == 5 && st.fg == g_theme->text);   /* a bright white is the theme's text: the basic codes are the theme's */
+    CHECK(nc_sgr_parse("\x1b[31m", 5, &st) == 5 && st.fg == g_theme->bad);   /* 31 is the theme's red on both screens */
+    /* a CSI that is not SGR is consumed and changes nothing; a private mode too */
+    st.fg = 0x123456;
+    CHECK(nc_sgr_parse("\x1b[2K", 4, &st) == 4 && st.fg == 0x123456);
+    CHECK(nc_sgr_parse("\x1b[?25h", 6, &st) == 6 && st.fg == 0x123456);
+    CHECK(nc_sgr_parse("abc", 3, &st) == 0);                                     /* not an escape at all */
+    CHECK(nc_sgr_parse("\x1b[31", 4, &st) == 4);                                  /* unterminated: the rest is the escape */
+    /* the palette: the 6x6x6 cube and the grey ramp */
+    CHECK(nc_color256(16) == 0x000000u && nc_color256(231) == 0xffffffu && nc_color256(232) == 0x080808u);
+    /* cells: text, a tab to the next stop, a multi-byte character, a combining mark, colours carried */
+    nc_cell cells[64];
+    nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 };
+    int n = nc_cells("\x1b[1mab\x1b[0m\tc", strlen("\x1b[1mab\x1b[0m\tc"), cells, 64, &carry);
+    CHECK(n == 2 + 6 + 1);                                                        /* a, b, six spaces to column 8, c */
+    CHECK(cells[0].st.styles & NC_ST_BOLD && strcmp(cells[0].egc, "a") == 0);
+    CHECK(!(cells[2].st.styles & NC_ST_BOLD) && cells[2].egc[0] == ' ');
+    CHECK(strcmp(cells[n - 1].egc, "c") == 0);
+    n = nc_cells("\xc3\xa6x", strlen("\xc3\xa6x"), cells, 64, NULL);                              /* æ then x */
+    CHECK(n == 2 && strcmp(cells[0].egc, "\xc3\xa6") == 0 && cells[0].w == 1 && strcmp(cells[1].egc, "x") == 0);
+    n = nc_cells("e\xcc\x81x", strlen("e\xcc\x81x"), cells, 64, NULL);                             /* e + combining acute: one cell */
+    CHECK(n == 2 && strlen(cells[0].egc) == 3);
+    n = nc_cells("\xe4\xb8\x80", strlen("\xe4\xb8\x80"), cells, 64, NULL);                          /* a wide character: two columns */
+    CHECK(n == 1 && cells[0].w == 2);
+    CHECK(nc_text_width("\xe4\xb8\x80x") == 3);
+    /* wrapping: a line rows at width, a wide character is not split */
+    n = nc_cells("abcdef", 6, cells, 64, NULL);
+    CHECK(nc_line_rows(cells, n, 4) == 2 && nc_line_rows(cells, n, 6) == 1 && nc_line_rows(cells, 0, 4) == 1);
+    n = nc_cells("abc\xe4\xb8\x80", strlen("abc\xe4\xb8\x80"), cells, 64, NULL);
+    CHECK(nc_line_rows(cells, n, 4) == 2);                                        /* abc then the wide one on row 2 */
+}
+
+static void test_wrap(void) {
+    /* word wrap: a row breaks after its last space; a word longer than a row is cut */
+    size_t st = 0; int r = 0, c = 0;
+    term_wrap("hello world foo", 15, 8, 0, 15, 1, &st, &r, &c);
+    CHECK(st == 6);
+    term_wrap("hello world foo", 15, 8, 0, 15, 2, &st, &r, &c);
+    CHECK(st == 12 && r == 2 && c == 3);
+    term_wrap("abcdefghijkl", 12, 5, 0, 12, 1, &st, &r, &c);
+    CHECK(st == 5 && r == 2 && c == 2);
+    term_wrap("ab cd", 5, 5, 0, 5, -1, NULL, &r, &c);
+    CHECK(r == 0 && c == 5);
+    term_wrap("x\ny", 3, 9, 0, 3, 1, &st, &r, &c);
+    CHECK(st == 2);
+}
+
+/* ---------- themes ---------- */
+static char *map_all(const char *in) {
+    theme_map m; memset(&m, 0, sizeof m);
+    sbuf o; sb_init(&o);
+    theme_map_bytes(&m, in, strlen(in), &o);
+    return o.data ? o.data : xstrdup("");
+}
+static void test_theme(void) {
+    const theme_t *def = g_theme;
+    CHECK(theme_set("nope") == false && g_theme == def);   /* an unknown name keeps the theme in use */
+    CHECK(theme_set("default") && g_theme == def && !strcmp(g_theme->name, "default"));
+    CHECK(theme_count() >= 2 && !strcmp(theme_name(0), "default") && theme_set("bright") && !strcmp(g_theme->name, "bright"));   /* the picker's list */
+    CHECK(theme_set("default") && g_theme == def);
+    /* a basic code becomes the theme's RGB; the sequence keeps its other parameters */
+    char *a = map_all("\x1b[31mred\x1b[0m");
+    CHECK_STR(a, "\x1b[38;2;191;97;106mred\x1b[0m");   /* #BF616A */
+    free(a);
+    a = map_all("\x1b[1;36mx\x1b[m");
+    CHECK_STR(a, "\x1b[1;38;2;86;182;194mx\x1b[m");     /* bold stays; 36 is the info colour #56B6C2 */
+    free(a);
+    /* a theme role is the theme's colour when the bytes leave, so the conversation recolours with the theme */
+    theme_set("default");
+    a = map_all("\x1b[1002m\x1b[1001mhi");
+    CHECK_STR(a, "\x1b[48;2;44;52;69m\x1b[38;2;239;188;255mhi");   /* user_bg #2C3445, user_text #EFBCFF */
+    free(a);
+    theme_set("bright");
+    a = map_all("\x1b[1002m\x1b[1001mhi");
+    CHECK_STR(a, "\x1b[48;2;227;236;247m\x1b[38;2;130;80;223mhi");  /* the bright theme's own pair */
+    free(a);
+    theme_set("default");
+    CHECK(theme_role(1001, &(unsigned){0}, &(bool){0}) && !theme_role(31, &(unsigned){0}, &(bool){0}));
+    /* the window's ground: the bright theme paints it on the full-screen ANSI screen only; the default leaves it */
+    CHECK(!strcmp(theme_base_sgr(), ""));
+    theme_set("bright");
+    CHECK(!strcmp(theme_base_sgr(), ""));                    /* not in full-screen mode: nothing is painted */
+    theme_paint_window(true);
+    CHECK_STR(theme_base_sgr(), "\x1b[0;38;2;31;35;40;48;2;255;255;255m");   /* text #1F2328 on window #FFFFFF */
+    a = map_all("x\x1b[0my\x1b[39mz\x1b[49mw");
+    CHECK_STR(a, "x\x1b[0;38;2;31;35;40;48;2;255;255;255my\x1b[38;2;31;35;40mz\x1b[48;2;255;255;255mw");
+    free(a);
+    a = map_all("x\x1b[my");
+    CHECK(strstr(a, "48;2;255;255;255") != NULL);            /* a bare ESC[m is a reset too */
+    free(a);
+    theme_paint_window(false);
+    a = map_all("x\x1b[0my");
+    CHECK_STR(a, "x\x1b[0my");                              /* off: a reset is a reset */
+    free(a);
+    theme_set("default");
+    a = map_all("\x1b[38;5;208mo\x1b[90mg");
+    CHECK_STR(a, "\x1b[38;2;240;136;62mo\x1b[38;2;124;135;153mg");   /* the orange, and 90 grey */
+    free(a);
+    /* an extended colour is numbers, not codes: 38;2;95;215;95 is the green of the field's edge, not a magenta */
+    a = map_all("\x1b[38;2;95;215;95m\x1b[48;5;236m");
+    CHECK_STR(a, "\x1b[38;2;95;215;95m\x1b[48;5;236m");
+    free(a);
+    /* what is not a themed colour goes as it came: resets, cursor moves, erases, 256-colour codes other than the accent */
+    a = map_all("\x1b[0m\x1b[2K\x1b[5;9H\x1b[38;5;132mx");
+    CHECK_STR(a, "\x1b[0m\x1b[2K\x1b[5;9H\x1b[38;5;132mx");
+    free(a);
+    /* a sequence the write ends inside is held and finished by the next write */
+    theme_map m; memset(&m, 0, sizeof m);
+    sbuf o; sb_init(&o);
+    theme_map_bytes(&m, "ab\x1b[3", 5, &o);
+    CHECK(o.len == 2 && m.np > 0);
+    theme_map_bytes(&m, "1mcd", 4, &o);
+    CHECK(o.data && !strcmp(o.data, "ab\x1b[38;2;191;97;106mcd"));
+    CHECK(m.np == 0);
+    sb_free(&o);
+    /* a sequence split at a write's end: nothing of it goes out before its end, and the next write completes it */
+    memset(&m, 0, sizeof m);
+    sb_init(&o);
+    theme_map_bytes(&m, "x\x1b[3", strlen("x\x1b[3"), &o);
+    CHECK(o.len == 1 && o.data[0] == 'x' && theme_map_pending(&m));   /* the partial escape is held, not written */
+    theme_map_bytes(&m, "2mz", 3, &o);
+    CHECK(!theme_map_pending(&m) && !strcmp(o.data, "x\x1b[38;2;163;190;140mz"));   /* 32 is the green */
+    sb_free(&o);
+    /* an ESC that is not a CSI goes out as it came */
+    a = map_all("\x1b" "7x\x1b" "8");
+    CHECK_STR(a, "\x1b" "7x\x1b" "8");
+    free(a);
+    /* the basic codes of the theme, for both screens: 30..37 and the bright 9x */
+    unsigned rgb = 0;
+    CHECK(theme_fg_code(32, &rgb) && rgb == g_theme->ok && theme_fg_code(92, &rgb) && rgb == g_theme->ok);
+    CHECK(theme_fg_code(90, &rgb) && rgb == g_theme->gray && !theme_fg_code(40, &rgb));   /* a background is not a fg */
+    CHECK(th_fg(0x5FD75Fu) && !strcmp(th_fg(0x5FD75Fu), "\x1b[38;2;95;215;95m"));
+    CHECK(!strcmp(th_bg(0x151922u), "\x1b[48;2;21;25;34m"));
 }
 
 int main(void) {
@@ -1179,11 +1974,11 @@ int main(void) {
     memset(&g_cfg, 0, sizeof g_cfg);
     g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 10; g_cfg.interactive = false;
     struct { const char *name; void (*fn)(void); } tests[] = {
-        { "sbuf", test_sbuf }, { "util", test_util }, { "markdown", test_md },
+        { "sbuf", test_sbuf }, { "util", test_util }, { "cmd head", test_cmd_head }, { "markdown", test_md }, { "highlight", test_highlight }, { "git branch", test_gitbranch },
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "orchestrate", test_orchestrate },
+        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

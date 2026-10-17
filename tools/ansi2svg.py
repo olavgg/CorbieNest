@@ -9,7 +9,9 @@ the source — `cat docs/demo.ansi` shows the same thing in a terminal.
     tools/ansi2svg.py docs/demo.ansi docs/demo.svg
 
 Understands the escapes corbienest itself emits (see the C_* macros in
-src/common.h): reset, bold, dim, the 30-37/90-97 colours and 38;5;N.
+src/common.h): reset, bold, dim, the 30-37/90-97 colours, 38;5;N, and the
+truecolour and background forms (38;2;R;G;B, 48;5;N, 48;2;R;G;B) that the
+notcurses screen draws.
 """
 import io
 import re
@@ -43,30 +45,43 @@ def cube(n):
 
 
 def runs(line):
-    """Split one line into (text, colour, bold, dim) runs."""
-    out, col, bold, dim, pos = [], None, False, False, 0
+    """Split one line into (text, colour, bold, dim, background) runs."""
+    out, col, bold, dim, bg, pos = [], None, False, False, None, 0
     for m in re.finditer(r"\x1b\[([0-9;]*)m", line):
         if m.start() > pos:
-            out.append((line[pos:m.start()], col, bold, dim))
+            out.append((line[pos:m.start()], col, bold, dim, bg))
         params = [int(p) for p in m.group(1).split(";") if p != ""] or [0]
         i = 0
         while i < len(params):
             p = params[i]
             if p == 0:
-                col, bold, dim = None, False, False
+                col, bold, dim, bg = None, False, False, None
             elif p == 1:
                 bold = True
             elif p == 2:
                 dim = True
+            elif p == 22:
+                bold = dim = False
+            elif p == 39:
+                col = None
+            elif p == 49:
+                bg = None
             elif p in BASE:
                 col = BASE[p]
-            elif p == 38 and params[i + 1:i + 2] == [5]:
-                col = cube(params[i + 2])
+            elif p in (38, 48) and params[i + 1:i + 2] == [5]:
+                c = cube(params[i + 2])
+                if p == 38: col = c
+                else: bg = c
                 i += 2
+            elif p in (38, 48) and params[i + 1:i + 2] == [2]:
+                c = "#%02x%02x%02x" % tuple(params[i + 2:i + 5])
+                if p == 38: col = c
+                else: bg = c
+                i += 4
             i += 1
         pos = m.end()
     if pos < len(line):
-        out.append((line[pos:], col, bold, dim))
+        out.append((line[pos:], col, bold, dim, bg))
     return out
 
 
@@ -88,7 +103,7 @@ def esc(s):
 def render(text):
     lines = text.rstrip("\n").split("\n")
     parsed = [runs(l) for l in lines]
-    cols = max((sum(width(t) for t, _, _, _ in r) for r in parsed), default=0)
+    cols = max((sum(width(t) for t, _, _, _, _ in r) for r in parsed), default=0)
     w = cols * CELL + 2 * PAD
     h = len(lines) * LINE + 2 * PAD
 
@@ -100,12 +115,19 @@ def render(text):
     ]
     for i, r in enumerate(parsed):
         y = PAD + SIZE + i * LINE
+        # a background is a rectangle of the run's cells, under the text
+        cell = 0
+        for txt, _, _, _, bg in r:
+            if bg and txt:
+                o.append('<rect x="%g" y="%g" width="%g" height="%g" fill="%s"/>'
+                         % (PAD + cell * CELL, PAD + i * LINE + 2, width(txt) * CELL, LINE, bg))
+            cell += width(txt)
         o.append('<text y="%g" xml:space="preserve" fill="%s">' % (y, FG))
         # Symbols like ● ⎿ ↳ ⏵ are drawn wider than a monospace cell by whatever
         # font the viewer falls back to, which would shift the rest of the line.
         # Pinning every run to its own column keeps the grid honest instead.
         cell = 0
-        for txt, col, bold, dim in r:
+        for txt, col, bold, dim, _ in r:
             if not txt:
                 continue
             a = ' x="%g"' % (PAD + cell * CELL)

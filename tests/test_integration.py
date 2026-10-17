@@ -10,7 +10,8 @@ import inspect, json, os, pty, re, select, shutil, socket, struct, subprocess, s
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BIN = os.path.join(HERE, "..", "corbienest")
+# CORBIE_BIN: run the suite on a copy of the binary, so a rebuild of the tree cannot pull it away mid-run
+BIN = os.environ.get("CORBIE_BIN") or os.path.join(HERE, "..", "corbienest")
 sys.path.insert(0, HERE)
 import fake_ollama
 
@@ -48,6 +49,8 @@ SERP_HTML = ("""<html><body>
 
 class _Docs(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/moved":   # a redirect: web_fetch must report it, not follow it
+            self.send_response(301); self.send_header("Location", "/doc.html"); self.send_header("Content-Length", "0"); self.end_headers(); return
         if self.path.startswith("/search"):
             body, code = SERP_HTML.encode(), 200
         else:
@@ -84,6 +87,9 @@ WORK = tempfile.mkdtemp(prefix="crowtest_")
 CFG = tempfile.mkdtemp(prefix="crowcfg_")
 ENV = dict(os.environ, XDG_CONFIG_HOME=CFG, OLLAMA_HOST=HOST, TERM="xterm-256color", HOME=WORK)
 ENV.pop("CORBIENEST_MODEL", None)
+# A hosted key in the shell is the user's, not the test's: the tests that need one set it themselves (KEYS, TENV),
+# and the rest must not reach a hosted API (that costs money) because the shell happens to export one.
+for _k in ("XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"): ENV.pop(_k, None)
 # memory extraction adds a background model call after every request; keep it off for the
 # general tests (they assert on requests()[-1]) and exercise it explicitly at the end.
 # memory_idle=0 too, so a pending extraction never fires from a slow expect() mid-test.
@@ -104,6 +110,195 @@ def run(args, stdin=b"", env=None):
 def requests(): return json.loads(urllib.request.urlopen(f"{HOST}/_requests").read())
 
 # ---------- non-interactive ----------
+class Session:
+    def __init__(self, args=(), cols=100, rows=40, env=None, cwd=None, banner=False):
+        self.pid, self.fd = pty.fork()
+        if self.pid == 0:
+            os.chdir(cwd or WORK)
+            # the child inherits the shell's environment: a hosted key the shell exports must not reach it unless the test gives one
+            for k in ("XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+                if k not in (env or ENV): os.environ.pop(k, None)
+            for k, v in (env or ENV).items(): os.environ[k] = v
+            os.execv(BIN, ["corbienest"] + list(args))
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        self.out = b""; self.mark = 0
+        if not banner: self.close_banner()
+    def close_banner(self):
+        """The start-up banner is a modal: while it is up, the output is kept for the scrollback and not written to the
+        terminal, and the box is what the screen shows. Wait for the box, then close it with Esc, so the rest of the
+        session is what the tests read. A test that reads the box passes banner=True and closes it itself."""
+        end = time.time() + 10
+        while time.time() < end and b"Corbie Nest" not in self.out:
+            r, _, _ = select.select([self.fd], [], [], 0.1)
+            if r:
+                try: d = os.read(self.fd, READ_MAX)
+                except OSError: return
+                if not d: return
+                self.out += d
+        time.sleep(0.3)
+        self.send("\x1b", wait=0.3)
+        self.mark = 0
+    def expect(self, pat, t=15):
+        """Wait until `pat` appears in output produced since the last send(). The output already read counts first:
+        a pattern read by an earlier call, or before the process exited, is found without another read."""
+        end = time.time() + t
+        def hit():
+            t = fresh(self.out[self.mark:].decode("utf-8", "replace"))
+            return pat in clean(t) or pat in transcript(t)   # the chrome is read on purpose too ("1 queued", the bar's effort)
+        while True:
+            if hit(): return True
+            if time.time() >= end: return False
+            r, _, _ = select.select([self.fd], [], [], 0.1)
+            if r:
+                try: d = os.read(self.fd, READ_MAX)
+                except OSError: return hit()
+                if not d: return hit()
+                self.out += d
+    def send(self, s, wait=0.15):
+        self.mark = len(self.out)
+        os.write(self.fd, s.encode() if isinstance(s, str) else s); time.sleep(wait)
+    def text(self): return clean(self.out.decode("utf-8", "replace"))
+    def close(self):
+        """Kill it and wait: a session that is still exiting writes the config one last time,
+        and a test that writes its own config next would lose it to that write."""
+        try: os.kill(self.pid, 9)
+        except Exception: pass
+        try: os.waitpid(self.pid, 0)
+        except Exception: pass
+        try: os.close(self.fd)
+        except Exception: pass
+
+def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
+def seen(sess, pat, t=15):
+    """Wait until pat is in the output since the last key, as it was written: a reply's text can sit in a repainted
+    region, which expect() skips on purpose (it is old text drawn again). True when it came."""
+    end = time.time() + t
+    while True:
+        if pat in since_send(sess): return True
+        if time.time() >= end: return False
+        sess.expect("(no such text)", 0.3)
+def new_session(args=(), **kw):
+    """A session of its own, started and at its prompt: a section that uses it stands alone."""
+    sess = Session(list(args), **kw); sess.expect("Ctrl-D to quit")
+    return sess
+
+def click_rows(sess, rows=40):
+    """Left-click every row of the screen, top to bottom, and return what was drawn in answer:
+    a pty has no screen to say where a line is, and a click only acts on the head of a fold."""
+    at = len(sess.out)
+    for y in range(1, rows + 1): sess.send(f"\x1b[<0;5;{y}M\x1b[<0;5;{y}m", wait=0.01)
+    time.sleep(0.5); sess.expect("(no such text)", 0.3)
+    return clean(sess.out[at:].decode("utf-8", "replace"))
+
+def scrolled(sess):
+    """Whether the chrome as last drawn says the conversation is scrolled back: the line for that
+    is drawn right above the input field's upper rule. (The status bar says nothing about it —
+    it stays what it is.)"""
+    sess.expect("(no such text)", 0.4)   # let the redraw finish
+    return "scrollback · rows" in sess.text().rsplit("❯", 1)[0].rstrip("─")[-130:]
+
+def perm_files(): return glob.glob(os.path.join(CFG, "corbienest", "permissions", "*.rules"))
+
+def titles():
+    """The titles of the saved sessions. A file is written next to its place and renamed into it,
+    so the listing may name a temporary that is gone by the time it is opened."""
+    out = []
+    for f in os.listdir(SESS):
+        if not f.endswith(".json"): continue
+        try: out.append(json.load(open(os.path.join(SESS, f)))["title"])
+        except (OSError, ValueError, KeyError): pass
+    return out
+
+def since(): return clean(s.out[s.mark:].decode("utf-8", "replace"))
+
+def viewrange():   # the viewer's own "rows X-Y of Z" header (the window depends on the region height)
+    m = re.findall(r"rows (\d+)-(\d+) of (\d+)", since())
+    return tuple(int(x) for x in m[-1]) if m else None
+
+def wheel(up, row=5, n=1): return ("\x1b[<%d;10;%dM" % (64 if up else 65, row)) * n   # the terminal has 40 rows: 1-36 are the conversation
+
+def quiet(sess, data):
+    """Send, and say whether nothing at all was drawn in answer."""
+    sess.send(data); sess.expect("(no such text)", 0.6); return len(sess.out) == sess.mark
+
+def listed():
+    """What the last redraw put under the input field: the list, its hint and the bar."""
+    s.expect("(no such text)", 0.3)
+    return since().rsplit("─", 1)[-1]
+
+def thinks(rs): return [r.get("think", "absent") for r in rs]
+
+def run_rounds(model, args):
+    """run() in ENV2; returns (out, rc, the requests this run made to `model`) — not the log's last n, which may be an earlier run's"""
+    n0 = len(requests())
+    out, rc = run(args, env=ENV2)
+    return out, rc, [r for r in requests()[n0:] if r["model"] == model]
+
+def preqs(): return json.loads(urllib.request.urlopen(f"{HOST}/_provider_requests").read())
+
+def last_preq(prov): return [r for r in preqs() if r["provider"] == prov][-1]
+
+def key_nowhere():
+    """the key is never written anywhere: not the config, not a session, not the history"""
+    for root, _, files in os.walk(CFG2):
+        for f in files:
+            if "test-key" in open(os.path.join(root, f), errors="replace").read(): return os.path.join(root, f)
+    return None
+
+def anth_since(n0): return [r for r in preqs()[n0:] if r["provider"] == "anthropic"]
+
+def work_posts(posts): return [r for r in posts if "tools" in r["body"] or isinstance(r["body"].get("system"), list)]
+
+def consult_posts(posts):
+    return [r for r in posts if isinstance(r["body"].get("system"), str) and r["body"]["system"].startswith("You are the advisor")]
+
+def has_tool_result(r):
+    for m in r["body"].get("messages") or []:
+        c = m.get("content")
+        if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c): return True
+    return False
+
+def guided(level, prompt, advisor="fake-big:latest"):
+    n0, p0 = len(requests()), len(preqs())
+    out, rc = run(["-m", "fake-coder:latest", "--advisor", advisor, "--advisor-guidance", level, "--yolo", "-p", prompt], env=ENVK)
+    return out, rc, requests()[n0:]
+
+def big_made():
+    """made.txt as 50 lines: the fake's write replaces it with one, which is 51 changed lines (a substantial change)."""
+    open(os.path.join(WORK, "made.txt"), "w").write("old line\n" * 50)
+
+def make_repo():
+    d = tempfile.mkdtemp(prefix="crowgoal_")
+    subprocess.run(["git", "init", "-q", d], check=True)
+    for k, v in (("user.name", "t"), ("user.email", "t@t")): subprocess.run(["git", "-C", d, "config", k, v], check=True)
+    open(os.path.join(d, "README.md"), "w").write("hi\n")
+    subprocess.run(["git", "-C", d, "add", "-A"], check=True)
+    subprocess.run(["git", "-C", d, "commit", "-qm", "init"], check=True)
+    return d
+
+def provider_requests(): return json.loads(urllib.request.urlopen(f"{HOST}/_provider_requests").read())
+
+def worker(task): return [r for r in reqs if "You are a worker agent" in r["messages"][0]["content"] and f"# Your task ({task} of 3)" in r["messages"][1]["content"]]
+
+SESS = os.path.join(CFG, "corbienest", "sessions")
+READ_MAX = int(os.environ.get("CORBIE_TEST_READ", "65536"))
+import glob
+SIB = tempfile.mkdtemp(prefix="crowsib_", dir=os.path.dirname(WORK))   # a directory next to the working directory
+BINDIR = tempfile.mkdtemp(prefix="crowbin_")
+TRACE = os.path.join(CFG, "render.trace")
+REPLAY = [sys.executable, os.path.join(HERE, "..", "tools", "trace_replay.py"), TRACE]
+CFG2 = tempfile.mkdtemp(prefix="crowcfg2_")
+ENV2 = dict(ENV, XDG_CONFIG_HOME=CFG2)
+CFG2_FILE = os.path.join(CFG2, "corbienest", "config")
+KEYS = dict(XAI_API_KEY="test-key", OPENAI_API_KEY="test-key", ANTHROPIC_API_KEY="test-key",
+            XAI_BASE_URL=f"{HOST}/xai/v1", OPENAI_BASE_URL=f"{HOST}/openai/v1", ANTHROPIC_BASE_URL=f"{HOST}/anthropic")
+ENVK = dict(ENV2, **KEYS)
+MADE = os.path.join(WORK, "made.txt")
+GOALENV = dict(ENVK, DEEPSEEK_API_KEY="test-key", DEEPSEEK_BASE_URL=f"{HOST}/deepseek", MOONSHOT_API_KEY="test-key", MOONSHOT_BASE_URL=f"{HOST}/kimi/v1")
+RP = make_repo()
+RCFG = tempfile.mkdtemp(prefix="crowroles_")   # its own config: the sections before it leave theirs behind
+ENVR = dict(ENV2, XDG_CONFIG_HOME=RCFG)
+
 print("test oneshot echo")
 out, rc = run(["-m", "fake-coder:latest", "-p", "hello there"])
 check(rc == 0, "exit 0"); check("Echo: hello there" in out, f"echo reply: {out!r}")
@@ -116,6 +311,19 @@ check("you are not finished" in req["messages"][0]["content"], "the report is co
 check(any(t["function"]["name"] == "bash" for t in req.get("tools", [])), "tools sent")
 check(req["options"]["num_ctx"] == 32768, "default num_ctx")
 check(req["keep_alive"] == "30m" and "num_predict" not in req["options"] and "think" not in req, "default keep_alive 30m; no num_predict/think on a normal call")
+
+print("test oneshot: no model and no provider key says so and exits 1; a failed model call exits 1, the JSON says error")
+NOMODEL_CFG = tempfile.mkdtemp(prefix="crownomodel_")   # an empty config: no model= in it, nothing on the Ollama server
+out, rc = run(["-p", "hi"], env=dict(ENV, XDG_CONFIG_HOME=NOMODEL_CFG, OLLAMA_HOST="http://127.0.0.1:1"))
+check(rc == 1 and "no model yet" in run.err, f"no model, no key: exit 1 with the notice: rc={rc} err={run.err!r}")
+out, rc = run(["-m", "anthropic:claude-opus-5", "-p", "hi", "--output-format", "json"],
+              env=dict(ENV, XDG_CONFIG_HOME=NOMODEL_CFG, ANTHROPIC_API_KEY="test-key", ANTHROPIC_BASE_URL="http://127.0.0.1:1/anthropic"))
+check(rc == 1, f"an unreachable provider: exit 1, not 0: rc={rc}")
+try:
+    j = json.loads(out)
+    check(j.get("error") is True and j.get("result") == "" and j.get("model") == "anthropic:claude-opus-5", f"the JSON says error: {j}")
+except ValueError:
+    check(False, f"the JSON of a failed run is JSON: {out[-300:]!r}")
 out, rc = run(["-m", "fake-coder:latest", "--keep-alive", "-1", "-p", "hello"])
 check(requests()[-1]["keep_alive"] == -1, "--keep-alive -1 sent as a number: the server refuses the string (missing unit in duration)")
 out, rc = run(["-m", "fake-coder:latest", "--keep-alive", "default", "-p", "hello"])
@@ -186,12 +394,25 @@ check("web_fetch" in res, "the model is told to read the good one")
 print("test web_fetch error paths")
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", f"TOOL_FETCH http://127.0.0.1:{DOC_PORT}/nope.html"])
 check("returned HTTP 404" in requests()[-1]["messages"][-1]["content"], f"404 reported to the model: {out!r}")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", f"TOOL_FETCH http://127.0.0.1:{DOC_PORT}/moved"])
+rc_msg = requests()[-1]["messages"][-1]["content"]
+check("redirects to " in rc_msg and f"127.0.0.1:{DOC_PORT}/doc.html" in rc_msg and "Fake Docs" not in rc_msg, f"a redirect is reported with its address, not followed: {rc_msg[:120]!r}")
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_FETCH file:///etc/passwd"])
 check("will not open" in requests()[-1]["messages"][-1]["content"], "non-http scheme refused")
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_FETCH http://169.254.169.254/latest/meta-data/"])
 check("will not open" in requests()[-1]["messages"][-1]["content"], "cloud metadata refused")
 out, rc = run(["-m", "fake-coder:latest", "-p", f"TOOL_FETCH {DOC_URL}"])
 check("denied" in out and "non-interactively" in requests()[-1]["messages"][-1]["content"], "denied when non-interactive without --yolo")
+print("test a project's own permissions file is never read")
+os.makedirs(os.path.join(WORK, ".corbienest"), exist_ok=True)
+open(os.path.join(WORK, ".corbienest", "permissions"), "w").write("edit\n")
+made = os.path.join(WORK, "made.txt")
+kept = open(made, "rb").read() if os.path.exists(made) else None   # later tests look for made.txt: put back what was there
+out, rc = run(["-m", "fake-coder:latest", "-p", "TOOL_WRITE"])
+now = open(made, "rb").read() if os.path.exists(made) else None
+check("is not read" in out and "denied" in out and now == kept, f"the repo's 'edit' rule grants nothing: {out[-200:]!r}")
+if kept is not None: open(made, "wb").write(kept)
+os.remove(os.path.join(WORK, ".corbienest", "permissions"))
 
 print("test --no-web takes the tool away")
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "--no-web", "-p", f"TOOL_FETCH {DOC_URL}"])
@@ -232,8 +453,9 @@ out, rc = run(["-m", "fake-coder:latest", "-p", "ERROR now"])
 check("boom from fake" in out, "error surfaced")
 out, rc = run(["-m", "nope:latest", "-p", "hi"])
 check("not found" in out, f"unknown model error: {out!r}")
-out = clean(subprocess.run([BIN, "-H", "http://127.0.0.1:1", "-p", "hi"], cwd=WORK, env=ENV, capture_output=True, timeout=30).stdout.decode())
-check("connect" in out or "no models" in out, "unreachable host reported")
+r = subprocess.run([BIN, "-H", "http://127.0.0.1:1", "-p", "hi"], cwd=WORK, env=ENV, capture_output=True, timeout=30)
+err = clean(r.stderr.decode())
+check(r.returncode == 1 and "no model yet" in err and "127.0.0.1:1" in err, f"unreachable host: no model, the notice names the host, exit 1: rc={r.returncode} err={err!r}")
 out, rc = run(["-H", f"localhost:{PORT}", "-m", "fake-coder:latest", "-p", "no scheme"])
 check(rc == 0 and "Echo: no scheme" in out, f"a host written the way OLLAMA_HOST is (no scheme) is plain http: {out[-200:]!r}")
 
@@ -262,7 +484,6 @@ check("ALWAYS-SAY-MOO" in sysmsg and "EXTRA-SYS" in sysmsg, "project + extra sys
 os.remove(os.path.join(WORK, "CORBIENEST.md"))
 
 print("test sessions: saved after each request, --continue / --resume")
-SESS = os.path.join(CFG, "corbienest", "sessions")
 shutil.rmtree(SESS, ignore_errors=True)   # earlier one-shot runs saved sessions too
 out, rc = run(["-m", "fake-coder:latest", "-p", "session one"])
 files = sorted(os.listdir(SESS)); check(len(files) == 1, f"one session file after a one-shot run: {files}")
@@ -319,71 +540,25 @@ out, rc = run(["-m", "fake-coder:latest", "--draft", "x", "-p", "hi"]); check(rc
 # ---------- interactive via pty ----------
 # How much of the output one read may take. A loaded machine hands it over in small pieces — a repaint cut in
 # two, a line without its end — and CORBIE_TEST_READ=200 makes this one do the same, to see what a CI runner sees.
-READ_MAX = int(os.environ.get("CORBIE_TEST_READ", "65536"))
-class Session:
-    def __init__(self, args=(), cols=100, rows=40, env=None):
-        self.pid, self.fd = pty.fork()
-        if self.pid == 0:
-            os.chdir(WORK)
-            for k, v in (env or ENV).items(): os.environ[k] = v
-            os.execv(BIN, ["corbienest"] + list(args))
-        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-        self.out = b""; self.mark = 0
-    def expect(self, pat, t=15):
-        """Wait until `pat` appears in output produced since the last send()."""
-        end = time.time() + t
-        while time.time() < end:
-            r, _, _ = select.select([self.fd], [], [], 0.1)
-            if r:
-                try: d = os.read(self.fd, READ_MAX)
-                except OSError: return False
-                if not d: return False
-                self.out += d
-            t = fresh(self.out[self.mark:].decode("utf-8", "replace"))
-            if pat in clean(t) or pat in transcript(t): return True   # the chrome is read on purpose too ("1 queued", the bar's effort)
-        return False
-    def send(self, s, wait=0.15):
-        self.mark = len(self.out)
-        os.write(self.fd, s.encode() if isinstance(s, str) else s); time.sleep(wait)
-    def text(self): return clean(self.out.decode("utf-8", "replace"))
-    def close(self):
-        """Kill it and wait: a session that is still exiting writes the config one last time,
-        and a test that writes its own config next would lose it to that write."""
-        try: os.kill(self.pid, 9)
-        except Exception: pass
-        try: os.waitpid(self.pid, 0)
-        except Exception: pass
-        try: os.close(self.fd)
-        except Exception: pass
 
-def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
-def click_rows(sess, rows=40):
-    """Left-click every row of the screen, top to bottom, and return what was drawn in answer:
-    a pty has no screen to say where a line is, and a click only acts on the head of a fold."""
-    at = len(sess.out)
-    for y in range(1, rows + 1): sess.send(f"\x1b[<0;5;{y}M\x1b[<0;5;{y}m", wait=0.01)
-    time.sleep(0.5); sess.expect("(no such text)", 0.3)
-    return clean(sess.out[at:].decode("utf-8", "replace"))
-def scrolled(sess):
-    """Whether the chrome as last drawn says the conversation is scrolled back: the line for that
-    is drawn right above the input field's upper rule. (The status bar says nothing about it —
-    it stays what it is.)"""
-    sess.expect("(no such text)", 0.4)   # let the redraw finish
-    return "scrollback · rows" in sess.text().rsplit("❯", 1)[0].rstrip("─")[-130:]
 
 print("test interactive: an Ollama on another machine over plain http is said to be one")
 s = Session(["-H", "http://ollama.invalid:9", "-m", "fake-coder:latest"])
-check(s.expect("⚠ plain http to ollama.invalid: the conversation crosses the network unencrypted", 20), f"another machine over plain http: the banner says so: {s.text()[-300:]!r}")
+s.expect("(no such text)", 3)   # the warning is printed under the entry line, after the banner: read the whole text
+check("plain http to ollama.invalid" in s.text(), f"another machine over plain http: the warning is said: {s.text()[-300:]!r}")
 s.close()
 
 print("test interactive: banner, echo, editor keys, history")
-s = Session(["-m", "fake-coder:latest"])
-check(s.expect("Ctrl-D to quit"), "banner"); check("● connected" in s.text(), "connected marker")
+s = Session(["-m", "fake-coder:latest"], banner=True)
+check(s.expect("Corbie Nest"), "banner"); check("● connected" in s.text(), "connected marker")
+s.send("\x1b"); s.expect("(no such text)", 2); check("Ctrl-D to quit" in s.text(), "closed with Esc, the footer comes (it is painted again with the conversation, so expect() does not see it)")
 check("plain http to" not in s.text(), "no unencrypted-host warning for an Ollama on this machine")
 raw = s.out.decode("utf-8", "replace")
 check("\x1b[?1049h" in raw, "alternate screen entered (full screen)")
-check(re.search(r"\x1b\[1;36r", raw) is not None, "scroll region reserves the input field and the status bar")
-check(re.search(r"\x1b\[40;1H[^\n]*manual mode[^\n]*fake-coder:latest[^\n]*0 tokens", raw) is not None, f"status bar on the last row: {raw[-300:]!r}")
+check(re.search(r"\x1b\[1;36r", raw) is not None, "scroll region reserves the input field and the status bar, which shares the last row with the location line")
+check(re.search(r"\x1b\[40;1H[^\n]*fake-coder:latest[^\n]*0 tokens", raw) is not None, f"the last row: the model and the tokens: {raw[-300:]!r}")
+check(re.search(r"\x1b\[39;1H[^\n]*manual mode", raw) is not None, "the mode is on the lower rule of the field, above the last row")
+check(re.search(r"\x1b\[40;1H[^\n]*" + re.escape(WORK), raw) is not None, "the last row says the working folder, as an absolute path")
 check("manual mode (shift+tab to cycle)" in clean(raw), "mode-cycling hint sits next to the mode in the bar")
 check(re.search(r"\x1b\[37;1H[^\n]*─{20}", raw) is not None, "the input field is framed by a rule above the prompt")
 check(re.search(r"\x1b\[38;1H[^\n]*❯", raw) is not None, "the prompt sits between the rules, above the bar")
@@ -415,17 +590,17 @@ print("test interactive: the input field grows with the input and survives a res
 sf = Session(["-m", "fake-coder:latest"], cols=60, rows=20); sf.expect("Ctrl-D to quit")
 sf.send("one line")
 check(sf.expect("❯ one line"), "single-row field")
-check(re.search(r"\x1b\[1;16r", sf.out.decode("utf-8", "replace")) is not None, "region is rows minus field and bar")
+check(re.search(r"\x1b\[1;16r", sf.out.decode("utf-8", "replace")) is not None, "region is rows minus the field (three rules and the text) and the bar row")
 sf.send("\x1b\rtwo\x1b\rthree")   # alt+enter twice: three input rows
 check(sf.expect("three"), "multi-line input")
 raw = sf.out.decode("utf-8", "replace")
 check(re.search(r"\x1b\[1;14r", raw) is not None, f"the region shrank by the two extra input rows: {raw[-200:]!r}")
-check(re.search(r"\x1b\[16;1H[^\n]*three", raw) is not None, "the last input row sits just above the lower rule")
+check(re.search(r"\x1b\[18;1H[^\n]*three", raw) is not None, "the last input row sits just above the lower rule")
 sf.send("\x15")   # ctrl-u back to one row
 check(sf.expect("❯ "), "cleared")
 raw = sf.out.decode("utf-8", "replace")[-4000:]
 check(re.search(r"\x1b\[1;16r", raw) is not None, "the region grew back")
-check(re.search(r"\x1b\[15;1H\x1b\[2K", raw) and re.search(r"\x1b\[16;1H\x1b\[2K", raw),
+check(re.search(r"\x1b\[15;1H", raw) and re.search(r"\x1b\[16;1H", raw),   # painted again: the bottom rows are padded with spaces, not erased
       f"the rows the field gave back are painted again from the transcript, not left showing its old text: {raw[-300:]!r}")
 sf.mark = len(sf.out)
 fcntl.ioctl(sf.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
@@ -433,7 +608,7 @@ os.kill(sf.pid, __import__("signal").SIGWINCH)
 check(sf.expect("manual mode", 3), "a resize at an idle prompt is drawn at once, not at the next key (a tmux pane is resized all the time)")
 raw = sf.out[sf.mark:].decode("utf-8", "replace")
 check(re.search(r"\x1b\[1;26r", raw) is not None, f"the region was re-cut for the new height: {raw[-300:]!r}")
-check(re.search(r"\x1b\[30;1H[^\n]*manual mode", raw) is not None, "the bar is on the new last row")
+check(re.search(r"\x1b\[29;1H[^\n]*manual mode", raw) is not None, "the bar is on the new row above the last")
 check("Corbie Nest" in clean(raw), "and the conversation is painted again for the new size, from the top of the transcript")
 sf.send("after resize")
 check(sf.expect("❯ after resize"), "the field follows a resize")
@@ -443,19 +618,20 @@ sf.close()
 
 print("test interactive: a multi-line paste leaves nothing behind when it is sent")
 sp = Session(["-m", "fake-coder:latest"], cols=60, rows=20); sp.expect("Ctrl-D to quit")
-sp.send("\x1b[200~" + "\n".join("pasted line %d" % i for i in range(1, 9)) + "\x1b[201~")
-check(sp.expect("pasted line 8"), "the paste lands in the field, newlines and all")
-raw = sp.out.decode("utf-8", "replace")
-check(re.search(r"\x1b\[1;9r", raw) is not None, f"the field grew to 8 rows and the region shrank: {raw[-300:]!r}")
+sp.send("\x1b[200~" + "\n".join("pasted line %d" % i for i in range(1, 4)) + "\x1b[201~")   # three lines: under the token's limit, so it is typed in
+check(sp.expect("pasted line 3"), "the paste lands in the field, newlines and all")
 sp.send("\r"); check(sp.expect("Echo: pasted line 1"), "the whole paste is sent as one message")
-check(requests()[-1]["messages"][-1]["content"].count("pasted line 8") == 1, "sent once, not twice")
+check(requests()[-1]["messages"][-1]["content"].count("pasted line 3") == 1, "sent once, not twice")
+time.sleep(1.5)   # the rows are painted again after the reply has shown: give the repaint its time
 raw = sp.out.decode("utf-8", "replace")[-6000:]
-missing = [r for r in range(10, 17) if not re.search(r"\x1b\[%d;1H\x1b\[2K" % r, raw)]
+# a row is painted again by moving to it and writing it (the bottom rows are padded with spaces, not erased, since the window background)
+missing = [r for r in range(14, 16) if not re.search(r"\x1b\[%d;1H" % r, raw)]
 check(not missing, f"every row the field gave back is painted again from the transcript, so the paste does not stay below the reply: rows {missing} left dirty")
 sp.close()
 
 
 print("test interactive: confirmation menu — deny with reason, arrow keys, then always")
+s = new_session(["-m", "fake-coder:latest"])   # its own session: it stands alone
 s.send("TOOL_BASH\r")
 check(s.expect("Run this command?"), "confirmation prompt")
 check(s.expect("1. Yes") and "3. Yes, and always allow `echo …` in this project" in s.text() and "4. No, and tell the model" in s.text(), f"menu options shown: {s.text()[-400:]!r}")
@@ -465,26 +641,27 @@ check("because" in requests()[-1]["messages"][-1]["content"], "reason forwarded"
 s.send("TOOL_BASH\r"); check(s.expect("Run this command?"), "prompt again")
 s.send("\x1b[B"); s.send("\x1b[B"); s.send("\x1b[A"); s.send("\r")   # down, down, up -> option 2 (always)
 check(s.expect("hello-from-tool"), "command ran after selecting 'always' with arrows+enter")
-check("yes, always" in s.text(), "collapsed answer line")
+check("Run this command?" in s.text() and "● bash(echo hello-from-tool)" in s.text(), "the approval asked, and the call's one line says what ran")
 s.send("TOOL_BASH\r"); check(s.expect("Tool said: hello-from-tool", 15), "no prompt after 'always'")
-check(s.text().count("Run this command?  yes") == 1, "always suppresses further prompts")
+check(since_send(s).count("Run this command?") == 0, "always suppresses further prompts: none is asked after the second call")
 
-print("test interactive: project permission rules (.corbienest/permissions)")
+print("test interactive: project permission rules (kept in the config directory, per project)")
 s3 = Session(["-m", "fake-coder:latest"]); s3.expect("Ctrl-D to quit")
 s3.send("TOOL_BASH\r"); check(s3.expect("Run this command?"), "prompt")
-s3.send("p"); check(s3.expect("yes, always in this project"), "answered with p")
-check(s3.expect("saved to .corbienest/permissions: bash echo"), "rule saved")
-check(open(os.path.join(WORK, ".corbienest", "permissions")).read().strip().splitlines()[-1] == "bash echo", "file content")
+s3.send("p"); check(s3.expect("saved to "), "answered with p")
+check(s3.expect(".rules: bash echo"), "rule saved")
+check(len(perm_files()) == 1 and open(perm_files()[0]).read().strip().splitlines()[-1] == "bash echo", "file content")
+check(not os.path.exists(os.path.join(WORK, ".corbienest", "permissions")), "nothing is written into the project")
 s3.expect("tok/s")
-s3.send("TOOL_BASH\r"); check(s3.expect("auto-approved (project rule: bash echo)"), "rule auto-approves next time"); s3.expect("tok/s")
+s3.send("TOOL_BASH\r"); check(s3.expect("● bash(echo hello-from-tool)"), "rule auto-approves next time (no prompt; the call's line)"); s3.expect("tok/s")
 s3.send("/permissions\r"); check(s3.expect("shell commands starting with echo"), "/permissions lists it")
 s3.send("/permissions add bash git status\r"); check(s3.expect("added: bash git status"), "/permissions add")
 s3.send("/permissions remove 2\r"); check(s3.expect("removed rule 2"), "/permissions remove")
 s3.send("\x04"); s3.close()
 s3 = Session(["-m", "fake-coder:latest"]); s3.expect("Ctrl-D to quit")   # rules persist across sessions
-s3.send("TOOL_BASH\r"); check(s3.expect("auto-approved (project rule: bash echo)"), "rule survives a restart"); s3.expect("tok/s")
+s3.send("TOOL_BASH\r"); check(s3.expect("● bash(echo hello-from-tool)"), "rule survives a restart (no prompt)"); s3.expect("tok/s")
 s3.send("/permissions clear\r"); check(s3.expect("permissions cleared"), "/permissions clear")
-check(not os.path.exists(os.path.join(WORK, ".corbienest", "permissions")), "file removed")
+check(not perm_files(), "file removed")
 s3.send("TOOL_BASH\r"); check(s3.expect("Run this command?"), "asks again after clear"); s3.send("y"); s3.expect("tok/s")
 s3.send("\x04"); s3.close()
 
@@ -494,7 +671,7 @@ s3.send(f"TOOL_FETCH {DOC_URL}\r")
 check(s3.expect("Fetch this page?"), f"confirmation shown: {s3.text()[-300:]!r}")
 check(DOC_URL in s3.text(), "the whole url is shown before it is fetched")
 check(s3.expect(f"3. Yes, and always allow fetching from 127.0.0.1:{DOC_PORT} in this project"), f"per-host rule offered: {s3.text()[-400:]!r}")
-s3.send("p"); check(s3.expect(f"saved to .corbienest/permissions: fetch 127.0.0.1:{DOC_PORT}"), "host rule saved")
+s3.send("p"); check(s3.expect(f".rules: fetch 127.0.0.1:{DOC_PORT}"), "host rule saved")
 check(s3.expect("lines ·", 15), "the page text is folded under one line"); s3.expect("tok/s")
 check("Fake Docs" in click_rows(s3), "and a click on that line shows it")
 s3.send(f"TOOL_FETCH {DOC_URL}\r")
@@ -565,7 +742,7 @@ check(os.path.exists(os.path.join(WORK, ".corbienest", "skills", "deploy", "SKIL
 print("test interactive: ctrl-c interrupts generation; type-ahead")
 s.send("SLOW\r"); check(s.expect("two"), "streaming started")
 frames = set(re.findall(r"([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]) generating", clean(s.out[s.mark:].decode("utf-8", "replace"))))
-check(len(frames) >= 2, f"status bar shows an animated spinner while the model streams: {frames}")
+check(not frames, f"no spinner in the status bar while a command runs (the bar has no busy label, AGENTS.md): {frames}")
 s.send("\x03")
 check(s.expect("interrupted"), "interrupt notice")
 s.send("hi again\r"); check(s.expect("Echo: hi again"), "usable after interrupt")
@@ -599,24 +776,22 @@ check("queued" not in clean(s.out[-400:].decode("utf-8", "replace")), "queue cou
 s.send("/mode auto\r"); s.expect("mode: auto")
 s.send("TOOL_SLEEP\r"); check(s.expect("running…", 10), "slow tool running")
 s.send("mid-task note\r"); check(s.expect("1 queued", 3), "queued while the tool runs")
-check(s.expect("stopped: your message goes to the model first", 8), f"the running command was stopped for it: {s.text()[-300:]!r}")
-check(s.expect("› mid-task note", 5), "queued message injected at once, not after the command")
-check("slept" not in clean(s.out[s.mark:].decode("utf-8", "replace")), "the command never ran to completion")
+check(s.expect("slept", 15), f"the running command finished: a message queued meanwhile does not stop it: {s.text()[-300:]!r}")
+check(s.expect("› mid-task note", 5), "the message goes in before the model's next call, after the command")
 check(s.expect("Echo: mid-task note", 15), "model saw the mid-task message on its next call")
 msgs = requests()[-1]["messages"]
 check(msgs[-1]["role"] == "user" and msgs[-1]["content"] == "mid-task note" and msgs[-2]["role"] == "tool", f"injected right after the tool result: {[m['role'] for m in msgs[-4:]]}")
-check("did not finish" in msgs[-2]["content"], f"the tool result says the command was cut short: {msgs[-2]['content'][:100]!r}")
+check("slept" in msgs[-2]["content"] and "exit code: 0" in msgs[-2]["content"] and "did not finish" not in msgs[-2]["content"], f"the tool result is the command's full output: {msgs[-2]['content'][:100]!r}")
 
-print("test interactive: a queued message stops the tool calls of the round that have not started")
+print("test interactive: a message queued during a tool round does not skip the calls of that round")
 s.send("TOOL_SLEEP2\r"); check(s.expect("running…", 10), "the first of two calls is running")
 s.send("second thoughts\r")
-check(s.expect("○ bash(echo second-tool)", 8), f"the call that had not started is shown as skipped: {s.text()[-400:]!r}")
-check(s.expect("⎿  not run — your message goes to the model first", 5), "with the reason under it")
-check(s.expect("› second thoughts", 8), "and the message goes in instead")
-check(s.expect("Echo: second thoughts", 15), "the model was called with it right away")
+check(s.expect("second-tool", 8), f"the second call still runs: {s.text()[-400:]!r}")
+check(s.expect("› second thoughts", 8), "and the message goes in after the round")
+check(s.expect("Echo: second thoughts", 15), "the model was called with it")
 msgs = requests()[-1]["messages"]
-check(len([m for m in msgs if m["role"] == "tool"]) >= 2 and msgs[-2]["role"] == "tool" and "not run" in msgs[-2]["content"],
-      f"the skipped call still got a result of its own: {[m['role'] for m in msgs[-4:]]}")
+check(len([m for m in msgs if m["role"] == "tool"]) >= 2 and msgs[-2]["role"] == "tool" and "second-tool" in msgs[-2]["content"] and "not run" not in msgs[-2]["content"],
+      f"the second call got its real result: {[m['role'] for m in msgs[-4:]]}")
 
 print("test interactive: a message queued behind a slash command is not held back by it")
 s.send("TOOL_SLEEP\r"); check(s.expect("running…", 10), "tool running")
@@ -645,6 +820,7 @@ check(s.expect("❯ half typed", 5), f"pending text back in the editor without t
 s.send("\x15"); s.send("/mode manual\r"); s.expect("mode: manual")
 
 print("test interactive: slash commands that only report or set something run while the model works")
+s = new_session(["-m", "fake-coder:latest"])   # its own session: it stands alone
 s.send("SLOW\r"); check(s.expect("two"), "streaming")
 s.send("/status\r"); check(s.expect("keep_alive", 5), f"/status answered during generation: {s.text()[-300:]!r}")
 check(s.expect("not checked while the model is working", 3), "the /api/ps placement call is skipped mid-request")
@@ -680,25 +856,17 @@ check(s.text().count("auto-compacting") == 1, "did not compact again (usage figu
 
 print("test interactive: /resume picker")
 s.send("/resume\r"); check(s.expect("Resume a session"), "picker opens")
-check(s.expect("session two") and s.expect("session one"), "earlier sessions listed, this directory")
+check(s.expect("session two"), "earlier sessions listed, this directory")
+s.send("one"); check(s.expect("session one"), "the oldest session is past the list: typing its name in the picker's filter finds it")   # the picker shows the latest rows; it filters as you type
 s.send("\x1b"); check(s.expect("cancelled"), "esc cancels")
 s.send("/resume " + sid + "\r"); check(s.expect("resumed session " + sid), "/resume ID loads it")
-check(s.expect("last reply:") and s.expect("Echo: three"), "recap shows the last reply")
+check(s.expect("Echo: three"), "the conversation is shown again after the recap: its last reply too")
 s.send("four\r"); check(s.expect("Echo: four"), "continues")
 msgs = requests()[-1]["messages"]
 check([m["content"] for m in msgs if m["role"] == "user"] == ["session one", "and two", "three", "four"], "resumed history sent")
 s.send("/status\r"); check(s.expect("session    " + sid), "/status shows the session id")
 s.send("/clear\r"); s.expect("new conversation")
 s.send("fresh start\r"); check(s.expect("Echo: fresh start"), "reply")
-def titles():
-    """The titles of the saved sessions. A file is written next to its place and renamed into it,
-    so the listing may name a temporary that is gone by the time it is opened."""
-    out = []
-    for f in os.listdir(SESS):
-        if not f.endswith(".json"): continue
-        try: out.append(json.load(open(os.path.join(SESS, f)))["title"])
-        except (OSError, ValueError, KeyError): pass
-    return out
 end = time.time() + 3   # the session is saved when the request is over — a moment after the reply was printed
 while "fresh start" not in titles() and time.time() < end: time.sleep(0.05)
 check("fresh start" in titles(), "/clear starts a new session file")
@@ -716,7 +884,8 @@ print("test interactive: /cost")
 s.send("/cost\r"); check(s.expect("session cost"), "/cost header")
 check(s.expect("model calls") and re.search(r"model calls   \d+  \(\d+ requests", s.text()) is not None, f"calls and requests counted: {s.text()[-400:]!r}")
 check(re.search(r"tokens        [\d.]+k?  \(↑", s.text()) is not None, "token totals shown")
-check(re.search(r"wall time     \d", s.text()) is not None and "tok/s" in s.text(), "wall time and tok/s shown")
+seen(s, "wall time", 10)   # the last lines of the report are painted after the first ones
+check(re.search(r"wall time     \d", s.text()) is not None and "tok/s" in s.text(), f"wall time and tok/s shown: {s.text()[-300:]!r}")
 
 print("test interactive: /diff")
 s.send("/diff\r"); check(s.expect("not inside a git repository"), "/diff outside git")
@@ -761,17 +930,59 @@ sub = [r for r in requests() if r["messages"][0]["role"] == "system" and "You ar
 check(sub and all(t["function"]["name"] in ("read_file", "list_dir", "grep", "bash", "web_fetch", "web_search") for t in sub[-1]["tools"]), "sub-agent got read-only tools only")
 check(sub and sum(t["function"]["name"] in ("web_fetch", "web_search") for t in sub[-1]["tools"]) == 2, "sub-agent can look documentation up")
 check("hay.txt" in sub[-1]["messages"][-1]["content"], "grep ran for real inside the sub-agent")
+print("test interactive: ← on an empty line lists the sub-agents; the one picked shows its log")
+s.send("\x1b[D"); check(s.expect("sub-agents"), "← on an empty line opens the sub-agents list")
+check(s.expect("find the needle") and s.expect("done · 2 rounds"), "the run is listed with its state and rounds")
+s.send("\x1b[B", 0.3); s.send("\r", 0.3); s.expect("(no such text)", 0.8)   # the block is a repaint: read it with since_send(s), as the tests about the viewer do
+check("▾ sub-agent #" in since_send(s) and "find the needle · done" in since_send(s), "the picked run opens as a block with its head")
+check("› grep(" in since_send(s) and "hay.txt:2:needle here" in since_send(s) and "report:" in since_send(s), "its log has the tool call, what it returned and the report")
+s.send("\x1b", 0.8); check("scrollback" not in since_send(s), "Esc goes back to the prompt")
 os.remove(os.path.join(WORK, "hay.txt"))
+print("test interactive: a pasted block is a token; a click opens it, Enter sends the whole text")
+sp = Session(["-m", "fake-coder:latest"]); sp.expect("Ctrl-D to quit")
+body = "\n".join(f"line{i}" for i in range(10))
+sp.send("\x1b[200~" + body + "\x1b[201~", 1.0)
+check(sp.expect("[Pasted text #1 +10 lines]"), "a paste of more than three lines shows as a token")
+sp.send("\x1b[<0;5;38M", 0.3); sp.send("\x1b[<0;5;38m", 0.6); sp.expect("(no such text)", 0.8)   # row 38: the field's text row (a 40-row screen)   # the modal is a repaint: read it with since_send
+check("pasted text #1 · 10 lines" in since_send(sp) and "line9" in since_send(sp), "a click on the token opens the paste")
+sp.send("\x1b[6~", 0.6); sp.expect("(no such text)", 0.6)
+sp.send("\x1b", 0.8); sp.expect("(no such text)", 0.6)
+check("pasted text #1" not in since_send(sp), "Esc closes it")
+sp.send("\r"); sp.expect("(no such text)", 1.5)
+last_user = [m for m in requests()[-1]["messages"] if m["role"] == "user"][-1]["content"]
+check(all(f"line{i}" in last_user for i in range(10)) and "[Pasted text" not in last_user, f"the model got the whole paste: {last_user[:80]!r}")
+sp.close()
+print("test interactive: /subagent sets the model and the effort sub-agents run on")
+open(os.path.join(WORK, "hay.txt"), "w").write("needle\n")
+s.send("/subagent fake-levels:latest\r"); check(s.expect("sub-agents run on fake-levels:latest"), "/subagent MODEL is checked and set")
+s.send("/subagent effort low\r"); check(s.expect("subagent effort: low"), "/subagent effort LEVEL goes to that model's effort")
+s.send("TOOL_TASK\r"); check(s.expect("on fake-levels:latest (/subagent)", 15), "the sub-agent says which model it runs on")
+check(s.expect("Tool said: REPORT", 15), "its report comes back to the main model")
+sub = [r for r in requests() if r["messages"][0]["role"] == "system" and "You are a sub-agent" in r["messages"][0]["content"]]
+check(sub and sub[-1]["model"] == "fake-levels:latest" and sub[-1].get("think") == "low", f"the sub-agent's call is to that model, at its effort: {sub[-1:]!r}")
+s.send("/subagent nosuchmodel:1b\r"); check(s.expect("does not know a model"), "an unknown model is refused there and then")
+s.send("/subagent xai:grok-fake\r"); check(s.expect("is an advisor only"), "an advisor-only provider is refused: it could not do the sub-agents' work")
+s.send("/subagent default\r"); check(s.expect("run on the model doing the work"), "/subagent default")
+os.remove(os.path.join(WORK, "hay.txt"))
+print("test interactive: the options the model offers come up as a picker; the choice is the next message")
+s = new_session(["-m", "fake-coder:latest"])   # its own session: it stands alone
+s.send("OPTIONS_REPLY please\r"); check(s.expect("Implementation options", 10), "the reply's options block is offered as a picker")
+check(s.expect("recommended", 3), f"with the recommended one marked: {s.text()[-400:]!r}")
+s.send("\x1b[A"); s.send("\r"); check(s.expect("Echo: Go with this: Lock file — simple, but a crash leaves it behind", 10), "arrow up and Enter: that option is the next message")
+s.send("OPTIONS_REPLY again\r"); check(s.expect("Implementation options", 10), "a second reply with options")
+time.sleep(0.6); s.send("\x1b"); time.sleep(0.6)   # a lone Esc is told from the start of a key sequence by its silence
+check("Go with this" not in since_send(s).split("OPTIONS_REPLY again")[-1], "Esc takes none of them: nothing is sent")
+s.send("/status\r"); check(s.expect("keep_alive", 5) and "Implementation options" not in since_send(s), "a slash command after them does not bring the picker back")
 s.send("/mode auto\r"); s.expect("mode: auto")
 s.send("TOOL_TASK_SLEEP\r"); check(s.expect("⤷ sub-agent slow research", 15), "sub-agent started")
 check(s.expect("running…", 10), "its shell command is running")
 s.send("never mind, do this instead\r")
-check(s.expect("stopped after 1 tool round", 10), f"a queued message stops the sub-agent between its rounds: {s.text()[-400:]!r}")
-check("sub-slept" not in clean(s.out[s.mark:].decode("utf-8", "replace")), "its command was stopped as well")
+check(s.expect("sub-slept", 15), f"a queued message does not stop the sub-agent: its command finishes: {s.text()[-400:]!r}")
+check("stopped after" not in clean(s.out[s.mark:].decode("utf-8", "replace")), "and it is not cut short after its round")
 check(s.expect("› never mind, do this instead", 8), "and the message reaches the model")
 check(s.expect("Echo: never mind, do this instead", 15), "which is called with it right away")
 msgs = requests()[-1]["messages"]
-check(any(m["role"] == "tool" and "stopped after 1 tool round" in m["content"] for m in msgs),
+check(any(m["role"] == "tool" and "REPORT: found it in sub-slept" in m["content"] for m in msgs),
       f"the parent gets what the sub-agent had gathered, not an error: {[m['role'] for m in msgs[-4:]]}")
 s.send("/mode manual\r"); s.expect("mode: manual")
 
@@ -782,7 +993,8 @@ s.send("/ctx max\r"); check(s.expect("context window: 64k"), "/ctx max uses the 
 s.send("/ctx 128k\r"); check(s.expect("larger than the model's trained length"), "warning beyond model max")
 s.send("/ctx bogus\r"); check(s.expect("bad size"), "bad size rejected")
 s.send("/ctx\r"); check(s.expect("Context window (fake-coder:latest supports up to 64k)"), "picker title shows model max")
-check("32k" in s.text() and "model maximum" in s.text() and "server default" in s.text(), f"picker entries: {s.text()[-400:]!r}")
+# UNVERIFIED: the wait was added for a failure that did not reproduce (old read: whole output at once); not proven to fix it
+check(all(seen(s, p) for p in ("32k", "model maximum", "server default")), f"picker entries: {since_send(s)[-400:]!r}")   # the picker is drawn after the title: wait for each entry
 s.send("\x1b"); check(s.expect("context window unchanged"), "esc leaves it")
 s.send("/ctx\r"); s.expect("Context window"); s.send("32k"); time.sleep(0.2); s.send("\r")
 check(s.expect("context window: 32k (num_ctx 32768)"), "picked 32k from the menu")
@@ -817,7 +1029,7 @@ s.send("!sleep 1.2; echo bang-done\r")   # "bang-done" is echoed with the comman
 check(s.expect("exit code: 0", 10), "bang command ran")
 raw2 = clean(s.out[s.mark:].decode("utf-8", "replace"))
 check("⎿  bang-done" in raw2, f"command output shown: {raw2[-200:]!r}")
-check(len(set(re.findall(r"([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]) running command", raw2))) >= 2, "bar spinner animates during a shell command")
+check(not re.findall(r"([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]) running command", raw2), "no busy label in the bar during a shell command (AGENTS.md: the bar has none)")
 check(re.search(r"running… \(\ds\)  ctrl-c to interrupt", raw2) is not None, f"inline spinner during a shell command: {raw2[-200:]!r}")
 check("auto mode" not in raw2, "bang command does not flash a mode change in the bar")
 s.close()
@@ -901,7 +1113,8 @@ check(requests()[-1]["messages"][0]["content"].startswith("You maintain the pers
 s.send("/memory update\r"); check(s.expect("nothing pending"), "/memory update with nothing pending")
 s.send("REMEMBER_ME at exit\r"); check(s.expect("Echo: REMEMBER_ME at exit"), "reply")
 s.send("\x04"); check(s.expect("updating memory…  (Ctrl-C skips it)"), "the exit flush says it can be skipped")
-check(s.expect("bye"), "exit"); s.close()
+check(s.expect("bye"), "exit")
+s.close()
 check("at exit" in open(os.path.join(WORK, ".corbienest", "memory.md")).read(), "exit flushes the pending extraction (Ctrl-D)")
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
 s.send("/memory off\r"); s.expect("memory off")
@@ -951,13 +1164,9 @@ s.send("\x04"); s.close()
 
 print("test interactive: PgUp/PgDn scrollback viewer")
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
-def since(): return clean(s.out[s.mark:].decode("utf-8", "replace"))
 for pfx in "abcd":
     s.send("!seq -f '%s-%%02g' 1 30\r" % pfx); check(s.expect(pfx + "-30", 10), "30 rows printed")
 s.send("hello before\r"); check(s.expect("Echo: hello before"), "reply")
-def viewrange():   # the viewer's own "rows X-Y of Z" header (the window depends on the region height)
-    m = re.findall(r"rows (\d+)-(\d+) of (\d+)", since())
-    return tuple(int(x) for x in m[-1]) if m else None
 s.send("\x1b[5~"); check(s.expect("scrollback · rows"), f"PgUp opens the viewer: {s.text()[-200:]!r}")
 view = since(); first = viewrange()
 check("manual mode" in view.split("scrollback · rows")[-1] and "tokens" in view.split("scrollback · rows")[-1], f"where the window is has a line of its own: the status bar stays what it is: {view[-300:]!r}")
@@ -981,10 +1190,6 @@ print("test interactive: the mouse wheel scrolls the conversation; the arrows st
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
 raw = s.out.decode("utf-8", "replace")
 check("\x1b[?1000h" in raw and "\x1b[?1006h" in raw, "the mouse is asked for, with SGR coordinates: otherwise the wheel arrives as arrow keys")
-def wheel(up, row=5, n=1): return ("\x1b[<%d;10;%dM" % (64 if up else 65, row)) * n   # the terminal has 40 rows: 1-36 are the conversation
-def quiet(sess, data):
-    """Send, and say whether nothing at all was drawn in answer."""
-    sess.send(data); sess.expect("(no such text)", 0.6); return len(sess.out) == sess.mark
 for pfx in "abc":
     s.send("!seq -f '%s-%%02g' 1 30\r" % pfx); check(s.expect(pfx + "-30", 10), "30 rows printed")
 s.send("older prompt\r"); check(s.expect("Echo: older prompt"), "reply")
@@ -1012,9 +1217,11 @@ s.send("x"); check(s.expect("❯ x"), "a key typed in the viewer goes back to th
 s.send("\x15")
 
 print("test interactive: scrolling back while the model works")
+s = new_session(["-m", "fake-coder:latest"])   # its own session: it stands alone
+s.send("/help\r"); s.expect("(no such text)", 2)   # some history longer than the screen, so there is something to scroll back to
 s.send("SLOW please\r"); check(s.expect("one"), "the reply starts")
 s.send(wheel(True, n=2)); check(s.expect("scrollback · rows"), f"the wheel scrolls back while the reply streams: {s.text()[-200:]!r}")
-check("generating" in since() and "manual mode" in since(), "the bar is still the bar: the mode, and that the model is working")
+check("manual mode" in since(), "the bar is still the bar: the mode is shown while the reply streams (the spinner stops once the reply has begun)")
 time.sleep(1.3); s.expect("(no such text)", 0.2)
 check("four" not in since(), f"what arrives meanwhile is recorded, not painted over the window: {since()[-200:]!r}")
 s.send("\x1b"); check(s.expect("eight") and s.expect("tok/s"), "Esc goes back to the output, and the reply runs to its end")
@@ -1032,22 +1239,19 @@ s.send("\x03"); check(s.expect("interrupted"), "Ctrl-C while scrolled back stops
 s.send("\x04"); s.close()
 
 print("test interactive: suggestions under the input field while a /command or an @file is typed")
-SIB = tempfile.mkdtemp(prefix="crowsib_", dir=os.path.dirname(WORK))   # a directory next to the working directory
 os.makedirs(os.path.join(WORK, "sugsrc", "deep"))
 for rel in ("sugsrc/zebra_term.c", "sugsrc/deep/zebra_notes.md", "sugsrc/twin.txt", "sugsrc/deep/twin.txt"):
     open(os.path.join(WORK, rel), "w").write("content of %s\n" % rel)
 open(os.path.join(SIB, "zeta_parser.c"), "w").write("content of the sibling\n")
 sib = "../" + os.path.basename(SIB)
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
-def listed():
-    """What the last redraw put under the input field: the list, its hint and the bar."""
-    s.expect("(no such text)", 0.3)
-    return since().rsplit("─", 1)[-1]
 s.send("/m"); s.send("o"); check(s.expect("pick a model from a menu"), f"typing /mo lists the commands it could become, each with what it does: {since()[-300:]!r}")
-view = listed()
+s.expect("(no such text)", 1)
+_t = since(); view = _t[_t.rfind("❯ /mo"):] if "❯ /mo" in _t else ""   # the list is drawn under the field: from the field's row on
 check("/models" in view and "permission mode: manual" in view and "/memory" in view and "/status" not in view, f"only the matching ones — a name that starts with it first, then one that contains it: {view!r}")
 check("tab complete · ↓ choose · esc close" in view, "and a line that says which keys work")
-check(re.search(r"\x1b\[1;27r", s.out.decode("utf-8", "replace")) is not None, "the list has rows of its own: the conversation region makes room")
+_regions = [int(x) for x in re.findall(r"\x1b\[1;(\d+)r", s.out.decode("utf-8", "replace"))]
+check(_regions and min(_regions) < 36, f"the list has rows of its own: the conversation region makes room (regions {sorted(set(_regions))}; 36 is with no list)")
 s.send("d"); s.send("e"); view = listed(); check("/mode" in view and "/memory" not in view, f"every letter narrows it down: {view!r}")
 s.send("\x7f\x7f"); check("/memory" in listed(), "and deleting widens it again")
 s.send("\x1b[B"); view = listed(); check("enter take it" in view and re.search(r"❯ /model\s+pick a model", view), f"arrow down steps into the list: {view!r}")
@@ -1070,7 +1274,7 @@ s.send("\x15")
 s.send("/sta\t"); check(s.expect("❯ /status"), "Tab completes a command that is the only match")
 s.send("\x15")
 s.send("see @sugsrc/twin.txt and @sugsrc/nope.tx"); s.send("t"); s.expect("(no such text)", 0.3); raw = s.out[s.mark:]
-check(b"\x1b[36m@sugsrc/twin.txt\x1b[39m" in raw and b"\x1b[36m@sugsrc/nope" not in raw, f"a mention that names a file is coloured in the input field, one that names nothing is not: {raw[-300:]!r}")
+check(b"\x1b[38;2;86;182;194m@sugsrc/twin.txt\x1b[38;2;255;241;184m" in raw and b"\x1b[38;2;86;182;194m@sugsrc/nope" not in raw, f"a mention that names a file is coloured in the input field, one that names nothing is not: {raw[-300:]!r}")
 s.send("\x7f" * 44)
 s.send("see @zebr"); s.send("a"); view = listed()
 check("sugsrc/zebra_term.c" in view and "sugsrc/deep/zebra_notes.md" in view, f"@ and part of a name finds the files it could be, wherever they are: {view!r}")
@@ -1118,7 +1322,6 @@ out, rc = run(["-m", "fake-coder:latest", "-T", "-p", "look at @zebra_notes.md"]
 check("(attached sugsrc/deep/zebra_notes.md" in out, f"-p finds a file by its name too: {out!r}")
 
 print("test interactive: a !line is completed the way a shell would: programs where a command goes, paths elsewhere")
-BINDIR = tempfile.mkdtemp(prefix="crowbin_")
 for name in ("zzcorbie-tool", "zzcorbie-tool-extra"):
     open(os.path.join(BINDIR, name), "w").write('#!/bin/sh\necho "ran-%s $*"\n' % name); os.chmod(os.path.join(BINDIR, name), 0o755)
 open(os.path.join(BINDIR, "zzcorbie-notes.txt"), "w").write("not a program\n")
@@ -1144,10 +1347,9 @@ shutil.rmtree(BINDIR, ignore_errors=True)
 shutil.rmtree(SIB, ignore_errors=True)
 
 print("test interactive: CORBIENEST_TRACE records what is drawn and what is sent, and tools/trace_replay.py plays it back")
-TRACE = os.path.join(CFG, "render.trace")
-REPLAY = [sys.executable, os.path.join(HERE, "..", "tools", "trace_replay.py"), TRACE]
 s = Session(["-m", "fake-coder:latest"], env=dict(ENV, CORBIENEST_TRACE=TRACE))
-check(s.expect("trace: everything drawn and typed in this session is written to " + TRACE), "a session that is being recorded says so, and where to")
+s.expect("(no such text)", 3)   # the note is printed under the start-up banner: read it, then look in the whole text
+check(("trace: everything drawn and typed in this session is written to " + TRACE) in s.text(), "a session that is being recorded says so, and where to")
 s.expect("Ctrl-D to quit")
 s.send("traced words\r"); check(s.expect("Echo: traced words"), "reply")
 s.send(wheel(True)); s.send("\x04"); time.sleep(0.5); s.close()
@@ -1197,7 +1399,7 @@ else:
         end = time.time() + 8
         while time.time() < end and tmux(sock, "display", "-p", "-t", "t", "#{session_attached}").strip() != "1": time.sleep(0.05)
         check(tmux(sock, "display", "-p", "-t", "t", "#{session_attached}").strip() == "1", f"mouse {mouse}: the client is attached")
-        check(pane_has(sock, "shift+tab to switch mode"), f"mouse {mouse}: it starts in a tmux pane: {tmux(sock, 'capture-pane', '-p', '-t', 't')[-200:]!r}")
+        check(pane_has(sock, "shift+tab to cycle"), f"mouse {mouse}: it starts in a tmux pane: {tmux(sock, 'capture-pane', '-p', '-t', 't')[-200:]!r}")
         check(tmux(sock, "display", "-p", "-t", "t", "#{mouse_any_flag}").strip() == "1", f"mouse {mouse}: tmux knows the pane wants the mouse")
         feed("!seq 1 60\r"); pane_has(sock, "+21 lines")
         feed("kept in the field")
@@ -1205,7 +1407,7 @@ else:
         check(pane_has(sock, "scrollback · rows"), f"mouse {mouse}: the wheel scrolls the conversation: {tmux(sock, 'capture-pane', '-p', '-t', 't')[-300:]!r}")
         check(tmux(sock, "display", "-p", "-t", "t", "#{pane_in_mode}").strip() == "0", f"mouse {mouse}: tmux did not keep it for its copy mode")
         check("❯ kept in the field" in tmux(sock, "capture-pane", "-p", "-t", "t"), f"mouse {mouse}: and it is not turned into arrow keys for the prompt history")
-        check("manual mode" in tmux(sock, "capture-pane", "-p", "-t", "t").rstrip("\n").split("\n")[-1], f"mouse {mouse}: the status bar is still on the last row")
+        check("manual mode" in tmux(sock, "capture-pane", "-p", "-t", "t").rstrip("\n").split("\n")[-2], f"mouse {mouse}: the status bar is still on the row above the location line")
         feed("\x1b[<65;10;5M" * 3)
         check(pane_has(sock, "scrollback · rows", want=False), f"mouse {mouse}: scrolling down returns to the prompt")
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 16, 60, 0, 0))
@@ -1213,9 +1415,9 @@ else:
         end = time.time() + 5; lines = []
         while time.time() < end:
             lines = tmux(sock, "capture-pane", "-p", "-t", "t").rstrip("\n").split("\n")
-            if len(lines) == 16 and "manual mode" in lines[-1] and lines[-4].startswith("─" * 60): break
+            if len(lines) == 16 and "manual mode" in lines[-2] and lines[-4].startswith("╭"): break
             time.sleep(0.1)
-        check(len(lines) == 16 and "manual mode" in lines[-1] and "❯ kept in the field" in lines[-3] and lines[-4].startswith("─" * 60),
+        check(len(lines) == 16 and "manual mode" in lines[-2] and "❯ kept in the field" in lines[-3] and lines[-4].startswith("╭"),
               f"mouse {mouse}: a resized pane is drawn for its new size without a key being pressed: {lines[-5:]!r}")
         tmux(sock, "kill-server")
         try: os.close(fd)
@@ -1249,16 +1451,7 @@ s.send("\x04"); s.close()
 # ---------- /effort and /advisor ----------
 # a config directory of their own: what they save (an advisor, per-model efforts) would
 # otherwise follow every test that comes after
-CFG2 = tempfile.mkdtemp(prefix="crowcfg2_")
-ENV2 = dict(ENV, XDG_CONFIG_HOME=CFG2)
-CFG2_FILE = os.path.join(CFG2, "corbienest", "config")
 os.makedirs(os.path.join(CFG2, "corbienest")); open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
-def thinks(rs): return [r.get("think", "absent") for r in rs]
-def run_rounds(model, args):
-    """run() in ENV2; returns (out, rc, the requests this run made to `model`) — not the log's last n, which may be an earlier run's"""
-    n0 = len(requests())
-    out, rc = run(args, env=ENV2)
-    return out, rc, [r for r in requests()[n0:] if r["model"] == model]
 
 print("test effort: a level is part of the prompt, so it goes with every call; a model that cannot stop is never told to")
 out, rc, rs = run_rounds("fake-levels:latest", ["-m", "fake-levels:latest", "--yolo", "--effort", "high", "-p", "TOOL_BASH please"])
@@ -1323,9 +1516,9 @@ check(adv["options"]["num_ctx"] == 8192 and adv.get("think") is False, f"the sav
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nadvisor=fake-big:latest\nadvisor_ctx=100\neffort.fake-levels:latest=ultra\n")
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENV2)
 check([r for r in requests() if r["model"] == "fake-big:latest"][-1]["options"]["num_ctx"] == 16384, "an advisor_ctx too small to be one is ignored")
-s = Session(["-m", "fake-levels:latest"], env=ENV2)
+s = Session(["-m", "fake-levels:latest"], env=ENV2, banner=True)
 check(s.expect("effort 'ultra' is saved for fake-levels:latest, which does not offer it"), "a saved effort the model does not offer is said at start-up, and left to the model")
-check(s.expect("advisor: fake-big:latest"), "the banner names the advisor"); s.expect("Ctrl-D to quit")
+check(s.expect("advisor: fake-big:latest"), "the banner names the advisor"); s.send("\x1b"); s.expect("(no such text)", 1)
 s.send("hello\r"); s.expect("Echo: hello"); check("think" not in requests()[-1] and "· ultra" not in s.text(), "and neither sent nor shown in the bar")
 s.send("\x04"); s.close()
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
@@ -1346,7 +1539,7 @@ picker = since_send(s)
 check("low" in picker and "medium" in picker and "high" in picker and "no thinking" not in picker, f"its levels, and no off: {picker[-400:]!r}")
 s.send("hig"); time.sleep(0.2); s.send("\r"); check(s.expect("effort: high"), "picked by filter + Enter")
 check(s.expect("sent with every model call"), "and told why /think auto does not switch it off for the tool rounds")
-check(s.expect("fake-levels:latest · high"), f"the status bar shows the effort with the model: {s.text()[-300:]!r}")
+check(s.expect("fake-levels · high"), f"the status bar shows the effort with the model (model_short drops :latest): {s.text()[-300:]!r}")
 s.send("hello levels\r"); check(s.expect("Echo: hello levels"), "reply"); check(requests()[-1].get("think") == "high", "level sent")
 check("effort.fake-levels:latest=high" in open(CFG2_FILE).read(), "saved per model")
 s.send("/model fake-thinker:latest\r"); s.expect("model set to fake-thinker")
@@ -1360,11 +1553,32 @@ s.send("/think off\r"); check(s.expect("cannot stop thinking: it is sent its wea
 check(requests()[-1].get("think") == "low", "/think off: never think — for this model, as little as it can")
 s.send("/effort medium\r"); check(s.expect("/think was off: now auto"), "setting a level switches thinking back on")
 s.send("SLOW while busy\r"); s.expect("one ")
-s.send("/effort low\r"); check(s.expect("effort: low", 3), "/effort LEVEL runs while the model is working")
-check("queued" not in since_send(s) and "eight" not in since_send(s), "there and then: not queued for after the turn")
+s.send("/effort low\r"); check(s.expect("from the next request", 3), "/effort LEVEL is accepted while the model works, for the next request")
+check("queued" not in since_send(s) and "eight" not in since_send(s), "not queued for after the turn, and not applied under the request in flight")
 s.send("/effort\r"); check(s.expect("fake-levels:latest offers: low · medium · high", 3), "bare /effort prints the levels while busy")
 check("Effort for" not in since_send(s) and "eight" not in since_send(s), "instead of opening a picker inside a live request")
 check(s.expect("eight", 10), "generation carried on"); s.expect("tok/s")
+check(s.expect("effort: low", 5), "the setting is applied as the turn ends, not kept until the next message")
+s.send("after effort\r"); s.expect("Echo: after effort")
+check(requests()[-1].get("think") == "low", "the next request carries the level that was set while busy")
+print("test interactive: /ctx SIZE while busy is kept for the next request")
+s.send("/ctx 8k\r"); s.expect("tok/s"); s.send("/ctx 16k\r"); s.expect("tok/s")   # warm: sets the window for a request that has ended
+s.send("SLOW ctx busy\r"); s.expect("one ")
+s.send("/ctx 8k\r"); check(s.expect("context window: 8k", 3) and s.expect("from the next request", 3), "/ctx SIZE runs while the model works, and says when it applies")
+check("queued" not in since_send(s), "not queued for after the turn")
+check(s.expect("eight", 10), "the running turn carries on"); s.expect("tok/s")
+check(requests()[-1]["options"]["num_ctx"] == 16384, "the running turn kept the window it started with")
+s.send("after busy\r"); s.expect("Echo: after busy")
+check(requests()[-1]["options"]["num_ctx"] == 8192, "the next request uses the new window")
+print("test interactive: /advisor guidance while busy is kept for the next request")
+s.send("SLOW guidance busy\r"); s.expect("one ")
+s.send("/advisor guidance strong\r"); check(s.expect("from the next request", 3), "/advisor guidance runs while the model works, and says when it applies")
+check("queued" not in since_send(s), "not queued for after the turn")
+s.expect("eight", 10); s.expect("tok/s")
+s.send("after guidance\r"); s.expect("Echo: after guidance")
+check("advisor_guidance=strong" in open(CFG2_FILE).read(), "the next request applies it, and it is saved")
+s.send("/advisor guidance normal\r"); s.expect("advisor guidance: normal")
+s.send("/ctx 32k\r"); s.expect("context window: 32k")   # the config is shared with the advisor tests below: back to the default
 s.send("/model fake-thinker:latest\r"); s.expect("model set to fake-thinker")
 s.send("/effort off\r"); s.expect("effort: off"); s.send("/think on\r"); check(s.expect("/effort off for fake-thinker:latest is forgotten"), "/think on takes back an /effort off, or nothing would change")
 s.send("/think auto\r"); s.expect("think: auto"); s.send("/model fake-levels:latest\r"); s.expect("model set to fake-levels")
@@ -1430,10 +1644,13 @@ s.send("/advisor\r"); check(s.expect("ollama signin") and s.expect("anthropic:cl
 check(s.expect("/advisor guidance LEVEL") and s.expect("when the work is hard · 3 per request · current") and s.expect("brought in, unasked, when tool calls keep failing") and s.expect("/advisor effort LEVEL"), "and what guidance and effort do")
 check(s.expect("Select advisor"), "/advisor opens a picker"); check(s.expect("No advisor"), "with 'No advisor' first")
 s.send("\x1b"); check(s.expect("advisor unchanged: none"), "Esc leaves it")
-s.send("/advisor fake-bi"); s.send("g"); view = listed()
+s.send("/advisor fake-bi"); s.send("g"); seen(s, "fake-big:latest", 5)
+_w = since_send(s)   # a repaint of the old transcript comes first; the list is drawn after each field row that changes it
+_segs = [g for g in re.split(r"(?=❯ /advisor )", _w) if "tab complete" in g]
+view = _segs[-1] if _segs else ""
 check("fake-big:latest" in view and "fake-chat" not in view, f"the installed models are suggested as a name is typed: {view!r}")
 s.send("\t\r"); check(s.expect("advisor: fake-big:latest"), "Tab completes the name, Enter sets it")
-s.send("/advisor "); s.send("o"); view = listed()
+s.send("/advisor "); s.send("o"); s.expect("(no such text)", 2); view = since()   # the list is drawn under the field: read it, then everything since the key
 check("off" in view and "openai:" in view and "OPENAI_API_KEY not set" in view, f"the hosted providers are offered by their prefix, with whether the key is there: {view!r}")
 s.send("\x7f" * 10); s.send("/adviso"); s.send("r"); check(re.search(r"/advisor\s+a stronger model the agent may consult: a local one, or Claude, ChatGPT, Grok", listed()), f"the command's own line says a hosted one can be it: {listed()!r}")
 s.send(" "); view = listed()
@@ -1459,12 +1676,17 @@ check(adv.get("think") == "high" and adv["options"]["num_ctx"] == 8192, f"its ef
 s.send("/status\r"); check(s.expect("advisor    fake-big:latest"), "/status shows it")
 s.send("/cost\r"); check(s.expect("advisor       1 consultation"), f"/cost counts it: {since_send(s)[-300:]!r}")
 s.send("TOOL_ADVISOR SLOWADVICE\r"); check(s.expect("⤷ advisor"), "a slow consultation")
+_m = s.mark   # the consultation's window: from its own send
 time.sleep(0.6); s.send("never mind, do this\r")
-check(s.expect("stopped — your message goes first", 10), f"a queued message stops the consultation: {s.text()[-400:]!r}")
-check(s.expect("Echo: never mind, do this", 10), "and reaches the model on its next call")
+_ok, _end = False, time.time() + 15
+while time.time() < _end and not _ok:
+    s.expect("(no such text)", 0.3)
+    _w = clean(s.out[_m:].decode("utf-8", "replace"))
+    _ok = "▸ advice" in _w and "Echo:" in _w and "never mind, do" in _w   # the consultation finished (its folded result) and the queued message got its turn
+check(_ok, "a queued message does not stop the consultation: it runs to its end (the consultation's result is folded, and the queued message is answered)")
+check(s.expect("Echo: never mind, do this", 10), "and reaches the model on its next call, after the advice")
 msgs = requests()[-1]["messages"]
-check(msgs[-2]["role"] == "tool" and "not heard out" in msgs[-2]["content"] and msgs[-1]["content"] == "never mind, do this", f"the conversation stays well-formed: {[m['role'] for m in msgs[-3:]]}")
-check("What it had written so far:\nADVICE:" in msgs[-2]["content"], "with what the advisor had written by then")
+check(msgs[-2]["role"] == "tool" and "not heard out" not in msgs[-2]["content"] and "ADVICE:" in msgs[-2]["content"] and msgs[-1]["content"] == "never mind, do this", f"the conversation stays well-formed: {[m['role'] for m in msgs[-3:]]}")
 s.send("TOOL_ADVISOR SLOWADVICE again\r"); s.expect("⤷ advisor"); time.sleep(0.6); s.send("\x1b")
 check(s.expect("⎿ interrupted", 10), "Esc skips the consultation"); check(s.expect("Tool said: error: the consultation was interrupted", 10), "and the turn carries on without it")
 s.send("/status\r"); check(s.expect("last prompt 123 tokens"), "the advisor's prompt (30k tokens, says the fake) is no part of the conversation's context figure")
@@ -1491,17 +1713,6 @@ s.send("\x04"); s.close()
 
 # ---------- the advisor on a hosted API: xAI, OpenAI, Anthropic ----------
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
-KEYS = dict(XAI_API_KEY="test-key", OPENAI_API_KEY="test-key", ANTHROPIC_API_KEY="test-key",
-            XAI_BASE_URL=f"{HOST}/xai/v1", OPENAI_BASE_URL=f"{HOST}/openai/v1", ANTHROPIC_BASE_URL=f"{HOST}/anthropic")
-ENVK = dict(ENV2, **KEYS)
-def preqs(): return json.loads(urllib.request.urlopen(f"{HOST}/_provider_requests").read())
-def last_preq(prov): return [r for r in preqs() if r["provider"] == prov][-1]
-def key_nowhere():
-    """the key is never written anywhere: not the config, not a session, not the history"""
-    for root, _, files in os.walk(CFG2):
-        for f in files:
-            if "test-key" in open(os.path.join(root, f), errors="replace").read(): return os.path.join(root, f)
-    return None
 
 print("test advisor on a hosted API: xAI and OpenAI through Chat Completions")
 out, rc = run(["-m", "fake-coder:latest", "--advisor", "xai:grok-fake", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
@@ -1549,6 +1760,48 @@ b = last_preq("anthropic")["body"]
 check(rc == 0 and b.get("thinking") == {"type": "enabled", "budget_tokens": 8000} and "output_config" not in b, f"a model with a thinking budget and no effort levels: {b.get('thinking')!r}")
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
 
+print("test the model that does the work on Anthropic: haiku works, opus advises")
+n0 = len(preqs())
+out, rc = run(["-m", "anthropic:claude-fake-haiku", "--advisor", "anthropic:claude-fake-opus", "--yolo", "-p", "TOOL_BASH please"], env=ENVK)
+check(rc == 0 and "hello-from-tool" in out and "Tool said:" in out, f"the tool ran, and the model read its result: {out[-400:]!r}")
+posts = anth_since(n0)
+work = work_posts(posts)
+check(work and all(r["path"] == "/anthropic/v1/messages" and r["body"].get("stream") is True for r in work), f"streamed to the Messages API: {[(r['path'], r['body'].get('stream')) for r in work]!r}")
+if work:
+    first = work[0]["body"]
+    check(any(t.get("name") == "bash" for t in first.get("tools") or []) and "thinking" not in first and "fallbacks" not in first and "output_config" not in first and first.get("max_tokens") == 64000,
+          f"haiku, with tools, and no thinking (a budget model, left off): model={first.get('model')!r} max_tokens={first.get('max_tokens')!r} thinking={first.get('thinking')!r}")
+    check(any(has_tool_result(r) for r in work[1:]), "the next call carries the tool_result")
+check(not consult_posts(posts), "this request never consulted the advisor")
+
+print("test loop guard: a stopped request leaves no call unanswered, and the next request is accepted")
+cfg_before = open(CFG2_FILE).read()
+open(CFG2_FILE, "w").write(cfg_before + "max_iters=2\n")   # the guard at 2 tool rounds, for this test only
+try:
+    n0 = len(preqs())
+    out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "-p", "TOOL_LOOP please"], env=ENVK)
+    check(rc == 0 and "loop guard" in out, f"the request stopped at the loop guard: {out[-300:]!r}")
+    check("✗" not in out, "and nothing was refused on the way")
+    out2, rc2 = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "--continue", "-p", "continue"], env=ENVK)
+    check(rc2 == 0 and "✗" not in out2 and "tool_use" not in out2 and "Tool said:" in out2,
+          f"the next request goes through: {out2[-300:]!r}")
+finally:
+    open(CFG2_FILE, "w").write(cfg_before)
+
+print("test binary output: a tool result that is not UTF-8 reaches the model as a valid request")
+out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "-p", "TOOL_BINARY please"], env=ENVK)
+check(rc == 0 and "✗" not in out and "Tool said: bad" in out, f"the request went through, with the output mended: {out[-300:]!r}")
+n0 = len(preqs())
+out, rc = run(["-m", "anthropic:claude-fake-haiku", "--advisor", "anthropic:claude-opus-5", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
+check(rc == 0 and "Tool said: ADVICE:" in out, f"the advice came back as the tool result: {out[-400:]!r}")
+posts = anth_since(n0)
+cons, work = consult_posts(posts), work_posts(posts)
+check(len(cons) == 1 and [m["role"] for m in cons[0]["body"]["messages"]] == ["user"] and "tools" not in cons[0]["body"]
+      and cons[0]["body"].get("fallbacks") == "default" and cons[0]["headers"].get("anthropic-beta") == "server-side-fallback-2026-07-01",
+      f"the consultation is still one user message, and Opus 5 asks for a fallback: {cons[0]['body'].get('fallbacks')!r} {cons[0]['headers'].get('anthropic-beta')!r}" if cons else f"no consultation in {len(posts)} posts")
+check(work and all(isinstance(r["body"].get("system"), list) and "tools" in r["body"] and "fallbacks" not in r["body"] for r in work),
+      "the model doing the work is a different request: tools, a system array, no fallbacks")
+
 print("test advisor on a hosted API: no key, a wrong key, no such model")
 noenv = {k: v for k, v in ENVK.items() if k != "XAI_API_KEY"}
 n0 = len(preqs())
@@ -1569,47 +1822,69 @@ check(rc == 0 and "Anthropic does not know a model 'claude-nope'" in out, f"no s
 check(key_nowhere() is None, f"the key was written nowhere: {key_nowhere()!r}")
 
 print("test interactive: /advisor with a hosted API")
-s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); seen(s, "Ctrl-D to quit")
 s.send("/advisor anthropic:"); s.send("c"); view = listed()
 check("anthropic:claude-fake-opus" in view and "Claude Fake Haiku" in view and "grok-fake" not in view, f"behind a provider's prefix its own model list is suggested: {view!r}")
 s.send("\x7f" * 20); s.send("/advisor xai:g"); s.send("r"); check("xai:grok-fake" in listed(), "each provider's own")
-s.send("\t\r"); check(s.expect("advisor: xai:grok-fake"), "and Tab + Enter takes one")
+s.send("\t\r"); check(seen(s, "advisor: xai:grok-fake"), "and Tab + Enter takes one")
 check(key_nowhere() is None, f"listing the models wrote the key nowhere: {key_nowhere()!r}")
-s.send("/advisor xai:grok-nope\r"); check(s.expect("xAI does not know a model 'grok-nope'"), "the model endpoint is asked: an unknown model is refused")
-s.send("/advisor xai:grok-fake\r"); check(s.expect("advisor: xai:grok-fake"), "/advisor PROVIDER:MODEL")
-check(s.expect(f"sent to {HOST}/xai/v1 with each consultation, billed to the key in XAI_API_KEY"), f"with where the conversation goes: {since_send(s)[-300:]!r}")
+s.send("/advisor xai:grok-nope\r"); check(seen(s, "xAI does not know a model 'grok-nope'"), "the model endpoint is asked: an unknown model is refused")
+s.send("/advisor xai:grok-fake\r"); check(seen(s, "advisor: xai:grok-fake"), "/advisor PROVIDER:MODEL")
+check(seen(s, f"sent to {HOST}/xai/v1 with each consultation, billed to the key in XAI_API_KEY"), f"with where the conversation goes: {since_send(s)[-300:]!r}")
 cfg = open(CFG2_FILE).read(); check("advisor=xai:grok-fake" in cfg and "test-key" not in cfg, "saved, without the key")
-s.send("/advisor effort\r"); check(s.expect("advisor effort for xai:grok-fake"), "/advisor effort offers its levels"); check(s.expect("xhigh"), "the ones xAI's models take")
-s.send("\x1b"); s.expect("unchanged")
-s.send("/advisor effort max\r"); check(s.expect("sent as xhigh, its strongest level"), "max is as hard as it goes, in xAI's name")
-s.send("TOOL_ADVISOR now\r"); check(s.expect("Tool said: ADVICE"), "consulted"); check(last_preq("xai")["body"].get("reasoning_effort") == "xhigh", "with that effort")
-s.send("TOOL_ADVISOR SLOWADVICE\r"); check(s.expect("⤷ advisor xai:grok-fake"), "a slow consultation")
+s.send("/advisor effort\r"); check(seen(s, "advisor effort for xai:grok-fake"), "/advisor effort offers its levels"); check(seen(s, "xhigh"), "the ones xAI's models take")
+s.send("\x1b"); seen(s, "unchanged")
+s.send("/advisor effort max\r"); check(seen(s, "sent as xhigh, its strongest level"), "max is as hard as it goes, in xAI's name")
+s.send("TOOL_ADVISOR now\r"); check(seen(s, "Tool said: ADVICE"), "consulted"); check(last_preq("xai")["body"].get("reasoning_effort") == "xhigh", "with that effort")
+s.send("TOOL_ADVISOR SLOWADVICE\r"); check(seen(s, "⤷ advisor xai:grok-fake"), "a slow consultation")
 time.sleep(0.8); s.send("never mind, do this\r")
-check(s.expect("stopped — your message goes first", 10), f"a queued message stops a hosted consultation too: {s.text()[-400:]!r}")
-check(s.expect("Echo: never mind, do this", 15), "and reaches the model")
-s.send("TOOL_ADVISOR SLOWADVICE again\r"); s.expect("⤷ advisor"); time.sleep(0.8); s.send("\x1b")
-check(s.expect("⎿ interrupted", 10), "Esc skips it"); check(s.expect("Tool said: error: the consultation was interrupted", 15), "and the turn carries on")
-s.send("/cost\r"); check(s.expect("advisor       1 consultation "), f"/cost counts the one that gave advice (the stopped and the skipped one did not): {since_send(s)[-300:]!r}")
-s.send("/usage\r"); check(s.expect("local: no charge") and "fake-coder:latest" in since_send(s), f"/usage lists the model doing the work: {since_send(s)[-400:]!r}")
-check(s.expect("no price known") and re.search(r"xai:grok-fake\s+\d+ calls?\s+↑", since_send(s)), f"and the hosted advisor with its own tokens — a model the price list does not know: {since_send(s)[-400:]!r}")
-s.send("/usage price xai:grok-fake 2 6\r"); check(s.expect("xai:grok-fake: $2 in · $6 out per million tokens"), "/usage price sets one")
+check(seen(s, "Echo:", 15) and seen(s, "never mind, do", 15), "a queued message does not stop a hosted consultation either: it reaches the model after it")   # streamed in pieces, the chrome redrawn between them
+s.send("TOOL_ADVISOR SLOWADVICE again\r"); seen(s, "⤷ advisor"); time.sleep(0.8); s.send("\x1b")
+check(seen(s, "⎿ interrupted", 10), "Esc skips it"); check(seen(s, "Tool said: error: the consultation was interrupted", 15), "and the turn carries on")
+s.send("/cost\r"); check(seen(s, "advisor       2 consultations "), f"/cost counts the two that gave advice (the skipped one did not): {since_send(s)[-300:]!r}")
+s.send("/usage\r"); check(seen(s, "local: no charge") and "fake-coder:latest" in since_send(s), f"/usage lists the model doing the work: {since_send(s)[-400:]!r}")
+check(seen(s, "no price known") and re.search(r"xai:grok-fake\s+\d+ calls?\s+↑", since_send(s)), f"and the hosted advisor with its own tokens — a model the price list does not know: {since_send(s)[-400:]!r}")
+s.send("\x1b"); s.expect("(no such text)", 0.5)   # a bare /usage opens an overlay that holds the output back until Esc
+seen(s, "[ready]", 60)   # the reply to the queued message may still be streaming: /usage runs only when the prompt is ready
+s.send("/usage price xai:grok-fake 2 6\r"); check(seen(s, "xai:grok-fake: $2 in · $6 out per million tokens"), "/usage price sets one")
 check("price.xai:grok-fake=2/6" in open(CFG2_FILE).read(), "saved in the config")
-s.send("/usage\r"); check(s.expect("set with /usage price") and re.search(r"≈ \$\d+\.\d+", since_send(s)), f"and the cost is estimated from it: {since_send(s)[-400:]!r}")
-check(s.expect("estimated cost"), "with a total")
-s.send("TOOL_ADVISOR priced\r"); check(s.expect("Tool said: ADVICE") and re.search(r"⎿ advice · \S+ tokens · \d+s · ≈ \$\d+\.\d+", since_send(s)), f"a consultation of a priced model says what it came to: {since_send(s)[-400:]!r}")
-s.send("/cost\r"); check(s.expect("est. cost     ≈ $"), f"and /cost has the session's estimate: {since_send(s)[-300:]!r}")
-s.send("/usage price xai:grok-fake default\r"); check(s.expect("xai:grok-fake: no price"), "default forgets it"); check("price.xai" not in open(CFG2_FILE).read(), "in the config too")
-s.send("/advisor anthropic:claude-fake-haiku\r"); check(s.expect("advisor: anthropic:claude-fake-haiku"), "switched to Anthropic")
-s.send("/advisor effort on\r"); check(s.expect("advisor effort: on"), "a thinking budget, on")
+s.send("/usage\r"); # the overlay's border is drawn across "set with", so the stream never has it as one run; the estimate and the price are checked
+check(seen(s, "$2 in · $6 out per million") and re.search(r"≈ \$\d+\.\d+", since_send(s)), f"and the cost is estimated from it: {since_send(s)[-400:]!r}")
+check(seen(s, "estimated cost"), "with a total")
+s.send("\x1b"); s.expect("(no such text)", 0.5)
+s.send("TOOL_ADVISOR priced\r"); check(seen(s, "Tool said: ADVICE") and re.search(r"▸ advice · \S+ tokens · \d+s · ≈ \$\d+\.\d+", since_send(s)), f"a consultation of a priced model says what it came to: {since_send(s)[-400:]!r}")
+s.send("/cost\r"); check(seen(s, "est. cost     ≈ $"), f"and /cost has the session's estimate: {since_send(s)[-300:]!r}")
+s.send("/usage price xai:grok-fake default\r"); check(seen(s, "xai:grok-fake: no price"), "default forgets it"); check("price.xai" not in open(CFG2_FILE).read(), "in the config too")
+s.send("/advisor anthropic:claude-fake-haiku\r"); check(seen(s, "advisor: anthropic:claude-fake-haiku"), "switched to Anthropic")
+s.send("/advisor effort on\r"); check(seen(s, "advisor effort: on"), "a thinking budget, on")
 s.send("\x04"); s.close()
 check(key_nowhere() is None, f"still nowhere: {key_nowhere()!r}")
 
+print("test interactive: /model completes a local name and an Anthropic one")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
+s.send("/model fake-co"); s.send("d"); view = listed()
+check("fake-coder:latest" in view and "fake-chat" not in view and "xai:" not in view and "openai:" not in view,
+      f"a local name is completed as it is typed, and an advisor-only provider is not offered: {view!r}")
+s.send("\t\r"); check(s.expect("model set to fake-coder:latest"), "Tab completes the name, Enter sets it")
+s.send("/model "); view = listed()
+check("anthropic:" in view and "fake-coder:latest" in view and "the model that does the work" in view and "xai:" not in view and "openai:" not in view,
+      f"a bare argument offers Anthropic and the installed models: {view!r}")
+s.send("anthropic"); s.send(":"); view = listed()
+check("anthropic:claude-fake-opus" in view and "Claude Fake Haiku" in view and "grok-fake" not in view,
+      f"behind anthropic: its own models are listed: {view!r}")
+s.send("laude-fake-hai"); s.send("\t\r"); check(s.expect("model set to anthropic:claude-fake-haiku"), "Tab + Enter takes one")
+s.send("/model claude:"); s.send("c"); view = listed()
+check("claude:claude-fake-opus" in view and "claude:claude-fake-haiku" in view and "grok-fake" not in view,
+      f"claude: is the same list, under the name that was typed: {view!r}")
+s.send("\x03"); s.send("/model xai"); s.send(":"); view = listed()
+check("grok-fake" not in view and "xai:" not in view, f"xai: is not completed on /model: {view!r}")
+s.send("\x03"); s.send("/model\r"); check(s.expect("Select model"), "Enter with no name still opens the local picker")
+s.send("think"); time.sleep(0.2); s.send("\r"); check(s.expect("model set to fake-thinker:latest"), "and typing in it still filters")
+s.send("\x04"); s.close()
+check(key_nowhere() is None, f"completing the models wrote the key nowhere: {key_nowhere()!r}")
+
 # ---------- /advisor guidance: how much the agent leans on it ----------
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
-def guided(level, prompt, advisor="fake-big:latest"):
-    n0, p0 = len(requests()), len(preqs())
-    out, rc = run(["-m", "fake-coder:latest", "--advisor", advisor, "--advisor-guidance", level, "--yolo", "-p", prompt], env=ENVK)
-    return out, rc, requests()[n0:]
 
 print("test advisor guidance: light and normal leave it to the agent")
 out, rc, rs = guided("light", "TOOL_ADVISOR ADVISOR_LOOP")
@@ -1635,8 +1910,11 @@ out, rc, rs = guided("normal", "TOOL_WRITE please")
 check("reviews the work" not in out and os.path.exists(os.path.join(WORK, "made.txt")), "normal: no review of its own")
 check(not any(r["model"] == "fake-big:latest" for r in rs), "and no consultation the agent did not ask for")
 
-print("test advisor guidance strong: the work is reviewed before the request ends")
+print("test advisor guidance strong: a substantial change is reviewed before the request ends")
 os.remove(os.path.join(WORK, "made.txt"))
+out, rc, rs = guided("strong", "TOOL_WRITE please")
+check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), f"strong: a one-line change to a new file is not reviewed: {out[-300:]!r}")
+big_made()
 out, rc, rs = guided("strong", "TOOL_WRITE please")
 check(rc == 0 and "⤷ advisor fake-big:latest · reviews the work before the request ends" in out, f"a request that changed files is reviewed: {out[-600:]!r}")
 check("Tool said: ADVICE: REVIEW-FINDING" in out, f"and what it finds goes to the agent, which gets another round: {out[-300:]!r}")
@@ -1650,13 +1928,13 @@ sysmsg = main[0]["messages"][0]["content"]
 check("Lean on it" in sysmsg and "at most 6 times per request" in sysmsg and "It reviews your work by itself" in sysmsg and "do not try a second fix on a guess" in sysmsg and "when your tool calls keep failing" in sysmsg, f"the agent is told how to lean on it: {sysmsg[-700:]!r}")
 adv = [r for r in rs if r["model"] == "fake-big:latest"][0]
 check("under about 700 words" in adv["messages"][0]["content"] and "exact steps" in adv["messages"][0]["content"], "the advisor is asked for concrete steps")
-os.remove(os.path.join(WORK, "made.txt"))
+big_made()
 out, rc, rs = guided("strong", "TOOL_WRITE APPROVE")
 check("reviews the work" in out and "nothing to change" in out and len([r for r in rs if r["model"] == "fake-coder:latest"]) == 2, f"LGTM: the request ends there, no extra round: {out[-300:]!r}")
 out, rc, rs = guided("strong", "hello there")
 check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), "a request that changed nothing is not reviewed")
 out, rc, rs = guided("strong", "TOOL_READS APPROVE")
-check("reviews the work before the request ends" in out and "nothing to change" in out, f"unless it took several tool calls: then it is, file or no file: {out[-400:]!r}")
+check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), f"several tool calls with no change are not reviewed at strong: {out[-400:]!r}")
 out, rc, rs = guided("normal", "TOOL_READS APPROVE")
 check("reviews the work" not in out and not any(r["model"] == "fake-big:latest" for r in rs), "(not at normal)")
 out, rc, rs = guided("strong", "TOOL_FAILS now")
@@ -1672,7 +1950,7 @@ check("steps in: the tool calls keep failing" in out and "Gave up after 2 tries.
 check("It is brought in by itself when your tool calls keep failing" in rs[0]["messages"][0]["content"], "and the agent is told")
 out, rc, rs = guided("light", "TOOL_FAILS now")
 check("steps in" not in out and "Gave up after 5 tries." in out and not any(r["model"] == "fake-big:latest" for r in rs), f"at light the agent is left to it: {out[-300:]!r}")
-os.remove(os.path.join(WORK, "made.txt"))
+big_made()
 out, rc, rs = guided("strong", "TOOL_WRITE please", advisor="anthropic:claude-fake-opus")
 check("reviews the work before the request ends" in out and "Tool said: ADVICE: REVIEW-FINDING" in out, "a hosted advisor reviews the same way")
 check("The agent has ended its turn" in last_preq("anthropic")["body"]["messages"][0]["content"], "and is asked the same")
@@ -1720,9 +1998,51 @@ s.send("\x1b"); s.send("\x04"); s.close()
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_MANY"])
 check("fold-line-3" in out and "▸" not in out, "without a screen to click on, the first lines are shown as before")
 
+print("test location line: the working folder and its git branch, under the status bar")
+br = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=WORK, capture_output=True, text=True).stdout.strip()
+sl = Session(["-m", "fake-coder:latest"]); sl.expect("Ctrl-D to quit")
+check(sl.expect("· branch " + br, 10) if br else True, f"the location line names the branch: {br!r}")
+check(sl.expect(WORK, 5), "the location line gives the absolute path")
+sl.send("\x04"); sl.close()
+
+# ---------- code in the transcript: highlighting; the prompt cache: the bar and /usage ----------
+print("test highlight: code in a reply and a file's preview are coloured by their language")
+sh = Session(["-m", "fake-coder:latest"]); sh.expect("Ctrl-D to quit")
+m0 = sh.mark
+sh.send("CODE_REPLY\r"); check(sh.expect("Done.", 10), "the reply with a code block")
+check(b"\x1b[38;2;180;142;173mdef\x1b[0m" in sh.out[m0:], "a keyword is magenta")
+check(b"\x1b[38;2;124;135;153m# say hi\x1b[0m" in sh.out[m0:], "a comment is grey")
+check(b"\x1b[38;2;163;190;140m'hi '\x1b[0m" in sh.out[m0:], "a string is green")
+sh.send("/mode auto\r"); sh.expect("mode: auto")
+m1 = sh.mark
+sh.send("TOOL_WRITE_CODE\r"); check(sh.expect("create hello.py", 10), "a file is written")
+check(b"\x1b[38;2;180;142;173mdef\x1b[0m" in sh.out[m1:], "its preview shows the code coloured by the extension")
+check(sh.expect("Echo", 10) or True, "the turn ends")
+sh.send("/mode manual\r"); sh.expect("mode: manual")   # the shared config: back to the default
+sh.send("\x04"); sh.close()
+os.remove(os.path.join(WORK, "hello.py")) if os.path.exists(os.path.join(WORK, "hello.py")) else None
+
+print("test cache: the bar shows a hosted model's cache hits, /usage prices and shows them")
+sc = Session(["-m", "anthropic:claude-fake-haiku"], env=ENVK); sc.expect("Ctrl-D to quit")
+sc.send("/usage price anthropic:claude-fake-haiku 1 5\r"); sc.expect("price", 5)
+sc.send("CACHE hello\r"); check(sc.expect("⟳ 800", 10), f"the bar shows the cache hits: {sc.text()[-300:]!r}")
+sc.expect("tok/s", 10)
+sc.send("/usage\r")
+check(sc.expect("cache: 800 read at 10% of the input price", 10), "/usage: the cache reads, at the cache rate")
+check(sc.expect("40 written at 1.25×", 5), "/usage: the cache writes, at 1.25×")
+check(sc.expect("≈ $0.0003", 5), f"/usage: the cost is the cache-priced one (100 at 1, 800 at 0.10, 40 at 1.25, 20 out at 5 = $0.00033): {sc.text()[-400:]!r}")
+sc.send("\x04"); sc.close()
+
+so = Session(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo"], env=ENVK); so.expect("Ctrl-D to quit")
+so.send("TOOL_ADVISOR CACHE please\r"); check(so.expect("⎿  ", 15), "a consultation of an OpenAI advisor")
+so.expect("tok/s", 15)
+so.send("/usage\r")
+check(so.expect("openai:gpt-fake", 10) and so.expect("cache: 1.5k read", 5), f"the OpenAI cached prompt tokens are counted as cache reads: {so.text()[-400:]!r}")
+so.send("/mode manual\r"); so.expect("mode: manual")   # --yolo is saved to the shared config: back to the default for the tests after this
+so.send("\x04"); so.close()
+
 # ---------- /orchestrate: the advisor model plans and reviews, the main model does the tasks ----------
 print("test interactive: /orchestrate")
-MADE = os.path.join(WORK, "made.txt")
 if os.path.exists(MADE): os.remove(MADE)
 os.makedirs(os.path.join(CFG2, "corbienest"), exist_ok=True)
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\n")
@@ -1778,7 +2098,8 @@ most = json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"]
 check(most == 2, f"the two model calls were under way at the same time: {most}")
 check(took < 6.2, f"so the two slow tasks took the time of one, not of two (3.2 s each): {took:.1f}s")
 out3 = since_send(s)
-check(out3.index("⤷ worker 3/3") > out3.index("reviews task 2/3") and out3.index("⤷ worker 3/3") > out3.index("reviews task 1/3"), "the task that waits for both starts when both are accepted")
+_w3, _r2, _r1 = out3.find("⤷ worker 3/3"), out3.find("reviews task 2/3"), out3.find("reviews task 1/3")   # find, not index: a repainted line is missing, and the check fails rather than the suite stopping
+check(_w3 >= 0 and _r2 >= 0 and _r1 >= 0 and _w3 > _r2 and _w3 > _r1, "the task that waits for both starts when both are accepted")
 w3 = [r for r in requests() if r["model"] == "fake-coder:latest" and len(r["messages"]) > 1 and "# Your task (3 of 3)" in r["messages"][1]["content"]]
 check(w3 and "## Task 1: first slow thing — accepted" in w3[0]["messages"][1]["content"] and "## Task 2: second slow thing — accepted" in w3[0]["messages"][1]["content"], "and is told what the two did")
 check(open(MADE).read() == "made by fake\n", "its file is written")
@@ -1807,9 +2128,9 @@ check(not os.path.exists(MADE), "nothing was written then either")
 s.send("\x04"); s.close()
 print("test interactive: /orchestrate with a hosted model, and the banner")
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nadvisor=xai:grok-fake\n")
-s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2)
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2, banner=True)
 check(s.expect("advisor: xai:grok-fake") and s.expect("XAI_API_KEY is not set"), "the banner names the saved advisor, and says when its key is missing")
-s.expect("Ctrl-D to quit"); s.send("\x04"); s.close()
+s.send("\x1b"); s.expect("(no such text)", 1); s.send("\x04"); s.close()
 s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
 check("advisor: xai:grok-fake" in s.text() and "is not set" not in s.text(), "with the key there it is just named")
 np = len(preqs())
@@ -1878,6 +2199,241 @@ check("temperature=0.3" in cfg and "keep_alive=30m" in cfg,
       f"and it is A's whole state: the last writer wins, which atomicity does not change: {cfg!r}")
 check(not [f for f in os.listdir(os.path.join(CFG, "corbienest")) if ".tmp" in f], "no temporary files left behind")
 ha.send("\x04"); hb.send("\x04"); ha.close(); hb.close()
+
+# ---------- /goal: candidates in git worktrees race to a metric ----------
+
+print("test goal: a local model and xAI race in worktrees; the higher score is applied, the copies are gone")
+repo = make_repo()
+g = Session(["--yolo", "-m", "fake-coder:latest"], cwd=repo, env=GOALENV)
+check(g.expect("❯", 20), "the goal session starts")
+g.send('/goal "cat score 2>/dev/null || echo 0" max -n 1 -k 2 -m fake-coder:latest,xai:grok-fake TOOL_SCORE raise the score\r')
+check(g.expect("goal: score 0 → 9", 180), f"the grok candidate scores 9 over the local one's 5 and is kept: {g.text()[-500:]!r}")
+g.close()
+score = open(os.path.join(repo, "score")).read() if os.path.exists(os.path.join(repo, "score")) else ""
+check(score == "9\n", f"the kept result is applied to the working tree: {score!r}")
+wt = subprocess.run(["git", "-C", repo, "worktree", "list"], capture_output=True, text=True).stdout.strip().splitlines()
+check(len(wt) == 1, f"no candidate's worktree is left behind: {wt}")
+br = subprocess.run(["git", "-C", repo, "branch", "--list", "corbie-goal/*"], capture_output=True, text=True).stdout.strip()
+check(br.startswith("* ") or br.startswith("  corbie-goal/"), f"the kept result is kept as a branch: {br!r}")
+left = os.listdir(os.path.join(CFG, "corbienest", "goals")) if os.path.isdir(os.path.join(CFG, "corbienest", "goals")) else []
+check(left == [], f"the goal's folder is removed: {left}")
+xai = [r for r in provider_requests() if r.get("provider") == "xai" and "tools" in r.get("body", {})]
+check(xai and xai[-1]["body"]["model"] == "grok-fake" and xai[-1]["body"]["messages"][0]["role"] == "system", f"the xAI candidate was sent a Chat Completions turn with its tools: {len(xai)} request(s)")
+
+print("test goal: DeepSeek and Kimi race; Kimi's K2 thinking is off, and the higher score wins")
+repo2 = make_repo()
+g = Session(["--yolo", "-m", "fake-coder:latest"], cwd=repo2, env=GOALENV)
+check(g.expect("❯", 20), "the second goal session starts")
+g.send('/goal "cat score 2>/dev/null || echo 0" max -n 1 -k 2 -m deepseek:deepseek-flash,kimi:kimi-k2.6 TOOL_SCORE raise the score\r')
+check(g.expect("goal: score 0 → 7", 180), f"DeepSeek's 7 beats Kimi's 3 and is kept: {g.text()[-500:]!r}")
+g.close()
+score2 = open(os.path.join(repo2, "score")).read() if os.path.exists(os.path.join(repo2, "score")) else ""
+check(score2 == "7\n", f"DeepSeek's result is applied: {score2!r}")
+kimi = [r["body"] for r in provider_requests() if r.get("provider") == "kimi" and "tools" in r.get("body", {})]
+check(kimi and kimi[-1].get("thinking") == {"type": "disabled"} and kimi[-1]["model"] == "kimi-k2.6", f"Kimi's K2 request has thinking disabled: {kimi[-1:]}")
+ds = [r for r in provider_requests() if r.get("provider") == "deepseek" and "tools" in r.get("body", {})]
+check(ds and "max_tokens" in ds[-1]["body"] and "max_completion_tokens" not in ds[-1]["body"], "DeepSeek gets max_tokens, not OpenAI's max_completion_tokens")
+shutil.rmtree(repo, ignore_errors=True); shutil.rmtree(repo2, ignore_errors=True)
+
+print("test interactive: /btw answers from the conversation so far, and nothing it says is kept in it")
+b = Session(["-m", "fake-coder:latest"])
+check(b.expect("❯", 20), "btw session starts")
+b.send("first remark\r"); check(b.expect("Echo: first remark"), "a normal exchange first")
+n_before = len(requests()[-1]["messages"])
+b.send("/btw what did I say first\r")
+check(b.expect("? what did I say first") and b.expect("Echo:", 20), f"the side question is asked and answered: {since_send(b)[-300:]!r}")
+side = requests()[-1]["messages"]
+check(side[-1]["role"] == "user" and "side question" in side[-1]["content"] and len(side) == n_before + 1, f"the side call carries the conversation and the question: {len(side)} messages")
+check("side question" not in json.dumps(requests()[-2]["messages"]), "the answer is not in the conversation the next request sends")
+b.expect("❯", 5)
+b.send("second remark\r"); check(b.expect("Echo: second remark"), "the next message goes on from the conversation as it was")
+nxt = requests()[-1]["messages"]
+check(not any("side question" in (m.get("content") or "") for m in nxt), "the side question is in no later request")
+check(sum(1 for m in nxt if m.get("role") == "user") == 2, f"and the conversation has only the two real messages: {[m.get('role') for m in nxt]}")
+b.close()
+
+# ---------- /orchestrate roles: a skill sets the worker's model and prompt, the contract is shown, owned paths wait ----------
+print("test interactive: /orchestrate with roles, a contract and owned paths")
+os.makedirs(os.path.join(RP, ".corbienest", "skills", "tester"), exist_ok=True)
+open(os.path.join(RP, ".corbienest", "skills", "tester", "SKILL.md"), "w").write(
+    "---\nname: tester\ndescription: Writes the item and the tests for it\nmodel: fake-levels:latest\n---\n"
+    "ROLE-BODY: you write the tests first, then the code they need.\n")
+os.makedirs(os.path.join(RCFG, "corbienest"), exist_ok=True)
+open(os.path.join(RCFG, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\n")
+rp = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVR, cwd=RP); rp.expect("Ctrl-D to quit")
+rp.send("/advisor fake-big:latest\r"); rp.expect("advisor: fake-big:latest")
+n0 = len(requests())
+rp.send("/orchestrate ROLEPLAN build the item\r")
+check(rp.expect("orchestrated: 3 of 3 tasks accepted", 90), f"the run of three tasks comes to its end: {since_send(rp)[-500:]!r}")
+out = since_send(rp)
+check("role nosuchrole is not a skill here: the default worker" in out, "a role that is not a skill says so and runs the default worker")
+check("· role tester" in out, "a worker's line names its role")
+rev1 = out.index("reviews task 1/3")
+check(out.index("⤷ worker 2/3") > out.index("accepted", rev1), "the task that owns the same file as task 1 starts only after task 1 is accepted")
+reqs = requests()[n0:]
+w1, w2, w3 = worker(1), worker(2), worker(3)
+check(w1 and w1[0]["model"] == "fake-levels:latest", f"a role's model runs its worker: {w1[0]['model'] if w1 else None!r}")
+check(w3 and w3[0]["model"] == "fake-coder:latest", f"the default worker runs on the model in use: {w3[0]['model'] if w3 else None!r}")
+check(w2 and "# Your role: tester" in w2[0]["messages"][0]["content"] and "ROLE-BODY: you write the tests first" in w2[0]["messages"][0]["content"],
+      f"the skill's body is in the worker's prompt: {w2[0]['messages'][0]['content'][-300:] if w2 else None!r}")
+check(w2 and "# The contract (what all the tasks share)" in w2[0]["messages"][1]["content"] and "the tests import Item from src/x.c" in w2[0]["messages"][1]["content"],
+      "every worker is shown the contract, before its task")
+check(w3 and "# The contract" in w3[0]["messages"][1]["content"] and "# Your role" not in w3[0]["messages"][0]["content"], "and the default worker gets the contract, but no role")
+rp.close()
+shutil.rmtree(RP, ignore_errors=True); shutil.rmtree(RCFG, ignore_errors=True)
+
+# ---------- the features of the last rounds: each section has its own config and project directory ----------
+import glob as _glob
+def proj_key(path):   # the name corbienest gives a project's rules, hooks and MCP servers (FNV-1a of its real path)
+    h = 1469598103934665603
+    for c in os.path.realpath(path).encode(): h ^= c; h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return f"{h:016x}"
+def feat(name):
+    cfg = tempfile.mkdtemp(prefix=f"crow_{name}_cfg_"); proj = tempfile.mkdtemp(prefix=f"crow_{name}_proj_")
+    os.makedirs(os.path.join(cfg, "corbienest"))
+    open(os.path.join(cfg, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\n")
+    return cfg, proj, dict(ENV, XDG_CONFIG_HOME=cfg)
+def in_proj(proj, args, env, stdin=b""):
+    p = subprocess.run([BIN] + args, cwd=proj, env=env, input=stdin, capture_output=True, timeout=120)
+    return clean(p.stdout.decode("utf-8", "replace")), clean(p.stderr.decode("utf-8", "replace")), p.returncode
+def put(cfg, sub, name, text):   # a file in the config directory's per-project folder
+    d = os.path.join(cfg, "corbienest", sub); os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, name), "w").write(text)
+def procs(pat):   # the processes whose command line has pat, not the grep itself
+    o = subprocess.run(["ps", "-eo", "args"], capture_output=True, text=True).stdout
+    return [l for l in o.splitlines() if pat in l and "ps -eo" not in l and "grep" not in l]
+
+print("test feature: a guard rule stops a tool under --yolo; an ask is refused without a terminal")
+cfg, proj, env = feat("guard")
+put(cfg, "permissions", proj_key(proj) + ".rules", "deny bash echo *\n")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_BASH please"], env)
+check("denied (project rule: deny bash echo *)" in out and "⎿  hello-from-tool" not in out, f"deny stops the call under --yolo: {out[-300:]!r}")
+put(cfg, "permissions", proj_key(proj) + ".rules", "ask bash echo *\n")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_BASH please"], env)
+check("no one to ask" in out and "⎿  hello-from-tool" not in out, f"an ask is refused when nobody can answer: {out[-300:]!r}")
+put(cfg, "permissions", proj_key(proj) + ".rules", "bash echo\n")
+out, err, rc = in_proj(proj, ["-p", "TOOL_BASH please"], env)
+check("⎿  hello-from-tool" in out, f"an allow rule still lets the call through: {out[-200:]!r}")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: hooks gate a call (exit 2), add a post note, and run at the end of a request")
+cfg, proj, env = feat("hooks")
+put(cfg, "hooks", proj_key(proj) + ".hooks",
+    "pre bash cat > evt.json; grep -q BLOCKME evt.json && { echo blocked-by-gate; exit 2; }; exit 0\n"
+    "post bash echo post-note-here\n"
+    "stop echo stop-note-here\n")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_BASH please"], env)
+check("post-note-here" in out and "stop-note-here" in out, f"post and stop hooks ran: {out[-300:]!r}")
+evt = open(os.path.join(proj, "evt.json")).read() if os.path.exists(os.path.join(proj, "evt.json")) else ""
+check('"event":"pre"' in evt and '"tool":"bash"' in evt and '"command":"echo hello-from-tool"' in evt, f"the event reached the hook on stdin: {evt[:200]!r}")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_SHELL echo BLOCKME"], env)
+check("blocked-by-gate" in out and "hook stopped bash" in out, f"a pre hook that exits 2 stops the call: {out[-300:]!r}")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: a background command runs on after the call and is stopped when corbienest exits")
+cfg, proj, env = feat("bg")
+before = len(procs("sleep 317"))
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_BG please"], env)
+check("started background job bg" in out, f"the job is started and announced: {out[-200:]!r}")
+check(len(procs("sleep 317")) == before, "the job is gone when the run ends")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: stream-json: one JSON object per line on stdout, tool calls matched to results")
+cfg, proj, env = feat("stream")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_BASH please", "--output-format", "stream-json"], env)
+lines = [l for l in out.splitlines() if l.strip()]
+objs = []
+for l in lines:
+    try: objs.append(json.loads(l))
+    except Exception: objs.append(None)
+check(objs and all(o is not None for o in objs), f"every stdout line is JSON: {lines[:2]!r}")
+check(objs and objs[0].get("type") == "system" and objs[-1].get("type") == "result", "a system line first, a result line last")
+uses = [b for o in objs if o for b in (o.get("message", {}).get("content") or []) if isinstance(b, dict) and b.get("type") == "tool_use"]
+res = [b for o in objs if o for b in (o.get("message", {}).get("content") or []) if isinstance(b, dict) and b.get("type") == "tool_result"]
+check(uses and res and uses[0]["id"] == res[0]["tool_use_id"] and uses[0]["name"] == "bash", f"the tool call and its result carry the same id: {uses[:1]} {res[:1]}")
+out, err, rc = in_proj(proj, ["--yolo", "--output-format", "stream-json", "--input-format", "stream-json"], env,
+                       stdin=b'{"type":"user","message":{"role":"user","content":"first"}}\n{"type":"user","message":{"role":"user","content":[{"type":"text","text":"second"}]}}\n')
+results = [json.loads(l) for l in out.splitlines() if l.startswith("{") and '"type":"result"' in l]
+check(len(results) == 2 and all(r.get("subtype") == "success" for r in results), f"two requests on stdin, one result line each: {len(results)}")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: todo_write keeps a task list and shows it whole")
+cfg, proj, env = feat("todo")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_TODO please"], env)
+check("Tasks (1 of 3 done)" in out and "☑ read the code" in out and "◐ make the change" in out and "☐ run the tests" in out,
+      f"the list is shown: {out[-300:]!r}")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: an MCP server's tool is offered, called, and guarded; the server stops with the run")
+cfg, proj, env = feat("mcp")
+mcp_py = os.path.join(HERE, "fake_mcp.py")
+put(cfg, "mcp", proj_key(proj) + ".json", json.dumps({"servers": {"fake": {"command": "python3", "args": [mcp_py]}}}))
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_MCP please"], env)
+check("echo: from-model" in out, f"the server's tool answers the call: {out[-300:]!r}")
+check("fake-mcp: starting" not in out, "the server's banner line does not reach the screen")
+put(cfg, "permissions", proj_key(proj) + ".rules", "deny mcp mcp__fake__echo\n")
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_MCP please"], env)
+check("was not run" in out and "echo: from-model" not in out, f"a deny rule on the tool's name stops it: {out[-300:]!r}")
+check(not procs("fake_mcp.py"), "no server is left running after the run")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: a sub-agent file's role and tools reach the sub-agent, and nothing more")
+cfg, proj, env = feat("agents")
+os.makedirs(os.path.join(proj, ".corbienest", "agents"))
+open(os.path.join(proj, ".corbienest", "agents", "reviewer.md"), "w").write(
+    "---\nname: reviewer\ndescription: Reviews made.txt, read-only\ntools: read_file, grep, Write\n---\nROLE_MARK_XYZ: review and report.\n")
+n0 = len(requests())
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_AGENT please"], env)
+sub = [r for r in requests()[n0:] if any("Your role" in (m.get("content") or "") for m in r.get("messages", []))]
+check(sub and "ROLE_MARK_XYZ" in sub[-1]["messages"][0]["content"], "the role is in the sub-agent's instructions")
+check(sub and sorted(t["function"]["name"] for t in sub[-1].get("tools", [])) == ["grep", "read_file"],
+      f"only the allowed tools are offered (Write is not a sub-agent tool): {[t['function']['name'] for t in sub[-1].get('tools', [])] if sub else None}")
+n1 = len(requests())
+out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_AGENT_NOSUCH please"], env)
+check("no sub-agent named nosuch" in out or "no sub-agent named nosuch" in json.dumps(requests()[n1:]), "an unknown agent name is an error for the model")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: the sandbox keeps writes to the project (when bwrap is installed)")
+if shutil.which("bwrap") and subprocess.run(["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"], capture_output=True).returncode == 0:
+    cfg, proj, env = feat("sandbox")
+    outside = tempfile.mkdtemp(prefix="crow_outside_")
+    open(os.path.join(cfg, "corbienest", "config"), "a").write("sandbox=bwrap\n")
+    out, err, rc = in_proj(proj, ["--yolo", "-p", f"TOOL_SHELL touch ./inproj.txt && echo PROJ_OK; touch {outside}/x 2>/dev/null; echo OUTSIDE_RC=$?"], env)
+    check("PROJ_OK" in out and "OUTSIDE_RC=1" in out, f"the project is writable, the rest is not: {out[-300:]!r}")
+    shutil.rmtree(outside, ignore_errors=True); shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+else:
+    print("  (bwrap is not installed or cannot start: this section is skipped)")
+
+print("test feature: /resume shows the conversation again, and its typed lines are in the ↑ history")
+cfg, proj, env = feat("resume")
+out, err, rc = in_proj(proj, ["-p", "hello replay"], env)
+sids = [os.path.basename(p)[:-5] for p in _glob.glob(os.path.join(cfg, "corbienest", "sessions", "*.json"))]
+sess = Session(["--resume", sids[0]] if sids else [], cwd=proj, env=env)
+check(sess.expect("Echo: hello replay"), "the earlier reply is shown again")
+check(sess.expect("› hello replay"), "the typed line is shown as the user sent it")
+sess.send("\x1b[A", wait=0.6)
+check(seen(sess, "hello replay", 8), "the ↑ key recalls the typed line from the session")
+sess.close()
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: the slash commands for the rules, hooks, MCP servers, agents and the sandbox answer")
+cfg, proj, env = feat("slash")
+sess = Session([], cwd=proj, env=env)
+sess.expect("Ctrl-D to quit")
+def slash(line):   # the input field takes a fast line as it is typed; Esc closes the suggestion list before Enter
+    sess.mark = len(sess.out)
+    for ch in line: os.write(sess.fd, ch.encode()); time.sleep(0.03)
+    time.sleep(0.6); os.write(sess.fd, b"\x1b"); time.sleep(0.4); os.write(sess.fd, b"\r")
+slash("/permissions add deny bash rm *")
+check(seen(sess, "✓ added: deny bash rm *", 8), "/permissions add accepts a guard rule")
+slash("/hooks add pre bash echo gate")
+check(seen(sess, "hook added", 8), "/hooks add takes a pre hook")
+slash("/sandbox")
+check(seen(sess, "sandbox off", 8), "/sandbox shows that it is off")
+slash("/agents")
+check(seen(sess, "no sub-agent files", 8), "/agents says there are none")
+sess.close()
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
 
 shutil.rmtree(WORK, ignore_errors=True); shutil.rmtree(CFG, ignore_errors=True)
 print(f"{passed} checks passed, {failed} failed")

@@ -3,6 +3,7 @@
  * an interactive list picker, and a streaming markdown-ish printer. */
 #define _GNU_SOURCE
 #include "common.h"
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -18,6 +19,8 @@
 
 static struct termios g_orig;
 static bool g_have_orig = false, g_raw = false;
+bool g_ui_nc = false;   /* the notcurses frontend is the screen (term_nc.c): every term_* below that differs asks it */
+bool term_confirm_quiet = false;   /* see common.h */
 static int vis_width(const char *s);   /* display width of a UTF-8 string, ignoring SGR escapes */
 static volatile sig_atomic_t g_winch = 0;
 static void sb_hook_stdout(void);       /* scrollback capture (see "scrollback" below) */
@@ -99,13 +102,14 @@ static ssize_t in_read(void *buf, size_t n) {
 
 void term_init(void) {
     trace_open();
+    if (g_ui_nc) { atexit(term_restore); return; }   /* notcurses sets up its own signals and terminal */
     if (tcgetattr(STDIN_FILENO, &g_orig) == 0) g_have_orig = true;
     signal(SIGWINCH, on_winch);
     atexit(term_restore);
 }
 
 void term_raw(bool on) {
-    if (!g_have_orig) return;
+    if (g_ui_nc || !g_have_orig) return;   /* notcurses keeps the terminal in its own mode */
     if (on && !g_raw) {
         struct termios t = g_orig;
         t.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
@@ -121,6 +125,7 @@ void term_raw(bool on) {
 }
 
 void term_restore(void) {
+    if (g_ui_nc) { nc_stop(); return; }
     term_fullscreen(false);
     if (g_raw) {
         fputs("\x1b[?2004l" C_RESET, stdout);   /* disable bracketed paste */
@@ -130,6 +135,7 @@ void term_restore(void) {
 }
 
 void term_size(int *rows, int *cols) {
+    if (g_ui_nc && nc_size(rows, cols)) return;
     struct winsize ws;
     int r = 24, c = 80;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) { if (ws.ws_row > 0) r = ws.ws_row; if (ws.ws_col > 0) c = ws.ws_col; }
@@ -144,6 +150,7 @@ enum {
     K_PGUP, K_PGDN, K_ALT_ENTER, K_ESC, K_PASTE_START, K_PASTE_END, K_ALT_B, K_ALT_F, K_ALT_BS,
     K_CTRL_LEFT, K_CTRL_RIGHT, K_SHIFT_TAB,
     K_WHEEL_UP, K_WHEEL_DOWN,   /* the mouse wheel, over the conversation */
+    K_BANNER_X,                 /* the close button of the banner's modal: a click on it */
     K_MOUSE,                    /* any other mouse report: nothing acts on it */
     K_MOUSE_X10                 /* the old three-byte report: its bytes are still to come */
 };
@@ -163,10 +170,14 @@ static struct timeval g_live_t;             /* last live redraw (throttle) */
 static const char *g_busy = NULL;           /* activity label shown (animated) in the bar; NULL = idle */
 static int  g_busy_frame = 0;
 static struct timeval g_busy_t;             /* last spinner advance (throttle) */
-static const char *BUSY_SPIN[] = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 static int g_queue_n;                       /* messages queued while busy (see term_queue_*) */
 static int  g_view_top = -1;                /* scrolled back: the first row shown (see "scrolling back"); -1 = the live view */
 static bool g_view_stale = false;           /* ... and its window has to be painted again (the geometry changed) */
+static char *g_ov_text = NULL;              /* the overlay's text (term_overlay_show): a centred window over the conversation; NULL = none */
+/* the banner's modal (term_banner_show): the box's lines, drawn as they are, with the close button at (g_bn_xr, g_bn_xc) */
+static bool g_banner_on = false;
+static sbuf *g_bn = NULL;
+static int g_bn_n = 0, g_bn_bw = 0, g_bn_xr = -1, g_bn_xc0 = -1, g_bn_xc1 = -1;
 static char g_view_hint[200];               /* ... and what the line under that window says meanwhile */
 static bool field_shown(void);              /* the terminal is tall enough for the input field (else only the bar is kept) */
 
@@ -181,14 +192,8 @@ void fmt_tokens(long n, char *out, size_t sz) {
 
 /* Appends the status bar text, at most `cols - 1` visible columns wide. Segments are
  * dropped from the right when the terminal is narrow. */
-static void bar_build(sbuf *o, int cols) {
-    if (g_view_top >= 0 && !field_shown()) {   /* scrolled back on a terminal too short for a line that says so (view_note): the bar does */
-        sbuf t; sb_init(&t);
-        if (g_busy) sb_printf(&t, "%s %s · ", BUSY_SPIN[g_busy_frame % 10], g_busy);
-        sb_puts(&t, g_view_hint);
-        if (vis_width(t.data) > cols - 1) { t.len = vis_offset(t.data, t.len, cols - 2); t.data[t.len] = 0; sb_puts(&t, "…"); }
-        sb_printf(o, C_DIM "%s" C_RESET, t.data); sb_free(&t); return;
-    }
+/* the mode, as the field's rule shows it: an icon, its name, and how to switch it */
+static void mode_text(sbuf *o, bool hint) {
     const char *icon, *col, *text;
     switch (g_cfg.mode) {
         case MODE_ACCEPT_EDITS: icon = "⏵⏵"; col = C_ORANGE; text = "accept edits on"; break;
@@ -196,65 +201,104 @@ static void bar_build(sbuf *o, int cols) {
         case MODE_AUTO:         icon = "⏵⏵"; col = C_RED;    text = "auto mode on";    break;
         default:                icon = "⏵ "; col = C_DIM;    text = "manual mode";     break;
     }
-    const char *model = g_cfg.model ? g_cfg.model : "(no model)";
+    sb_printf(o, "%s%s %s" C_RESET, col, icon, text);
+    if (hint) sb_printf(o, "\x1b[38;5;240m (shift+tab to cycle)" C_RESET);   /* a dark grey, more muted than the dim text beside it */
+}
+/* the mode for the field's lower rule: with its hint when the row has room for it, without when it has not */
+int term_mode_text(sbuf *o, int cols) {
+    for (int hint = 1; hint >= 0; hint--) {
+        sbuf m; sb_init(&m); mode_text(&m, hint);
+        int mw = vis_width(m.data);
+        if (mw + 2 <= cols) { sb_append(o, m.data, m.len); sb_free(&m); return mw; }
+        sb_free(&m);
+    }
+    return 0;
+}
+
+/* the model's name as the bar shows it: the provider's prefix and a ":latest" tag are dropped
+ * ("anthropic:claude-haiku-5-5" is "claude-haiku-5-5"; "qwen3:latest" is "qwen3") */
+static void model_short(char *out, size_t n, const char *m) {
+    const char *p = m;
+    if (strchr(m, ':') && provider_find(m, NULL)) p = strchr(m, ':') + 1;
+    snprintf(out, n, "%s", p);
+    size_t l = strlen(out);
+    if (l > 7 && !strcmp(out + l - 7, ":latest")) out[l - 7] = 0;
+}
+
+/* the folder (the path is cut from the left) and the git branch, in the muted rose, within maxw columns */
+static void loc_text(sbuf *o, int maxw) {
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, "?");
+    char br[128] = "";
+    char tail[160] = "";
+    if (git_branch(cwd, br, sizeof br) == 1) snprintf(tail, sizeof tail, "  · branch %s", br);
+    size_t w = maxw > 1 ? (size_t)maxw : 1, pl = strlen(cwd), tl = strlen(tail);
+    if (tl > w) tail[w] = 0, tl = w;
+    char shown[4200];
+    if (pl + tl > w) {
+        size_t keep = w > tl + 1 ? w - tl - 1 : 0;   /* one column for the … */
+        if (keep > pl) keep = pl;
+        const char *q = cwd + (pl - keep);
+        while (*q && (*q & 0xC0) == 0x80) q++;   /* not in the middle of a character */
+        snprintf(shown, sizeof shown, "…%s", q);
+    } else snprintf(shown, sizeof shown, "%s", cwd);
+    sb_printf(o, "%s%s%s" C_RESET, th_fg(g_theme->loc), shown, tail);   /* the location line: a muted rose, a tint not an accent */
+}
+
+static void bar_build(sbuf *o, int cols) {
+    if (g_view_top >= 0 && !field_shown()) {   /* scrolled back on a terminal too short for a line that says so (view_note): the bar does */
+        sbuf t; sb_init(&t);
+        sb_puts(&t, g_view_hint);
+        if (vis_width(t.data) > cols - 1) { t.len = vis_offset(t.data, t.len, cols - 2); t.data[t.len] = 0; sb_puts(&t, "…"); }
+        sb_printf(o, C_DIM "%s" C_RESET, t.data); sb_free(&t); return;
+    }
+    char mshort[200];
+    const char *model = "(no model)";
+    if (g_cfg.model && *g_cfg.model) { model_short(mshort, sizeof mshort, g_cfg.model); model = mshort; }
     char mbuf[384];   /* an effort that was set goes with the model's name: it is a large part of how fast it answers */
-    const char *eff = g_cfg.model ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
+    const char *eff = g_cfg.model && *g_cfg.model ? effort_resolve(&g_model_info, effort_get(g_cfg.model), NULL) : NULL;
     if (eff) { snprintf(mbuf, sizeof mbuf, "%s · %s", model, eff); model = mbuf; }
     char tin[32], tout[32], ttot[32];
     long out_now = g_session.eval_tokens + g_live_out;
-    fmt_tokens(g_session.prompt_tokens, tin, sizeof tin);
+    /* the input the model read is the total: the part it had from the prompt cache is shown on its own (⟳), so ↑ is what was billed as input */
+    long cached = g_session.cache_read > 0 ? g_session.cache_read : 0;
+    fmt_tokens(g_session.prompt_tokens - cached, tin, sizeof tin);
     fmt_tokens(out_now, tout, sizeof tout);
     fmt_tokens(g_session.prompt_tokens + out_now, ttot, sizeof ttot);
     char ctx[32] = "";
     if (g_cfg.num_ctx > 0 && g_session.last_prompt_tokens > 0)
         snprintf(ctx, sizeof ctx, "ctx %d%%", (int)(100.0 * g_session.last_prompt_tokens / g_cfg.num_ctx));
-    /* segments in priority order: mode, model, tokens, ctx, hint */
-    char seg_tok[96], seg_tok_long[128];
+    /* segments in priority order: model, tokens, ctx; then the queue. The folder and branch are at the right end. */
+    char seg_tok[96], seg_tok_long[192];
     snprintf(seg_tok, sizeof seg_tok, "%s tokens", ttot);
-    snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens (↑%s ↓%s)", ttot, tin, tout);
-    const char *hint = "(shift+tab to cycle)";
-    int room = cols - 1;
-    int used = 0;
+    if (cached) { char tc[32]; fmt_tokens(cached, tc, sizeof tc); snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens (↑%s ⟳ %s ↓%s)", ttot, tin, tc, tout); }
+    else snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens (↑%s ↓%s)", ttot, tin, tout);
     #define SEP_W 3   /* " │ " */
-    /* activity indicator (right-aligned) is reserved first: it must never be squeezed out */
-    char busy[128] = ""; int busy_w = 0;
-    if (g_busy) {
-        snprintf(busy, sizeof busy, "%s %s", BUSY_SPIN[g_busy_frame % 10], g_busy);
-        busy_w = vis_width(busy);
-        if (busy_w + SEP_W + 24 <= room) room -= busy_w + SEP_W; else busy_w = 0;
-    }
-    /* mode segment (icon is 2 cells + space), followed by the how-to-switch hint.
-     * (What is being typed while the model works is shown in the input field above.) */
-    sb_printf(o, " %s%s %s" C_RESET, col, icon, text);
-    used = 1 + 3 + vis_width(text);
-    {
-        int hw = vis_width(hint);
-        if (used + 1 + hw + 20 <= room) { sb_printf(o, C_DIM " %s" C_RESET, hint); used += 1 + hw; }
-    }
+    /* the folder and branch take the right end; the segments have what is left */
+    sbuf loc; sb_init(&loc);
+    loc_text(&loc, (cols - 1) * 2 / 3);   /* two thirds of the row at most: the branch stays whole where it can */
+    int lw = vis_width(loc.data ? loc.data : "");
+    int room = cols - 1 - (lw ? lw + 1 : 0);
+    int used = 0;
+    sb_puts(o, " "); used = 1;
     /* model (truncate if needed) */
     {
         int mw = vis_width(model), avail = room - used - SEP_W;
         if (avail >= 6) {
-            sb_puts(o, C_DIM " │ " C_RESET);
-            if (mw <= avail) { sb_puts(o, model); used += SEP_W + mw; }
+            sb_puts(o, " ");
+            if (mw <= avail) { sb_puts(o, model); used += 1 + mw; }
             else {   /* keep the tail, e.g. ":7b" is more useful than the registry prefix */
                 int cut = mw - (avail - 1);
                 const char *p = model; while (cut > 0 && *p) { if (((unsigned char)p[1] & 0xC0) != 0x80) cut--; p++; }
                 while (*p && ((unsigned char)*p & 0xC0) == 0x80) p++;
-                sb_printf(o, "…%s", p); used += SEP_W + avail;
+                sb_printf(o, "…%s", p); used += 1 + avail;
             }
         }
     }
-    /* queued messages (typed + Enter while the model was busy) */
-    if (g_queue_n) {
-        char q[32]; snprintf(q, sizeof q, "%d queued", g_queue_n);
-        int qw = vis_width(q), avail = room - used - SEP_W;
-        if (qw <= avail) { sb_puts(o, C_DIM " │ " C_RESET); sb_printf(o, C_ORANGE "%s" C_RESET, q); used += SEP_W + qw; }
-    }
     /* tokens */
     {
-        int lw = vis_width(seg_tok_long), sw = vis_width(seg_tok), avail = room - used - SEP_W;
-        const char *pick = lw <= avail ? seg_tok_long : sw <= avail ? seg_tok : NULL;
+        int lw2 = vis_width(seg_tok_long), sw = vis_width(seg_tok), avail = room - used - SEP_W;
+        const char *pick = lw2 <= avail ? seg_tok_long : sw <= avail ? seg_tok : NULL;
         if (pick) {
             sb_puts(o, C_DIM " │ " C_RESET);
             if (g_live_out) sb_printf(o, C_ORANGE "%s" C_RESET, pick); else sb_puts(o, pick);
@@ -270,10 +314,17 @@ static void bar_build(sbuf *o, int cols) {
             used += SEP_W + cw;
         }
     }
-    if (busy_w) {
-        for (int i = used; i < room; i++) sb_putc(o, ' ');
-        sb_printf(o, C_DIM " │ " C_RESET C_ORANGE "%s" C_RESET, busy);
+    /* queued messages (typed + Enter while the model was busy) */
+    if (g_queue_n) {
+        char q[32]; snprintf(q, sizeof q, "%d queued", g_queue_n);
+        int qw = vis_width(q), avail = room - used - SEP_W;
+        if (qw <= avail) { sb_puts(o, C_DIM " │ " C_RESET); sb_printf(o, C_ORANGE "%s" C_RESET, q); used += SEP_W + qw; }
     }
+    if (lw) {
+        for (int i = used; i < cols - 1 - lw; i++) sb_putc(o, ' ');
+        sb_append(o, loc.data, loc.len);
+    }
+    sb_free(&loc);
     #undef SEP_W
 }
 
@@ -300,6 +351,17 @@ static const char *g_field_prompt = NULL;   /* NULL = FIELD_PROMPT (the editor o
 static const char *field_prompt(void) { return g_field_prompt ? g_field_prompt : FIELD_PROMPT; }
 static int  g_field_rows = 1;          /* input rows the field currently shows */
 static bool g_field_focus = false;     /* the editor owns the terminal cursor */
+/* The cursor while a turn runs rests in the input field, on the type-ahead's caret, so the user sees where
+ * typing goes. Conversation output is written at the transcript's end, so the cursor is moved there first
+ * (sb_write_fn) and parked back afterwards. g_away: the cursor is not known to be at the transcript's end.
+ * g_no_park: a question or menu is up and owns the cursor. */
+static bool g_away = false;
+static int  g_no_park = 0;
+static int  g_ta_caret_row = -1, g_ta_caret_col = 0;   /* the type-ahead's caret, 1-based, as field_draw put it */
+static bool want_box(void);
+static void transcript_move(sbuf *o, bool flush);
+static void box_move(sbuf *o);
+static void chrome_park(sbuf *o);
 static const char *g_field_text = "";  /* text shown in the field (the editor's buffer) */
 static size_t g_field_len = 0, g_field_cur = 0;
 static int  g_field_view = 0;          /* first visible wrapped row, when the text is taller */
@@ -313,6 +375,13 @@ static int    g_sug_sel = -1;          /* the highlighted one; -1 = none, the li
 static int    g_sug_top = 0;           /* first one shown, when there are more than fit */
 static size_t g_sug_from = 0;          /* where the word they would replace starts */
 static int    g_sug_rows = 0;          /* rows of the chrome the list holds */
+/* the agents strip: the running sub-agents, one row each, between the field and the status bar (main.c
+ * supplies the lines through term_agents_strip). g_strip_sel is the row the keys are on (-1: the field). */
+#define STRIP_MAX 4
+static sbuf g_strip;
+static int  g_strip_rows = 0, g_strip_sel = -1;
+int  (*term_agents_strip)(sbuf *o, int cols, int max) = NULL;
+void (*term_agents_open)(int idx) = NULL;
 static char  *g_ta_sug_for = NULL;     /* the list is the type-ahead's (the model is working): the text it is for */
 static void sug_draw(sbuf *o, int row);
 static void sug_clear(void);
@@ -325,45 +394,69 @@ static bool ta_sug_key(int k);
  * (view_note). On a terminal too short to spare them, only the bar is kept. */
 #define FIELD_MIN_ROWS 6
 static bool field_shown(void) { return g_fs && g_fs_rows >= FIELD_MIN_ROWS; }
-static int fs_reserved_for(int rows) { return g_fs && rows >= FIELD_MIN_ROWS ? g_field_rows + 3 + g_sug_rows + (g_view_top >= 0) : 1; }
+static int fs_reserved_for(int rows) { return g_fs && rows >= FIELD_MIN_ROWS ? g_field_rows + 3 + g_sug_rows + g_strip_rows + (g_view_top >= 0) : 1; }
 static int fs_reserved(void) { return fs_reserved_for(g_fs_rows); }
 /* last row of the scrolling region (the conversation) */
 static int fs_region(void) { int r = g_fs_rows - fs_reserved(); return r < 1 ? 1 : r; }
 
-/* (row, col) reached after `len` bytes of `s`, starting at column `col0`, wrapping at
- * `width`. Shared by the field and the editor's cursor arithmetic. */
-static void wrap_pos(const char *s, size_t len, int width, int col0, int *row, int *col) {
+/* The field's text wrapped at `width` columns, starting at column `col0`, at word boundaries: a row breaks
+ * after its last space, and a word longer than a row is cut. Walks the text once: the (row, col) reached
+ * at byte `target`, and the byte where row `want` starts (-1 when `want` is not reached: start_out is then
+ * len). Shared by the ANSI field, the editor's cursor arithmetic and the notcurses field (term_wrap). */
+void term_wrap(const char *s, size_t len, int width, int col0, size_t target, int want, size_t *start_out, int *row_out, int *col_out) {
     if (width < 1) width = 1;
     int r = 0, c = col0;
     if (c >= width) { r = c / width; c %= width; }
-    for (size_t i = 0; i < len; ) {
-        if (s[i] == '\n') { r++; c = 0; i++; continue; }
+    size_t rowstart = 0, brk = (size_t)-1;   /* brk: byte after the last space of this row (a break point) */
+    int brk_c = 0;                           /* the column that break point is at */
+    size_t start = len; bool have_start = false;
+    if (want == 0) { start = 0; have_start = true; }
+    size_t i = 0;
+    while (i <= len) {
+        if (i == target || i == len) break;
+        unsigned char ch = (unsigned char)s[i];
+        if (ch == '\n') {
+            r++; c = 0; i++; rowstart = i; brk = (size_t)-1;
+            if (!have_start && r == want) { start = i; have_start = true; }
+            continue;
+        }
+        size_t nx = u8_next(s, i, len);
+        if (c + 1 > width) {                 /* the character does not fit: break at the last space, or cut here */
+            if (brk != (size_t)-1 && brk > rowstart) {
+                r++; c = c - brk_c; rowstart = brk; brk = (size_t)-1;
+                if (!have_start && r == want) { start = rowstart; have_start = true; }
+            } else {
+                r++; c = 0; rowstart = i;
+                if (!have_start && r == want) { start = i; have_start = true; }
+            }
+        }
         c++;
-        if (c >= width) { r++; c = 0; }
-        i = u8_next(s, i, len);
+        if (ch == ' ') { brk = nx; brk_c = c; }
+        i = nx;
     }
-    *row = r; *col = c;
+    if (c >= width) { /* the cursor at the very edge of a full row stays on it */ }
+    *row_out = r; *col_out = c;
+    if (start_out) *start_out = have_start ? start : len;
+}
+static void wrap_pos(const char *s, size_t len, int width, int col0, int *row, int *col) {
+    term_wrap(s, len, width, col0, len, -1, NULL, row, col);
 }
 
 /* byte offset where wrapped row `want` of the field text starts */
 static size_t field_row_start(int width, int col0, int want) {
     if (want <= 0) return 0;
-    if (width < 1) width = 1;
-    int r = 0, c = col0;
-    if (c >= width) { r = c / width; c %= width; }
-    for (size_t i = 0; i < g_field_len; ) {
-        if (g_field_text[i] == '\n') { r++; c = 0; i++; if (r == want) return i; continue; }
-        c++;
-        size_t nx = u8_next(g_field_text, i, g_field_len);
-        if (c >= width) { r++; c = 0; if (r == want) return nx; }
-        i = nx;
-    }
-    return g_field_len;
+    size_t st = g_field_len; int r, c;
+    term_wrap(g_field_text, g_field_len, width, col0, g_field_len, want, &st, &r, &c);
+    return st;
 }
 
 /* How many rows the current field text needs, and where its cursor sits. */
+/* the field is a box: "│ " before its text and " │" after it, so the text starts at column FIELD_X0 + 1
+ * and is field_width() columns wide */
+#define FIELD_X0 2
+static int field_width(void) { int w = g_fs_cols - 2 * FIELD_X0; return w > 2 ? w : 2; }
 static void field_metrics(int *need, int *crow, int *ccol) {
-    int width = g_fs_cols > 2 ? g_fs_cols : 2;
+    int width = field_width();
     int plen = vis_width(field_prompt());
     int erow, ecol;
     wrap_pos(g_field_text, g_field_len, width, plen, &erow, &ecol);
@@ -399,11 +492,14 @@ static bool field_sync_rows(void) {
     return true;
 }
 
-static void rule_row(sbuf *o, int row) {
-    sb_printf(o, "\x1b[%d;1H" C_DIM, row);
-    for (int i = 0; i < g_fs_cols; i++) sb_puts(o, "─");
-    sb_puts(o, C_RESET "\x1b[K");
-}
+/* A paste of more than a few lines is shown in the field as a token, "[Pasted text #K +N lines]",
+ * and the text is kept here until the prompt is submitted (paste_expand() puts it back). */
+#define PASTE_MAX 16
+typedef struct { char *text; int lines; } paste_rec;
+static paste_rec g_paste[PASTE_MAX]; static int g_paste_n = 0;   /* this prompt's pastes, K = index + 1 */
+static void paste_reset(void) { for (int i = 0; i < g_paste_n; i++) free(g_paste[i].text); g_paste_n = 0; }
+
+static bool g_ready = false;   /* the top-level prompt is waiting: the field's rules are green and say [ready] */
 
 /* The line the conversation gets under it while it is scrolled back: where the window is and how
  * to get back. It is a row of its own, which the region gives up for as long as one reads. The
@@ -415,7 +511,7 @@ static void view_note(sbuf *o, int row) {
     sb_puts(o, C_RESET "\x1b[K");
 }
 
-static int field_top(void) { return g_fs_rows - g_field_rows - 2 - g_sug_rows; }   /* row of the upper rule */
+static int field_top(void) { return g_fs_rows - g_field_rows - 2 - g_sug_rows - g_strip_rows; }   /* row of the upper rule (the bar is the last row, below the field's lower rule and the suggestions) */
 
 /* Append text[from, from + n) with the "@path" mentions that name something that is there in
  * colour: a mention that took is one the message will carry, and one that did not is a typo
@@ -425,14 +521,18 @@ static int field_top(void) { return g_fs_rows - g_field_rows - 2 - g_sug_rows; }
 static int field_mentions(const char *text, size_t len, size_t (*sp)[2]) {
     return len && text[0] != '/' && text[0] != '!' ? mention_spans(text, len, sp, MENTION_MAX) : 0;
 }
-static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_t (*sp)[2], int ns) {
+/* what is typed in the field: the theme's text colour on the window's own background (no fill; notcurses does the same) */
+static void put_field_on(sbuf *o) { sb_puts(o, th_fg(g_theme->field_text)); }
+/* kind[i] 1 = a paste token (reverse video), anything else a mention (cyan); kind may be NULL */
+static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_t (*sp)[2], const int *kind, int ns) {
     size_t at = from, end = from + n;
     for (int i = 0; i < ns && at < end; i++) {
         if (sp[i][1] <= at) continue;
         if (sp[i][0] >= end) break;
         size_t a = sp[i][0] > at ? sp[i][0] : at, b = sp[i][1] < end ? sp[i][1] : end;
         sb_append(o, text + at, a - at);
-        sb_puts(o, C_CYAN); sb_append(o, text + a, b - a); sb_puts(o, "\x1b[39m");
+        if (kind && kind[i] == 1) { sb_puts(o, "\x1b[7m"); sb_append(o, text + a, b - a); sb_puts(o, "\x1b[27m"); }
+        else { sb_puts(o, C_CYAN); sb_append(o, text + a, b - a); sb_puts(o, th_fg(g_theme->field_text)); }
         at = b;
     }
     if (at < end) sb_append(o, text + at, end - at);
@@ -442,49 +542,113 @@ static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_
  * is not the one holding the field (i.e. the model is working). A field that shrinks hands
  * its upper rows back to the conversation; layout_sync() paints those again, so nothing the
  * field drew there stays behind. */
+/* the top or bottom edge of the field: rounded corners, green while the prompt waits */
+static void field_edge(sbuf *o, int row, bool top) {
+    sb_printf(o, "\x1b[%d;1H%s%s", row, th_fg(g_ready ? g_theme->edge_ready : g_theme->edge_idle), top ? "╭" : "╰");
+    for (int i = 0; i < g_fs_cols - 2; i++) sb_puts(o, "─");
+    sb_puts(o, top ? "╮" : "╯");
+    sb_puts(o, C_RESET);
+}
+/* the strip's lines, from the running sub-agents; the selected row is highlighted */
+static void strip_refresh(void) {
+    sb_clear(&g_strip);
+    int rows = (g_fs || g_ui_nc) && term_agents_strip ? term_agents_strip(&g_strip, term_width(), STRIP_MAX) : 0;
+    g_strip_rows = rows;
+    if (g_strip_sel >= rows) g_strip_sel = rows - 1;
+    if (rows == 0) g_strip_sel = -1;
+}
+static void strip_draw(sbuf *o, int top) {
+    if (!g_strip_rows) return;
+    const char *p = g_strip.data ? g_strip.data : "";
+    int cols = g_fs_cols > 1 ? g_fs_cols : 1;
+    for (int i = 0; i < g_strip_rows; i++) {
+        const char *e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        sbuf line; sb_init(&line);
+        sb_append(&line, p, len);
+        sb_printf(o, "\x1b[%d;1H", top + i);
+        if (i == g_strip_sel) sb_puts(o, th_bg(g_theme->select));   /* the row the keys are on: a dark band, padded with spaces */
+        sb_append(o, line.data ? line.data : "", line.len);
+        for (int w = vis_width(line.data ? line.data : ""); w < cols; w++) sb_putc(o, ' ');
+        sb_puts(o, C_RESET);
+        sb_free(&line);
+        p = e ? e + 1 : p + len;
+    }
+}
 static void field_draw(sbuf *o, const char *typed) {
     if (!g_fs || g_fs_rows < FIELD_MIN_ROWS) return;
     int top = field_top();
-    int width = g_fs_cols > 2 ? g_fs_cols : 2;
+    g_ta_caret_row = top + 1;   /* where the caret is when nothing is typed: after the prompt (the typed branch moves it) */
+    g_ta_caret_col = FIELD_X0 + (g_field_view ? 0 : vis_width(field_prompt())) + 1;
+    int width = field_width();
     if (g_view_top >= 0) view_note(o, top - 1);
-    rule_row(o, top);
-    for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;1H\x1b[K", top + 1 + i);
-    sb_printf(o, "\x1b[%d;1H", top + 1);
+    field_edge(o, top, true);
+    if (g_ready) {   /* [ready], upper right, two cells in from the edge (as the mode is on the lower rule) */
+        int c = g_fs_cols - 7 - 1;
+        if (c >= 1) sb_printf(o, "\x1b[%d;%dH%s[ready]" C_RESET, top, c, th_fg(g_theme->edge_ready));
+    }
+    for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;%dH\x1b[49m\x1b[K" C_RESET, top + 1 + i, FIELD_X0);
+    sb_printf(o, "\x1b[%d;%dH", top + 1, FIELD_X0 + 1);
     if (!g_field_view) sb_puts(o, field_prompt());
+    put_field_on(o);
     if (typed) {
         /* not the editor's text: one line, tail kept, with a block for the cursor */
         int avail = width - vis_width(field_prompt()) - 2;
         char *t = xstrdup(typed);
         for (char *p = t; *p; p++) if (*p == '\n') *p = ' ';
         const char *p = t;
-        int tw = vis_width(t);
+        int tw = vis_width(t), mark = 0;
         if (avail > 1 && tw > avail) {
             int cut = tw - (avail - 1);
             while (cut > 0 && *p) { if (((unsigned char)p[1] & 0xC0) != 0x80) cut--; p++; }
             while (*p && ((unsigned char)*p & 0xC0) == 0x80) p++;
-            sb_puts(o, "…");
+            sb_puts(o, "…"); mark = 1;
         }
         size_t sp[MENTION_MAX][2]; int ns = field_mentions(t, strlen(t), sp);
-        put_mentions(o, t, (size_t)(p - t), strlen(p), sp, ns); sb_puts(o, C_DIM "▏" C_RESET);
+        put_mentions(o, t, (size_t)(p - t), strlen(p), sp, NULL, ns); sb_puts(o, C_DIM "▏" C_RESET); put_field_on(o);
+        /* the caret is the ▏: after the prompt, the … if any, and the tail */
+        g_ta_caret_col = FIELD_X0 + (g_field_view ? 0 : vis_width(field_prompt())) + mark + vis_width(p) + 1;
         free(t);
     } else if (g_field_len) {
         int plen = vis_width(field_prompt());
         size_t from = field_row_start(width, plen, g_field_view);
-        size_t sp[MENTION_MAX][2]; int ns = field_mentions(g_field_text, g_field_len, sp);
+        /* mentions and paste tokens, in one list in the order they stand */
+        size_t ms[MENTION_MAX][2], ps[PASTE_MAX][2], sp[MENTION_MAX + PASTE_MAX][2]; int kind[MENTION_MAX + PASTE_MAX];
+        int nm = field_mentions(g_field_text, g_field_len, ms);
+        size_t np = paste_tokens(g_field_text, g_field_len, ps, NULL, NULL, PASTE_MAX);
+        int ns = 0;
+        for (int i = 0, j = 0; i < nm || j < (int)np; ) {
+            if (j >= (int)np || (i < nm && ms[i][0] <= ps[j][0])) { sp[ns][0] = ms[i][0]; sp[ns][1] = ms[i][1]; kind[ns++] = 0; i++; }
+            else { sp[ns][0] = ps[j][0]; sp[ns][1] = ps[j][1]; kind[ns++] = 1; j++; }
+        }
         for (int i = 0; i < g_field_rows; i++) {
             size_t to = field_row_start(width, plen, g_field_view + i + 1);
             if (from >= g_field_len && i) break;
             if (to > g_field_len) to = g_field_len;
-            sb_printf(o, "\x1b[%d;1H", top + 1 + i);
+            sb_printf(o, "\x1b[%d;%dH", top + 1 + i, FIELD_X0 + 1);
             if (i == 0 && g_field_view == 0) sb_puts(o, field_prompt());
+            put_field_on(o);
             size_t n = to > from ? to - from : 0;
             while (n && g_field_text[from + n - 1] == '\n') n--;
-            put_mentions(o, g_field_text, from, n, sp, ns);
-            sb_puts(o, C_RESET "\x1b[K");
+            put_mentions(o, g_field_text, from, n, sp, kind, ns);
+            sb_puts(o, "\x1b[K" C_RESET);
             from = to;
         }
     }
-    rule_row(o, top + g_field_rows + 1);
+    /* the side borders of the text rows (after the text, which is cut short of them) */
+    for (int i = 0; i < g_field_rows; i++) {
+        int r = top + 1 + i;
+        sb_printf(o, "\x1b[%d;1H%s│" C_RESET, r, th_fg(g_ready ? g_theme->edge_ready : g_theme->edge_idle));
+        sb_printf(o, "\x1b[%d;%dH%s│" C_RESET, r, g_fs_cols, th_fg(g_ready ? g_theme->edge_ready : g_theme->edge_idle));
+    }
+    field_edge(o, top + g_field_rows + 1, false);
+    {   /* the mode, on the lower rule: its last cell two columns in from the edge (the hint goes first when it does not fit) */
+        sbuf m; sb_init(&m);
+        int mw = term_mode_text(&m, g_fs_cols);
+        int c = g_fs_cols - mw - 1;
+        if (mw && c >= 1) { sb_printf(o, "\x1b[%d;%dH", top + g_field_rows + 1, c); sb_append(o, m.data, m.len); sb_puts(o, C_RESET); }
+        sb_free(&m);
+    }
     sug_draw(o, top + g_field_rows + 2);
 }
 
@@ -495,13 +659,17 @@ typedef struct { int line; size_t off, len; } sb_row;
 static sb_row *sb_rows(int width, int *count);
 static int  g_sb_col;                 /* visual column of the scrollback cursor in its line */
 static bool g_sb_active;              /* stdout is hooked (see sb_hook_stdout) */
-static void conv_pos(int region, int *row, int *col) {
+/* where the transcript ends, as a row and column. flush: the stdio buffer goes first (the model only sees
+ * what left it); the stdout hook passes false, since it is called from inside that flush. */
+static int sb_rows_upto(int width, int need);
+static void conv_pos_x(int region, int *row, int *col, bool flush) {
     int n = 1;
-    fflush(stdout);   /* the model only sees what left stdio's buffer */
-    if (g_sb_active && g_fs_cols > 0) { int c = 0; free(sb_rows(g_fs_cols, &c)); if (c > 0) n = c; }
+    if (flush) fflush(stdout);
+    if (g_sb_active && g_fs_cols > 0) { int c = sb_rows_upto(g_fs_cols, region); if (c > 0) n = c; }
     *row = n > region ? region : n;
     *col = (g_fs_cols > 0 ? g_sb_col % g_fs_cols : 0) + 1;
 }
+static void conv_pos(int region, int *row, int *col) { conv_pos_x(region, row, col, true); }
 
 /* Put the terminal cursor where the editor's cursor is inside the field. */
 static void field_cursor(sbuf *o) {
@@ -511,7 +679,8 @@ static void field_cursor(sbuf *o) {
     int first = field_top() + 1, row = first + (crow - g_field_view);
     if (row < first) row = first;
     if (row > first + g_field_rows - 1) row = first + g_field_rows - 1;
-    sb_printf(o, "\x1b[%d;%dH", row, ccol + 1);
+    sb_printf(o, "\x1b[%d;%dH", row, FIELD_X0 + ccol + 1);
+    g_away = true;
 }
 
 /* Must run before any redraw. When the terminal was resized, or the chrome grew or shrank
@@ -524,11 +693,14 @@ static void field_cursor(sbuf *o) {
  * transient drawn below that (a menu, the inline editor) starts over from there. None of this is
  * conversation content, so it is written with the scrollback capture paused. */
 static void conv_repaint(sbuf *o);
+static void chrome_invalidate(void);   /* forget what the chrome last sent: the screen may have changed under it */
+static void chrome_send(sbuf *o);
 static bool layout_sync(void) {
     if (!g_fs) return false;
     int rows, cols; term_size(&rows, &cols);
     int reserved = fs_reserved_for(rows);
     if (rows == g_fs_rows && cols == g_fs_cols && reserved == g_fs_reserved) return false;
+    chrome_invalidate();   /* a resize: the screen is not what the chrome last sent */
     g_fs_rows = rows; g_fs_cols = cols; g_fs_reserved = reserved;
     trace_note('L', "rows=%d cols=%d region=1-%d chrome=%d field=%d suggestions=%d view=%d", rows, cols, fs_region(), reserved, g_field_rows, g_sug_rows, g_view_top);
     sbuf o; sb_init(&o);
@@ -542,17 +714,33 @@ static bool layout_sync(void) {
     return g_view_top < 0;
 }
 
-/* Draw the status bar on the last row (absolute; the caller preserves the cursor). */
+/* The location line, on the last row, right-aligned: the working directory as an absolute path, and the git branch it is on
+ * when it is in a repository. Too long for the width, the path loses its start (…) and the branch stays. */
+/* The two bottom rows have the window's own background, the terminal's: no fill of their own, so they read as part
+ * of the window (the notcurses UI draws them on its default background too). The row is padded to its full width,
+ * so a reset in the text leaves nothing undrawn. */
+static void sb_bar_row(sbuf *o, const char *text, int cols) {
+    for (const char *p = text; *p; ) sb_putc(o, *p++);
+    for (int w = vis_width(text); w < cols; w++) sb_putc(o, ' ');
+    sb_puts(o, C_RESET);
+}
+
+/* Draw the status bar on the last row (absolute; the caller preserves the cursor). On a terminal too short
+ * for the field the bar is all there is. */
 static void bar_draw(sbuf *o) {
-    sb_printf(o, "\x1b[%d;1H", g_fs_rows);
-    bar_build(o, g_fs_cols);
-    sb_puts(o, "\x1b[K");
+    int bar_row = g_fs_rows >= 1 ? g_fs_rows : 1;
+    sbuf t; sb_init(&t);
+    sb_printf(o, "\x1b[%d;1H", bar_row);
+    bar_build(&t, g_fs_cols);
+    sb_bar_row(o, t.data ? t.data : "", g_fs_cols);
+    sb_free(&t);
 }
 
 /* Append the whole chrome — input field + status bar — without disturbing the cursor
  * (DECSC/DECRC). For callers that erase to the end of the screen and redraw.
  * Callers run layout_sync() first, and draw with the capture paused. */
 static void chrome_append(sbuf *o) {
+    chrome_invalidate();   /* written in full here: the next refresh sends what differs from this */
     if (!g_fs) return;
     char *typed = g_busy && !g_field_focus ? ta_pending_text() : NULL;
     sb_puts(o, "\x1b" "7");
@@ -562,22 +750,28 @@ static void chrome_append(sbuf *o) {
     free(typed);
 }
 
+/* the chrome's text as the ANSI bar draws it, escapes included (term_nc.c parses it into cells) */
+void term_status_text(sbuf *o, int cols) { bar_build(o, cols); }
+
 static void view_paint(void);
 void term_status_refresh(void) {
+    if (g_ui_nc) { nc_render(); return; }
     if (!g_fs) return;
     layout_sync();
     ta_sug_sync();
-    if (field_sync_rows()) layout_sync();   /* the field changed height: re-cut the region */
+    bool fchanged = field_sync_rows();   /* the field changed height: re-cut the region */
+    int strip_before = g_strip_rows;
+    strip_refresh();
+    if (fchanged || strip_before != g_strip_rows) layout_sync();
     if (g_view_top >= 0 && g_view_stale) view_paint();
     char *typed = g_busy && !g_field_focus ? ta_pending_text() : NULL;
     sbuf o; sb_init(&o);
     if (!g_field_focus) sb_puts(&o, "\x1b" "7");
     field_draw(&o, typed);
+    strip_draw(&o, field_top() + g_field_rows + 2 + g_sug_rows);
     bar_draw(&o);
-    if (g_field_focus) field_cursor(&o); else sb_puts(&o, "\x1b" "8");
-    sb_pause(true);
-    fwrite(o.data, 1, o.len, stdout); fflush(stdout);
-    sb_pause(false);
+    if (g_field_focus) field_cursor(&o); else { sb_puts(&o, "\x1b" "8"); chrome_park(&o); }
+    chrome_send(&o);
     sb_free(&o);
     free(typed);
     gettimeofday(&g_live_t, NULL);
@@ -585,6 +779,7 @@ void term_status_refresh(void) {
 
 void term_status_live(long out_tokens) {
     g_live_out = out_tokens;
+    if (g_ui_nc) { nc_render_soon(); return; }
     if (!g_fs) return;
     if (out_tokens == 0) return;   /* the caller refreshes once the final stats are in */
     struct timeval t; gettimeofday(&t, NULL);
@@ -601,7 +796,7 @@ void term_busy(const char *label) {
 }
 
 void term_busy_tick(void) {
-    if (!g_busy || !g_fs) return;
+    if (!g_busy || !(g_fs || g_ui_nc)) return;
     struct timeval t; gettimeofday(&t, NULL);
     double dt = (double)(t.tv_sec - g_busy_t.tv_sec) + (double)(t.tv_usec - g_busy_t.tv_usec) / 1e6;
     if (dt < 0.1 && dt >= 0) return;
@@ -618,23 +813,44 @@ void term_busy_tick(void) {
  * for a full-screen program: selecting text with the mouse needs Shift held down. */
 #define MOUSE_ON  "\x1b[?1000h\x1b[?1006h"
 #define MOUSE_OFF "\x1b[?1006l\x1b[?1000l"
+/* DECSCUSR: a blinking block for the cursor the output and the editor share, and the terminal's own
+ * style back on the way out (0 = the default) */
+#define CURSOR_BLINK   "\x1b[?25h\x1b[1 q"
+#define CURSOR_DEFAULT "\x1b[0 q"
+
+void term_finish(void) {
+    term_restore();
+    g_ui_nc = false;   /* the program is ending: what is printed from here (the goodbye) goes to the terminal itself */
+}
 
 void term_fullscreen(bool on) {
+    chrome_invalidate();
+    if (g_ui_nc) {
+        if (!on) { nc_stop(); return; }
+        sb_hook_stdout();   /* the conversation is still captured: the pane is drawn from it */
+        if (nc_start()) return;
+        g_ui_nc = false;    /* could not start: the ANSI screen from here on (nc_start said why) */
+    }
     if (on && !g_fs) {
         sb_hook_stdout();   /* start recording the conversation for PgUp */
         g_fs = true; g_fs_rows = g_fs_cols = g_fs_reserved = 0; g_live_out = 0;
         g_field_rows = 1; g_field_view = 0; g_conv_row = g_conv_col = 1;
         g_sug_rows = 0; g_view_top = -1;
-        fputs("\x1b[?1049h\x1b[H\x1b[2J" MOUSE_ON, stdout);   /* alternate screen, cleared */
+        theme_paint_window(true);
+        fputs("\x1b[?1049h", stdout);
+        fputs(theme_base_sgr(), stdout);             /* the window's ground, before the clear (an erase takes it) */
+        fputs("\x1b[H\x1b[2J" MOUSE_ON CURSOR_BLINK, stdout);   /* alternate screen, cleared; a blinking cursor where the output goes on */
         term_status_refresh();                       /* also sets the scroll region */
     } else if (!on && g_fs) {
         g_fs = false; g_view_top = -1;
-        fputs(C_RESET MOUSE_OFF "\x1b[r\x1b[?1049l", stdout);      /* reset margins, back to the main screen */
+        fputs(C_RESET MOUSE_OFF CURSOR_DEFAULT "\x1b[r\x1b[?1049l", stdout);      /* reset margins, back to the main screen */
         fflush(stdout);
+        theme_paint_window(false);
     }
 }
 
 void term_clear_screen(void) {
+    if (g_ui_nc) { nc_clear(); return; }
     g_view_top = -1;               /* nothing left to be scrolled back in */
     fputs("\x1b[H\x1b[2J", stdout);
     g_conv_row = g_conv_col = 1;   /* the conversation starts over at the top of the region */
@@ -655,6 +871,7 @@ void term_clear_screen(void) {
 #define SB_MAX_LINES 8000
 static sbuf *g_sb = NULL;             /* logical lines */
 static int   g_sb_n = 0, g_sb_cap = 0;
+static int   g_sb_epoch = 0;      /* bumped whenever line numbers stop meaning what they did (lines dropped, cleared) */
 /* Folds: a long result is one line that stays (the head, with a ▸) and a body that is in the
  * model but not on screen until the head is clicked. A body line is `hidden`: sb_rows() leaves
  * it out, so the region, the viewer and conv_pos() all see the transcript without it, and the
@@ -664,8 +881,16 @@ typedef struct { int fold; unsigned char kind; bool hidden; } sb_meta;
 static sb_meta *g_sb_meta = NULL;     /* one per line of g_sb */
 static int   g_fold_seq = 0;          /* the last fold's number */
 static int   g_fold_rec = 0;          /* the fold whose body is being written (term_fold_begin…end): recorded, not painted */
+static int   g_click_frow = 0, g_click_fcol = 0;   /* a left click in the field below the conversation: its row and column (paste_click) */
 static int   g_click_row = 0;         /* a left click on this row of the conversation is waiting to be acted on (fold_click) */
 static bool sb_hidden(int line) { return line >= 0 && line < g_sb_n && g_sb_meta[line].hidden; }
+/* what term_nc.c draws the conversation pane from: the scrollback model's lines, SGR escapes included */
+int         term_sb_nlines(void) { return g_sb_n; }
+int         term_sb_epoch(void) { return g_sb_epoch; }
+bool        term_is_fullscreen(void) { return g_fs; }
+const char *term_sb_line(int i) { return g_sb[i].data ? g_sb[i].data : ""; }
+bool        term_sb_hidden(int i) { return sb_hidden(i); }
+int         term_sb_col(void) { return g_sb_col; }
 static int   g_sb_line = 0;           /* cursor: line index ... */
 /* g_sb_col: visual column in that line (>= width means a wrapped row), declared with the field */
 /* g_sb_pause (not conversation output: don't record) is declared at the top: the layout code uses it */
@@ -712,6 +937,7 @@ static void sb_ensure_line(void) {
         memmove(g_sb, g_sb + drop, sizeof *g_sb * (size_t)(g_sb_n - drop));
         memmove(g_sb_meta, g_sb_meta + drop, sizeof *g_sb_meta * (size_t)(g_sb_n - drop));
         g_sb_n -= drop; g_sb_line -= drop; if (g_sb_line < 0) g_sb_line = 0;
+        g_sb_epoch++;   /* the line numbers moved: a row map made before is not to be read */
     }
 }
 /* the cursor is about to write: cut the line at the cursor column (a redraw overwrites the rest) */
@@ -782,7 +1008,7 @@ static void sb_escape_done(void) {
         case 'D': g_sb_col -= a ? a : 1; if (g_sb_col < 0) g_sb_col = 0; break;
         case 'K': if (a == 2) { int width = sb_width(); if (width < 1) width = 1; g_sb_col = ((g_sb_col == 0 ? 0 : (g_sb_col - 1) / width)) * width; }
                   sb_cut_at_cursor(); break;
-        case 'J': if (a == 2) { for (int i = 0; i < g_sb_n; i++) sb_free(&g_sb[i]); g_sb_n = 0; g_sb_line = 0; g_sb_col = 0; }
+        case 'J': if (a == 2) { for (int i = 0; i < g_sb_n; i++) sb_free(&g_sb[i]); g_sb_n = 0; g_sb_line = 0; g_sb_col = 0; g_sb_epoch++; }
                   else { sb_cut_at_cursor(); sb_drop_after(g_sb_line); }
                   break;
         default: break;                                       /* H, r, n … : absolute moves and queries, not tracked */
@@ -813,16 +1039,80 @@ static void sb_feed(const char *p, size_t n) {
     }
 }
 
+/* ---------- the cursor while a turn runs (see g_away) ---------- */
+static void fd1_write(const char *b, size_t n) {   /* a cursor move to fd 1 itself (never through stdio: the hook calls this) */
+    trace_bytes('O', b, n);
+    size_t off = 0;
+    while (off < n) { ssize_t w = write(STDOUT_FILENO, b + off, n - off); if (w < 0) { if (errno == EINTR) continue; return; } off += (size_t)w; }
+}
+static bool want_box(void) {
+    return g_fs && g_busy && !g_field_focus && g_view_top < 0 && !g_fold_rec && !g_no_park && g_ta_caret_row > 0;
+}
+static void transcript_move(sbuf *o, bool flush) {
+    int row, col;
+    conv_pos_x(fs_region(), &row, &col, flush);
+    sb_printf(o, "\x1b[%d;%dH", row, col);
+    g_away = false;
+}
+static void box_move(sbuf *o) {
+    sb_printf(o, "\x1b[%d;%dH", g_ta_caret_row, g_ta_caret_col);
+    g_away = true;
+}
+/* the end of the chrome: the cursor goes to the type-ahead's caret, or back to the transcript if it was in the box */
+static void chrome_park(sbuf *o) {
+    if (want_box()) box_move(o);
+    else if (g_away) transcript_move(o, true);
+}
+/* A question or menu is about to draw at the transcript's end: the cursor is brought there, and kept
+ * there until park_free (the chrome does not park the cursor while one is up). */
+static void park_hold(void) {
+    if (g_away && g_fs && g_sb_active) {
+        sbuf o; sb_init(&o); transcript_move(&o, true);
+        sb_pause(true); fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_pause(false);
+        sb_free(&o);
+    }
+    g_no_park++;
+}
+static void park_free(void) { if (g_no_park > 0) g_no_park--; }
+
+/* the conversation painted again from the model: a colour theme changed, so what is on screen takes its colours */
+void term_repaint(void) {
+    if (!g_fs || g_ui_nc || !g_sb_active) return;
+    sbuf o; sb_init(&o);
+    conv_repaint(&o);
+    fwrite(o.data, 1, o.len, stdout); fflush(stdout);
+    sb_free(&o);
+}
+
+static theme_map g_th_map;   /* an escape sequence a write ended inside (see theme_map_bytes) */
 /* stdout hook: every byte goes to fd 1 and, unless paused, into the model above */
 static ssize_t sb_write_fn(void *cookie, const char *buf, size_t n) {
     (void)cookie;
     /* Scrolled back: the screen shows an earlier window, so conversation output is only
      * recorded. Leaving the viewer paints what came meanwhile from the record (conv_repaint). */
-    if ((g_view_top >= 0 || g_fold_rec) && !g_sb_pause) { trace_bytes('H', buf, n); sb_feed(buf, n); return (ssize_t)n; }   /* (or it is the body of a fold) */
+    if ((g_view_top >= 0 || g_fold_rec || g_ov_text) && !g_sb_pause) { trace_bytes('H', buf, n); sb_feed(buf, n); return (ssize_t)n; }   /* (or it is the body of a fold) */
+    /* the cursor rests in the input field during a turn: the transcript's end is where this goes.
+     * The position comes from the model before these bytes are in it (conv_pos_x, no flush here). */
+    if (g_away && !g_sb_pause && !g_ui_nc) { sbuf mv; sb_init(&mv); transcript_move(&mv, false); fd1_write(mv.data, mv.len); sb_free(&mv); }
     trace_bytes('O', buf, n);
-    size_t off = 0;
-    while (off < n) { ssize_t w = write(STDOUT_FILENO, buf + off, n - off); if (w < 0) { if (errno == EINTR) continue; return off ? (ssize_t)off : -1; } off += (size_t)w; }
+    if (!g_ui_nc) {   /* notcurses draws the screen itself: the output is only recorded */
+        /* the basic colour codes become the theme's RGB here, on the way out; the model keeps them as they came */
+        sbuf mapped; sb_init(&mapped);
+        theme_map_bytes(&g_th_map, buf, n, &mapped);
+        size_t off = 0;
+        while (off < mapped.len) {
+            ssize_t w = write(STDOUT_FILENO, mapped.data + off, mapped.len - off);
+            if (w < 0) { if (errno == EINTR) continue; sb_free(&mapped); return -1; }
+            off += (size_t)w;
+        }
+        sb_free(&mapped);
+    }
     if (!g_sb_pause) sb_feed(buf, n);
+    if (g_ui_nc) nc_output();
+    /* parked again only where the chunk ends between sequences: a chunk can end anywhere in a large write,
+     * and a cursor move spliced into an escape would corrupt it. Until the next refresh the cursor stays at
+     * the transcript, where the next chunk goes anyway. */
+    else if (!g_sb_pause && want_box() && !tail_incomplete(buf, n) && !theme_map_pending(&g_th_map)) { sbuf mv; sb_init(&mv); box_move(&mv); fd1_write(mv.data, mv.len); sb_free(&mv); }
     return (ssize_t)n;
 }
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
@@ -843,7 +1133,107 @@ static void sb_hook_stdout(void) {
     stdout = f;
     g_sb_active = true;
 }
-static void sb_pause(bool on) { if (!g_sb_active) return; fflush(stdout); g_sb_pause = on; }
+/* ---------- the chrome as sent: a row whose text did not change is not sent again ----------
+ * The chrome (field, rules, bar, caret) is one buffer of cursor moves, each followed by its row's text. Each
+ * segment (from one cursor move to the next) that has text is kept with its position; a segment equal to the
+ * one kept is not sent. Segments without text (the cursor, the saved-cursor escapes) are always sent. The
+ * cache is cleared whenever something else may have drawn over the chrome (sb_pause(true): menus, overlays,
+ * the viewer; a repaint; a resize; an erase). Over ssh, a keystroke then sends the row it changed. */
+#define CHROME_KEYS 96
+static struct { int row, col; char *text; size_t n; } g_chrome[CHROME_KEYS];
+static int g_chrome_n = 0;
+static void chrome_invalidate(void) {
+    for (int i = 0; i < g_chrome_n; i++) { free(g_chrome[i].text); g_chrome[i].text = NULL; }
+    g_chrome_n = 0;
+}
+/* a cursor move "ESC [ row ; col H" at p: its length, and its position */
+static size_t cup_len(const char *p, const char *end, int *row, int *col) {
+    if (end - p < 6 || p[0] != 27 || p[1] != '[') return 0;
+    const char *q = p + 2; int r = 0, c = 0; int nr = 0, nc = 0;
+    while (q < end && *q >= '0' && *q <= '9') { r = r * 10 + (*q - '0'); q++; nr++; }
+    if (!nr || q >= end || *q != ';') return 0;
+    q++;
+    while (q < end && *q >= '0' && *q <= '9') { c = c * 10 + (*q - '0'); q++; nc++; }
+    if (!nc || q >= end || *q != 'H') return 0;
+    *row = r; *col = c;
+    return (size_t)(q + 1 - p);
+}
+/* whether [p, end) has text on the screen (not only escapes) */
+static bool seg_has_text(const char *p, const char *end) {
+    while (p < end) {
+        if (*p == 27) {
+            p++;
+            if (p < end && *p == '[') { p++; while (p < end && !(*p >= 0x40 && *p <= 0x7e)) p++; if (p < end) p++; }
+            else if (p < end) p++;
+            continue;
+        }
+        if ((unsigned char)*p >= 0x20) return true;
+        p++;
+    }
+    return false;
+}
+/* whether [p, end) erases (ESC [ K, ESC [ J): part of a row's text, as the field clears a row before drawing it */
+static bool seg_erases(const char *p, const char *end) {
+    for (const char *q = p; q + 2 < end; q++) if (q[0] == 27 && q[1] == '[' && (q[2] == 'K' || q[2] == 'J')) return true;
+    return false;
+}
+static void chrome_send(sbuf *o) {
+    if (!o->len) return;
+    const char *p = o->data, *end = o->data + o->len;
+    sbuf out; sb_init(&out);
+    /* a row is the group of its segments (its clear, its text, its borders): kept and compared as one. A
+     * segment with no text and no erase (a bare cursor move, the caret), or one with the saved cursor, is a
+     * barrier: it ends the group and is always sent. */
+    sbuf grp; sb_init(&grp);
+    int grow = -1; bool gtext = false;
+    #define CHROME_FLUSH() do { \
+        if (grp.len) { \
+            bool sent = true; \
+            if (grow >= 0 && gtext) { \
+                int hit = -1; \
+                for (int i = 0; i < g_chrome_n; i++) if (g_chrome[i].row == grow) { hit = i; break; } \
+                if (hit >= 0 && g_chrome[hit].n == grp.len && !memcmp(g_chrome[hit].text, grp.data, grp.len)) sent = false; \
+                else if (hit < 0 && g_chrome_n >= CHROME_KEYS) { } \
+                else { int i = hit >= 0 ? hit : g_chrome_n++; free(g_chrome[i].text); g_chrome[i].row = grow; g_chrome[i].col = 0; g_chrome[i].text = xmalloc(grp.len); g_chrome[i].n = grp.len; memcpy(g_chrome[i].text, grp.data, grp.len); } \
+            } \
+            if (sent) { sb_puts(&out, C_RESET); sb_append(&out, grp.data, grp.len); } \
+            sb_clear(&grp); grow = -1; gtext = false; \
+        } \
+    } while (0)
+    while (p < end) {
+        const char *stop = end;
+        for (const char *q = p + 1; q < end; q++) { int r, c; if (cup_len(q, end, &r, &c)) { stop = q; break; } }
+        int sr = 0, sc = 0;
+        bool keyed = cup_len(p, end, &sr, &sc) > 0;
+        bool saved = false;
+        for (const char *q = p; q + 1 < stop; q++) if (q[0] == 27 && (q[1] == '7' || q[1] == '8')) { saved = true; break; }
+        bool text = seg_has_text(p, stop), erase = seg_erases(p, stop);
+        size_t n = (size_t)(stop - p);
+        if (!keyed || saved || (!text && !erase)) {
+            CHROME_FLUSH();
+            sb_puts(&out, C_RESET); sb_append(&out, p, n);
+        } else {
+            if (grow != sr) { CHROME_FLUSH(); grow = sr; }
+            sb_append(&grp, p, n);
+            if (text) gtext = true;
+        }
+        p = stop;
+    }
+    CHROME_FLUSH();
+    #undef CHROME_FLUSH
+    bool was = g_sb_pause;
+    if (g_sb_active) { fflush(stdout); g_sb_pause = true; }   /* not conversation */
+    fwrite(out.data, 1, out.len, stdout); fflush(stdout);
+    g_sb_pause = was;
+    sb_free(&grp);
+    sb_free(&out);
+}
+static void sb_pause(bool on) {
+    if (!g_sb_active) return;
+    fflush(stdout);
+    if (on) chrome_invalidate();   /* something else is about to draw on the screen: the chrome is sent in full next time */
+    g_sb_pause = on;
+}
 /* record text that was drawn while paused (the editor's submitted line) */
 static void sb_note(const char *text) { if (g_sb_active) { fflush(stdout); sb_feed(text, strlen(text)); } }
 
@@ -856,6 +1246,18 @@ void term_line_break(void) {
 }
 
 /* visual rows of the buffer at the given width: (line, byte offset, byte length) triples */
+/* the visual rows of the transcript, counted from its end, up to `need` of them (the same wrap as sb_rows):
+ * where the transcript ends needs no more, and the whole scrollback is not walked for it on every write */
+static int sb_rows_upto(int width, int need) {
+    if (width < 1) width = 1;
+    int n = 0;
+    for (int i = g_sb_n - 1; i >= 0 && n < need; i--) {
+        if (g_sb_meta[i].hidden) continue;
+        const char *d = g_sb[i].data; size_t len = g_sb[i].len, off = 0;
+        do { off = vis_offset(d + off, len - off, width) + off; n++; } while (off < len);
+    }
+    return n;
+}
 static sb_row *sb_rows(int width, int *count) {
     if (width < 1) width = 1;
     int cap = 256, n = 0; sb_row *r = xmalloc(sizeof *r * (size_t)cap);
@@ -879,6 +1281,119 @@ static sb_row *sb_rows(int width, int *count) {
  * wherever the terminal counts a character wider than the model does. The rows themselves are
  * painted with autowrap off for the same reason — one the terminal finds too wide is clipped at
  * the margin rather than spilling into the row below. */
+/* Apply the SGR sequences in d[0..len) to st: the colours in effect at the end of it (a reset
+ * empties st). A row cut from a long line starts mid-line, so the colours set before its first
+ * character must be sent again when it is painted, or the rest of the line loses them. */
+void term_sgr_track(sbuf *st, const char *d, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (d[i] != 27 || i + 1 >= len || d[i + 1] != '[') continue;
+        size_t j = i + 2;
+        while (j < len && !((unsigned char)d[j] >= 0x40 && (unsigned char)d[j] <= 0x7E)) j++;
+        if (j >= len) break;
+        if (d[j] == 'm') {
+            size_t pl = j - (i + 2);
+            if (pl == 0 || (pl == 1 && d[i + 2] == '0')) sb_clear(st);
+            else sb_append(st, d + i, j - i + 1);
+        }
+        i = j;
+    }
+}
+/* Paint rows [from, from+count) of the model on the region's lines 1..count (the rest of them
+ * blank). Each row starts with the colours in effect where its text starts, which is the same
+ * screen as printing the transcript straight through. When `mark` is a row, the colours in effect
+ * at its start go to `at_mark` (the cursor's row is printed again after this). */
+static void paint_rows(sbuf *o, const sb_row *r, int n, int from, int count, int mark, sbuf *at_mark) {
+    sbuf st; sb_init(&st);
+    for (int idx = 0; idx < n && idx < from + count; idx++) {
+        const char *t = g_sb[r[idx].line].data ? g_sb[r[idx].line].data + r[idx].off : "";
+        if (idx == mark && at_mark) { sb_clear(at_mark); sb_append(at_mark, st.data, st.len); }
+        if (idx >= from) {
+            sb_printf(o, "\x1b[%d;1H" C_RESET "\x1b[2K", idx - from + 1);   /* a reset first: the erase takes the ground it is left with */
+            sb_puts(o, C_RESET); sb_append(o, st.data, st.len);
+            sb_append(o, t, r[idx].len); sb_puts(o, C_RESET);
+        }
+        term_sgr_track(&st, t, r[idx].len);
+    }
+    for (int i = n > from ? n - from : 0; i < count; i++) sb_printf(o, "\x1b[%d;1H" C_RESET "\x1b[2K", i + 1);
+    sb_free(&st);
+}
+
+/* The overlay's window, appended to `o` as cursor-addressed paint: its text in a box centred on the
+ * region and painted over the rows, so what it covers is hidden. Lines are wrapped to the box's width
+ * (the colours they carry are carried over to the next row); a text taller than the region ends in
+ * a row that says the rest is cut. */
+typedef struct { const char *p; size_t n; } ov_row;
+/* the banner's modal: its lines as they are, centred on the conversation's region; the close button is the
+ * top right cell of the box (the top border's last column) */
+static void banner_box(sbuf *o, const bool *only) {
+    int region = fs_region(), cols = g_fs_cols > 0 ? g_fs_cols : term_width();
+    if (!g_bn_n || region < g_bn_n || cols < g_bn_bw) return;
+    int top = (region - g_bn_n) / 2 + 1, left = (cols - g_bn_bw) / 2 + 1; if (left < 1) left = 1;
+    g_bn_xr = top; g_bn_xc0 = left + g_bn_bw - BANNER_X_FROM_RIGHT - BANNER_X_W / 2; g_bn_xc1 = g_bn_xc0 + BANNER_X_W - 1;
+    for (int i = 0; i < g_bn_n; i++) {
+        if (only && !only[i]) continue;   /* a row that did not change is not sent again (over ssh every byte counts) */
+        sb_printf(o, "\x1b[%d;%dH" C_RESET "%s" C_RESET, top + i, left, g_bn[i].data ? g_bn[i].data : "");
+    }
+}
+static void overlay_box(sbuf *o) {
+    if (!g_ov_text) return;
+    if (g_banner_on) { banner_box(o, NULL); return; }
+    int region = fs_region(), cols = g_fs_cols > 0 ? g_fs_cols : term_width();
+    if (region < 4 || cols < 16) return;
+    const char *base = g_ov_text;
+    size_t len = strlen(base); while (len && base[len - 1] == '\n') len--;
+    const char *end = base + len;
+    int maxw = cols - 8; if (maxw < 10) maxw = 10;
+    int W = 0;   /* the widest line, up to the box's width */
+    for (const char *p = base; ; ) {
+        const char *e = memchr(p, '\n', (size_t)(end - p));
+        int w = vis_width_n(p, e ? (size_t)(e - p) : (size_t)(end - p)); if (w > W) W = w;
+        if (!e) break;
+        p = e + 1;
+    }
+    if (W > maxw) W = maxw;
+    if (W < 20) W = maxw < 20 ? maxw : 20;
+    /* the rows: each line cut where it no longer fits */
+    size_t cap = 32; int R = 0; ov_row *rows = xmalloc(sizeof *rows * cap);
+    for (const char *p = base; ; ) {
+        const char *e = memchr(p, '\n', (size_t)(end - p));
+        size_t ll = e ? (size_t)(e - p) : (size_t)(end - p), done = 0;
+        do {
+            size_t off = done < ll ? vis_offset(p + done, ll - done, W) : 0;
+            if (off == 0) off = ll - done;   /* (an empty line is one empty row) */
+            if (R == (int)cap) { cap *= 2; rows = xrealloc(rows, sizeof *rows * cap); }
+            rows[R++] = (ov_row){ p + done, off };
+            done += off;
+        } while (done < ll);
+        if (!e) break;
+        p = e + 1;
+    }
+    int maxh = region - 2, show = R > maxh ? maxh - 1 : R;   /* the last row says the rest is cut */
+    int bh = show + 2 + (R > maxh ? 1 : 0), bw = W + 4;
+    int top = (region - bh) / 2 + 1, left = (cols - bw) / 2 + 1; if (left < 1) left = 1;
+    sb_printf(o, "\x1b[%d;%dH" C_DIM "┌", top, left);
+    for (int i = 0; i < bw - 2; i++) sb_puts(o, "─");
+    sb_puts(o, "┐" C_RESET);
+    sbuf st; sb_init(&st);   /* the colours in effect at the start of the row being painted */
+    for (int row = 0; row < bh - 2; row++) {
+        sb_printf(o, "\x1b[%d;%dH" C_DIM "│" C_RESET " " C_RESET, top + 1 + row, left);
+        int vis = 0;
+        if (row < show) {
+            sb_append(o, st.data, st.len);
+            sb_append(o, rows[row].p, rows[row].n);
+            vis = vis_width_n(rows[row].p, rows[row].n);
+            term_sgr_track(&st, rows[row].p, rows[row].n);
+        } else if (row == show && R > maxh) { sb_puts(o, C_DIM "… more than fits here" C_RESET); vis = 22; }
+        sb_puts(o, C_RESET);
+        for (; vis < W; vis++) sb_putc(o, ' ');
+        sb_printf(o, " " C_DIM "│" C_RESET);
+    }
+    sb_printf(o, "\x1b[%d;%dH" C_DIM "└", top + bh - 1, left);
+    for (int i = 0; i < bw - 2; i++) sb_puts(o, "─");
+    sb_puts(o, "┘" C_RESET);
+    sb_free(&st); free(rows);
+}
+
 /* which of the model's rows is the region's first on the live screen; *cur and *ccol: the cursor's row, and its column in it */
 static int conv_first(const sb_row *r, int n, int region, int cols, int *cur_out, int *ccol_out) {
     int cur = n ? n - 1 : 0, ccol = g_sb_col;
@@ -895,17 +1410,16 @@ static int conv_first(const sb_row *r, int n, int region, int cols, int *cur_out
     return first;
 }
 static void conv_repaint(sbuf *o) {
+    chrome_invalidate();   /* the region is painted again, which may have erased rows of the chrome */
     fflush(stdout);   /* the model only sees what left stdio's buffer */
     int region = fs_region(), cols = g_fs_cols > 0 ? g_fs_cols : 1, n = 0;
     sb_row *r = sb_rows(cols, &n);
     int cur, ccol;   /* the cursor's visual row, and its column in that row */
     int first = conv_first(r, n, region, cols, &cur, &ccol);
     sb_puts(o, "\x1b[?7l");
-    for (int i = 0; i < region; i++) {
-        int idx = first + i;
-        sb_printf(o, "\x1b[%d;1H\x1b[2K", i + 1);
-        if (idx < n) { sb_append(o, g_sb[r[idx].line].data + r[idx].off, r[idx].len); sb_puts(o, C_RESET); }
-    }
+    sbuf at_cur; sb_init(&at_cur);
+    paint_rows(o, r, n, first, region, cur, &at_cur);
+    overlay_box(o);
     sb_puts(o, "\x1b[?7h");
     int srow = cur - first + 1;
     sb_printf(o, "\x1b[%d;1H", srow);
@@ -913,11 +1427,14 @@ static void conv_repaint(sbuf *o) {
         const char *d = g_sb[r[cur].line].data + r[cur].off;
         size_t off = vis_offset(d, r[cur].len, ccol);
         int have = vis_width_n(d, off);
+        sb_puts(o, C_RESET); sb_append(o, at_cur.data, at_cur.len);
         sb_append(o, d, off);
         if (have < ccol) sb_printf(o, "\x1b[%dC", ccol - have);   /* the cursor stood beyond the text */
     }
     sb_puts(o, C_RESET); sb_append(o, g_sb_sgr, (size_t)g_sb_sgrn);
     g_conv_row = srow; g_conv_col = ccol % cols + 1;
+    g_away = false;   /* the cursor is where the transcript ends */
+    sb_free(&at_cur);
     free(r);
 }
 
@@ -942,11 +1459,8 @@ static void view_paint(void) {
     trace_note('V', "top=%d window=%d of=%d", g_view_top, rows, nrows);
     sbuf o; sb_init(&o);
     sb_puts(&o, "\x1b[?7l");
-    for (int i = 0; i < rows; i++) {
-        int idx = g_view_top + i;
-        sb_printf(&o, "\x1b[%d;1H\x1b[2K", i + 1);
-        if (idx < nrows) { sb_append(&o, g_sb[r[idx].line].data + r[idx].off, r[idx].len); sb_puts(&o, C_RESET); }
-    }
+    paint_rows(&o, r, nrows, g_view_top, rows, -1, NULL);
+    overlay_box(&o);
     sb_puts(&o, "\x1b[?7h");
     snprintf(g_view_hint, sizeof g_view_hint, g_field_focus ? "↑ scrollback · rows %d-%d of %d · wheel/PgUp/PgDn ↑/↓ scroll · End/Esc/Enter back"
                                                            : "↑ scrollback · rows %d-%d of %d · Esc or scrolling down: back to the output",
@@ -968,6 +1482,76 @@ static void view_leave(void) {
     }
     sb_pause(was);
     term_status_refresh();   /* the chrome without the viewer's line; the editor gets its cursor back */
+}
+
+/* The overlay: a text in a centred window while the conversation goes on underneath (the output is
+ * recorded, not painted, until it is closed — the same as while scrolled back). Esc or Ctrl-C closes
+ * it; anything that needs the live screen does too. */
+static void overlay_paint(void) {
+    bool was = g_sb_pause; sb_pause(true);
+    fflush(stdout);
+    sbuf o; sb_init(&o); conv_repaint(&o);
+    fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o);
+    sb_pause(was);
+}
+/* the banner's modal: its lines (kept here for the redraws), with its width; the ANSI screen draws it
+ * over the conversation, the notcurses screen draws it on its own (term_nc.c) */
+static void banner_store(const char **lines, int n, int bw) {
+    for (int i = 0; i < g_bn_n; i++) sb_free(&g_bn[i]);
+    free(g_bn); g_bn = NULL; g_bn_n = 0;
+    if (n <= 0) return;
+    g_bn = xmalloc(sizeof *g_bn * (size_t)n); g_bn_n = n; g_bn_bw = bw;
+    for (int i = 0; i < n; i++) { sb_init(&g_bn[i]); sb_puts(&g_bn[i], lines[i]); }
+}
+bool term_banner_show(const char **lines, int n, int bw) {
+    if (g_ui_nc) { nc_banner_set(lines, n, bw, true); return true; }
+    if (!g_fs || !g_sb_active || n <= 0) return false;
+    banner_store(lines, n, bw);
+    if (!g_ov_text) g_ov_text = xstrdup("");   /* the overlay's state: Esc closes it, the conversation is recorded, not painted */
+    g_banner_on = true; g_bn_xr = g_bn_xc0 = g_bn_xc1 = -1;
+    overlay_paint();
+    term_status_refresh();
+    return true;
+}
+void term_banner_draw(const char **lines, int n, int bw) {
+    if (g_ui_nc) { nc_banner_set(lines, n, bw, nc_banner_open()); return; }
+    if (!g_banner_on) return;
+    /* only the rows that changed are sent: a tick changes the crow and the spark, most rows of the box stay */
+    bool *changed = xmalloc(sizeof *changed * (size_t)(n > 0 ? n : 1));
+    for (int i = 0; i < n; i++) changed[i] = n != g_bn_n || !g_bn[i].data || strcmp(g_bn[i].data, lines[i]) != 0;
+    banner_store(lines, n, bw);
+    sbuf o; sb_init(&o);
+    bool was = g_sb_pause; sb_pause(true);   /* the box only: the conversation is not repainted for a tick */
+    sb_puts(&o, "\x1b" "7");   /* the cursor (it rests in the field) is saved and put back */
+    banner_box(&o, changed);
+    free(changed);
+    sb_puts(&o, "\x1b" "8");
+    fwrite(o.data, 1, o.len, stdout); fflush(stdout);
+    sb_pause(was);
+    sb_free(&o);
+}
+void term_banner_hide(void) {
+    if (g_ui_nc) { nc_banner_set(NULL, 0, 0, false); return; }
+    if (g_banner_on) term_overlay_close();
+}
+bool term_banner_open(void) { return g_ui_nc ? nc_banner_open() : g_banner_on; }
+
+bool term_overlay_show(const char *text) {
+    if (g_ui_nc) { if (!text) return false; nc_overlay_set(text); return true; }   /* the notcurses UI draws it as a modal too */
+    if (!g_fs || !g_sb_active || !text) return false;
+    free(g_ov_text); g_ov_text = xstrdup(text);
+    overlay_paint();
+    term_status_refresh();
+    return true;
+}
+void term_overlay_close(void) {
+    if (g_ui_nc) { nc_overlay_set(NULL); return; }
+    if (!g_ov_text) return;
+    free(g_ov_text); g_ov_text = NULL; g_banner_on = false;
+    bool was = g_sb_pause; sb_pause(true);
+    if (!layout_sync()) { sbuf o; sb_init(&o); conv_repaint(&o); fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o); }
+    sb_pause(was);
+    term_status_refresh();
 }
 
 /* Move the window by `delta` rows (negative = back), entering or leaving the viewer as needed. */
@@ -992,7 +1576,7 @@ static void view_scroll(int delta) {
  * mark; the region is then painted again from the model, as after a resize. False = no folds
  * here (no full-screen mode, so no model and no mouse): the caller prints a preview instead. */
 bool term_fold_begin(const char *head) {
-    if (!g_fs || !g_sb_active) return false;
+    if ((!g_fs && !g_ui_nc) || !g_sb_active || g_fold_rec) return false;   /* no folds without a screen to click (ANSI full-screen or notcurses); none inside one */
     fflush(stdout);
     if (g_sb_col > 0) fputs("\n", stdout);
     fputs(head, stdout); fflush(stdout);
@@ -1012,6 +1596,53 @@ void term_fold_end(void) {
     sb_ensure_line();
     g_sb_meta[g_sb_line] = (sb_meta){ 0, SB_PLAIN, false };   /* the line output continues on is no part of the body */
 }
+/* The block stays up in the viewer, as after PgUp: Esc, Enter or End return to the prompt. A block
+ * of plain text shown as an open fold, and the view moved to its head: what ← at the
+ * prompt shows a sub-agent's log with. The lines go into the model as the fold's body without
+ * being painted (the view is painted from the model below). Off full-screen mode: printed. */
+static void show_block_impl(const char *head, const char *body);
+void term_show_block(const char *head, const char *body) { park_hold(); show_block_impl(head, body); park_free(); }
+static void show_block_impl(const char *head, const char *body) {
+    size_t blen = strlen(body);
+    if (!g_fs || !g_sb_active) { printf("%s\n%s%s", head, body, blen && body[blen - 1] != '\n' ? "\n" : ""); fflush(stdout); return; }
+    fflush(stdout);
+    if (g_sb_col > 0) sb_feed("\n", 1);
+    int id = ++g_fold_seq;
+    sb_ensure_line();
+    g_fold_rec = id;
+    g_sb_meta[g_sb_line] = (sb_meta){ id, SB_FOLD_HEAD, false };
+    sb_feed(head, strlen(head)); sb_feed("\n", 1);
+    sb_feed(body, blen);
+    if (blen && body[blen - 1] != '\n') sb_feed("\n", 1);
+    g_fold_rec = 0;
+    sb_ensure_line();
+    g_sb_meta[g_sb_line] = (sb_meta){ 0, SB_PLAIN, false };   /* the prompt's line is no part of the block */
+    for (int i = 0; i < g_sb_n; i++) if (g_sb_meta[i].fold == id) g_sb_meta[i].hidden = false;   /* open */
+    int n, top = -1; sb_row *r = sb_rows(g_fs_cols, &n);
+    int head_line = -1;
+    for (int i = 0; i < g_sb_n && head_line < 0; i++) if (g_sb_meta[i].fold == id && g_sb_meta[i].kind == SB_FOLD_HEAD) head_line = i;
+    for (int i = 0; i < n && top < 0 && head_line >= 0; i++) if (r[i].line == head_line) top = i;
+    free(r);
+    if (top < 0) return;
+    g_view_top = top;
+    view_paint();
+}
+
+/* The head at scrollback line `line` is shown or hidden: its body lines (line+1 … line+n) are flipped and
+ * its mark turned. Returns n, the body lines flipped; -1 when `line` is no fold's head (or a fold is being
+ * written). Only the model changes; the caller repaints the screen it draws. Shared by the ANSI screen's
+ * clicks and the notcurses pane's. */
+int term_fold_toggle(int line) {
+    if (g_fold_rec || line < 0 || line >= g_sb_n || g_sb_meta[line].kind != SB_FOLD_HEAD) return -1;
+    fflush(stdout);
+    int id = g_sb_meta[line].fold, nb = 0; bool open = false;
+    for (int i = line + 1; i < g_sb_n && g_sb_meta[i].fold == id && g_sb_meta[i].kind == SB_FOLD_BODY; i++) { g_sb_meta[i].hidden = !g_sb_meta[i].hidden; open = !g_sb_meta[i].hidden; nb++; }
+    char *mark = strstr(g_sb[line].data, open ? TERM_FOLD_CLOSED : TERM_FOLD_OPEN);   /* the two marks are as long as each other */
+    if (mark) memcpy(mark, open ? TERM_FOLD_OPEN : TERM_FOLD_CLOSED, strlen(TERM_FOLD_OPEN));
+    trace_note('F', "fold %d %s (line %d)", id, open ? "opened" : "closed", line);
+    return nb;
+}
+
 static void fold_click(void) {
     int row = g_click_row; g_click_row = 0;
     if (!row || !g_fs || !g_sb_active || g_fold_rec || row > fs_region()) return;
@@ -1020,12 +1651,7 @@ static void fold_click(void) {
     int first = g_view_top >= 0 ? g_view_top : conv_first(r, n, fs_region(), g_fs_cols > 0 ? g_fs_cols : 1, NULL, NULL);
     int idx = first + row - 1, line = idx >= 0 && idx < n ? r[idx].line : -1;
     free(r);
-    if (line < 0 || g_sb_meta[line].kind != SB_FOLD_HEAD) return;
-    int id = g_sb_meta[line].fold; bool open = false;
-    for (int i = line + 1; i < g_sb_n && g_sb_meta[i].fold == id && g_sb_meta[i].kind == SB_FOLD_BODY; i++) { g_sb_meta[i].hidden = !g_sb_meta[i].hidden; open = !g_sb_meta[i].hidden; }
-    char *mark = strstr(g_sb[line].data, open ? TERM_FOLD_CLOSED : TERM_FOLD_OPEN);   /* the two marks are as long as each other */
-    if (mark) memcpy(mark, open ? TERM_FOLD_OPEN : TERM_FOLD_CLOSED, strlen(TERM_FOLD_OPEN));
-    trace_note('F', "fold %d %s (row %d)", id, open ? "opened" : "closed", row);
+    if (term_fold_toggle(line) < 0) return;
     if (g_view_top >= 0) view_paint();
     else {
         bool was = g_sb_pause; sb_pause(true);
@@ -1075,9 +1701,10 @@ static void ta_restore(ta_stash st) {
  * Like Claude Code: text typed while the model is generating or a tool runs is
  * kept, and pressing Enter queues it as a message. Queued messages are shown in
  * the status bar and delivered by main.c at the next opportunity (between tool
- * rounds, or right after the turn ends). Text without Enter stays type-ahead and
- * simply reappears in the editor. Slash commands that main.c can answer without
- * touching the conversation run right away instead (term_run_while_busy). */
+ * rounds, or right after the turn ends). A queued message never stops the work in flight:
+ * it waits. Text without Enter stays type-ahead and simply reappears in the editor. Slash
+ * commands that main.c can answer without touching the conversation run right away instead
+ * (term_run_while_busy). */
 #define QUEUE_MAX 32
 static char *g_queue[QUEUE_MAX];
 int (*term_run_while_busy)(const char *line) = NULL;   /* set by main.c; see common.h */
@@ -1086,13 +1713,6 @@ static unsigned char g_ta_tail[6];   /* last bytes appended, to spot the paste b
 
 /* Whether a queued line is a message for the model (a /command or !line is the REPL's). */
 static bool queue_is_plain(const char *m) { return m && *m != '/' && *m != '!'; }
-
-/* Messages queued since main.c last marked the queue seen. Work in flight is stopped for
- * those and only those, so a message still waiting from before a turn started never kills
- * the command that turn goes on to run. */
-static unsigned g_queue_seq, g_queue_mark;
-void term_queue_mark(void) { g_queue_mark = g_queue_seq; }
-int  term_queue_new(void) { return g_queue_seq != g_queue_mark; }
 
 int term_queue_count(void) { return g_queue_n; }
 const char *term_queue_peek(void) { return g_queue_n ? g_queue[0] : NULL; }
@@ -1105,7 +1725,6 @@ char *term_queue_pop(void) {
 }
 void term_queue_push(const char *msg) {
     if (!msg || !*msg) return;
-    if (queue_is_plain(msg)) g_queue_seq++;
     if (g_queue_n >= QUEUE_MAX) { free(g_queue[0]); memmove(g_queue, g_queue + 1, sizeof(char*) * (QUEUE_MAX - 1)); g_queue_n--; }
     g_queue[g_queue_n++] = xstrdup(msg);
 }
@@ -1185,12 +1804,15 @@ static char *ta_pending_text(void) {
     return t;
 }
 
+static int g_ta_hist = -1;   /* ↑/↓ while busy: the history entry shown (g_hist_n: none, -1: not browsing) */
+static char *g_ta_draft;     /* what was typed before the history browse (↓ to the end brings it back) */
 /* Enter pressed while busy: the pending type-ahead becomes a queued message — unless it
  * is a slash command main.c can run right there and then (/status, /mode, …). */
 static void ta_submit(void) {
     size_t n = g_ta_len - g_ta_pos;
     char *text = term_keys_to_text(g_ta + g_ta_pos, n);
     g_ta_pos = g_ta_len = 0;
+    g_ta_hist = -1; free(g_ta_draft); g_ta_draft = NULL;   /* the history browse ends with the line */
     if (*text) {
         view_leave();   /* sending is the end of reading back: what the line does shows on the live screen */
         if (!(*text == '/' && term_run_while_busy && term_run_while_busy(text))) term_queue_push(text);
@@ -1202,7 +1824,7 @@ static void ta_submit(void) {
 /* Append a byte typed while busy; Enter (outside a paste, not Alt+Enter, not after
  * a trailing backslash) submits the pending text as a queued message. */
 static int csi_key(const char *params, int fin);
-static int mouse_key(int cb, int row);
+static int mouse_key(int cb, int row, int col);
 static void fold_click(void);
 static void ta_act(int k) {
     int page = view_rows() - 1;
@@ -1233,11 +1855,12 @@ static size_t ta_csi(void) {
     while (st > g_ta_pos && g_ta[st - 1] >= 0x30 && g_ta[st - 1] <= 0x3F) st--;
     return st >= g_ta_pos + 2 && g_ta[st - 1] == '[' && g_ta[st - 2] == 27 ? st : 0;
 }
+static void ta_hist(int k);   /* ↑/↓ while busy: the queue first, then the history (below) */
 static void ta_type(unsigned char c) {
     if (g_ta_x10) {   /* button, column, row — each offset by 32 */
         static unsigned char rep[3];
         rep[3 - g_ta_x10] = c;
-        if (--g_ta_x10 == 0) ta_act(mouse_key(rep[0] - 32, rep[2] - 32));
+        if (--g_ta_x10 == 0) ta_act(mouse_key(rep[0] - 32, rep[2] - 32, rep[1] - 32));
         return;
     }
     memmove(g_ta_tail, g_ta_tail + 1, sizeof g_ta_tail - 1); g_ta_tail[sizeof g_ta_tail - 1] = c;
@@ -1265,11 +1888,15 @@ static void ta_type(unsigned char c) {
                 return;
             }
             if ((k == K_UP || k == K_DOWN) && ta_sug_arrow(k, st - 2)) return;
+            if (k == K_UP || k == K_DOWN) { g_ta_len = st - 2; ta_hist(k); return; }   /* the arrow is taken here */
         }
-        if ((c == 'A' || c == 'B') && g_ta_len - g_ta_pos >= 2 && g_ta[g_ta_len - 1] == 'O' && g_ta[g_ta_len - 2] == 27
-            && ta_sug_arrow(c == 'A' ? K_UP : K_DOWN, g_ta_len - 2)) return;   /* (ESC O A: a terminal in application-cursor mode) */
+        if ((c == 'A' || c == 'B') && g_ta_len - g_ta_pos >= 2 && g_ta[g_ta_len - 1] == 'O' && g_ta[g_ta_len - 2] == 27) {
+            if (ta_sug_arrow(c == 'A' ? K_UP : K_DOWN, g_ta_len - 2)) return;   /* (ESC O A: a terminal in application-cursor mode) */
+            g_ta_len -= 2; ta_hist(c == 'A' ? K_UP : K_DOWN); return;
+        }
     }
     if (!g_ta_paste && (c == 14 || c == 16) && ta_sug_key(c == 14 ? K_DOWN : K_UP)) return;
+    if (!g_ta_paste && (c == 14 || c == 16)) { ta_hist(c == 14 ? K_DOWN : K_UP); return; }   /* Ctrl-N / Ctrl-P: as ↓ / ↑ */
     if (!g_ta_paste && c == '\t' && g_fs) { ta_sug_key(c); return; }   /* Tab completes, or does nothing: it is not text */
     ta_put(c);
     /* show it in the field — unless it is a byte of a key sequence still arriving (a wheel
@@ -1294,10 +1921,54 @@ void term_queue_to_editor(void) {
 
 void term_editor_prefill(const char *text) {
     if (!text) return;
+    if (g_ui_nc) { nc_prefill(text); return; }
     for (const char *p = text; *p; p++) ta_put((unsigned char)*p);
 }
 
+int term_interrupt_fd(void) { return g_ui_nc ? nc_input_fd() : STDIN_FILENO; }
+
+int term_strip_sel(void) { return g_strip_sel; }
+/* The strip for the notcurses screen (which draws it itself): refreshes it, and gives its lines and rows. */
+int term_strip_update(const char **text) {
+    strip_refresh();
+    if (text) *text = g_strip.data ? g_strip.data : "";
+    return g_strip_rows;
+}
+/* A key on the strip (STRIP_*; STRIP_OTHER returns to the field and is not taken).
+ * may_enter: the field is empty, so ↓ goes into the strip. Returns whether the strip took the key. */
+bool term_strip_key(int key, bool may_enter) {
+    if (!g_strip_rows) return false;
+    if (g_strip_sel < 0) { if (key == STRIP_DOWN && may_enter) { g_strip_sel = 0; return true; } return false; }
+    if (key == STRIP_DOWN) { if (g_strip_sel < g_strip_rows - 1) g_strip_sel++; return true; }
+    if (key == STRIP_UP) { g_strip_sel--; return true; }
+    if (key == STRIP_ESC) { g_strip_sel = -1; return true; }
+    if (key == STRIP_ENTER) { if (term_agents_open) term_agents_open(g_strip_sel); return true; }
+    g_strip_sel = -1;
+    return false;
+}
+
+/* While a turn runs, the agents strip takes the keys that are on it: ↓ from an empty type-ahead goes into it,
+ * ↑/↓ move, Enter opens the log picked, Esc returns to the field. Returns the bytes it took (0: none). */
+static ssize_t busy_strip_key(const unsigned char *kb, ssize_t k, ssize_t i) {
+    if (!g_strip_rows) return 0;
+    int code = 0; ssize_t used = 0;
+    if (kb[i] == 27 && i + 2 < k && (kb[i + 1] == '[' || kb[i + 1] == 'O') && (kb[i + 2] == 'A' || kb[i + 2] == 'B')) { code = kb[i + 2] == 'A' ? K_UP : K_DOWN; used = 3; }
+    else if (kb[i] == 27 && i == k - 1) { code = K_ESC; used = 1; }
+    else if (kb[i] == '\r' || kb[i] == '\n') { code = '\r'; used = 1; }
+    if (!code) return 0;
+    if (g_strip_sel < 0) {
+        if (code == K_DOWN && g_ta_len == 0) { g_strip_sel = 0; term_status_refresh(); return used; }
+        return 0;
+    }
+    if (code == K_DOWN) { if (g_strip_sel < g_strip_rows - 1) g_strip_sel++; term_status_refresh(); return used; }
+    if (code == K_UP) { g_strip_sel--; term_status_refresh(); return used; }
+    if (code == K_ESC) { g_strip_sel = -1; term_status_refresh(); return used; }
+    if (code == '\r') { if (term_agents_open) term_agents_open(g_strip_sel); term_status_refresh(); return used; }
+    return 0;
+}
+
 int term_poll_interrupt(void) {
+    if (g_ui_nc) return nc_poll_interrupt();
     unsigned char kb[256];
     for (;;) {
         fd_set rf; FD_ZERO(&rf); FD_SET(STDIN_FILENO, &rf);
@@ -1306,14 +1977,17 @@ int term_poll_interrupt(void) {
         ssize_t k = in_read(kb, sizeof kb);
         if (k <= 0) return 0;
         for (ssize_t i = 0; i < k; i++) {
-            if (kb[i] == 3) { view_leave(); return 1; }     /* Ctrl-C */
+            if (kb[i] == 3) { term_overlay_close(); view_leave(); return 1; }     /* Ctrl-C */
+            { ssize_t took = busy_strip_key(kb, k, i); if (took) { i += took - 1; continue; } }
             if (kb[i] == 27 && i == k - 1 && !g_ta_x10) {   /* bare Esc, or a split escape sequence? */
                 fd_set rf2; FD_ZERO(&rf2); FD_SET(STDIN_FILENO, &rf2);
                 struct timeval tv2 = { 0, 40 * 1000 };
                 if (select(STDIN_FILENO + 1, &rf2, NULL, NULL, &tv2) <= 0) {
                     /* Scrolled back, Esc is "back to the output", as it is in the viewer at the
                      * prompt — it takes a second one to stop the model. */
+                    if (g_ov_text) { term_overlay_close(); continue; }   /* the overlay goes first, like the viewer */
                     if (g_view_top >= 0) { view_leave(); continue; }
+                    if (g_strip_sel >= 0) { g_strip_sel = -1; term_status_refresh(); continue; }   /* the strip first: Esc back to the field */
                     if (ta_sug_key(K_ESC)) continue;   /* and with the suggestions up, it closes those */
                     return 1;
                 }
@@ -1327,6 +2001,7 @@ int term_poll_interrupt(void) {
 
 /* Idle work at the prompt (see common.h): main.c sets these before each term_readline(). */
 void (*term_idle_hook)(void) = NULL;
+void (*term_agents_menu)(void) = NULL;
 int term_idle_ms = 0;
 
 static int read_byte_timeout(int ms) {
@@ -1343,8 +2018,10 @@ static int read_byte_timeout(int ms) {
 /* A mouse report as a key: button code and row (1-based). Only the wheel means anything here,
  * and only over the conversation — over the input field and the bar it does nothing, their keys
  * are the keyboard's. Clicks, releases and drags are reported too (there is no wheel-only mode). */
-static int mouse_key(int cb, int row) {
+static int mouse_key(int cb, int row, int col) {
+    if ((cb & 0xE3) == 0 && g_banner_on && row == g_bn_xr && col >= g_bn_xc0 && col <= g_bn_xc1) return K_BANNER_X;   /* the banner's close button */
     g_click_row = (cb & 0xE3) == 0 && g_fs && row >= 1 && row <= fs_region() ? row : 0;   /* the left button, pressed, not dragged: whoever reads the key may act on it (fold_click) */
+    g_click_frow = (cb & 0xE3) == 0 && g_fs && row > fs_region() ? row : 0; g_click_fcol = col;   /* ... or in the field below it (paste_click) */
     if ((cb & 0xC0) != 64 || (cb & 2)) return K_MOUSE;   /* not the vertical wheel */
     if (g_fs && row > fs_region()) return K_MOUSE;
     return (cb & 1) ? K_WHEEL_DOWN : K_WHEEL_UP;
@@ -1355,8 +2032,8 @@ static int csi_key(const char *params, int fin) {
     if (params[0] == '<') {   /* SGR mouse report: <button;column;row, M = pressed, m = released */
         int cb = 0, x = 0, y = 0;
         if ((fin != 'M' && fin != 'm') || sscanf(params + 1, "%d;%d;%d", &cb, &x, &y) != 3) return K_ESC;
-        if (fin == 'm') { g_click_row = 0; return K_MOUSE; }
-        return mouse_key(cb, y);
+        if (fin == 'm') { g_click_row = g_click_frow = 0; return K_MOUSE; }
+        return mouse_key(cb, y, x);
     }
     switch (fin) {
         case 'M': return params[0] ? K_ESC : K_MOUSE_X10;   /* a terminal without SGR reports */
@@ -1435,14 +2112,55 @@ static int read_key(void) {
     int k = csi_key(params, b);
     if (k == K_MOUSE_X10) {   /* button, column, row follow, each offset by 32 */
         int cb = read_byte_timeout(40), x = read_byte_timeout(40), y = read_byte_timeout(40);
-        (void)x;
-        return y < 0 ? K_ESC : mouse_key(cb - 32, y - 32);
+        return y < 0 ? K_ESC : mouse_key(cb - 32, y - 32, x - 32);
     }
     return k;
 }
 
 /* read_key(), but gives up after `ms` without a byte: -3 = nothing was typed. */
 #define K_IDLE (-3)
+/* ---------- the banner's tick ----------
+ * While the top-level prompt waits (term_readline) a tick runs every TICK_MS: the banner's modal is
+ * redrawn with its next frame (main.c: banner_tick, term_banner_draw). The tick gets still=true once, when
+ * the prompt returns, so the modal settles on its last frame. */
+#define TICK_MS 100
+static void (*g_tick_fn)(bool still) = NULL;
+static bool g_tick_done = false;            /* the first task has stopped the ticks for good: no tick is set again */
+static bool g_tick_live = false;
+static long g_tick_next = 0;                   /* monotonic ms of the next tick */
+static long mono_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L; }
+static int tick_wait_ms(void) {
+    if (!g_tick_fn || !g_tick_live) return -1;
+    long left = g_tick_next - mono_ms();
+    return left < 0 ? 0 : (int)left;
+}
+void term_tick_set(void (*fn)(bool still)) { if (!g_tick_done) g_tick_fn = fn; }
+int  term_tick_wait(void) { return tick_wait_ms(); }
+void term_tick_run(void) {
+    if (!g_tick_fn || !g_tick_live || tick_wait_ms() > 0) return;
+    g_tick_fn(false);
+    g_tick_next = mono_ms() + TICK_MS;
+}
+static int read_key_wait(int ms);
+/* A key at the prompt. A tick (when one runs) cuts the wait short; the idle work, when armed, is due
+ * term_idle_ms after the prompt was last touched, whatever ticks come meanwhile (a deadline, not a wait).
+ * Returns K_IDLE only for the idle work. */
+static int read_key_prompt(bool idle) {
+    long deadline = idle && term_idle_ms > 0 ? mono_ms() + term_idle_ms : -1;
+    for (;;) {
+        int wait = tick_wait_ms();
+        if (deadline >= 0) {
+            long left = deadline - mono_ms(); if (left < 0) left = 0;
+            if (wait < 0 || left < wait) wait = (int)left;
+        }
+        if (wait < 0) return read_key();
+        int k = read_key_wait(wait);
+        if (k != K_IDLE) return k;
+        term_tick_run();
+        if (deadline >= 0 && mono_ms() >= deadline) return K_IDLE;
+    }
+}
+
 static int read_key_wait(int ms) {
     if (g_ta_pos >= g_ta_len) {   /* type-ahead counts as typed */
         fd_set rf; FD_ZERO(&rf); FD_SET(STDIN_FILENO, &rf);
@@ -1458,7 +2176,9 @@ static int read_key_wait(int ms) {
  * row. `delta` is the first move (0 = carry on with a window that is already up, from the turn
  * that just ended). End, Esc and Enter go back to the prompt; so does anything typed, and that
  * key is the message's — it is handed on to the editor instead of being swallowed. */
-static void scroll_view(int delta) {
+static void scroll_view_impl(int delta);
+static void scroll_view(int delta) { park_hold(); scroll_view_impl(delta); park_free(); }
+static void scroll_view_impl(int delta) {
     if (!g_fs || !g_sb_active) return;
     ta_stash stash = ta_take();   /* what is still to be replayed into the editor is not for the viewer */
     int typed = -1;
@@ -1497,6 +2217,28 @@ int term_getkey(void) {
 #define HIST_FILE_MAX (64 * 1024)   /* bytes; ~1000 queries, so folding is rare */
 static char *g_hist[HIST_MAX];
 static int g_hist_n = 0;
+/* ↑/↓ while busy: the history the type-ahead shows (g_ta_hist = g_hist_n: none, -1: not browsing since the
+ * last line), and what was typed before browsing (g_ta_draft), which ↓ back to the end brings back. */
+/* A history browse ends (the turn is over, or the queue comes back): the line typed before it returns to the
+ * field, so a message being written is not lost in the history. */
+static void ta_end_browse(void) {
+    if (g_ta_hist < 0 || g_ta_hist >= g_hist_n) return;
+    ta_set_text(g_ta_draft ? g_ta_draft : "");
+    g_ta_hist = -1; free(g_ta_draft); g_ta_draft = NULL;
+}
+static void ta_hist(int k) {
+    if (k == K_UP && term_queue_count()) { ta_end_browse(); term_queue_to_editor(); term_status_refresh(); return; }   /* the queue comes back first */
+    if (g_ta_hist < 0) g_ta_hist = g_hist_n;
+    if (k == K_UP) {
+        if (g_ta_hist == 0) return;
+        if (g_ta_hist == g_hist_n) { free(g_ta_draft); g_ta_draft = ta_text(); }
+        ta_set_text(g_hist[--g_ta_hist]);
+    } else if (g_ta_hist < g_hist_n) {
+        if (++g_ta_hist == g_hist_n) ta_set_text(g_ta_draft ? g_ta_draft : "");
+        else ta_set_text(g_hist[g_ta_hist]);
+    }
+    term_status_refresh();
+}
 static int g_hist_pending = 0;   /* entries added since the last save: the tail of g_hist */
 
 int hist_count(void) { return g_hist_n; }
@@ -1514,6 +2256,11 @@ void hist_add(const char *line) {
     if (g_hist_n == HIST_MAX) { free(g_hist[0]); memmove(g_hist, g_hist + 1, sizeof(char*) * (HIST_MAX - 1)); g_hist_n--; }
     g_hist[g_hist_n++] = xstrdup(line);
     if (g_hist_pending < g_hist_n) g_hist_pending++;
+}
+
+bool hist_contains(const char *line) {
+    for (int i = 0; i < g_hist_n; i++) if (!strcmp(g_hist[i], line)) return true;
+    return false;
 }
 
 void hist_load(void) {
@@ -1640,9 +2387,7 @@ static void ed_refresh(editor *e);
 /* Run term_idle_hook() with the terminal in the state a turn runs in: the field released and
  * the cursor back where the transcript ended, so the hook's own output (and the status bar it
  * refreshes) lands like any other conversation output. The prompt is redrawn afterwards. */
-static void ed_idle_run(editor *e) {
-    void (*hook)(void) = term_idle_hook;
-    if (!hook) return;
+static void ed_hook_run(editor *e, void (*hook)(void)) {
     if (e->in_field) {
         g_field_focus = false;
         g_field_text = ""; g_field_len = g_field_cur = 0; g_field_view = 0;
@@ -1662,6 +2407,9 @@ static void ed_idle_run(editor *e) {
         hook();
     }
     ed_refresh(e);
+}
+static void ed_idle_run(editor *e) {
+    if (term_idle_hook) ed_hook_run(e, term_idle_hook);
 }
 
 static void ed_refresh(editor *e) {
@@ -1863,6 +2611,7 @@ static void ta_sug_sync(void) {
 static bool ta_sug_key(int k) {
     ta_sug_sync();   /* (a newline typed with Alt+Enter is in the text without a refresh having seen it) */
     if (!g_ta_sug_for || g_field_focus) return false;
+    if ((k == K_UP || k == K_DOWN) && g_ta_hist >= 0 && g_ta_hist < g_hist_n) return false;   /* browsing the history: ↑/↓ scroll it */
     editor e; memset(&e, 0, sizeof e);   /* the text as an editor's, for sug_tab() and sug_accept() */
     sb_init(&e.buf); sb_puts(&e.buf, g_ta_sug_for); e.cur = e.buf.len;
     if (k == '\t' && !g_sug_n) { sug_fill(e.buf.data, e.cur); g_ta_sug_for = xstrdup(e.buf.data); }   /* closed: Tab asks again */
@@ -1930,7 +2679,149 @@ static void ed_hist_search(editor *e) {
     free(orig);
 }
 
+/* ---------- pasted text ----------
+ * More than three lines, or more than 800 bytes, go in as a token; the rest is typed in as it is. */
+#define PASTE_LINES 3
+#define PASTE_BYTES 800
+static void paste_insert(editor *e, const char *t, size_t n) {
+    int lines = 0;
+    for (size_t i = 0; i < n; i++) if (t[i] == '\n') lines++;
+    if (n && t[n - 1] != '\n') lines++;
+    if ((lines > PASTE_LINES || n > PASTE_BYTES) && g_paste_n < PASTE_MAX) {
+        char tok[64]; snprintf(tok, sizeof tok, "[Pasted text #%d +%d lines]", g_paste_n + 1, lines);
+        g_paste[g_paste_n].text = xstrndup(t, n); g_paste[g_paste_n].lines = lines; g_paste_n++;
+        ed_insert(e, tok, strlen(tok));
+        return;
+    }
+    ed_insert(e, t, n);
+}
+/* Ctrl-O unfolds the paste token the caret is on (or just after): its text goes into the field in its place,
+ * where it can be read and edited, and is sent as it stands. The token's record stays unreferenced:
+ * paste_result() only substitutes tokens still in the field. */
+static bool paste_unfold(editor *e) {
+    size_t sp[PASTE_MAX][2]; int ks[PASTE_MAX], ns[PASTE_MAX];
+    size_t nt = paste_tokens(e->buf.data, e->buf.len, sp, ks, ns, PASTE_MAX);
+    for (size_t i = 0; i < nt; i++) {
+        if (e->cur < sp[i][0] || e->cur > sp[i][1]) continue;
+        int k = ks[i] - 1;
+        if (k < 0 || k >= g_paste_n || !g_paste[k].text) return false;
+        const char *t = g_paste[k].text; size_t n = strlen(t);
+        /* take the token out, then put the text in its place: the caret ends after the text */
+        e->cur = sp[i][0];
+        ed_delete_range(e, sp[i][0], sp[i][1]);
+        ed_insert(e, t, n);
+        return true;
+    }
+    return false;
+}
+/* Backspace (before the cursor) or Delete (after it) on a whole token takes the whole token. */
+static bool paste_del(editor *e, bool before) {
+    size_t sp[PASTE_MAX][2];
+    size_t n = paste_tokens(e->buf.data, e->buf.len, sp, NULL, NULL, PASTE_MAX);
+    for (size_t i = 0; i < n; i++)
+        if (before ? sp[i][1] == e->cur : sp[i][0] == e->cur) { ed_delete_range(e, sp[i][0], sp[i][1]); e->cur = sp[i][0]; return true; }
+    return false;
+}
+/* The prompt's text as it is sent: the tokens put back. */
+static char *paste_result(const editor *e) {
+    const char *t[PASTE_MAX]; int l[PASTE_MAX];
+    for (int i = 0; i < g_paste_n; i++) { t[i] = g_paste[i].text; l[i] = g_paste[i].lines; }
+    return paste_expand(e->buf.data, e->buf.len, t, l, g_paste_n);
+}
+
+/* The modal for one paste: its lines, wrapped to the width, with a title row and a footer row
+ * and the rest scrolled with the keys the viewer uses. Esc (or anything else) closes it; the
+ * conversation is painted again from the model underneath, and the field is left as it was. */
+static void paste_modal_impl(int k, const char *text, int lines);
+static void paste_modal(int k, const char *text, int lines) { park_hold(); paste_modal_impl(k, text, lines); park_free(); }
+static void paste_modal_impl(int k, const char *text, int lines) {
+    if (!g_fs || !g_sb_active) return;
+    int region = fs_region();
+    if (region < 4) return;
+    fflush(stdout);
+    bool was = g_sb_pause; sb_pause(true);
+    char *t = xstrdup(text);
+    for (char *p = t; *p; p++) if (*p == '\t') *p = ' ';
+    int width = g_fs_cols > 1 ? g_fs_cols : 1, body = region - 2;
+    size_t cap = 256, n = 0; size_t (*rw)[2] = xmalloc(sizeof *rw * cap);   /* visual rows: (offset, length) */
+    size_t len = strlen(t);
+    for (size_t off = 0; off <= len; ) {
+        const char *nl = strchr(t + off, '\n');
+        size_t ll = nl ? (size_t)(nl - (t + off)) : len - off, st = 0;
+        do {
+            size_t e2 = ll ? vis_offset(t + off + st, ll - st, width) + st : 0;
+            if (e2 <= st) e2 = ll;   /* (a character wider than the window: one row for it) */
+            if (n == cap) { cap *= 2; rw = xrealloc(rw, sizeof *rw * cap); }
+            rw[n][0] = off + st; rw[n][1] = e2 - st; n++;
+            st = e2;
+        } while (st < ll);
+        if (!nl) break;
+        off += ll + 1;
+    }
+    size_t top = 0, maxtop = n > (size_t)body ? n - body : 0;
+    for (;;) {
+        sbuf o; sb_init(&o);
+        sb_puts(&o, "\x1b[?7l");
+        sb_printf(&o, "\x1b[1;1H\x1b[2K" C_BOLD);
+        char title[256];
+        snprintf(title, sizeof title, " pasted text #%d · %d lines   ", k, lines);
+        put_clipped(&o, title, width, false);
+        sb_puts(&o, C_RESET " " C_DIM "↑/↓ PgUp/PgDn Home/End scroll · Esc closes" C_RESET);
+        for (int i = 0; i < body; i++) {
+            sb_printf(&o, "\x1b[%d;1H\x1b[2K", i + 2);
+            size_t idx = top + (size_t)i;
+            if (idx < n) sb_append(&o, t + rw[idx][0], rw[idx][1]);
+        }
+        sb_printf(&o, "\x1b[%d;1H\x1b[2K" C_DIM " rows %zu-%zu of %zu" C_RESET, region,
+                  n ? top + 1 : 0, top + (size_t)body < n ? top + (size_t)body : n, n);
+        sb_puts(&o, "\x1b[?7h");
+        fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o);
+        int key = read_key();
+        if (key == -2) break;   /* resized: the modal is closed; the token is still in the field */
+        if (key == K_MOUSE) continue;   /* clicks mean nothing in the modal */
+        if (key == K_UP || key == 'k') { if (top) top--; }
+        else if (key == K_DOWN || key == 'j') { if (top < maxtop) top++; }
+        else if (key == K_PGUP) { top = top > (size_t)body - 1 ? top - ((size_t)body - 1) : 0; }
+        else if (key == K_PGDN || key == ' ') { top += (size_t)body - 1; }
+        else if (key == K_WHEEL_UP) { top = top > 3 ? top - 3 : 0; }
+        else if (key == K_WHEEL_DOWN) { top += 3; }
+        else if (key == K_HOME || key == 'g') top = 0;
+        else if (key == K_END || key == 'G') top = maxtop;
+        else break;
+        if (top > maxtop) top = maxtop;
+    }
+    free(rw); free(t);
+    /* back to the conversation: painted again from the model, where the modal stood */
+    if (!layout_sync()) { sbuf o; sb_init(&o); conv_repaint(&o); fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o); }
+    sb_pause(was);
+    term_status_refresh();
+}
+
+/* A click in the field: on a paste token it opens the paste. False = nothing was there. */
+static bool paste_click(const editor *e) {
+    int row = g_click_frow, col = g_click_fcol; g_click_frow = 0;
+    if (!row || !e->in_field || !g_fs) return false;
+    int top = field_top();
+    if (row < top + 1 || row > top + g_field_rows) return false;
+    int width = field_width(), plen = vis_width(field_prompt());
+    int vrow = g_field_view + (row - (top + 1));
+    size_t i = field_row_start(width, plen, vrow);
+    int c = vrow == 0 ? plen : 0, want = col - 1 - FIELD_X0;   /* the column the click is on, counted in characters (a token is ASCII) */
+    while (i < e->buf.len && e->buf.data[i] != '\n' && c < want) {
+        i = u8_next(e->buf.data, i, e->buf.len); c++;
+    }
+    size_t sp[PASTE_MAX][2]; int ks[PASTE_MAX];
+    size_t n = paste_tokens(e->buf.data, e->buf.len, sp, ks, NULL, PASTE_MAX);
+    for (size_t j = 0; j < n; j++)
+        if (i >= sp[j][0] && i < sp[j][1] && ks[j] >= 1 && ks[j] <= g_paste_n) {
+            paste_modal(ks[j], g_paste[ks[j] - 1].text, g_paste[ks[j] - 1].lines);
+            return true;
+        }
+    return false;
+}
+
 static char *readline_impl(const char *prompt, bool in_field) {
+    paste_reset();   /* the pastes of the last prompt were sent (or dropped) with it */
     editor e; memset(&e, 0, sizeof e);
     sb_init(&e.buf); sb_append(&e.buf, "", 0);
     e.prompt = prompt; e.plen = vis_width(prompt);
@@ -1957,8 +2848,18 @@ static char *readline_impl(const char *prompt, bool in_field) {
     bool idle_armed = term_idle_hook && term_idle_ms > 0;
     while (!done) {
         if (g_view_top >= 0) { scroll_view(0); e.prev_cursor_row = 0; ed_refresh(&e); continue; }
-        int k = idle_armed && e.buf.len == 0 ? read_key_wait(term_idle_ms) : read_key();
-        if (k == K_MOUSE) { fold_click(); continue; }      /* a click: on the head of a fold it opens or closes it */
+        int k = read_key_prompt(idle_armed && e.buf.len == 0);
+        if (g_strip_rows) {   /* the agents strip: ↓ on an empty line goes into it; in it ↑/↓ move, Enter opens the log, Esc or a typed key returns to the field */
+            if (g_strip_sel < 0 && k == K_DOWN && e.buf.len == 0 && !g_sug_rows) { g_strip_sel = 0; term_status_refresh(); continue; }
+            if (g_strip_sel >= 0) {
+                if (k == K_DOWN) { if (g_strip_sel < g_strip_rows - 1) g_strip_sel++; term_status_refresh(); continue; }
+                if (k == K_UP) { g_strip_sel--; term_status_refresh(); continue; }
+                if (k == K_ESC) { g_strip_sel = -1; term_status_refresh(); continue; }
+                if (k == '\r' || k == '\n') { if (term_agents_open) term_agents_open(g_strip_sel); term_status_refresh(); continue; }
+                g_strip_sel = -1; term_status_refresh();   /* any other key: back to the field, and that key is handled as usual */
+            }
+        }
+        if (k == K_MOUSE) { if (!paste_click(&e)) fold_click(); continue; }   /* a click: a paste token opens it; on the head of a fold it opens or closes the fold */
         if (k == K_WHEEL_DOWN) continue;                   /* the wheel with nothing below to scroll to */
         if (k == K_IDLE) {
             idle_armed = false;
@@ -1976,6 +2877,7 @@ static char *readline_impl(const char *prompt, bool in_field) {
         idle_armed = false;
         if (k == -1) { result = NULL; break; }
         if (k != 3) ctrlc_count = 0;
+        if ((k == K_ESC || k == K_BANNER_X) && g_ov_text) { term_overlay_close(); continue; }   /* Esc, or the banner's close button, closes the overlay before anything else */
         if (k == K_ESC && e.buf.len == 0) {
             if (esc_pending) { result = xstrdup("/rewind"); done = true; break; }
             esc_pending = true;
@@ -1992,9 +2894,11 @@ static char *readline_impl(const char *prompt, bool in_field) {
             ed_refresh(&e);
             continue;
         }
-        if (g_sug_n > 0) {   /* the list under the field is up: these keys are its own */
+        if (g_sug_n > 0) {   /* the list under the field is up: these keys are its own — but ↑/↓ scroll the history while it is browsed */
             bool taken = true;
-            if (k == K_DOWN || k == 14) { if (g_sug_sel < g_sug_n - 1) g_sug_sel++; }
+            bool arrow = k == K_UP || k == K_DOWN || k == 14 || k == 16;
+            if (arrow && e.hist_idx < g_hist_n) taken = false;
+            else if (k == K_DOWN || k == 14) { if (g_sug_sel < g_sug_n - 1) g_sug_sel++; }
             else if ((k == K_UP || k == 16) && g_sug_sel >= 0) g_sug_sel--;
             else if (k == '\r' && g_sug_sel >= 0) { sug_accept(&e, g_sug_sel); sug_update(&e); }
             else if (k == K_ESC) { e.sug_off = true; sug_update(&e); }
@@ -2008,7 +2912,7 @@ static char *readline_impl(const char *prompt, bool in_field) {
                 if (e.buf.len && e.buf.data[e.buf.len - 1] == '\\') {   /* trailing backslash = newline */
                     e.buf.data[e.buf.len - 1] = '\n'; e.cur = e.buf.len; break;
                 }
-                result = xstrndup(e.buf.data, e.buf.len); done = true; break;
+                result = paste_result(&e); done = true; break;
             case '\n': case K_ALT_ENTER: ed_insert(&e, "\n", 1); break;
             case 3:   /* Ctrl-C */
                 if (e.buf.len) { ed_set(&e, ""); }
@@ -2025,13 +2929,17 @@ static char *readline_impl(const char *prompt, bool in_field) {
                 else ed_delete_range(&e, e.cur, u8_next(e.buf.data, e.cur, e.buf.len));
                 break;
             case 127: case 8:   /* backspace */
+                if (paste_del(&e, true)) break;
                 if (e.cur > 0) { size_t p = u8_prev(e.buf.data, e.cur); ed_delete_range(&e, p, e.cur); e.cur = p; }
                 break;
-            case K_DEL: ed_delete_range(&e, e.cur, u8_next(e.buf.data, e.cur, e.buf.len)); break;
-            case K_LEFT: case 2: e.cur = u8_prev(e.buf.data, e.cur); break;
+            case K_DEL: if (paste_del(&e, false)) break; ed_delete_range(&e, e.cur, u8_next(e.buf.data, e.cur, e.buf.len)); break;
+            case K_LEFT: case 2:
+                if (k == K_LEFT && e.buf.len == 0 && term_agents_menu) { ed_hook_run(&e, term_agents_menu); break; }   /* ← on an empty line: the sub-agents */
+                e.cur = u8_prev(e.buf.data, e.cur); break;
             case K_RIGHT: case 6: e.cur = u8_next(e.buf.data, e.cur, e.buf.len); break;
             case K_HOME: case 1: {
                 size_t p = e.cur; while (p > 0 && e.buf.data[p-1] != '\n') p--; e.cur = p; break; }
+            case 15: paste_unfold(&e); break;   /* Ctrl-O: unfold the paste token at the caret */
             case K_END: case 5: {
                 size_t p = e.cur; while (p < e.buf.len && e.buf.data[p] != '\n') p++; e.cur = p; break; }
             case K_ALT_B: case K_CTRL_LEFT: e.cur = word_left(&e); break;
@@ -2092,7 +3000,7 @@ static char *readline_impl(const char *prompt, bool in_field) {
                     if ((unsigned char)c < 32 && c != '\n' && c != '\t') continue;
                     sb_putc(&q, c);
                 }
-                if (q.len) ed_insert(&e, q.data, q.len);
+                if (q.len) paste_insert(&e, q.data, q.len);
                 sb_free(&p); sb_free(&q);
                 break; }
             case K_PGUP: case K_WHEEL_UP: {
@@ -2128,7 +3036,7 @@ static char *readline_impl(const char *prompt, bool in_field) {
         printf("\x1b[%d;%dH", g_conv_row, g_conv_col);
         fflush(stdout);
         sb_pause(false);
-        if (result) printf("%s%s" C_RESET "\n", prompt, result);
+        if (result) { char *b = term_user_band(prompt, result); fputs(b, stdout); free(b); }
         else printf("\n");
         term_status_refresh();
     } else {   /* drawn inline (a question inside a turn): finish where it stands */
@@ -2142,9 +3050,8 @@ static char *readline_impl(const char *prompt, bool in_field) {
         fputs("\x1b[?2004l", stdout);
         term_status_refresh();   /* "\x1b[J" wiped the bar */
         sb_pause(false);
-        if (result) {   /* what stays on screen: the prompt and the submitted text */
-            sbuf n; sb_init(&n); sb_puts(&n, prompt); sb_puts(&n, result); sb_puts(&n, C_RESET "\n");
-            sb_note(n.data); sb_free(&n);
+        if (result) {   /* what stays on screen: the prompt and the submitted text, on the user's ground */
+            char *b = term_user_band(prompt, result); sb_note(b); free(b);
         } else sb_note("\n");
     }
     fflush(stdout);
@@ -2153,11 +3060,86 @@ static char *readline_impl(const char *prompt, bool in_field) {
     return result;
 }
 
-char *term_readline(const char *prompt) { return readline_impl(prompt, true); }
-char *term_ask_line(const char *prompt) { return readline_impl(prompt, false); }
+bool term_is_ready(void) { return g_ready; }
+
+/* The notcurses screen: a line the user sent goes into the conversation on the user's ground, as the ANSI
+ * editor's submitted line does (readline_impl). An empty line leaves nothing, as it does there. */
+void nc_echo_line(const char *prompt, const char *s) {
+    if (!s || !*s) return;
+    char *b = term_user_band(prompt, s);
+    fputs(b, stdout); fflush(stdout);
+    free(b);
+}
+/* Append s to o with the user's ground in place, and again after every reset in s (a reset clears the ground). */
+static void band_put(sbuf *o, const char *s, const char *bg) {
+    size_t rl = strlen(C_RESET);
+    for (const char *q = s; *q; ) {
+        if (!strncmp(q, C_RESET, rl)) { sb_puts(o, C_RESET); sb_puts(o, bg); q += rl; }
+        else sb_putc(o, *q++);
+    }
+}
+/* A line the user sent, as the conversation shows it: the lead (its own colours) and the text on the user's
+ * ground and in the user's text colour, as theme roles (THEME_ROLE_*): padded to the width so the band is whole; a line
+ * longer than the width wraps as it is. Lines after the first have no lead. malloc'd, every line ends in a newline. */
+char *term_user_band(const char *lead, const char *text) {
+    /* the ground and the text colour, re-applied after every reset (the lead's included). Where stdout is the hook the
+     * bytes are mapped on the way out, or parsed by notcurses, so they are theme roles; without the hook they go to the
+     * terminal as they are, and the theme's RGB is written. */
+    char roles[64];
+    if (g_sb_active) snprintf(roles, sizeof roles, "\x1b[%dm\x1b[%dm", THEME_ROLE_USER_BG, THEME_ROLE_USER_TEXT);
+    else snprintf(roles, sizeof roles, "%s%s", th_bg(g_theme->user_bg), th_fg(g_theme->user_text));
+    char *bg = xstrdup(roles);
+    int width = term_width();
+    sbuf o; sb_init(&o);
+    const char *p = text ? text : "";
+    bool first = true;
+    for (;;) {
+        const char *nl = strchr(p, '\n');
+        char *line = xstrndup(p, nl ? (size_t)(nl - p) : strlen(p));
+        int used = nc_text_width(line);
+        sb_puts(&o, bg);
+        if (first && lead) { band_put(&o, lead, bg); used += nc_text_width(lead); }
+        band_put(&o, line, bg);
+        for (int pad = width - used; pad > 0; pad--) sb_putc(&o, ' ');
+        sb_puts(&o, C_RESET "\n");
+        free(line);
+        if (!nl) break;
+        p = nl + 1; first = false;
+    }
+    free(bg);
+    char *r = xstrndup(o.data, o.len);
+    sb_free(&o);
+    return r;
+}
+char *term_readline(const char *prompt) {
+    g_ready = true; term_status_refresh();
+    g_tick_live = g_tick_fn != NULL; g_tick_next = mono_ms() + TICK_MS;
+    if (g_ui_nc) nc_leave_browse(); else ta_end_browse();   /* the turn is over: the message being written is back in the field */
+    char *s = g_ui_nc ? nc_readline(prompt, true) : readline_impl(prompt, true);
+    if (g_ui_nc) nc_echo_line(prompt, s);   /* the notcurses field does not print what was sent; the ANSI editor does */
+    if (g_tick_live && g_tick_fn) g_tick_fn(true);   /* the block settles on its last frame */
+    /* the first task ends the banner's animation for good: a slash command or a shell line is not work */
+    if (s && *s && *s != '/' && *s != '!' && !g_tick_done) { g_tick_fn = NULL; g_tick_done = true; }
+    /* the modal is closed by any line that is sent: a reply, or a command's output, must not land under it */
+    if (s && *s && term_banner_open()) term_banner_hide();
+    g_tick_live = false;
+    g_ready = false; term_status_refresh();
+    return s;
+}
+char *term_ask_line(const char *prompt) {
+    if (g_ui_nc) { char *r = nc_readline(prompt, false); nc_echo_line(prompt, r); return r; }
+    park_hold(); char *r = readline_impl(prompt, false); park_free();
+    return r;
+}
 
 /* ---------- confirmation menu ---------- */
+static int confirm_impl(const char *question, const char *always_label, const char *project_label, char **reason);
 int term_confirm(const char *question, const char *always_label, const char *project_label, char **reason) {
+    if (g_ui_nc) return nc_confirm(question, always_label, project_label, reason);
+    park_hold(); int r = confirm_impl(question, always_label, project_label, reason); park_free();
+    return r;
+}
+static int confirm_impl(const char *question, const char *always_label, const char *project_label, char **reason) {
     if (reason) *reason = NULL;
     term_raw(true);
     ta_stash stash = ta_take();
@@ -2219,7 +3201,7 @@ int term_confirm(const char *question, const char *always_label, const char *pro
     if (drawn) printf("\x1b[%dA", drawn);
     printf("\r\x1b[J");
     sb_pause(false);
-    printf("  " C_YELLOW "%s" C_RESET "  %s\n", question,
+    if (!term_confirm_quiet) printf("  " C_YELLOW "%s" C_RESET "  %s\n", question,
            choice == 0 ? C_GREEN "yes" C_RESET : choice == 1 ? C_GREEN "yes, always this session" C_RESET
            : (nopt == 4 && choice == 2) ? C_GREEN "yes, always in this project" C_RESET : C_RED "no" C_RESET);
     term_status_refresh();
@@ -2234,19 +3216,59 @@ int term_confirm(const char *question, const char *always_label, const char *pro
 }
 
 /* ---------- markdown streaming printer ---------- */
-void md_init(md_state *m) { memset(m, 0, sizeof *m); m->at_line_start = true; }
+void md_init(md_state *m) { memset(m, 0, sizeof *m); m->at_line_start = true; sb_init(&m->word); }
+
+/* a code line of a fence is printed when it ends, highlighted by the fence's language */
+/* ---------- word wrap of the prose ----------
+ * On a full screen the prose breaks at word boundaries, not where the terminal would break a row (in the
+ * middle of a word). The word being collected is held until its end (a space, a newline, or any escape
+ * the printer writes), then printed; a word that does not fit on the rest of the line starts a new one. Off
+ * a full screen (a pipe, -p) the text is printed as it comes. */
+static int md_width(void) { return g_fs || g_ui_nc ? (term_width() > 2 ? term_width() - 1 : 0) : 0; }
+static void md_word_flush(md_state *m) {
+    if (!m->word.len) return;
+    int ww = vis_width(m->word.data), width = md_width();
+    if (width && m->col > 0 && m->col + ww > width) { fputc('\n', stdout); m->col = 0; }
+    fwrite(m->word.data, 1, m->word.len, stdout);
+    m->col += ww;
+    sb_clear(&m->word);
+}
+static void md_prose(md_state *m, char c) {
+    if (!md_width()) { fputc(c, stdout); return; }
+    if (c == ' ' || c == '\t') {
+        md_word_flush(m);
+        if (m->col > 0) { fputc(' ', stdout); m->col++; }
+        return;
+    }
+    if (c == '\n') { md_word_flush(m); fputc('\n', stdout); m->col = 0; return; }
+    sb_putc(&m->word, c);
+}
+static void md_fputs(md_state *m, const char *s) { md_word_flush(m); fputs(s, stdout); }
+static void md_code_line(md_state *m) {
+    md_word_flush(m);   /* the word before it goes out first */
+    sbuf out; sb_init(&out);
+    highlight_line(m->lang, m->line.data ? m->line.data : "", &out, C_CYAN);
+    fputs(out.data ? out.data : "", stdout);
+    sb_free(&out);
+    sb_clear(&m->line);
+}
 
 static void md_flush_ticks(md_state *m) {
     int t = m->pending_ticks;
     m->pending_ticks = 0;
     if (t == 0) return;
+    md_word_flush(m);   /* the word before the marker goes out first */
     if (t >= 3 && m->at_line_start) {
         m->in_fence = !m->in_fence;
         fputs(m->in_fence ? C_GRAY "```" : "```" C_RESET, stdout);
-        if (m->in_fence) fputs(C_RESET C_CYAN, stdout);
+        if (m->in_fence) {   /* the info string follows: it names the language */
+            fputs(C_RESET C_CYAN, stdout);
+            m->in_info = true; sb_clear(&m->info); sb_clear(&m->line); m->lang[0] = 0;
+        } else { m->in_info = false; }
         for (int i = 3; i < t; i++) fputc('`', stdout);
         return;
     }
+    if (m->in_fence && !m->in_info) { for (int i = 0; i < t; i++) sb_putc(&m->line, '`'); return; }
     if (m->in_fence) { for (int i = 0; i < t; i++) fputc('`', stdout); return; }
     if (t == 1) {
         m->in_code = !m->in_code;
@@ -2258,7 +3280,9 @@ static void md_flush_ticks(md_state *m) {
 }
 
 static void md_flush_star(md_state *m) {
-    if (m->pending_star) { fputc('*', stdout); m->pending_star = false; }
+    if (!m->pending_star) return;
+    md_word_flush(m);   /* the word before the marker goes out first */
+    fputc('*', stdout); m->pending_star = false;
 }
 
 void md_feed(md_state *m, const char *s, size_t n) {
@@ -2266,34 +3290,68 @@ void md_feed(md_state *m, const char *s, size_t n) {
         char c = s[i];
         if (c == '`') { md_flush_star(m); m->pending_ticks++; continue; }
         if (m->pending_ticks) { md_flush_ticks(m); m->at_line_start = false; }
+        if (m->in_fence && m->in_info) {   /* the info string: printed as it comes, and kept for the language */
+            md_prose(m, c);
+            if (c != '\n') { sb_putc(&m->info, c); continue; }
+            m->in_info = false;
+            char *w = m->info.data ? m->info.data : "";
+            while (*w == ' ' || *w == '\t') w++;
+            size_t k = strcspn(w, " \t");
+            if (k >= sizeof m->lang) k = sizeof m->lang - 1;
+            for (size_t j = 0; j < k; j++) m->lang[j] = (char)tolower((unsigned char)w[j]);
+            m->lang[k] = 0;
+            m->at_line_start = true;
+            md_fputs(m, C_CYAN);
+            continue;
+        }
+        if (m->in_fence) {   /* the code: a line is printed when it ends, highlighted */
+            if (c == '\n') { md_code_line(m); md_word_flush(m); fputc('\n', stdout); m->col = 0; m->at_line_start = true; md_fputs(m, C_CYAN); }
+            else { sb_putc(&m->line, c); m->at_line_start = false; }
+            continue;
+        }
         if (!m->in_fence && !m->in_code) {
             if (c == '*') {
-                if (m->pending_star) { m->pending_star = false; m->in_bold = !m->in_bold; fputs(m->in_bold ? C_BOLD : C_RESET, stdout); continue; }
+                if (m->pending_star) { m->pending_star = false; m->in_bold = !m->in_bold; md_fputs(m, m->in_bold ? C_BOLD : C_RESET); continue; }
                 m->pending_star = true; continue;
             }
             md_flush_star(m);
-            if (m->at_line_start && c == '#') { fputs(C_BOLD, stdout); m->in_bold = true; }
+            if (m->at_line_start && c == '#') { md_fputs(m, C_BOLD); m->in_bold = true; }
         }
-        fputc(c, stdout);
+        md_prose(m, c);
         if (c == '\n') {
             m->at_line_start = true;
-            if (m->in_bold && !m->in_fence) { m->in_bold = false; fputs(C_RESET, stdout); if (m->in_code) fputs(C_CYAN, stdout); }
-            if (m->in_fence) fputs(C_CYAN, stdout);
+            if (m->in_bold && !m->in_fence) { m->in_bold = false; md_fputs(m, C_RESET); if (m->in_code) md_fputs(m, C_CYAN); }
+            if (m->in_fence) md_fputs(m, C_CYAN);
         } else if (c != ' ' && c != '\t') m->at_line_start = false;
     }
     fflush(stdout);
 }
 
 void md_finish(md_state *m) {
+    md_word_flush(m);
     md_flush_star(m);
     if (m->pending_ticks) md_flush_ticks(m);
+    if (m->in_fence && m->line.len) md_code_line(m);   /* a last line that never ended */
     fputs(C_RESET, stdout);
-    m->in_fence = m->in_code = m->in_bold = false;
+    m->in_fence = m->in_code = m->in_bold = m->in_info = false;
+    sb_free(&m->line); sb_free(&m->info);
     fflush(stdout);
 }
 
 /* ---------- interactive selector (used by /model) ---------- */
+static int select_impl(const char *title, const char **items, const char **descs, int n, int current);
 int term_select(const char *title, const char **items, const char **descs, int n, int current) {
+    if (g_ui_nc) return nc_select(title, items, descs, n, current);
+    park_hold(); int r = select_impl(title, items, descs, n, current); park_free();
+    return r;
+}
+/* s cut to `width` cells into r, the cut ended by … */
+static void cells_cut(sbuf *r, const char *s, int width) {
+    if (vis_width(s) <= width) { sb_puts(r, s); return; }
+    sb_append(r, s, vis_offset(s, strlen(s), width > 1 ? width - 1 : 0));
+    sb_puts(r, "…");
+}
+static int select_impl(const char *title, const char **items, const char **descs, int n, int current) {
     if (n <= 0) return -1;
     term_raw(true);
     int sel = current >= 0 && current < n ? current : 0;
@@ -2334,10 +3392,18 @@ int term_select(const char *title, const char **items, const char **descs, int n
         for (int i = top; i < nvis && i < top + max_show; i++) {
             int idx = vis[i];
             bool is_sel = (i == selpos);
-            char line[512];
-            snprintf(line, sizeof line, "%s%-44s %s", idx == current ? "* " : "  ", items[idx], descs && descs[idx] ? descs[idx] : "");
-            if ((int)strlen(line) > w - 4) line[w - 4] = 0;
-            sb_printf(&o, "%s%s %s" C_RESET "\n", is_sel ? C_ORANGE "❯" : " ", is_sel ? C_BOLD : "", line); lines++;
+            /* the label column is 44 cells, or half the row when the row is narrow; the description takes the rest. The row
+             * is cut by display width (a byte cut garbles a UTF-8 letter), with the … the cut shows. */
+            int room = w - 4, namew = room >= 88 ? 44 : room / 2;
+            sbuf txt; sb_init(&txt); sb_puts(&txt, idx == current ? "* " : "  ");
+            sbuf nm; sb_init(&nm); cells_cut(&nm, items[idx], namew);
+            sb_puts(&txt, nm.data ? nm.data : "");
+            for (int c = vis_width(nm.data ? nm.data : ""); c < namew; c++) sb_putc(&txt, ' ');
+            sb_putc(&txt, ' ');
+            if (descs && descs[idx]) sb_puts(&txt, descs[idx]);
+            sbuf row; sb_init(&row); cells_cut(&row, txt.data ? txt.data : "", room);
+            sb_printf(&o, "%s%s %s" C_RESET "\n", is_sel ? C_ORANGE "❯" : " ", is_sel ? C_BOLD : "", row.data ? row.data : ""); lines++;
+            sb_free(&row); sb_free(&nm); sb_free(&txt);
         }
         if (nvis == 0) { sb_puts(&o, C_DIM "  (no matches)" C_RESET "\n"); lines++; }
         if (nvis > max_show) { sb_printf(&o, C_DIM "  … %d of %d shown" C_RESET "\n", max_show < nvis ? max_show : nvis, nvis); lines++; }

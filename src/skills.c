@@ -17,7 +17,7 @@
 static skill_t *g_skills = NULL;
 static int g_nskills = 0, g_cap = 0;
 
-static void skill_free(skill_t *s) { free(s->name); free(s->desc); free(s->path); free(s->dir); free(s->body); }
+static void skill_free(skill_t *s) { free(s->name); free(s->desc); free(s->path); free(s->dir); free(s->body); free(s->model); }
 
 static void skills_clear(void) {
     for (int i = 0; i < g_nskills; i++) skill_free(&g_skills[i]);
@@ -33,8 +33,8 @@ static char *trim_dup(const char *s, size_t n) {
 }
 
 /* Parse "---\nkey: value\n---\nbody". Missing frontmatter => whole file is body. */
-static void parse_skill(const char *text, char **name, char **desc, char **body) {
-    *name = *desc = NULL;
+static void parse_skill(const char *text, char **name, char **desc, char **body, char **model) {
+    *name = *desc = *model = NULL;
     const char *p = text;
     if (strncmp(p, "---", 3) != 0) { *body = xstrdup(text); return; }
     p += 3; while (*p == ' ' || *p == '\r') p++;
@@ -51,6 +51,7 @@ static void parse_skill(const char *text, char **name, char **desc, char **body)
             char *v = trim_dup(colon + 1, n - kl - 1);
             if (!strcmp(k, "name")) { free(*name); *name = v; v = NULL; }
             else if (!strcmp(k, "description")) { free(*desc); *desc = v; v = NULL; }
+            else if (!strcmp(k, "model") && v && *v) { free(*model); *model = v; v = NULL; }
             free(k); free(v);
         }
         if (!e) { p += n; break; }
@@ -70,16 +71,16 @@ static bool valid_name(const char *n) {
 static void add_skill(const char *path, const char *dir, const char *fallback_name, const char *source) {
     size_t n; char *d = read_whole_file(path, &n, 256 * 1024);
     if (!d) return;
-    char *name, *desc, *body;
-    parse_skill(d, &name, &desc, &body);
+    char *name, *desc, *body, *model;
+    parse_skill(d, &name, &desc, &body, &model);
     free(d);
     if (!name || !*name) { free(name); name = xstrdup(fallback_name); }
-    if (!valid_name(name) || name[0] == '/') { free(name); free(desc); free(body); return; }
+    if (!valid_name(name) || name[0] == '/') { free(name); free(desc); free(body); free(model); return; }
     for (int i = 0; i < g_nskills; i++)   /* first hit wins (project before user) */
-        if (!strcmp(g_skills[i].name, name)) { free(name); free(desc); free(body); return; }
+        if (!strcmp(g_skills[i].name, name)) { free(name); free(desc); free(body); free(model); return; }
     if (g_nskills == g_cap) { g_cap = g_cap ? g_cap * 2 : 16; g_skills = xrealloc(g_skills, sizeof(skill_t) * (size_t)g_cap); }
     skill_t *s = &g_skills[g_nskills++];
-    s->name = name; s->desc = desc ? desc : xstrdup(""); s->path = xstrdup(path); s->dir = xstrdup(dir); s->body = body; s->source = source;
+    s->name = name; s->desc = desc ? desc : xstrdup(""); s->path = xstrdup(path); s->dir = xstrdup(dir); s->body = body; s->model = model; s->source = source;
 }
 
 static int cmp_name(const void *a, const void *b) { return strcmp(*(char* const*)a, *(char* const*)b); }

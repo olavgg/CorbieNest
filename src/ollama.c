@@ -52,9 +52,9 @@ static void on_idle(void *ud) {
     if (c->thinking_header && g_cfg.show_thinking) return;   /* thinking is being streamed visibly */
     c->spin_i = (c->spin_i + 1) % 10;
     if (c->think_tokens > 0)
-        printf("\r\x1b[2K" C_MAGENTA "%s" C_RESET C_DIM " thinking… (%d tokens, %.0fs)  " C_GRAY "esc to interrupt" C_RESET, SPIN[c->spin_i], c->think_tokens, elapsed(&c->t0));
+        printf("\r\x1b[2K" C_MAGENTA "%s" C_RESET C_DIM " thinking… (%d tokens, %.0fs)  " C_RESET "esc to interrupt", SPIN[c->spin_i], c->think_tokens, elapsed(&c->t0));
     else
-        printf("\r\x1b[2K" C_ORANGE "%s" C_RESET C_DIM " %s… (%.0fs)  " C_GRAY "esc to interrupt" C_RESET, SPIN[c->spin_i],
+        printf("\r\x1b[2K" C_ORANGE "%s" C_RESET C_DIM " %s… (%.0fs)  " C_RESET "esc to interrupt", SPIN[c->spin_i],
                elapsed(&c->t0) > 8 ? "loading model / waiting" : "thinking", elapsed(&c->t0));
     fflush(stdout);
     c->spinner_shown = true;
@@ -94,6 +94,7 @@ static int on_line(const char *line, size_t len, void *ud) {
                 if (c->thinking_header && g_cfg.show_thinking) printf(C_RESET "\n\n");
                 /* skip leading whitespace-only starts */
                 fputs(C_ORANGE "●" C_RESET " ", stdout);
+                c->md.col = 2;   /* the marker is two columns: the word wrap counts from the text */
                 c->got_content = true;
                 const char *s = ct->valuestring; while (*s == '\n' || *s == ' ') s++;
                 sb_puts(&c->content, ct->valuestring);
@@ -234,15 +235,6 @@ static void add_keep_alive(cJSON *req, const char *v) {
     else cJSON_AddStringToObject(req, "keep_alive", v);
 }
 
-/* A call that is one long wait and not what the user is after (the advisor's answer) gives way
- * to a message they queue meanwhile, the way a shell command and a sub-agent do. */
-bool ollama_stopped_for_message = false;
-int ollama_poll_or_message(void) {
-    if (term_poll_interrupt()) return 1;
-    if (term_queue_new()) { ollama_stopped_for_message = true; return 1; }
-    return 0;
-}
-
 /* The body of an /api/chat call as ollama_call and the configuration say it: the one place a
  * request to the model is put together, streamed or not. malloc'd. */
 static char *chat_request(cJSON *messages, cJSON *tools, bool stream) {
@@ -328,9 +320,8 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
     gettimeofday(&c.t0, NULL);
 
     term_raw(true);
-    ollama_stopped_for_message = false;
-    http_interrupt_fd = g_cfg.interactive ? STDIN_FILENO : -1;
-    http_interrupt_check = ollama_call.stop_on_message ? ollama_poll_or_message : term_poll_interrupt;
+    http_interrupt_fd = g_cfg.interactive ? term_interrupt_fd() : -1;
+    http_interrupt_check = term_poll_interrupt;   /* a message queued meanwhile waits for the next request */
     http_idle = on_idle; http_idle_ud = &c;
     term_busy(busy_or("waiting for model"));
     on_idle(&c);
@@ -350,7 +341,7 @@ cJSON *ollama_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool *abort
     cJSON *msg = NULL;
     if (res.aborted) {
         *aborted = true;
-        if (!ollama_stopped_for_message) printf("\n" C_YELLOW "⏹ interrupted" C_RESET "\n");   /* else the caller says what it stopped for */
+        printf("\n" C_YELLOW "⏹ interrupted" C_RESET "\n");
     } else if (rc != 0) {
         snprintf(ollama_error, sizeof ollama_error, "%s", res.err);
         printf(C_RED "✗ request failed: %s" C_RESET "\n", res.err);

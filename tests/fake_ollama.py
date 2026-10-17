@@ -3,9 +3,11 @@
 Serves /api/version, /api/tags, /api/show and a scripted /api/chat. The chat handler is
 deterministic: it looks at the last message and replies with canned streaming
 NDJSON, including tool calls, so the whole agent loop can be exercised without
-a real model. It also stands in for the hosted APIs the advisor can consult, under
-/xai/v1, /openai/v1 (Chat Completions) and /anthropic/v1 (Messages), with the key
-"test-key". Run standalone: python3 fake_ollama.py PORT
+a real model. It also stands in for the hosted APIs, under /xai/v1, /openai/v1
+(Chat Completions) and /anthropic/v1 (Messages), with the key "test-key": a
+consultation is one user string, and a Messages request with tools (or any other
+shape) is the model that does the work, scripted the same way and streamed as SSE
+when asked. Run standalone: python3 fake_ollama.py PORT
 """
 import json, re, ssl, sys, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -47,9 +49,12 @@ PROVIDER_KEY = "test-key"
 ADAPTIVE = {"thinking": {"supported": True, "types": {"enabled": {"supported": False}, "adaptive": {"supported": True}}},
             "effort": dict({"supported": True}, **{l: {"supported": True} for l in ("low", "medium", "high", "xhigh", "max")})}
 BUDGET = {"thinking": {"supported": True, "types": {"enabled": {"supported": True}, "adaptive": {"supported": False}}}, "effort": {"supported": False}}
+SCORES = {"grok": 9, "deepseek": 7, "kimi": 3}   # what TOOL_SCORE writes, by the model's name (5 otherwise)
 PROVIDER_MODELS = {
     "xai": {"grok-fake": {}},
     "openai": {"gpt-fake": {}},   # takes reasoning_effort up to high, like the gpt-5 family
+    "deepseek": {"deepseek-flash": {}, "deepseek-v4-pro": {}},   # the DeepSeek API, OpenAI-compatible at the root
+    "kimi": {"kimi-k2.6": {}, "kimi-k3": {}},                    # the Kimi API, OpenAI-compatible under /v1
     "anthropic": {"claude-fake-opus": {"max_input_tokens": 1_000_000, "max_tokens": 128_000, "capabilities": ADAPTIVE},
                   "claude-opus-5": {"max_input_tokens": 1_000_000, "max_tokens": 128_000, "capabilities": ADAPTIVE},   # has refusal fallbacks
                   "claude-fake-haiku": {"max_input_tokens": 200_000, "max_tokens": 64_000, "capabilities": BUDGET}},
@@ -61,6 +66,11 @@ def advisor_text(brief):
     ends) and a check (of the first change) find something unless the request says APPROVE."""
     if "# PLAN this request" in brief:   # /orchestrate: the plan, in the markdown a real model wraps it in
         if "NOPLAN" in brief: return "I would rather talk this through first."
+        if "ROLEPLAN" in brief:   # a contract; two tasks that own the same file (they wait for each other); a role nobody has
+            return ("CONTRACT: the tests import Item from src/x.c\n\n"
+                    "TASK 1: write the item\nROLE: tester\nOWNS: src/x.c\nAFTER: none\nTOOL_WRITE the file made.txt.\nDONE WHEN: made.txt exists\n\n"
+                    "TASK 2: test the item\nROLE: tester\nOWNS: src/x.c\nAFTER: none\nJust reply.\nDONE WHEN: you replied\n\n"
+                    "TASK 3: write the notes\nROLE: nosuchrole\nOWNS: docs/\nAFTER: none\nJust reply.\nDONE WHEN: you replied\n")
         if "PARALLEL" in brief:   # two tasks that may overlap (each a slow answer), and one that waits for both
             return ("TASK 1: first slow thing\nAFTER: none\nSLOW one\n\nTASK 2: second slow thing\nAFTER: none\nSLOW two\n\n"
                     "TASK 3: wrap it up\nAFTER: 1, 2\nTOOL_WRITE the file made.txt.\n")
@@ -76,6 +86,98 @@ def advisor_text(brief):
         return "LGTM" if "APPROVE" in brief else "ADVICE: CHECK-FINDING write to the other file instead."
     asked = brief.split("# What the agent asks you\n", 1)[-1].strip().splitlines()[0][:80]
     return "ADVICE: read hay.txt before you edit anything.\nYou asked: " + asked
+
+def _advisor_shape(req):
+    """A consultation: no tools, exactly one user message, and its content a string.
+    Anything else is the model that does the work, on the Messages API."""
+    if req.get("tools"): return False
+    msgs = req.get("messages") or []
+    if [m.get("role") for m in msgs] != ["user"]: return False
+    return isinstance(msgs[0].get("content"), str)
+
+def _flat(content):
+    if isinstance(content, str): return content
+    if not isinstance(content, list): return ""
+    parts = []
+    for b in content:
+        if not isinstance(b, dict): continue
+        if b.get("type") == "text": parts.append(b.get("text") or "")
+        elif b.get("type") == "tool_result": parts.append(b.get("content") or "")
+    return "\n".join(parts)
+
+def _typed(m):
+    """The text the user typed in a message, or None (an assistant turn, or only tool results)."""
+    if m.get("role") != "user": return None
+    c = m.get("content")
+    if isinstance(c, str): return c
+    if isinstance(c, list):
+        t = [b.get("text") or "" for b in c if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(t) if t else None
+    return None
+
+def _tool_results(req):
+    out = []
+    for m in req.get("messages") or []:
+        c = m.get("content")
+        if isinstance(c, list):
+            out += [b.get("content") or "" for b in c if isinstance(b, dict) and b.get("type") == "tool_result"]
+    return out
+
+def _turn_blocks(req):
+    """The same keywords as script(), as Messages content blocks. A tool_result is answered
+    before the keyword that produced the call is seen again, or the model never stops."""
+    typed = [t for t in (_typed(m) for m in (req.get("messages") or [])) if t is not None]   # what the user typed (a merged turn's text only)
+    if typed and "TOOL_LOOP" in typed[-1]:  # the user's own message asks for it: a call every time, until the loop guard stops it
+        return [{"type": "tool_use", "id": "toolu_loop", "name": "bash", "input": {"command": "echo looping"}}], "tool_use"
+    results = _tool_results(req)
+    if typed and "TOOL_BINARY" in typed[-1] and not results:   # a command whose output is not UTF-8 (a binary file, a cut)
+        return [{"type": "tool_use", "id": "toolu_bin", "name": "bash", "input": {"command": "printf 'bad \\377 byte'"}}], "tool_use"
+    if results:
+        line = results[-1].strip().splitlines()[0][:60] if results[-1].strip() else ""
+        return [{"type": "text", "text": "Tool said: " + line}], "end_turn"
+    text = "\n".join(_flat(m.get("content")) for m in (req.get("messages") or []))
+    system = req.get("system")
+    sys_text = system if isinstance(system, str) else _flat(system)
+    if "TOOL_ADVISOR" in text:
+        return [{"type": "tool_use", "id": "toolu_adv", "name": "advisor",
+                 "input": {"question": "Why does the needle test fail, and where should I look first?"}}], "tool_use"
+    if "TOOL_BASH" in text:
+        return [{"type": "text", "text": "Running it."},
+                {"type": "tool_use", "id": "toolu_bash", "name": "bash", "input": {"command": "echo hello-from-tool"}}], "tool_use"
+    if "TOOL_WRITE" in text:
+        return [{"type": "tool_use", "id": "toolu_write", "name": "write_file",
+                 "input": {"path": "made.txt", "content": "made by fake\n"}}], "tool_use"
+    if "persistent memory file" in sys_text:
+        return [{"type": "text", "text": "NO_CHANGE"}], "end_turn"
+    first = ""
+    for m in reversed(req.get("messages") or []):
+        t = _flat(m.get("content")).strip()
+        if t:
+            first = t.splitlines()[0]
+            break
+    return [{"type": "text", "text": "Echo: " + first}], "end_turn"
+
+def _cache_usage(req):
+    """CACHE in the conversation: the prompt was partly served from the provider's cache (Anthropic's fields)."""
+    if "CACHE" not in json.dumps(req.get("messages") or []): return {}
+    return {"cache_read_input_tokens": 800, "cache_creation_input_tokens": 40}
+
+def _turn_events(model, blocks, stop, usage=None):
+    events = [("message_start", {"type": "message_start", "message": {"id": "msg_fake", "type": "message", "role": "assistant",
+               "content": [], "model": model, "stop_reason": None, "usage": dict({"input_tokens": 100, "output_tokens": 1}, **(usage or {}))}})]
+    for i, b in enumerate(blocks):
+        if b["type"] == "tool_use":
+            start = {"type": "tool_use", "id": b["id"], "name": b["name"], "input": {}}
+            events.append(("content_block_start", {"type": "content_block_start", "index": i, "content_block": start}))
+            events.append(("content_block_delta", {"type": "content_block_delta", "index": i,
+                           "delta": {"type": "input_json_delta", "partial_json": json.dumps(b["input"])}}))
+        else:
+            events.append(("content_block_start", {"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}}))
+            events.append(("content_block_delta", {"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": b.get("text") or ""}}))
+        events.append(("content_block_stop", {"type": "content_block_stop", "index": i}))
+    events.append(("message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None}, "usage": {"output_tokens": 20}}))
+    events.append(("message_stop", {"type": "message_stop"}))
+    return events
 
 def chunk(model, content=None, tool_calls=None, thinking=None, done=False, prompt_tokens=123, done_reason=None):
     msg = {"role": "assistant", "content": content or ""}
@@ -204,6 +306,23 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "advisor", "arguments": {"question": "Why does the needle test fail, and where should I look first?"}}}])
         yield chunk(model, done=True)
         return
+    if "TOOL_SHELL" in text:   # a bash call of the rest of the message (the sandbox checks)
+        cmd = text.split("TOOL_SHELL", 1)[1].strip().split("\n")[0]
+        yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": cmd}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_AGENT_CC" in text:   # the Claude Code file cc.md (Read, Grep; model: sonnet)
+        yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "cc review", "agent": "cc", "prompt": "Look at made.txt."}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_AGENT_NOSUCH" in text:   # an agent that is not defined
+        yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "nobody", "agent": "nosuch", "prompt": "Anything."}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_AGENT" in text:   # task with agent=reviewer (a sub-agent file of the test project)
+        yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "review the file", "agent": "reviewer", "prompt": "Review made.txt for bugs."}}}])
+        yield chunk(model, done=True)
+        return
     if "TOOL_TASK_SLEEP" in text:
         yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "slow research", "prompt": "SLEEP, then report."}}}])
         yield chunk(model, done=True)
@@ -232,6 +351,13 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "printf 'fold-line-%s\\n' 1 2 3 4 5"}}}])
         yield chunk(model, done=True)
         return
+    if "TOOL_SCORE" in text:   # a /goal candidate: writes the score file, then reports
+        if last["role"] == "tool":
+            yield chunk(model, "Tool said: " + str(last["content"]).strip().splitlines()[0][:60])
+        else:
+            yield chunk(model, tool_calls=[{"function": {"name": "write_file", "arguments": {"path": "score", "content": "5\n"}}}])
+        yield chunk(model, done=True)
+        return
     if "TOOL_BASH" in text:
         yield chunk(model, "Running it.")
         yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "echo hello-from-tool"}}}])
@@ -253,6 +379,28 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "write_file", "arguments": {"path": "AGENTS.md", "content": "# Project\nBuild with make.\n"}}}])
         yield chunk(model, done=True)
         return
+    if "TOOL_WRITE_CODE" in text:   # a file whose extension names its language: the preview shows the code coloured
+        yield chunk(model, tool_calls=[{"function": {"name": "write_file", "arguments": {"path": "hello.py", "content": "def greet(name):  # say hi\n    return 'hi ' + name\n"}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_MCP_FAIL" in text:   # the MCP test server's shout tool, which answers isError
+        yield chunk(model, tool_calls=[{"function": {"name": "mcp__fake__shout", "arguments": {}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_MCP" in text:   # a call of the MCP test server's echo tool (tests/fake_mcp.py)
+        yield chunk(model, tool_calls=[{"function": {"name": "mcp__fake__echo", "arguments": {"message": "from-model"}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_BG" in text:   # a background command, which has to end with corbienest (sleep 317 is the marker)
+        yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "sleep 317", "run_in_background": True}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_TODO" in text:   # a task list: one task done, one in progress, one to do
+        yield chunk(model, tool_calls=[{"function": {"name": "todo_write", "arguments": {"todos": [
+            {"content": "read the code", "status": "completed"}, {"content": "make the change", "status": "in_progress"},
+            {"content": "run the tests", "status": "pending"}]}}}])
+        yield chunk(model, done=True)
+        return
     if "TOOL_WRITE" in text:
         yield chunk(model, tool_calls=[{"function": {"name": "write_file", "arguments": {"path": "made.txt", "content": "made by fake\n"}}}])
         yield chunk(model, done=True)
@@ -260,6 +408,14 @@ def script(model, messages, req):
     if "TOOL_XML" in text:
         # leaked native syntax; corbienest must recover it
         yield chunk(model, "<tool_call>\n<function=list_dir>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>")
+        yield chunk(model, done=True)
+        return
+    if "OPTIONS_REPLY" in text:   # two implementation options; the second is recommended
+        yield chunk(model, "Two ways to do it.\n```options\n- Lock file — simple, but a crash leaves it behind\n- [recommended] Advisory lock — survives a crash, needs flock\n```")
+        yield chunk(model, done=True)
+        return
+    if "CODE_REPLY" in text:   # a reply with a code block: its language is named on the fence
+        yield chunk(model, "Here is the code:\n```python\ndef greet(name):  # say hi\n    return 'hi ' + name\n```\nDone.")
         yield chunk(model, done=True)
         return
     if "SLOW" in text:
@@ -304,7 +460,7 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass   # the client gave up waiting (Esc, a queued message)
     def _provider(self):
-        m = re.match(r"^/(xai|openai|anthropic)/v1(/.*)$", self.path)
+        m = re.match(r"^/(xai|openai|anthropic|kimi)/v1(/.*)$", self.path) or re.match(r"^/(deepseek)(/chat/completions)$", self.path)
         return (m.group(1), m.group(2)) if m else (None, None)
     def _provider_auth(self, prov):
         """None if the request may go on, else the error already sent"""
@@ -342,8 +498,9 @@ class H(BaseHTTPRequestHandler):
         if prov == "anthropic":
             if rest != "/messages": return self._json(404, {"type": "error", "error": {"type": "not_found_error", "message": "Not found"}})
             return self._messages(model, req)
+        if "tools" in req: return self._cc_turn(prov, model, req)   # a worker's turn (the tool calls of /goal)
         if rest != "/chat/completions": return self._json(404, {"error": {"message": "Unknown request URL"}})
-        if "max_tokens" in req:
+        if prov == "openai" and "max_tokens" in req:
             return self._json(400, {"error": {"message": "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead."}})
         eff = req.get("reasoning_effort")
         if eff is not None and eff not in EFFORTS[prov]:
@@ -355,7 +512,25 @@ class H(BaseHTTPRequestHandler):
         if "REFUSEADVICE" in brief: msg["content"], msg["refusal"] = None, "I can't help with that."
         return self._json(200, {"id": "chatcmpl-fake", "object": "chat.completion", "model": model,
                                 "choices": [{"index": 0, "message": msg, "finish_reason": why}],
-                                "usage": {"prompt_tokens": 2000, "completion_tokens": 150, "total_tokens": 2150}})
+                                "usage": dict({"prompt_tokens": 2000, "completion_tokens": 150, "total_tokens": 2150},
+                                              **({"prompt_tokens_details": {"cached_tokens": 1500}} if "CACHE" in brief else {}))})
+    def _cc_turn(self, prov, model, req):
+        """A worker's Chat Completions turn: TOOL_SCORE writes the score file (the score is the model's own, see SCORES), then reports."""
+        msgs = req.get("messages") or []
+        last = msgs[-1] if msgs else {}
+        text = "\n".join(m["content"] for m in msgs if m.get("role") in ("user", "system") and isinstance(m.get("content"), str))
+        if last.get("role") == "tool":
+            first = str(last.get("content") or "").strip().splitlines()[:1]
+            msg, why = {"role": "assistant", "content": "Tool said: " + (first[0][:60] if first else "")}, "stop"
+        elif "TOOL_SCORE" in text:
+            score = next((v for k, v in SCORES.items() if k in model), 5)
+            msg = {"role": "assistant", "content": "", "tool_calls": [{"id": "call_score_1", "type": "function",
+                   "function": {"name": "write_file", "arguments": json.dumps({"path": "score", "content": f"{score}\n"})}}]}
+            why = "tool_calls"
+        else:
+            msg, why = {"role": "assistant", "content": "Done."}, "stop"
+        return self._json(200, {"id": "chatcmpl-fake", "object": "chat.completion", "model": model, "choices": [{"index": 0, "message": msg, "finish_reason": why}],
+                                "usage": {"prompt_tokens": 120, "completion_tokens": 12, "total_tokens": 132}})
     def _messages(self, model, req):
         caps = PROVIDER_MODELS["anthropic"][model]["capabilities"]
         bad = lambda m: self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": m}})
@@ -364,17 +539,42 @@ class H(BaseHTTPRequestHandler):
         th = req.get("thinking", {}).get("type")
         if th and not caps["thinking"]["types"].get(th, {}).get("supported"): return bad(f"thinking.type: {th} is not supported on this model")
         if "output_config" in req and not caps["effort"]["supported"]: return bad("output_config.effort: not supported on this model")
-        if not isinstance(req.get("max_tokens"), int) or [m["role"] for m in req.get("messages", [])] != ["user"]: return bad("messages: malformed")
-        brief = req["messages"][0]["content"]
-        if "SLOWADVICE" in brief: time.sleep(3)
-        usage = {"input_tokens": 1800, "cache_read_input_tokens": 200, "output_tokens": 120}
-        if "REFUSEADVICE" in brief:
-            return self._json(200, {"type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": "refusal",
-                                    "stop_details": {"type": "refusal", "category": "cyber", "explanation": "declined"}, "usage": usage})
-        blocks = [{"type": "thinking", "thinking": "", "signature": "sig"}]
-        if "CUTADVICE" not in brief: blocks.append({"type": "text", "text": advisor_text(brief)})
-        return self._json(200, {"type": "message", "role": "assistant", "model": model, "content": blocks,
-                                "stop_reason": "max_tokens" if "CUTADVICE" in brief else "end_turn", "usage": usage})
+        if not isinstance(req.get("max_tokens"), int): return bad("messages: malformed")
+        msgs = req.get("messages") or []
+        for i, m in enumerate(msgs):  # as the real API: every tool_use answered by a tool_result right after it
+            uses = [b.get("id") for b in (m.get("content") if isinstance(m.get("content"), list) else []) if isinstance(b, dict) and b.get("type") == "tool_use"]
+            nxt = msgs[i + 1].get("content") if i + 1 < len(msgs) else None
+            have = [b.get("tool_use_id") for b in (nxt if isinstance(nxt, list) else []) if isinstance(b, dict) and b.get("type") == "tool_result"]
+            missing = [u for u in uses if u not in have]
+            if missing:
+                return bad(f"messages.{i + 1}: `tool_use` ids were found without `tool_result` blocks immediately after: {', '.join(missing)}. "
+                           "Each `tool_use` block must have a corresponding `tool_result` block in the next message.")
+        if _advisor_shape(req):
+            brief = req["messages"][0]["content"]
+            if "SLOWADVICE" in brief: time.sleep(3)
+            usage = {"input_tokens": 1800, "cache_read_input_tokens": 200, "output_tokens": 120}
+            if "REFUSEADVICE" in brief:
+                return self._json(200, {"type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": "refusal",
+                                        "stop_details": {"type": "refusal", "category": "cyber", "explanation": "declined"}, "usage": usage})
+            blocks = [{"type": "thinking", "thinking": "", "signature": "sig"}]
+            if "CUTADVICE" not in brief: blocks.append({"type": "text", "text": advisor_text(brief)})
+            return self._json(200, {"type": "message", "role": "assistant", "model": model, "content": blocks,
+                                    "stop_reason": "max_tokens" if "CUTADVICE" in brief else "end_turn", "usage": usage})
+        blocks, stop = _turn_blocks(req)
+        cu = _cache_usage(req)
+        if req.get("stream") is True: return self._sse(_turn_events(model, blocks, stop, cu))
+        return self._json(200, {"type": "message", "role": "assistant", "model": model, "content": blocks, "stop_reason": stop,
+                                "usage": dict({"input_tokens": 100, "output_tokens": 20}, **cu)})
+    def _sse(self, events):
+        try:
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked"); self.end_headers()
+            for ev, data in events:
+                b = f"event: {ev}\ndata: {json.dumps(data)}\n\n".encode()
+                self.wfile.write(b"%x\r\n" % len(b) + b + b"\r\n"); self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n"); self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
     def do_GET(self):
         prov, rest = self._provider()
         if prov: return self._provider_get(prov, rest)
@@ -392,7 +592,10 @@ class H(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
-        req = json.loads(self.rfile.read(n) or b"{}")
+        raw = self.rfile.read(n) or b"{}"
+        try: raw.decode("utf-8")
+        except UnicodeDecodeError: return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "The request body is not valid JSON: invalid unicode code point"}})
+        req = json.loads(raw)
         model = req.get("model", "")
         prov, rest = self._provider()
         if prov: return self._provider_post(prov, rest, req)

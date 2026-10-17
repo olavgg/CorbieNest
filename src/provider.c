@@ -1,6 +1,8 @@
-/* Hosted model APIs the advisor can consult instead of a model on the Ollama server: xAI (Grok),
- * OpenAI and Anthropic (Claude), named PROVIDER:MODEL — "xai:grok-4.7", "openai:gpt-5.2",
- * "anthropic:claude-opus-5". xAI and OpenAI speak Chat Completions, Anthropic the Messages API.
+/* Hosted model APIs, named PROVIDER:MODEL — "xai:grok-4.7", "openai:gpt-5.2",
+ * "anthropic:claude-opus-5". xAI, OpenAI, DeepSeek and Kimi speak Chat Completions: advisors, and the workers of /goal.
+ * Anthropic speaks the Messages API: a consultation (provider_chat) is one toolless question,
+ * and a turn (provider_turn) is the model that does the work — tools, streaming, the same
+ * conversation ollama_chat() speaks, translated at the wire.
  *
  * A consultation is one request, not streamed: the advice is not shown while it is being written,
  * so there is nothing to stream it for, and one JSON answer is one thing to parse where streaming
@@ -22,6 +24,9 @@ static const provider_def PROVIDERS[] = {
     { "openai",    "chatgpt","OpenAI",    "OPENAI_API_KEY",    "OPENAI_BASE_URL",    "https://api.openai.com/v1", PROVIDER_CHAT_COMPLETIONS, "gpt-5.2", "ChatGPT" },
     /* no /v1 in the base: ANTHROPIC_BASE_URL is written that way for the SDKs (and Claude Code) */
     { "anthropic", "claude", "Anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "https://api.anthropic.com", PROVIDER_MESSAGES,         "claude-opus-5", "Claude" },
+    /* verified against the vendors' docs (2026-10): DeepSeek's API is OpenAI-compatible at the root, Kimi's at /v1 */
+    { "deepseek",  "deepseek","DeepSeek","DEEPSEEK_API_KEY",  "DEEPSEEK_BASE_URL",  "https://api.deepseek.com",  PROVIDER_CHAT_COMPLETIONS, "deepseek-flash", "DeepSeek" },
+    { "kimi",      "moonshot","Kimi",    "MOONSHOT_API_KEY",  "MOONSHOT_BASE_URL",  "https://api.moonshot.ai/v1", PROVIDER_CHAT_COMPLETIONS, "kimi-k2.6", "Kimi" },
 };
 
 const provider_def *provider_at(int i) {
@@ -47,12 +52,18 @@ const char *provider_base_url(const provider_def *p) {
     return u && *u ? u : p->url;
 }
 
-/* Anthropic's models with server-side refusal fallbacks: a request their safety classifiers
+const char *provider_chat_path(const provider_def *p) {
+    return p && p->style == PROVIDER_MESSAGES ? "/v1/messages" : "/chat/completions";
+}
+
+/* Anthropic's models with server-side refusal fallbacks (the refusals page, which names them: Fable
+ * 5.1 and 5, Opus 5.5 and 5, Sonnet 5.5; Haiku 5.5 has none): a request their safety classifiers
  * decline (security tooling can look like that) is answered by another model instead of not at all */
 bool provider_fallbacks(const char *advisor) {
     const char *model; const provider_def *p = provider_find(advisor, &model);
     if (!p || p->style != PROVIDER_MESSAGES) return false;
-    return !strncmp(model, "claude-opus-5", 13) || !strncmp(model, "claude-fable-5", 14) || !strncmp(model, "claude-mythos-5", 15);
+    return !strncmp(model, "claude-opus-5", 13) || !strncmp(model, "claude-fable-5", 14) || !strncmp(model, "claude-mythos-5", 15)
+        || !strncmp(model, "claude-sonnet-5-5", 17);
 }
 
 /* What a Chat Completions model may be set to. The API does not say per model, so these are the
@@ -80,9 +91,12 @@ void provider_parse_model(const char *advisor, const char *json, model_info *mi)
     const provider_def *p = provider_find(advisor, NULL);
     if (!p) return;
     if (p->style == PROVIDER_CHAT_COMPLETIONS) { chat_levels(p, mi); return; }
+    mi->tools = true;   /* a Messages model does the work with the same tools; the endpoint does not say so */
     cJSON *j = cJSON_Parse(json ? json : "");
     if (!j) return;
     cJSON *v = cJSON_GetObjectItemCaseSensitive(j, "max_input_tokens");
+    cJSON *mo = cJSON_GetObjectItemCaseSensitive(j, "max_tokens");
+    if (cJSON_IsNumber(mo)) mi->max_output = (int)mo->valuedouble;
     if (cJSON_IsNumber(v)) mi->context_length = (int)v->valuedouble;
     cJSON *caps = cJSON_GetObjectItemCaseSensitive(j, "capabilities");
     cJSON *th = caps ? cJSON_GetObjectItemCaseSensitive(caps, "thinking") : NULL;
@@ -199,6 +213,8 @@ char *provider_parse_reply(const char *advisor, const char *json, int status, ch
         if (u) {
             const char *in_keys[] = { "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens" };
             for (int i = 0; i < 3; i++) if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(u, in_keys[i]))) st->prompt_tokens += (int)v->valuedouble;
+            if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(u, "cache_creation_input_tokens"))) st->cache_write += (int)v->valuedouble;
+            if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(u, "cache_read_input_tokens"))) st->cache_read += (int)v->valuedouble;
             if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(u, "output_tokens"))) st->eval_tokens = (int)v->valuedouble;
         }
         if (!strcmp(why, "refusal")) {
@@ -218,6 +234,9 @@ char *provider_parse_reply(const char *advisor, const char *json, int status, ch
         if (u) {
             if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(u, "prompt_tokens"))) st->prompt_tokens = (int)v->valuedouble;
             if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(u, "completion_tokens"))) st->eval_tokens = (int)v->valuedouble;
+            /* the cached part of the prompt (OpenAI and xAI: prompt_tokens_details.cached_tokens, a part of prompt_tokens) */
+            cJSON *pd = cJSON_GetObjectItemCaseSensitive(u, "prompt_tokens_details");
+            if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(pd, "cached_tokens"))) st->cache_read = (int)v->valuedouble;
         }
         cJSON *rf = msg ? cJSON_GetObjectItemCaseSensitive(msg, "refusal") : NULL;
         if ((cJSON_IsString(rf) && rf->valuestring[0]) || !strcmp(why, "content_filter")) {
@@ -230,6 +249,450 @@ done:
     sb_free(&text);
     cJSON_Delete(j);
     return out;
+}
+
+/* ---------- a Messages turn: the conversation ollama_chat() speaks, on the wire ----------
+ * The stored messages stay as they are (sessions, the advisor, compaction). This is the only
+ * place that knows a tool call is a tool_use block and a tool result has to sit in the user
+ * message after it. provider_content, when the assistant message has it, is that reply's blocks
+ * verbatim — thinking and its signature included, which the next call is refused without. */
+
+static const char *jrole(cJSON *m) {
+    cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role");
+    return cJSON_IsString(r) ? r->valuestring : "";
+}
+static const char *jcontent(cJSON *m) {
+    cJSON *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+    return cJSON_IsString(c) ? c->valuestring : "";
+}
+static bool tool_offered(cJSON *tools, const char *name) {
+    cJSON *t;
+    if (!tools || !name) return false;
+    cJSON_ArrayForEach(t, tools) {
+        cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
+        cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+        if (cJSON_IsString(nm) && !strcmp(nm->valuestring, name)) return true;
+    }
+    return false;
+}
+static cJSON *args_object(cJSON *args) {
+    if (cJSON_IsObject(args)) return cJSON_Duplicate(args, 1);
+    if (cJSON_IsString(args) && args->valuestring[0]) {
+        cJSON *p = cJSON_Parse(args->valuestring);
+        if (cJSON_IsObject(p)) return p;
+        cJSON_Delete(p);
+    }
+    return cJSON_CreateObject();
+}
+static void cache_break(cJSON *block) {
+    if (!block || cJSON_GetObjectItemCaseSensitive(block, "cache_control")) return;
+    cJSON *cc = cJSON_AddObjectToObject(block, "cache_control");
+    cJSON_AddStringToObject(cc, "type", "ephemeral");
+}
+static cJSON *text_block(const char *s) {
+    cJSON *b = cJSON_CreateObject();
+    cJSON_AddStringToObject(b, "type", "text");
+    cJSON_AddStringToObject(b, "text", s ? s : "");
+    return b;
+}
+static void user_add(cJSON **acc, cJSON *block) {
+    if (!*acc) *acc = cJSON_CreateArray();
+    cJSON_AddItemToArray(*acc, block);
+}
+static void user_flush(cJSON *out, cJSON **acc) {
+    if (!*acc || cJSON_GetArraySize(*acc) == 0) { cJSON_Delete(*acc); *acc = NULL; return; }
+    cJSON *m = cJSON_CreateObject();
+    cJSON_AddStringToObject(m, "role", "user");
+    cJSON_AddItemToObject(m, "content", *acc);
+    *acc = NULL;
+    cJSON_AddItemToArray(out, m);
+}
+
+/* tool calls of one assistant message, in order, and whether each one may go out as a tool_use
+ * (a name the request is not offering — the advisor, after it was turned off — would be a 400) */
+#define TURN_CALLS 64
+typedef struct { char id[40]; bool demote; } turn_call;
+
+static bool blocks_sendable(cJSON *blocks, cJSON *tools) {
+    cJSON *b;
+    if (!cJSON_IsArray(blocks) || cJSON_GetArraySize(blocks) == 0) return false;
+    cJSON_ArrayForEach(b, blocks) {
+        cJSON *ty = cJSON_GetObjectItemCaseSensitive(b, "type");
+        cJSON *nm = cJSON_GetObjectItemCaseSensitive(b, "name");
+        if (cJSON_IsString(ty) && !strcmp(ty->valuestring, "tool_use") && !tool_offered(tools, cJSON_IsString(nm) ? nm->valuestring : "")) return false;
+    }
+    return true;
+}
+
+static cJSON *assistant_blocks(cJSON *m, cJSON *tools, turn_call *pend, int *pn) {
+    *pn = 0;
+    cJSON *pc = cJSON_GetObjectItemCaseSensitive(m, "provider_content");
+    cJSON *calls = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+    if (blocks_sendable(pc, tools)) {
+        cJSON *b, *dup = cJSON_Duplicate(pc, 1);
+        cJSON_ArrayForEach(b, dup) {
+            cJSON *ty = cJSON_GetObjectItemCaseSensitive(b, "type");
+            if (!cJSON_IsString(ty) || strcmp(ty->valuestring, "tool_use") || *pn >= TURN_CALLS) continue;
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(b, "id");
+            snprintf(pend[*pn].id, sizeof pend[*pn].id, "%s", cJSON_IsString(id) ? id->valuestring : "");
+            pend[*pn].demote = false;
+            (*pn)++;
+        }
+        return dup;
+    }
+    cJSON *blocks = cJSON_CreateArray();
+    const char *text = jcontent(m);
+    if (text[0]) cJSON_AddItemToArray(blocks, text_block(text));
+    cJSON *call;
+    cJSON_ArrayForEach(call, calls) {
+        if (*pn >= TURN_CALLS) break;
+        cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
+        cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+        cJSON *id = cJSON_GetObjectItemCaseSensitive(call, "id");
+        const char *name = cJSON_IsString(nm) ? nm->valuestring : "tool";
+        if (cJSON_IsString(id) && id->valuestring[0]) snprintf(pend[*pn].id, sizeof pend[*pn].id, "%s", id->valuestring);
+        else snprintf(pend[*pn].id, sizeof pend[*pn].id, "call_%d", *pn + 1);
+        cJSON *input = args_object(fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL);
+        pend[*pn].demote = !tool_offered(tools, name);
+        if (pend[*pn].demote) {
+            char *a = cJSON_PrintUnformatted(input);
+            sbuf t; sb_init(&t); sb_printf(&t, "[called %s]\n%s", name, a ? a : "{}");
+            cJSON_AddItemToArray(blocks, text_block(t.data));
+            sb_free(&t); free(a); cJSON_Delete(input);
+        } else {
+            cJSON *b = cJSON_CreateObject();
+            cJSON_AddStringToObject(b, "type", "tool_use");
+            cJSON_AddStringToObject(b, "id", pend[*pn].id);
+            cJSON_AddStringToObject(b, "name", name);
+            cJSON_AddItemToObject(b, "input", input);
+            cJSON_AddItemToArray(blocks, b);
+        }
+        (*pn)++;
+    }
+    return blocks;
+}
+
+char *provider_turn_body(const char *model_name, const model_info *mi, cJSON *messages, cJSON *tools, int max_tokens, const char *effort, bool thinking, double temperature, bool stream) {
+    const char *model = ""; provider_find(model_name, &model);
+    cJSON *req = cJSON_CreateObject();
+    cJSON_AddStringToObject(req, "model", model);
+    cJSON_AddNumberToObject(req, "max_tokens", max_tokens > 0 ? max_tokens : 32000);
+    cJSON_AddBoolToObject(req, "stream", stream);
+    if (temperature >= 0) cJSON_AddNumberToObject(req, "temperature", temperature);
+    bool named = effort && strcmp(effort, "off") && strcmp(effort, "on");
+    if (thinking && mi && mi->think_adaptive) {
+        cJSON *t = cJSON_AddObjectToObject(req, "thinking"); cJSON_AddStringToObject(t, "type", "adaptive");
+    } else if (thinking && mi && mi->think_budget && max_tokens > 2048) {
+        cJSON *t = cJSON_AddObjectToObject(req, "thinking"); cJSON_AddStringToObject(t, "type", "enabled");
+        cJSON_AddNumberToObject(t, "budget_tokens", max_tokens / 2);
+    }
+    if (thinking && named) { cJSON *oc = cJSON_AddObjectToObject(req, "output_config"); cJSON_AddStringToObject(oc, "effort", effort); }
+    if (provider_fallbacks(model_name)) cJSON_AddStringToObject(req, "fallbacks", "default");
+    if (tools && cJSON_GetArraySize(tools) > 0) {
+        cJSON *arr = cJSON_AddArrayToObject(req, "tools"), *t;
+        cJSON_ArrayForEach(t, tools) {
+            cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
+            if (!fn) continue;
+            cJSON *o = cJSON_CreateObject();
+            cJSON *nm = cJSON_GetObjectItemCaseSensitive(fn, "name"), *ds = cJSON_GetObjectItemCaseSensitive(fn, "description");
+            cJSON *ps = cJSON_GetObjectItemCaseSensitive(fn, "parameters");
+            cJSON_AddStringToObject(o, "name", cJSON_IsString(nm) ? nm->valuestring : "");
+            cJSON_AddStringToObject(o, "description", cJSON_IsString(ds) ? ds->valuestring : "");
+            cJSON_AddItemToObject(o, "input_schema", ps ? cJSON_Duplicate(ps, 1) : cJSON_CreateObject());
+            cJSON_AddItemToArray(arr, o);
+        }
+    }
+    sbuf sys; sb_init(&sys);
+    cJSON *out = cJSON_CreateArray(), *acc = NULL, *m;
+    turn_call pend[TURN_CALLS]; int pn = 0, pi = 0;
+    cJSON_ArrayForEach(m, messages) {
+        const char *role = jrole(m);
+        if (!strcmp(role, "system")) {
+            user_flush(out, &acc);
+            if (sys.len && jcontent(m)[0]) sb_puts(&sys, "\n\n");
+            sb_puts(&sys, jcontent(m));
+        } else if (!strcmp(role, "assistant")) {
+            user_flush(out, &acc); pi = 0;
+            cJSON *blocks = assistant_blocks(m, tools, pend, &pn);
+            if (cJSON_GetArraySize(blocks) == 0) { cJSON_Delete(blocks); continue; }
+            cJSON *am = cJSON_CreateObject();
+            cJSON_AddStringToObject(am, "role", "assistant");
+            cJSON_AddItemToObject(am, "content", blocks);
+            cJSON_AddItemToArray(out, am);
+        } else if (!strcmp(role, "tool")) {
+            const char *got = NULL;
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(m, "tool_call_id");
+            if (cJSON_IsString(id) && id->valuestring[0]) got = id->valuestring;
+            bool demote = true; const char *use = got;
+            if (pi < pn) {
+                if (!use || !*use) use = pend[pi].id;
+                demote = pend[pi].demote;
+                pi++;
+            }
+            cJSON *tn = cJSON_GetObjectItemCaseSensitive(m, "tool_name");
+            const char *name = cJSON_IsString(tn) ? tn->valuestring : "tool";
+            if (demote || !use || !*use) {
+                sbuf t; sb_init(&t); sb_printf(&t, "[%s result]\n%s", name, jcontent(m));
+                user_add(&acc, text_block(t.data)); sb_free(&t);
+            } else {
+                cJSON *b = cJSON_CreateObject();
+                cJSON_AddStringToObject(b, "type", "tool_result");
+                cJSON_AddStringToObject(b, "tool_use_id", use);
+                cJSON_AddStringToObject(b, "content", jcontent(m));
+                user_add(&acc, b);
+            }
+        } else {   /* user, and anything else: said by the person */
+            if (jcontent(m)[0]) user_add(&acc, text_block(jcontent(m)));
+        }
+    }
+    user_flush(out, &acc);
+    if (sys.len) {
+        cJSON *arr = cJSON_CreateArray(), *b = text_block(sys.data);
+        cache_break(b);
+        cJSON_AddItemToArray(arr, b);
+        cJSON_AddItemToObject(req, "system", arr);
+    }
+    sb_free(&sys);
+    if (cJSON_GetArraySize(out) > 0) {
+        cJSON *last = cJSON_GetArrayItem(out, cJSON_GetArraySize(out) - 1);
+        cJSON *c = cJSON_GetObjectItemCaseSensitive(last, "content");
+        cJSON *b = cJSON_IsArray(c) && cJSON_GetArraySize(c) > 0 ? cJSON_GetArrayItem(c, cJSON_GetArraySize(c) - 1) : NULL;
+        cache_break(b);
+    }
+    cJSON_AddItemToObject(req, "messages", out);
+    char *body = cJSON_PrintUnformatted(req);
+    cJSON_Delete(req);
+    return body;
+}
+
+/* one assistant message, the shape run_turn already reads. `refusal` fills an empty answer. */
+static cJSON *assistant_from_blocks(cJSON *content, const char *stop, const char *refusal, chat_stats *st) {
+    sbuf text; sb_init(&text);
+    cJSON *calls = cJSON_CreateArray(), *keep = cJSON_CreateArray(), *b;
+    cJSON_ArrayForEach(b, content) {
+        cJSON *ty = cJSON_GetObjectItemCaseSensitive(b, "type");
+        const char *t = cJSON_IsString(ty) ? ty->valuestring : "";
+        if (!strcmp(t, "text")) {
+            cJSON *tx = cJSON_GetObjectItemCaseSensitive(b, "text");
+            if (!cJSON_IsString(tx) || !tx->valuestring[0]) continue;
+            sb_puts(&text, tx->valuestring);
+            cJSON_AddItemToArray(keep, cJSON_Duplicate(b, 1));
+        } else if (!strcmp(t, "redacted_thinking")) {
+            cJSON_AddItemToArray(keep, cJSON_Duplicate(b, 1));
+        } else if (!strcmp(t, "thinking")) {
+            cJSON *th = cJSON_GetObjectItemCaseSensitive(b, "thinking"), *sig = cJSON_GetObjectItemCaseSensitive(b, "signature");
+            if ((cJSON_IsString(th) && th->valuestring[0]) || (cJSON_IsString(sig) && sig->valuestring[0]))
+                cJSON_AddItemToArray(keep, cJSON_Duplicate(b, 1));
+        } else if (!strcmp(t, "tool_use")) {
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(b, "id"), *nm = cJSON_GetObjectItemCaseSensitive(b, "name");
+            cJSON *part = cJSON_GetObjectItemCaseSensitive(b, "_partial");
+            cJSON *parsed = NULL;
+            if (cJSON_IsString(part) && part->valuestring[0]) {
+                cJSON *p = cJSON_Parse(part->valuestring);
+                if (cJSON_IsObject(p)) parsed = p; else cJSON_Delete(p);
+            }
+            cJSON *in = parsed ? parsed : cJSON_GetObjectItemCaseSensitive(b, "input");
+            cJSON *call = cJSON_CreateObject();
+            if (cJSON_IsString(id) && id->valuestring[0]) cJSON_AddStringToObject(call, "id", id->valuestring);
+            cJSON *fn = cJSON_AddObjectToObject(call, "function");
+            cJSON_AddStringToObject(fn, "name", cJSON_IsString(nm) ? nm->valuestring : "");
+            char *args = cJSON_IsObject(in) ? cJSON_PrintUnformatted(in) : xstrdup("{}");
+            cJSON_AddStringToObject(fn, "arguments", args ? args : "{}");
+            free(args);
+            cJSON_AddItemToArray(calls, call);
+            cJSON *copy = cJSON_Duplicate(b, 1);
+            cJSON_DeleteItemFromObject(copy, "_partial");
+            if (parsed) {
+                cJSON_DeleteItemFromObject(copy, "input");
+                cJSON_AddItemToObject(copy, "input", parsed);   /* the copy keeps the object the stream assembled */
+            }
+            cJSON_AddItemToArray(keep, copy);
+        }
+    }
+    if (refusal && refusal[0] && !text.len) sb_puts(&text, refusal);
+    cJSON *msg = cJSON_CreateObject();
+    cJSON_AddStringToObject(msg, "role", "assistant");
+    cJSON_AddStringToObject(msg, "content", text.data ? text.data : "");
+    if (cJSON_GetArraySize(calls) > 0) cJSON_AddItemToObject(msg, "tool_calls", calls); else cJSON_Delete(calls);
+    if (cJSON_GetArraySize(keep) > 0) cJSON_AddItemToObject(msg, "provider_content", keep); else cJSON_Delete(keep);
+    sb_free(&text);
+    if (st) snprintf(st->done_reason, sizeof st->done_reason, "%s", stop && !strcmp(stop, "max_tokens") ? "length" : "stop");
+    return msg;
+}
+
+static void take_usage(cJSON *u, chat_stats *st, bool inputs) {
+    if (!cJSON_IsObject(u) || !st) return;
+    cJSON *v;
+    const char *in_keys[] = { "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens" };
+    if (inputs) for (int i = 0; i < 3; i++) if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(u, in_keys[i]))) st->prompt_tokens += (int)v->valuedouble;
+    if (inputs && cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(u, "cache_creation_input_tokens"))) st->cache_write += (int)v->valuedouble;
+    if (inputs && cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(u, "cache_read_input_tokens"))) st->cache_read += (int)v->valuedouble;
+    if (cJSON_IsNumber(v = cJSON_GetObjectItemCaseSensitive(u, "output_tokens"))) st->eval_tokens = (int)v->valuedouble;
+}
+
+/* ---------- Chat Completions turns (the workers of /goal on xAI, OpenAI, DeepSeek, Kimi) ----------
+ * The conversation is the one ollama_chat() speaks, and so is the reply: an assistant message with its
+ * tool_calls (arguments as an object) and its content. Chat Completions wants the arguments as a JSON
+ * string, every result after the id of its call, and max_completion_tokens from OpenAI; that is
+ * translated here, at the wire. Calls that arrive without an id get one, and the results that follow
+ * them without one are matched to those ids in order. */
+static bool cc_openai(const provider_def *p) { return !strcmp(p->name, "openai"); }
+
+static cJSON *cc_messages(cJSON *messages) {
+    cJSON *out = cJSON_CreateArray();
+    cJSON *pending = cJSON_CreateArray();   /* the ids of the last assistant message's calls */
+    int seq = 0, next = 0;
+    cJSON *m;
+    cJSON_ArrayForEach(m, messages) {
+        cJSON *role = cJSON_GetObjectItemCaseSensitive(m, "role");
+        if (!cJSON_IsString(role)) continue;
+        cJSON *content = cJSON_GetObjectItemCaseSensitive(m, "content");
+        const char *text = cJSON_IsString(content) ? content->valuestring : "";
+        cJSON *o = cJSON_CreateObject();
+        if (!strcmp(role->valuestring, "tool")) {
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(m, "tool_call_id");
+            const char *cid = cJSON_IsString(id) && id->valuestring[0] ? id->valuestring : NULL;
+            if (!cid && next < cJSON_GetArraySize(pending)) cid = cJSON_GetArrayItem(pending, next++)->valuestring;
+            cJSON_AddStringToObject(o, "role", "tool");
+            if (cid) cJSON_AddStringToObject(o, "tool_call_id", cid);
+            cJSON_AddStringToObject(o, "content", text);
+        } else if (!strcmp(role->valuestring, "assistant")) {
+            cJSON_AddStringToObject(o, "role", "assistant");
+            cJSON_AddStringToObject(o, "content", text);
+            cJSON *calls = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+            if (cJSON_IsArray(calls) && cJSON_GetArraySize(calls)) {
+                cJSON *tc = cJSON_AddArrayToObject(o, "tool_calls");
+                cJSON_Delete(pending); pending = cJSON_CreateArray(); next = 0;
+                cJSON *call;
+                cJSON_ArrayForEach(call, calls) {
+                    cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
+                    cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+                    cJSON *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+                    cJSON *id = cJSON_GetObjectItemCaseSensitive(call, "id");
+                    char idbuf[48];
+                    if (cJSON_IsString(id) && id->valuestring[0]) snprintf(idbuf, sizeof idbuf, "%s", id->valuestring);
+                    else snprintf(idbuf, sizeof idbuf, "call_%d", ++seq);
+                    cJSON *t = cJSON_CreateObject();
+                    cJSON_AddStringToObject(t, "id", idbuf);
+                    cJSON_AddStringToObject(t, "type", "function");
+                    cJSON *f = cJSON_AddObjectToObject(t, "function");
+                    cJSON_AddStringToObject(f, "name", cJSON_IsString(nm) ? nm->valuestring : "");
+                    char *as = cJSON_IsString(args) ? xstrdup(args->valuestring) : args ? cJSON_PrintUnformatted(args) : xstrdup("{}");
+                    cJSON_AddStringToObject(f, "arguments", as);
+                    free(as);
+                    cJSON_AddItemToArray(tc, t);
+                    cJSON_AddItemToArray(pending, cJSON_CreateString(idbuf));
+                }
+            }
+        } else {
+            cJSON_AddStringToObject(o, "role", role->valuestring);
+            cJSON_AddStringToObject(o, "content", text);
+            cJSON_Delete(pending); pending = cJSON_CreateArray(); next = 0;
+        }
+        cJSON_AddItemToArray(out, o);
+    }
+    cJSON_Delete(pending);
+    return out;
+}
+
+/* the body of one turn for a Chat Completions provider; mid is the model's own name (no prefix) */
+static char *cc_turn_body(const provider_def *p, const char *mid, cJSON *messages, cJSON *tools, int max_tokens, double temperature) {
+    cJSON *b = cJSON_CreateObject();
+    cJSON_AddStringToObject(b, "model", mid);
+    cJSON_AddItemToObject(b, "messages", cc_messages(messages));
+    if (tools && cJSON_GetArraySize(tools)) { cJSON_AddItemToObject(b, "tools", cJSON_Duplicate(tools, 1)); cJSON_AddStringToObject(b, "tool_choice", "auto"); }
+    cJSON_AddBoolToObject(b, "stream", false);
+    if (max_tokens > 0) cJSON_AddNumberToObject(b, cc_openai(p) ? "max_completion_tokens" : "max_tokens", max_tokens);
+    if (temperature >= 0) cJSON_AddNumberToObject(b, "temperature", temperature);
+    /* Kimi's K2 thinking models keep their reasoning between turns only when asked to; corbienest does not
+     * carry it, so thinking is off for them. kimi-k3 always reasons (reasoning_effort) and is left alone. */
+    if (!strcmp(p->name, "kimi") && !strncmp(mid, "kimi-k2", 7)) {
+        cJSON *th = cJSON_AddObjectToObject(b, "thinking");
+        cJSON_AddStringToObject(th, "type", "disabled");
+    }
+    char *s = cJSON_PrintUnformatted(b);
+    cJSON_Delete(b);
+    return s;
+}
+
+/* the reply, in the shape ollama_chat() returns: role, content and tool_calls (id, function.name, function.arguments as an object) */
+static cJSON *cc_turn_reply(const provider_def *p, const char *mid, const char *json, int status, chat_stats *st, char *err, size_t n) {
+    (void)mid;
+    if (status >= 400 || status == 0) { status_error(p, mid, status, json, err, n); return NULL; }
+    cJSON *j = cJSON_Parse(json ? json : "");
+    if (!j) { snprintf(err, n, "%s sent an answer that is not JSON: %.120s", p->label, json ? json : ""); return NULL; }
+    cJSON *ch = cJSON_GetObjectItemCaseSensitive(j, "choices");
+    cJSON *c0 = cJSON_IsArray(ch) ? cJSON_GetArrayItem(ch, 0) : NULL;
+    cJSON *msg = c0 ? cJSON_GetObjectItemCaseSensitive(c0, "message") : NULL;
+    if (!msg) { snprintf(err, n, "%s sent an answer with no message", p->label); cJSON_Delete(j); return NULL; }
+    cJSON *reply = cJSON_CreateObject();
+    cJSON_AddStringToObject(reply, "role", "assistant");
+    cJSON *content = cJSON_GetObjectItemCaseSensitive(msg, "content");
+    cJSON_AddStringToObject(reply, "content", cJSON_IsString(content) ? content->valuestring : "");
+    cJSON *tcs = cJSON_GetObjectItemCaseSensitive(msg, "tool_calls");
+    if (cJSON_IsArray(tcs) && cJSON_GetArraySize(tcs)) {
+        cJSON *calls = cJSON_AddArrayToObject(reply, "tool_calls");
+        cJSON *t; int k = 0;
+        cJSON_ArrayForEach(t, tcs) {
+            cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
+            cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+            cJSON *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(t, "id");
+            char idbuf[48];
+            if (cJSON_IsString(id) && id->valuestring[0]) snprintf(idbuf, sizeof idbuf, "%s", id->valuestring);
+            else snprintf(idbuf, sizeof idbuf, "call_%d", ++k);
+            cJSON *c = cJSON_CreateObject();
+            cJSON_AddStringToObject(c, "id", idbuf);
+            cJSON *f = cJSON_AddObjectToObject(c, "function");
+            cJSON_AddStringToObject(f, "name", cJSON_IsString(nm) ? nm->valuestring : "");
+            cJSON *parsed = cJSON_IsString(args) ? cJSON_Parse(args->valuestring) : NULL;
+            if (parsed) cJSON_AddItemToObject(f, "arguments", parsed);
+            else cJSON_AddStringToObject(f, "arguments", cJSON_IsString(args) ? args->valuestring : "{}");
+            cJSON_AddItemToArray(calls, c);
+        }
+    }
+    if (st) {
+        memset(st, 0, sizeof *st);
+        cJSON *u = cJSON_GetObjectItemCaseSensitive(j, "usage");
+        if (u) {
+            cJSON *pt = cJSON_GetObjectItemCaseSensitive(u, "prompt_tokens"), *ct = cJSON_GetObjectItemCaseSensitive(u, "completion_tokens");
+            cJSON *pd = cJSON_GetObjectItemCaseSensitive(u, "prompt_tokens_details");
+            cJSON *cached = pd ? cJSON_GetObjectItemCaseSensitive(pd, "cached_tokens") : NULL;
+            cJSON *cw = pd ? cJSON_GetObjectItemCaseSensitive(pd, "cache_write_tokens") : NULL;
+            if (cJSON_IsNumber(pt)) st->prompt_tokens = pt->valueint;
+            if (cJSON_IsNumber(ct)) st->eval_tokens = ct->valueint;
+            if (cJSON_IsNumber(cached)) st->cache_read = cached->valueint;
+            if (cJSON_IsNumber(cw)) st->cache_write = cw->valueint;
+        }
+        cJSON *fr = c0 ? cJSON_GetObjectItemCaseSensitive(c0, "finish_reason") : NULL;
+        if (cJSON_IsString(fr)) snprintf(st->done_reason, sizeof st->done_reason, "%s", !strcmp(fr->valuestring, "length") ? "length" : "stop");
+    }
+    cJSON_Delete(j);
+    err[0] = 0;
+    return reply;
+}
+
+cJSON *provider_turn_reply(const char *model, const char *json, int status, chat_stats *st, char *err, size_t n) {
+    const char *mid = ""; const provider_def *p = provider_find(model, &mid);
+    err[0] = 0;
+    if (st) memset(st, 0, sizeof *st);
+    if (!p) { snprintf(err, n, "'%s' is not a hosted model", model ? model : ""); return NULL; }
+    if (p->style == PROVIDER_CHAT_COMPLETIONS) return cc_turn_reply(p, mid, json, status, st, err, n);
+    if (status >= 400 || status == 0) { status_error(p, mid, status, json, err, n); return NULL; }
+    cJSON *j = cJSON_Parse(json ? json : "");
+    if (!j) { snprintf(err, n, "%s sent an answer that is not JSON: %.120s", p->label, json ? json : ""); return NULL; }
+    cJSON *sr = cJSON_GetObjectItemCaseSensitive(j, "stop_reason");
+    const char *why = cJSON_IsString(sr) ? sr->valuestring : "";
+    char whybuf[160] = "";
+    if (!strcmp(why, "refusal")) {
+        cJSON *sd = cJSON_GetObjectItemCaseSensitive(j, "stop_details");
+        cJSON *cat = sd ? cJSON_GetObjectItemCaseSensitive(sd, "category") : NULL;
+        snprintf(whybuf, sizeof whybuf, "%s declined to answer (refusal%s%s)", mid, cJSON_IsString(cat) ? ": " : "", cJSON_IsString(cat) ? cat->valuestring : "");
+    }
+    cJSON *msg = assistant_from_blocks(cJSON_GetObjectItemCaseSensitive(j, "content"), why, whybuf, st);
+    take_usage(cJSON_GetObjectItemCaseSensitive(j, "usage"), st, true);
+    cJSON_Delete(j);
+    return msg;
 }
 
 /* the headers a request to p carries; the strings live in *keep (free with sb_free) */
@@ -345,9 +808,8 @@ char *provider_chat(const char *advisor, const model_info *mi, const provider_re
     const char *hdrs[4]; sbuf keep; auth_headers(p, advisor, key, hdrs, &keep);
     struct timeval t0, t1; gettimeofday(&t0, NULL);
     term_raw(true);
-    ollama_stopped_for_message = false;
-    http_interrupt_fd = g_cfg.interactive ? STDIN_FILENO : -1;
-    http_interrupt_check = ollama_poll_or_message;
+    http_interrupt_fd = g_cfg.interactive ? term_interrupt_fd() : -1;
+    http_interrupt_check = term_poll_interrupt;
     http_idle = idle_tick; http_idle_ud = NULL;
     http_headers = hdrs;
     int idle_was = http_idle_timeout_ms;
@@ -361,9 +823,321 @@ char *provider_chat(const char *advisor, const model_info *mi, const provider_re
     gettimeofday(&t1, NULL);
     st->total_seconds = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_usec - t0.tv_usec) / 1e6;
     char *text = NULL;
+    ratelimit_set(advisor, &res.rl);
     if (res.aborted) *aborted = true;
     else if (rc != 0) snprintf(err, n, "%s", res.err);
     else text = provider_parse_reply(advisor, out.data, res.status, st, err, n);
     free(body); sb_free(&out); sb_free(&keep);
     return text;
+}
+
+/* The headers of one call. Built here, on the main thread: the key is in the environment, and a
+ * worker's thread reads neither. The strings live in *keep until the caller has handed them to
+ * http_job_start (which copies them) or http_request has returned. */
+bool provider_call_headers(const char *model, const char *hdrs[4], sbuf *keep, char *err, size_t n) {
+    err[0] = 0;
+    const provider_def *p = provider_find(model, NULL);
+    if (!p) { snprintf(err, n, "'%s' is not a hosted model", model ? model : ""); return false; }
+    const char *key = getenv(p->key_env);
+    if (!key || !*key) { snprintf(err, n, "%s is not set — export it before starting corbienest (a NAME=value line without `export` is not passed on)", p->key_env); return false; }
+    if (base_insecure(p, err, n)) return false;
+    auth_headers(p, model, key, hdrs, keep);
+    return true;
+}
+
+/* What this call asks the working model for, from ollama_call and the configuration — the same
+ * places ollama_chat() reads. A quiet call (think == 0: the memory update, a compaction) sends
+ * neither thinking nor an effort, even when a level would otherwise stay for the prompt cache. */
+static void turn_ask(const char *model, const model_info *mi, int *max_tokens, const char **effort, bool *thinking, double *temperature) {
+    *max_tokens = ollama_call.num_predict > 0 ? ollama_call.num_predict : (mi && mi->max_output > 0 ? mi->max_output : 32000);
+    *effort = NULL; *thinking = false;
+    bool other = ollama_call.model && !model_same(ollama_call.model, g_cfg.model);
+    *temperature = g_cfg.temperature >= 0 && !other ? g_cfg.temperature : -1;
+    if (ollama_call.think == 0 || !mi) return;
+    const char *level = NULL;
+    think_kind k = think_decide(ollama_call.model ? -1 : g_cfg.think, false, ollama_call.followup, effort_get(model), mi, &level);
+    if ((k == THINK_TRUE || k == THINK_LEVEL) && (mi->think_adaptive || mi->think_budget)) *thinking = true;
+    if (*thinking && k == THINK_LEVEL && level && strcmp(level, "off") && strcmp(level, "on")) *effort = level;
+}
+
+char *provider_turn_request(cJSON *messages, cJSON *tools) {
+    const char *model = ollama_call.model ? ollama_call.model : g_cfg.model;
+    static const model_info no_info;
+    const model_info *mi = ollama_call.model ? (ollama_call.info ? ollama_call.info : &no_info) : &g_model_info;
+    int max_tokens; const char *effort; bool thinking; double temperature;
+    turn_ask(model, mi, &max_tokens, &effort, &thinking, &temperature);
+    const char *mid = ""; const provider_def *p = provider_find(model, &mid);
+    if (p && p->style == PROVIDER_CHAT_COMPLETIONS) return cc_turn_body(p, mid, messages, tools, max_tokens, temperature);
+    return provider_turn_body(model, mi, messages, tools, max_tokens, effort, thinking, temperature, false);
+}
+
+/* ---------- a streamed turn ----------
+ * Anthropic's stream is Server-Sent Events: "event: …", "data: {…}", a blank line. Text is
+ * printed as it arrives, the way Ollama's chunks are; a tool's arguments are accumulated and
+ * not shown. At the end the blocks are the same assistant message provider_turn_reply() builds. */
+static const char *TURN_SPIN[] = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+
+typedef struct {
+    md_state md;
+    chat_stats *stats;
+    cJSON *blocks;
+    sbuf data;
+    char event[40];
+    char error[512];
+    char stop_reason[32];
+    char refusal[160];
+    bool got_content, thinking_header, spinner_shown;
+    int think_tokens, out_chunks, spin_i, index;
+    struct timeval t0, t_think;
+    double think_secs;
+} turn_ctx;
+
+static double turn_elapsed(struct timeval *t0) {
+    struct timeval t; gettimeofday(&t, NULL);
+    return (double)(t.tv_sec - t0->tv_sec) + (double)(t.tv_usec - t0->tv_usec) / 1e6;
+}
+static const char *turn_busy(const char *def) { return ollama_call.busy ? ollama_call.busy : def; }
+static void turn_spin_clear(turn_ctx *c) {
+    if (c->spinner_shown) { fputs("\r\x1b[2K", stdout); fflush(stdout); c->spinner_shown = false; }
+}
+static void turn_idle(void *ud) {
+    turn_ctx *c = ud;
+    term_busy_tick();
+    if (!g_cfg.interactive || c->got_content || ollama_quiet) return;
+    if (c->thinking_header && g_cfg.show_thinking) return;
+    c->spin_i = (c->spin_i + 1) % 10;
+    if (c->think_tokens > 0)
+        printf("\r\x1b[2K" C_MAGENTA "%s" C_RESET C_DIM " thinking… (%d tokens, %.0fs)  " C_RESET "esc to interrupt", TURN_SPIN[c->spin_i], c->think_tokens, turn_elapsed(&c->t0));
+    else
+        printf("\r\x1b[2K" C_ORANGE "%s" C_RESET C_DIM " %s… (%.0fs)  " C_RESET "esc to interrupt", TURN_SPIN[c->spin_i],
+               turn_elapsed(&c->t0) > 8 ? "waiting" : "thinking", turn_elapsed(&c->t0));
+    fflush(stdout);
+    c->spinner_shown = true;
+}
+static void jstr_append(cJSON *obj, const char *key, const char *add) {
+    if (!obj || !add || !*add) return;
+    cJSON *v = cJSON_GetObjectItemCaseSensitive(obj, key);
+    const char *cur = cJSON_IsString(v) ? v->valuestring : "";
+    size_t a = strlen(cur), b = strlen(add);
+    char *s = xmalloc(a + b + 1);
+    memcpy(s, cur, a); memcpy(s + a, add, b + 1);
+    if (v) cJSON_ReplaceItemInObject(obj, key, cJSON_CreateString(s));
+    else cJSON_AddStringToObject(obj, key, s);
+    free(s);
+}
+static cJSON *turn_block(turn_ctx *c, int index) {
+    if (index < 0 || index >= TURN_CALLS) return NULL;
+    while (cJSON_GetArraySize(c->blocks) <= index) cJSON_AddItemToArray(c->blocks, cJSON_CreateObject());
+    return cJSON_GetArrayItem(c->blocks, index);
+}
+static void turn_close_thinking(turn_ctx *c) {
+    if (c->think_tokens && c->think_secs == 0) c->think_secs = turn_elapsed(&c->t_think);
+    if (c->thinking_header && g_cfg.show_thinking && !ollama_quiet) { printf(C_RESET "\n\n"); c->thinking_header = false; }
+}
+static void turn_text(turn_ctx *c, const char *s) {
+    if (!s || !*s) return;
+    if (ollama_quiet) { term_busy(turn_busy("generating")); return; }
+    turn_spin_clear(c);
+    turn_close_thinking(c);
+    term_busy(turn_busy("generating"));
+    if (!c->got_content) {
+        fputs(C_ORANGE "●" C_RESET " ", stdout);
+        c->got_content = true;
+        while (*s == '\n' || *s == ' ') s++;
+        if (*s) md_feed(&c->md, s, strlen(s));
+    } else md_feed(&c->md, s, strlen(s));
+}
+static void turn_event(turn_ctx *c, cJSON *j, const char *type) {
+    if (!strcmp(type, "error")) {
+        cJSON *e = cJSON_GetObjectItemCaseSensitive(j, "error");
+        cJSON *m = cJSON_IsObject(e) ? cJSON_GetObjectItemCaseSensitive(e, "message") : e;
+        if (!cJSON_IsString(m)) m = cJSON_GetObjectItemCaseSensitive(j, "message");
+        snprintf(c->error, sizeof c->error, "%s", cJSON_IsString(m) ? m->valuestring : "the API refused the call");
+        return;
+    }
+    if (!strcmp(type, "message_start")) {
+        cJSON *msg = cJSON_GetObjectItemCaseSensitive(j, "message");
+        take_usage(msg ? cJSON_GetObjectItemCaseSensitive(msg, "usage") : NULL, c->stats, true);
+        return;
+    }
+    if (!strcmp(type, "message_delta")) {
+        cJSON *d = cJSON_GetObjectItemCaseSensitive(j, "delta");
+        cJSON *sr = d ? cJSON_GetObjectItemCaseSensitive(d, "stop_reason") : NULL;
+        if (cJSON_IsString(sr) && sr->valuestring[0]) snprintf(c->stop_reason, sizeof c->stop_reason, "%s", sr->valuestring);
+        cJSON *sd = d ? cJSON_GetObjectItemCaseSensitive(d, "stop_details") : NULL;
+        cJSON *cat = sd ? cJSON_GetObjectItemCaseSensitive(sd, "category") : NULL;
+        if (!strcmp(c->stop_reason, "refusal"))
+            snprintf(c->refusal, sizeof c->refusal, "declined to answer (refusal%s%s)", cJSON_IsString(cat) ? ": " : "", cJSON_IsString(cat) ? cat->valuestring : "");
+        take_usage(cJSON_GetObjectItemCaseSensitive(j, "usage"), c->stats, false);
+        return;
+    }
+    if (!strcmp(type, "content_block_start")) {
+        cJSON *ix = cJSON_GetObjectItemCaseSensitive(j, "index");
+        int index = cJSON_IsNumber(ix) ? (int)ix->valuedouble : c->index + 1;
+        cJSON *slot = turn_block(c, index);
+        if (!slot) return;
+        cJSON *src = cJSON_GetObjectItemCaseSensitive(j, "content_block");
+        cJSON *copy = cJSON_IsObject(src) ? cJSON_Duplicate(src, 1) : cJSON_CreateObject();
+        cJSON_ReplaceItemInArray(c->blocks, index, copy);
+        c->index = index;
+        cJSON *ty = cJSON_GetObjectItemCaseSensitive(copy, "type");
+        const char *bt = cJSON_IsString(ty) ? ty->valuestring : "";
+        if (!strcmp(bt, "thinking")) {
+            if (c->think_tokens == 0) { term_busy(turn_busy("thinking")); gettimeofday(&c->t_think, NULL); }
+        } else if (!strcmp(bt, "tool_use")) {
+            turn_close_thinking(c);
+            term_busy(turn_busy("calling tools"));
+        }
+        return;
+    }
+    if (!strcmp(type, "content_block_delta")) {
+        cJSON *ix = cJSON_GetObjectItemCaseSensitive(j, "index");
+        int index = cJSON_IsNumber(ix) ? (int)ix->valuedouble : c->index;
+        cJSON *blk = turn_block(c, index);
+        cJSON *d = cJSON_GetObjectItemCaseSensitive(j, "delta");
+        cJSON *dt = d ? cJSON_GetObjectItemCaseSensitive(d, "type") : NULL;
+        const char *k = cJSON_IsString(dt) ? dt->valuestring : "";
+        if (!strcmp(k, "text_delta")) {
+            cJSON *tx = cJSON_GetObjectItemCaseSensitive(d, "text");
+            if (!cJSON_IsString(tx) || !tx->valuestring[0]) return;
+            term_status_live(++c->out_chunks); term_busy_tick();
+            jstr_append(blk, "text", tx->valuestring);
+            turn_text(c, tx->valuestring);
+        } else if (!strcmp(k, "thinking_delta")) {
+            cJSON *th = cJSON_GetObjectItemCaseSensitive(d, "thinking");
+            if (!cJSON_IsString(th) || !th->valuestring[0]) return;
+            if (c->think_tokens == 0) { term_busy(turn_busy("thinking")); gettimeofday(&c->t_think, NULL); }
+            c->think_tokens++;
+            term_status_live(++c->out_chunks); term_busy_tick();
+            jstr_append(blk, "thinking", th->valuestring);
+            if (g_cfg.show_thinking && !ollama_quiet) {
+                turn_spin_clear(c);
+                if (!c->thinking_header) { printf(C_MAGENTA "✻ Thinking…" C_RESET "\n" C_GRAY); c->thinking_header = true; }
+                fputs(th->valuestring, stdout); fflush(stdout);
+            } else if (!c->thinking_header) c->thinking_header = true;
+        } else if (!strcmp(k, "signature_delta")) {
+            cJSON *sg = cJSON_GetObjectItemCaseSensitive(d, "signature");
+            if (cJSON_IsString(sg)) jstr_append(blk, "signature", sg->valuestring);
+        } else if (!strcmp(k, "input_json_delta")) {
+            cJSON *pj = cJSON_GetObjectItemCaseSensitive(d, "partial_json");
+            if (cJSON_IsString(pj)) jstr_append(blk, "_partial", pj->valuestring);
+        }
+    }
+}
+static void turn_dispatch(turn_ctx *c) {
+    if (!c->data.len) { c->event[0] = 0; return; }
+    cJSON *j = cJSON_Parse(c->data.data);
+    sb_clear(&c->data);
+    char ev[sizeof c->event]; snprintf(ev, sizeof ev, "%s", c->event); c->event[0] = 0;
+    if (!j) return;
+    cJSON *ty = cJSON_GetObjectItemCaseSensitive(j, "type");
+    turn_event(c, j, cJSON_IsString(ty) ? ty->valuestring : ev);
+    cJSON_Delete(j);
+}
+static int turn_line(const char *line, size_t len, void *ud) {
+    turn_ctx *c = ud;
+    while (len && (*line == ' ' || *line == '\r')) { line++; len--; }
+    while (len && (line[len - 1] == '\r' || line[len - 1] == ' ')) len--;
+    if (len == 0) { turn_dispatch(c); return 0; }
+    if (len >= 6 && !strncmp(line, "event:", 6)) {
+        if (c->data.len) turn_dispatch(c);
+        const char *v = line + 6; size_t vl = len - 6; while (vl && *v == ' ') { v++; vl--; }
+        if (vl >= sizeof c->event) vl = sizeof c->event - 1;
+        memcpy(c->event, v, vl); c->event[vl] = 0;
+        return 0;
+    }
+    if (len >= 5 && !strncmp(line, "data:", 5)) {
+        const char *v = line + 5; size_t vl = len - 5; while (vl && *v == ' ') { v++; vl--; }
+        if (c->data.len) sb_putc(&c->data, '\n');
+        sb_append(&c->data, v, vl);
+        return 0;
+    }
+    if (line[0] == '{') {   /* an error body is one JSON line, not an event */
+        if (c->data.len) turn_dispatch(c);
+        sb_append(&c->data, line, len);
+        turn_dispatch(c);
+    }
+    return 0;
+}
+
+cJSON *provider_turn(cJSON *messages, cJSON *tools, chat_stats *stats, bool *aborted) {
+    *aborted = false;
+    ollama_error[0] = 0;
+    if (stats) memset(stats, 0, sizeof *stats);
+    const char *model = ollama_call.model ? ollama_call.model : g_cfg.model;
+    const char *mid = ""; const provider_def *p = provider_find(model, &mid);
+    if (!p || p->style != PROVIDER_MESSAGES) {
+        snprintf(ollama_error, sizeof ollama_error, "'%s' is not an Anthropic model", model ? model : "");
+        printf(C_RED "✗ %s" C_RESET "\n", ollama_error);
+        return NULL;
+    }
+    static const model_info no_info;
+    const model_info *mi = ollama_call.model ? (ollama_call.info ? ollama_call.info : &no_info) : &g_model_info;
+    int max_tokens; const char *effort; bool thinking; double temperature;
+    turn_ask(model, mi, &max_tokens, &effort, &thinking, &temperature);
+    char *body = provider_turn_body(model, mi, messages, tools, max_tokens, effort, thinking, temperature, true);
+    char err[512]; const char *hdrs[4]; sbuf keep;
+    if (!provider_call_headers(model, hdrs, &keep, err, sizeof err)) {
+        snprintf(ollama_error, sizeof ollama_error, "%s", err);
+        printf(C_RED "✗ %s" C_RESET "\n", ollama_error);
+        free(body);
+        return NULL;
+    }
+    turn_ctx c; memset(&c, 0, sizeof c);
+    md_init(&c.md); sb_init(&c.data); c.blocks = cJSON_CreateArray(); c.stats = stats; c.index = -1;
+    gettimeofday(&c.t0, NULL);
+    term_raw(true);
+    http_interrupt_fd = g_cfg.interactive ? term_interrupt_fd() : -1;
+    http_interrupt_check = term_poll_interrupt;
+    http_idle = turn_idle; http_idle_ud = &c;
+    http_headers = hdrs;
+    term_busy(turn_busy("waiting for model"));
+    turn_idle(&c);
+    http_result res;
+    int idle_was = http_idle_timeout_ms;
+    if (ollama_call.idle_ms > 0) http_idle_timeout_ms = ollama_call.idle_ms;
+    int rc = http_request(provider_base_url(p), "POST", "/v1/messages", body, NULL, turn_line, &c, &res);
+    http_idle_timeout_ms = idle_was;
+    http_headers = NULL; http_idle = NULL; http_interrupt_fd = -1;
+    term_busy(NULL);
+    ratelimit_set(model, &res.rl);
+    free(body); sb_free(&keep);
+    if (c.data.len) turn_dispatch(&c);
+    term_status_live(0);
+    turn_spin_clear(&c);
+    if (c.got_content) md_finish(&c.md);
+    else if (c.thinking_header && g_cfg.show_thinking && !ollama_quiet) fputs(C_RESET, stdout);
+    struct timeval t1; gettimeofday(&t1, NULL);
+    if (stats) {
+        stats->total_seconds = (double)(t1.tv_sec - c.t0.tv_sec) + (double)(t1.tv_usec - c.t0.tv_usec) / 1e6;
+        if (c.think_tokens) { stats->think_chunks = c.think_tokens; stats->think_seconds = c.think_secs > 0 ? c.think_secs : turn_elapsed(&c.t_think); }
+    }
+    cJSON *msg = NULL;
+    bool failed = false;
+    if (res.aborted) {
+        *aborted = true;
+        if (!ollama_quiet) printf("\n" C_YELLOW "⏹ interrupted" C_RESET "\n");
+    } else if (rc != 0) {
+        failed = true;
+        snprintf(ollama_error, sizeof ollama_error, "%s", res.err);
+        printf(C_RED "✗ request failed: %s" C_RESET "\n", res.err);
+        if (strstr(res.err, "connect")) printf(C_DIM "  is %s reachable? (%s)" C_RESET "\n", p->label, provider_base_url(p));
+    } else if (c.error[0] || res.status >= 400 || res.status == 0) {
+        failed = true;
+        if (!c.error[0]) status_error(p, mid, res.status, "", ollama_error, sizeof ollama_error);
+        else snprintf(ollama_error, sizeof ollama_error, "%s", c.error);
+        printf(C_RED "✗ %s" C_RESET "\n", ollama_error);
+    }
+    if (res.aborted || !failed) {
+        if (c.got_content && !ollama_quiet) printf("\n");
+        msg = assistant_from_blocks(c.blocks, c.stop_reason, c.refusal, stats);
+        if (res.aborted) {
+            cJSON *ct = cJSON_GetObjectItemCaseSensitive(msg, "content");
+            if (!cJSON_IsString(ct) || !ct->valuestring[0]) { cJSON_Delete(msg); msg = NULL; }
+            else { cJSON_DeleteItemFromObject(msg, "tool_calls"); cJSON_DeleteItemFromObject(msg, "provider_content"); }
+        }
+    }
+    cJSON_Delete(c.blocks); sb_free(&c.data);
+    fflush(stdout);
+    return msg;
 }

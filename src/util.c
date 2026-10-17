@@ -413,14 +413,22 @@ void config_load(void) {
         else if (!strncmp(k, "price.", 6)) { double pi, po; if (k[6] && sscanf(v, "%lf/%lf", &pi, &po) == 2 && pi >= 0 && po >= 0) price_set(k + 6, pi, po); }
         else if (!strcmp(k, "advisor")) { free(g_cfg.advisor); g_cfg.advisor = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "advisor_ctx")) { int n = atoi(v); if (n == 0 || n >= ADVISOR_CTX_MIN) g_cfg.advisor_ctx = n; }
-        else if (!strcmp(k, "workers")) { int n = atoi(v); if (n >= 1 && n <= ORCH_WORKERS_MAX) g_cfg.workers = n; }
+        else if (!strcmp(k, "subagent")) { free(g_cfg.subagent); g_cfg.subagent = *v ? xstrdup(v) : NULL; }
+        else if (!strcmp(k, "workers")) { int n = atoi(v); if (n >= 1 && n <= ORCH_PARALLEL_MAX) g_cfg.workers = n; }
+        else if (!strcmp(k, "build")) { free(g_cfg.build); g_cfg.build = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "advisor_window")) { double m = atof(v); if (m >= 0 && m <= 24 * 60) g_cfg.advisor_window = (int)(m * 60 + 0.5); }
         else if (!strcmp(k, "advisor_guidance")) { int n = advisor_guidance_parse(v); if (n >= 0) g_cfg.advisor_guidance = n; }
         else if (!strcmp(k, "show_thinking")) g_cfg.show_thinking = atoi(v) != 0;
+        else if (!strcmp(k, "ui")) { free(g_cfg.ui); g_cfg.ui = !strcmp(v, "notcurses") ? xstrdup("notcurses") : NULL; }
+        else if (!strcmp(k, "theme")) {   /* a name no theme has is said, and the default is used */
+            if (theme_set(v)) { free(g_cfg.theme); g_cfg.theme = xstrdup(v); }
+            else fprintf(stderr, "corbienest: no theme named \"%s\" in the config: the default is used\n", v);
+        }
         else if (!strcmp(k, "yolo")) { if (atoi(v)) g_cfg.mode = MODE_AUTO; }
         else if (!strcmp(k, "mode")) { int m = mode_parse(v); if (m >= 0) g_cfg.mode = m; }
         else if (!strcmp(k, "memory")) g_cfg.memory = atoi(v) != 0;
         else if (!strcmp(k, "web")) g_cfg.web = atoi(v) != 0;
+        else if (!strcmp(k, "sandbox")) g_cfg.sandbox = !strcmp(v, "bwrap") || atoi(v) != 0;
         else if (!strcmp(k, "search_url")) { free(g_cfg.search_url); g_cfg.search_url = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "max_iters")) { int n = atoi(v); if (n > 0) g_cfg.max_iters = n; }
         else if (!strcmp(k, "memory_every")) { int n = atoi(v); if (n > 0) g_cfg.memory_every = n; }
@@ -442,7 +450,7 @@ void config_save(void) {
     snprintf(path, sizeof path, "%s/config", config_dir());
     sbuf b; sb_init(&b);
     sb_puts(&b, "# corbienest config (auto-written)\n");
-    if (g_cfg.model) sb_printf(&b, "model=%s\n", g_cfg.model);
+    if (g_cfg.model && *g_cfg.model) sb_printf(&b, "model=%s\n", g_cfg.model);
     if (g_cfg.host) sb_printf(&b, "host=%s\n", g_cfg.host);
     sb_printf(&b, "num_ctx=%d\n", g_cfg.num_ctx);
     if (g_cfg.temperature >= 0) sb_printf(&b, "temperature=%g\n", g_cfg.temperature);
@@ -451,7 +459,9 @@ void config_save(void) {
     for (int i = 0; i < g_cfg.n_prices; i++) sb_printf(&b, "price.%s=%g/%g\n", g_cfg.prices[i].model, g_cfg.prices[i].in, g_cfg.prices[i].out);
     if (g_cfg.advisor) sb_printf(&b, "advisor=%s\n", g_cfg.advisor);
     if (g_cfg.advisor_ctx > 0) sb_printf(&b, "advisor_ctx=%d\n", g_cfg.advisor_ctx);
+    if (g_cfg.subagent && *g_cfg.subagent) sb_printf(&b, "subagent=%s\n", g_cfg.subagent);
     if (g_cfg.workers > 0) sb_printf(&b, "workers=%d\n", g_cfg.workers);
+    if (g_cfg.build && *g_cfg.build) sb_printf(&b, "build=%s\n", g_cfg.build);
     if (g_cfg.advisor_window != ADVISOR_WINDOW_DEFAULT) sb_printf(&b, "advisor_window=%g\n", g_cfg.advisor_window / 60.0);   /* in minutes, as it is typed */
     if (g_cfg.advisor_guidance != GUIDANCE_NORMAL) sb_printf(&b, "advisor_guidance=%s\n", advisor_guidance()->name);
     sb_printf(&b, "show_thinking=%d\n", g_cfg.show_thinking ? 1 : 0);
@@ -459,10 +469,13 @@ void config_save(void) {
     sb_printf(&b, "max_iters=%d\n", g_cfg.max_iters);
     sb_printf(&b, "memory=%d\n", g_cfg.memory ? 1 : 0);
     sb_printf(&b, "web=%d\n", g_cfg.web ? 1 : 0);
+    sb_printf(&b, "sandbox=%s\n", g_cfg.sandbox ? "bwrap" : "off");
     if (g_cfg.search_url) sb_printf(&b, "search_url=%s\n", g_cfg.search_url);
     sb_printf(&b, "memory_every=%d\n", g_cfg.memory_every);
     sb_printf(&b, "memory_idle=%d\n", g_cfg.memory_idle);
     sb_printf(&b, "keep_alive=%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "");
+    if (g_cfg.ui) sb_printf(&b, "ui=%s\n", g_cfg.ui);
+    if (g_cfg.theme) sb_printf(&b, "theme=%s\n", g_cfg.theme);
     write_whole_file_atomic(path, b.data, b.len);
     sb_free(&b);
 }
@@ -531,39 +544,135 @@ static bool plan_after(const char *line, size_t len, int *nums, int *n, bool *no
     return true;
 }
 
+/* "KEY: value" among a plan's lines (a task's, or the plan's): the value's span. KEY is a whole word, matched
+ * without case and past the markers a model puts in front of it (bullets, bold); false for any other line. */
+static bool plan_field(const char *line, size_t len, const char *key, const char **val, size_t *vlen) {
+    const char *p = line, *end = line + len;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '*' || *p == '_' || *p == '-' || *p == '>' || *p == '#')) p++;
+    size_t kl = strlen(key);
+    if ((size_t)(end - p) < kl || strncasecmp(p, key, kl)) return false;
+    p += kl;
+    while (p < end && (*p == ' ' || *p == '*' || *p == '_')) p++;
+    if (p == end || *p != ':') return false;
+    p++;
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '`' || *p == '*' || *p == '_')) p++;
+    while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '`' || end[-1] == '*' || end[-1] == '_')) end--;
+    *val = p; *vlen = (size_t)(end - p);
+    return true;
+}
+
+/* "OWNS: a, b": the paths a task may write, appended to its list (a literal file, or a directory prefix) */
+static void plan_owns(orch_task *t, const char *v, size_t vl) {
+    for (size_t i = 0; i < vl; ) {
+        size_t j = i; while (j < vl && v[j] != ',') j++;
+        size_t a = i, b = j;
+        while (a < b && (v[a] == ' ' || v[a] == '\t')) a++;
+        while (b > a && (v[b - 1] == ' ' || v[b - 1] == '\t')) b--;
+        if (b > a && t->nowns < ORCH_OWNS_MAX) {
+            t->owns = xrealloc(t->owns, sizeof *t->owns * (size_t)(t->nowns + 1));
+            t->owns[t->nowns++] = xstrndup(v + a, b - a);
+        }
+        i = j + 1;
+    }
+}
+
+/* An OWNS: path without its "./" in front and its "/" behind: "" is the whole project */
+static char *owns_norm(const char *p) {
+    while (p[0] == '.' && p[1] == '/') p += 2;
+    size_t l = strlen(p);
+    while (l && p[l - 1] == '/') l--;
+    if (l == 1 && p[0] == '.') l = 0;
+    return xstrndup(p, l);
+}
+
+/* Two OWNS: paths overlap when they are the same file, or one is a directory (a prefix up to a '/') holding the other.
+ * The whole project ("." or "./") overlaps everything. */
+bool owns_overlap_one(const char *a, const char *b) {
+    char *x = owns_norm(a), *y = owns_norm(b);
+    bool hit = false;
+    if (!x[0] || !y[0]) hit = true;
+    else {
+        size_t lx = strlen(x), ly = strlen(y);
+        if (lx > ly) { char *t = x; x = y; y = t; size_t tl = lx; lx = ly; ly = tl; }   /* x is the shorter */
+        hit = !strcmp(x, y) || (!strncmp(x, y, lx) && y[lx] == '/');
+    }
+    free(x); free(y);
+    return hit;
+}
+
+bool owns_overlap(char **a, int na, char **b, int nb) {
+    for (int i = 0; i < na; i++)
+        for (int j = 0; j < nb; j++)
+            if (owns_overlap_one(a[i], b[j])) return true;
+    return false;
+}
+
 int orch_parse_plan(const char *text, orch_task **tasks) {
+    return orch_parse_plan_ex(text, tasks, NULL);
+}
+
+int orch_parse_plan_ex(const char *text, orch_task **tasks, char **contract) {
     *tasks = NULL;
-    int n = 0;
+    if (contract) *contract = NULL;
+    int n = 0; bool in_contract = false;   /* in_contract: the CONTRACT: block before the first task */
     int num[ORCH_MAX_TASKS + 1] = { 0 };                 /* the number the plan gave each task */
     int dep[ORCH_MAX_TASKS + 1][ORCH_MAX_TASKS], ndep[ORCH_MAX_TASKS + 1]; bool said[ORCH_MAX_TASKS + 1];
     memset(ndep, 0, sizeof ndep); memset(said, 0, sizeof said);
-    sbuf body; sb_init(&body);
+    sbuf body, csb; sb_init(&body); sb_init(&csb);
     for (const char *p = text ? text : ""; *p; ) {
         size_t len = strcspn(p, "\n"), tl = 0;
         const char *title = plan_header(p, len, &tl);
-        bool none;
+        bool none; const char *v = NULL; size_t vl = 0;
         if (title) {
+            in_contract = false;
             if (n) { (*tasks)[n - 1].body = xstrdup(body.data ? body.data : ""); trim((*tasks)[n - 1].body); }
             body.len = 0; if (body.data) body.data[0] = 0;
             if (n == ORCH_MAX_TASKS) { n++; break; }   /* (counted to say so, never stored) */
             *tasks = xrealloc(*tasks, sizeof **tasks * (size_t)(n + 1));
             const char *d = p; while (d < title && !isdigit((unsigned char)*d)) d++;
             num[n] = atoi(d);
-            (*tasks)[n++] = (orch_task){ xstrndup(title, tl), NULL, 0 };
+            (*tasks)[n++] = (orch_task){ .title = xstrndup(title, tl) };
         } else if (n && plan_after(p, len, dep[n - 1], &ndep[n - 1], &none)) said[n - 1] = true;   /* (not part of the instructions) */
+        else if (n && plan_field(p, len, "role", &v, &vl)) {
+            free((*tasks)[n - 1].role);
+            (*tasks)[n - 1].role = vl ? xstrndup(v, vl) : NULL;
+        } else if (n && plan_field(p, len, "owns", &v, &vl)) plan_owns(&(*tasks)[n - 1], v, vl);
+        else if (n && plan_field(p, len, "layer", &v, &vl)) {
+            int lv = 0;
+            for (size_t k = 0; k < vl && k < 4 && isdigit((unsigned char)v[k]); k++) lv = lv * 10 + (v[k] - '0');
+            if (lv > 0) (*tasks)[n - 1].layer = lv;
+        }
+        else if (!n && plan_field(p, len, "contract", &v, &vl)) {
+            in_contract = true;
+            if (vl) { sb_append(&csb, v, vl); sb_putc(&csb, '\n'); }
+        } else if (!n && in_contract) { sb_append(&csb, p, len); sb_putc(&csb, '\n'); }
         else if (n) { sb_append(&body, p, len); sb_putc(&body, '\n'); }
         p += len; if (*p == '\n') p++;
     }
     if (n > ORCH_MAX_TASKS) n = ORCH_MAX_TASKS;
     else if (n) { (*tasks)[n - 1].body = xstrdup(body.data ? body.data : ""); trim((*tasks)[n - 1].body); }
     sb_free(&body);
+    if (contract && csb.len) {
+        *contract = xstrdup(csb.data);
+        trim(*contract);
+        if (!(*contract)[0]) { free(*contract); *contract = NULL; }
+    }
+    sb_free(&csb);
     /* a header with nothing to it — no title and no instructions — is not a task */
     int keep = 0, at[ORCH_MAX_TASKS];   /* at[i]: where task i ended up, -1 = dropped */
     for (int i = 0; i < n; i++) {
         if (!(*tasks)[i].body) (*tasks)[i].body = xstrdup("");
-        if (!(*tasks)[i].title[0] && !(*tasks)[i].body[0]) { free((*tasks)[i].title); free((*tasks)[i].body); at[i] = -1; continue; }
+        if (!(*tasks)[i].title[0] && !(*tasks)[i].body[0]) {
+            free((*tasks)[i].title); free((*tasks)[i].body); free((*tasks)[i].role);
+            for (int k = 0; k < (*tasks)[i].nowns; k++) free((*tasks)[i].owns[k]);
+            free((*tasks)[i].owns);
+            at[i] = -1; continue;
+        }
         at[i] = keep; (*tasks)[keep++] = (*tasks)[i];
     }
+    /* layers (/plan): a task with none is in the layer of the one before it, the first in layer 1; a layer never goes back */
+    int lay = 1;
+    for (int k = 0; k < keep; k++) { if ((*tasks)[k].layer > lay) lay = (*tasks)[k].layer; (*tasks)[k].layer = lay; }
     /* what each waits for: the tasks its AFTER line names — earlier ones only, so nothing can wait
      * in a circle — or, having none, the task before it: a plan that says nothing runs in order */
     for (int i = 0; i < n; i++) {
@@ -578,7 +687,11 @@ int orch_parse_plan(const char *text, orch_task **tasks) {
 }
 
 void orch_tasks_free(orch_task *t, int n) {
-    for (int i = 0; i < n; i++) { free(t[i].title); free(t[i].body); }
+    for (int i = 0; i < n; i++) {
+        free(t[i].title); free(t[i].body); free(t[i].role);
+        for (int k = 0; k < t[i].nowns; k++) free(t[i].owns[k]);
+        free(t[i].owns);
+    }
     free(t);
 }
 
@@ -588,23 +701,27 @@ void orch_tasks_free(orch_task *t, int n) {
  * /usage price sets another. The higher rates some charge for a very long prompt (xAI from 200k
  * tokens, OpenAI from 272k, Haiku 5.5 from 100k) are left out: the one hosted call corbienest
  * makes is a consultation, whose brief is capped far below that. */
-static const struct { const char *name; double in, out; } LIST_PRICES[] = {
-    { "anthropic:claude-fable-5", 10, 50 },   { "anthropic:claude-mythos-5", 10, 50 },
-    { "anthropic:claude-opus-5-5", 4, 20 },   { "anthropic:claude-opus-5", 5, 25 },
-    { "anthropic:claude-opus-4", 5, 25 },     { "anthropic:claude-opus-4-1", 15, 75 },
-    { "anthropic:claude-sonnet-5", 2, 10 },   { "anthropic:claude-sonnet-4", 3, 15 },
-    { "anthropic:claude-haiku-5", 0.10, 0.50 }, { "anthropic:claude-haiku-4-5", 1, 5 },
-    { "openai:gpt-6-astra", 10, 50 },   { "openai:gpt-6.1-sol", 2, 10 },    { "openai:gpt-6-sol", 2, 10 },      { "openai:gpt-6-luna", 0.10, 0.50 },
-    { "openai:gpt-5.6-sol", 4, 20 },    { "openai:gpt-5.6-terra", 2, 12 },  { "openai:gpt-5.6-luna", 0.20, 1.20 },
-    { "openai:gpt-5.5", 5, 30 },        { "openai:gpt-5.5-pro", 30, 180 },
-    { "openai:gpt-5.4", 2.50, 15 },     { "openai:gpt-5.4-mini", 0.75, 4.50 }, { "openai:gpt-5.4-nano", 0.20, 1.25 }, { "openai:gpt-5.4-pro", 30, 180 },
-    { "openai:gpt-5.2", 1.75, 14 },     { "openai:gpt-5.2-pro", 21, 168 },  { "openai:gpt-5.1", 1.25, 10 },
-    { "openai:gpt-5", 1.25, 10 },       { "openai:gpt-5-mini", 0.25, 2 },   { "openai:gpt-5-nano", 0.05, 0.40 }, { "openai:gpt-5-pro", 15, 120 },
-    { "openai:gpt-4.1", 2, 8 },         { "openai:gpt-4.1-mini", 0.40, 1.60 }, { "openai:gpt-4.1-nano", 0.10, 0.40 },
-    { "openai:gpt-4o", 2.50, 10 },      { "openai:gpt-4o-mini", 0.15, 0.60 },
-    { "openai:o3", 2, 8 },              { "openai:o3-pro", 20, 80 },        { "openai:o3-mini", 1.10, 4.40 },   { "openai:o4-mini", 1.10, 4.40 },
-    { "xai:grok-4.7", 2, 6 },           { "xai:grok-4.6", 2, 6 },           { "xai:grok-4.5", 2, 6 },
-    { "xai:grok-4.3", 1.25, 2.50 },     { "xai:grok-4.20", 1.25, 2.50 },    { "xai:grok-4.20-multi-agent", 1.25, 2.50 }, { "xai:grok-build-0.1", 1, 2 },
+static const struct { const char *name; double in, out, cache; } LIST_PRICES[] = {
+    /* cache: what a cached input token costs, × the input price (the providers' cached-input column; the
+     * newest Anthropic models read at 5% or 2.5%). A model with no cached price is 1: no discount assumed. */
+    { "anthropic:claude-fable-5", 10, 50, 0.10 },     { "anthropic:claude-fable-5-1", 10, 50, 0.025 },
+    { "anthropic:claude-mythos-5", 10, 50, 0.10 },    { "anthropic:claude-mythos-5-1", 10, 50, 0.025 },
+    { "anthropic:claude-opus-5-5", 4, 20, 0.05 },     { "anthropic:claude-opus-5", 5, 25, 0.10 },
+    { "anthropic:claude-opus-4", 5, 25, 0.10 },       { "anthropic:claude-opus-4-1", 15, 75, 0.10 },
+    { "anthropic:claude-sonnet-5-5", 2, 10, 0.05 },   { "anthropic:claude-sonnet-5", 2, 10, 0.10 },
+    { "anthropic:claude-sonnet-4", 3, 15, 0.10 },
+    { "anthropic:claude-haiku-5", 0.10, 0.50, 0.10 }, { "anthropic:claude-haiku-4-5", 1, 5, 0.10 },
+    { "openai:gpt-6-astra", 10, 50, 0.10 },   { "openai:gpt-6.1-sol", 2, 10, 0.05 },   { "openai:gpt-6-sol", 2, 10, 0.10 },   { "openai:gpt-6-luna", 0.10, 0.50, 0.10 },
+    { "openai:gpt-5.6-sol", 4, 20, 0.10 },    { "openai:gpt-5.6-terra", 2, 12, 0.10 }, { "openai:gpt-5.6-luna", 0.20, 1.20, 0.10 },
+    { "openai:gpt-5.5", 5, 30, 0.10 },        { "openai:gpt-5.5-pro", 30, 180, 1 },
+    { "openai:gpt-5.4", 2.50, 15, 0.10 },     { "openai:gpt-5.4-mini", 0.75, 4.50, 0.10 }, { "openai:gpt-5.4-nano", 0.20, 1.25, 0.10 }, { "openai:gpt-5.4-pro", 30, 180, 1 },
+    { "openai:gpt-5.2", 1.75, 14, 0.10 },     { "openai:gpt-5.2-pro", 21, 168, 1 },  { "openai:gpt-5.1", 1.25, 10, 0.10 },
+    { "openai:gpt-5", 1.25, 10, 0.10 },       { "openai:gpt-5-mini", 0.25, 2, 0.10 },   { "openai:gpt-5-nano", 0.05, 0.40, 0.10 }, { "openai:gpt-5-pro", 15, 120, 1 },
+    { "openai:gpt-4.1", 2, 8, 0.25 },         { "openai:gpt-4.1-mini", 0.40, 1.60, 0.25 }, { "openai:gpt-4.1-nano", 0.10, 0.40, 0.25 },
+    { "openai:gpt-4o", 2.50, 10, 0.50 },      { "openai:gpt-4o-mini", 0.15, 0.60, 0.50 },
+    { "openai:o3", 2, 8, 0.25 },              { "openai:o3-pro", 20, 80, 1 },        { "openai:o3-mini", 1.10, 4.40, 0.50 },   { "openai:o4-mini", 1.10, 4.40, 0.25 },
+    { "xai:grok-4.7", 2, 6, 0.25 },           { "xai:grok-4.6", 2, 6, 0.25 },           { "xai:grok-4.5", 2, 6, 0.15 },
+    { "xai:grok-4.3", 1.25, 2.50, 0.16 },     { "xai:grok-4.20", 1.25, 2.50, 0.16 },    { "xai:grok-4.20-multi-agent", 1.25, 2.50, 0.16 }, { "xai:grok-build-0.1", 1, 2, 0.20 },
 };
 
 /* a hosted model under its provider's own name ("claude:x" is "anthropic:x"); any other as it is. malloc'd */
@@ -615,21 +732,57 @@ static char *price_key(const char *model) {
     return sb_detach(&b);
 }
 
+/* the built-in price for a key ("provider:model"): the longest name it is, or a dated snapshot of, -1 if none.
+ * "gpt-5" says nothing about "gpt-5.9" or "gpt-5-mini" */
+static int list_match(const char *key) {
+    int best = -1; size_t bl = 0;
+    for (size_t i = 0; i < sizeof LIST_PRICES / sizeof *LIST_PRICES; i++) {
+        size_t l = strlen(LIST_PRICES[i].name);
+        if (l <= bl || strncmp(key, LIST_PRICES[i].name, l)) continue;
+        if (key[l] && !(key[l] == '-' && isdigit((unsigned char)key[l + 1]))) continue;
+        best = (int)i; bl = l;
+    }
+    return best;
+}
+
 int model_price(const char *model, double *in, double *out) {
     if (!model || !*model) return 0;
     char *key = price_key(model);
-    int found = 0; size_t best = 0;
+    int found = 0;
     for (int i = 0; !found && i < g_cfg.n_prices; i++)
         if (!strcmp(g_cfg.prices[i].model, key)) { *in = g_cfg.prices[i].in; *out = g_cfg.prices[i].out; found = 2; }
-    /* the name itself, or a dated snapshot of it ("-2026…") — "gpt-5" says nothing about "gpt-5.9" or "gpt-5-mini" */
-    for (size_t i = 0; !found && i < sizeof LIST_PRICES / sizeof *LIST_PRICES; i++) {
-        size_t l = strlen(LIST_PRICES[i].name);
-        if (l <= best || strncmp(key, LIST_PRICES[i].name, l)) continue;
-        if (key[l] && !(key[l] == '-' && isdigit((unsigned char)key[l + 1]))) continue;
-        *in = LIST_PRICES[i].in; *out = LIST_PRICES[i].out; best = l;
-    }
+    if (!found) { int m = list_match(key); if (m >= 0) { *in = LIST_PRICES[m].in; *out = LIST_PRICES[m].out; found = 1; } }
     free(key);
-    return found ? found : best ? 1 : 0;
+    return found;
+}
+
+/* Prompt caching, as Anthropic bills it (its prompt-caching and models pages): a read costs a tenth of
+ * the base input price — 2.5% on Fable 5.1 and Mythos 5.1, 5% on Opus 5.5 and Sonnet 5.5 — and a write to
+ * the 5-minute cache 1.25 times it. OpenAI and xAI bill cached input at the rate in LIST_PRICES (their
+ * usage reports it as a part of the prompt; they bill no separate write). */
+static bool anthropic_model(const char *model, const char **name) {
+    const provider_def *p = model ? provider_find(model, name) : NULL;
+    return p && p->style == PROVIDER_MESSAGES;
+}
+double model_cache_write_ratio(const char *model) { return anthropic_model(model, NULL) ? 1.25 : 1; }
+/* a cached input token costs this × the input price: the list's figure, else Anthropic's tenth and 1 for the rest */
+double model_cache_read_ratio(const char *model) {
+    if (!model || !*model) return 1;
+    char *key = price_key(model);
+    int m = list_match(key);
+    double r = m >= 0 ? LIST_PRICES[m].cache : anthropic_model(model, NULL) ? 0.10 : 1;
+    free(key);
+    return r;
+}
+/* what a model's tokens cost in USD: the uncached input at the input price, the cache reads and writes
+ * at their ratios, the output at the output price. known = model_price()'s answer (0 = no price: cost 0). */
+double usage_cost_usd(const char *model, long in, long out, long cache_read, long cache_write, int *known) {
+    double pi = 0, po = 0;
+    *known = model_price(model, &pi, &po);
+    if (!*known) return 0;
+    long plain = in - cache_read - cache_write; if (plain < 0) plain = 0;
+    return ((double)plain * pi + (double)cache_read * pi * model_cache_read_ratio(model)
+            + (double)cache_write * pi * model_cache_write_ratio(model) + (double)out * po) / 1e6;
 }
 
 void price_set(const char *model, double in, double out) {
@@ -1168,6 +1321,174 @@ void sb_put_cut(sbuf *b, const char *s, size_t cap) {
     sb_append(b, t, tail);
 }
 
+/* ---------- what a request body must satisfy ----------
+ * The server parses the body as strict JSON: one byte of invalid UTF-8 (a cut that split a
+ * character, a binary file in a command's output) makes the whole request refused. cJSON does not
+ * check, so the text is made valid where it enters the conversation. */
+static size_t utf8_seq_len(const unsigned char *p, size_t left) {
+    unsigned char c = p[0];
+    size_t n = c < 0x80 ? 1 : (c >> 5) == 0x6 && c >= 0xC2 ? 2 : (c >> 4) == 0xE ? 3 : (c >> 3) == 0x1E && c <= 0xF4 ? 4 : 0;
+    if (!n || n > left) return 0;
+    if (n == 1) return 1;
+    unsigned lo = 0x80, hi = 0xBF;   /* the second byte has its own bounds for E0, ED, F0, F4 */
+    if (p[1] < lo || p[1] > hi) return 0;
+    if (c == 0xE0) lo = 0xA0; else if (c == 0xED) hi = 0x9F; else if (c == 0xF0) lo = 0x90; else if (c == 0xF4) hi = 0x8F;
+    if (p[1] < lo || p[1] > hi) return 0;
+    for (size_t i = 2; i < n; i++) if (p[i] < 0x80 || p[i] > 0xBF) return 0;
+    return n;
+}
+
+/* true when buf ends inside an escape sequence or a UTF-8 character: what follows it is then not
+ * the rest of that sequence, so nothing may be written between the two (the stdout hook splices
+ * cursor moves between chunks, and a chunk can end anywhere in a large write). */
+bool tail_incomplete(const char *buf, size_t n) {
+    size_t from = n > 64 ? n - 64 : 0;
+    const unsigned char *b = (const unsigned char *)buf;
+    /* an escape sequence that starts in the tail and has not ended */
+    size_t e = n;
+    for (size_t k = n; k > from; k--) if (b[k - 1] == 0x1b) { e = k - 1; break; }
+    if (e < n) {
+        if (e + 1 == n) return true;                              /* a lone ESC */
+        unsigned char c = b[e + 1];
+        if (c == '[') {                                           /* CSI: parameters, then a final byte 0x40-0x7e */
+            size_t j = e + 2;
+            while (j < n && b[j] >= 0x20 && b[j] <= 0x3f) j++;
+            if (j == n) return true;
+        } else if (c == ']') {                                    /* OSC: ends at BEL or ESC \ */
+            size_t j = e + 2; bool ended = false;
+            for (; j < n; j++) {
+                if (b[j] == 0x07) { ended = true; break; }
+                if (b[j] == 0x1b && j + 1 < n && b[j + 1] == '\\') { ended = true; break; }
+            }
+            if (!ended) return true;
+        } else if (c >= 0x20 && c <= 0x2f) {                     /* an intermediate byte: one final byte follows */
+            if (e + 2 >= n) return true;
+        }
+    }
+    /* a UTF-8 character whose continuation bytes have not all come */
+    for (size_t k = n, seen = 0; k > from && seen < 4; k--, seen++) {
+        unsigned char c = b[k - 1];
+        if ((c & 0xC0) == 0x80) continue;                         /* a continuation byte: look further back */
+        size_t want = c >= 0xF0 && c <= 0xF4 ? 4 : c >= 0xE0 ? 3 : c >= 0xC2 && c < 0xE0 ? 2 : 1;
+        return want > 1 && n - (k - 1) < want;
+    }
+    return false;
+}
+
+bool utf8_ok(const char *s, size_t len) {
+    const unsigned char *p = (const unsigned char *)s;
+    for (size_t i = 0; i < len;) {
+        size_t n = utf8_seq_len(p + i, len - i);
+        if (!n) return false;
+        i += n;
+    }
+    return true;
+}
+
+char *utf8_fix(const char *s) {
+    size_t len = strlen(s);
+    if (utf8_ok(s, len)) return xstrdup(s);
+    sbuf b; sb_init(&b);
+    const unsigned char *p = (const unsigned char *)s;
+    for (size_t i = 0; i < len;) {
+        size_t n = utf8_seq_len(p + i, len - i);
+        if (n) { sb_append(&b, s + i, n); i += n; }
+        else { sb_puts(&b, "\xEF\xBF\xBD"); i++; }   /* U+FFFD for each bad byte */
+    }
+    return sb_detach(&b);
+}
+
+size_t utf8_cut(const char *s, size_t len, size_t cap) {
+    if (cap >= len) return len;
+    size_t n = cap;
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;   /* s[n] starts a character: the prefix ends on a boundary */
+    return n;
+}
+
+/* The first line of a shell command, as a fold's head: the leading blank lines and the trailing
+ * whitespace go, control characters become spaces, and the line is cut to `width` columns (a
+ * character is a column; the cut ends with "…"). Returns how many lines follow the first one,
+ * not counting blank ones at the end: 0 means the command is one line and needs no fold. */
+int cmd_head(const char *cmd, int width, char *out, size_t n) {
+    size_t len = strlen(cmd), s = 0, e = len;
+    while (s < len && isspace((unsigned char)cmd[s])) s++;
+    while (e > s && isspace((unsigned char)cmd[e - 1])) e--;
+    int more = 0;
+    for (size_t i = s; i < e; i++) if (cmd[i] == '\n') more++;
+    size_t fl = strcspn(cmd + s, "\n");
+    if (s + fl > e) fl = e - s;
+    while (fl > 0 && isspace((unsigned char)cmd[s + fl - 1])) fl--;
+    int columns = 0;
+    for (size_t i = 0; i < fl; i++) if (((unsigned char)cmd[s + i] & 0xC0) != 0x80) columns++;
+    bool cut = columns > width;
+    int limit = cut ? width - 1 : width; if (limit < 0) limit = 0;
+    size_t o = 0; int cols = 0;
+    if (n == 0) return more;
+    for (size_t i = 0; i < fl; i++) {
+        unsigned char c = (unsigned char)cmd[s + i];
+        bool lead = (c & 0xC0) != 0x80;
+        if (lead && cols == limit) break;
+        if (lead) cols++;
+        if (c < 32 || c == 127) c = ' ';
+        if (o + 1 >= n) break;
+        out[o++] = (char)c;
+    }
+    if (cut && o + 3 < n) { memcpy(out + o, "\xe2\x80\xa6", 3); o += 3; }   /* … */
+    out[o] = 0;
+    return more;
+}
+
+/* A tool result for a call the conversation has no answer to (see messages_repair). */
+static cJSON *orphan_result(const char *name, cJSON *id) {
+    cJSON *tm = cJSON_CreateObject();
+    cJSON_AddStringToObject(tm, "role", "tool");
+    cJSON_AddStringToObject(tm, "tool_name", name);
+    if (cJSON_IsString(id) && id->valuestring[0]) cJSON_AddStringToObject(tm, "tool_call_id", id->valuestring);
+    cJSON_AddStringToObject(tm, "content",
+        "not run: the request stopped before this call ran (its tool round hit the limit, or was interrupted). "
+        "The user's next message follows; call the tool again if it is still needed.");
+    return tm;
+}
+
+static const char *msg_role(cJSON *m) {
+    cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role");
+    return cJSON_IsString(r) ? r->valuestring : "";
+}
+
+int messages_repair(cJSON *msgs) {
+    int fixed = 0;
+    for (int i = 0; i < cJSON_GetArraySize(msgs); i++) {
+        cJSON *m = cJSON_GetArrayItem(msgs, i);
+        cJSON *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+        if (cJSON_IsString(c) && !utf8_ok(c->valuestring, strlen(c->valuestring))) {
+            char *clean = utf8_fix(c->valuestring);
+            cJSON_SetValuestring(c, clean); free(clean); fixed++;
+        }
+        cJSON *tc = cJSON_GetObjectItemCaseSensitive(m, "tool_calls");
+        if (strcmp(msg_role(m), "assistant") || !cJSON_IsArray(tc)) continue;
+        /* the run of tool results that follows this reply: each call needs one of them */
+        int end = i + 1;
+        while (end < cJSON_GetArraySize(msgs) && !strcmp(msg_role(cJSON_GetArrayItem(msgs, end)), "tool")) end++;
+        cJSON *call;
+        cJSON_ArrayForEach(call, tc) {
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(call, "id");
+            cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
+            cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+            if (!cJSON_IsString(id) || !id->valuestring[0]) continue;   /* no id, nothing to match it by */
+            bool answered = false;
+            for (int k = i + 1; k < end && !answered; k++) {
+                cJSON *rid = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(msgs, k), "tool_call_id");
+                answered = cJSON_IsString(rid) && !strcmp(rid->valuestring, id->valuestring);
+            }
+            if (answered) continue;
+            cJSON_InsertItemInArray(msgs, end, orphan_result(cJSON_IsString(nm) ? nm->valuestring : "?", id));
+            end++; fixed++;
+        }
+        i = end - 1;
+    }
+    return fixed;
+}
+
 /* one message as a block, or NULL when it says nothing (an assistant turn that only called the advisor) */
 static char *transcript_block(cJSON *m, size_t budget) {
     cJSON *role = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
@@ -1238,15 +1559,27 @@ char *transcript_text(cJSON *msgs, int keep, size_t budget) {
 /* ---------- the advisor: how much it is leaned on ----------
  * normal is what the advisor always was: the agent asks when it judges the work hard. A small
  * model is a poor judge of that — it is sure of the wrong approach, and calls a task done that is
- * not — so strong has corbienest ask as well, before a request that changed files ends, and max
+ * not — so strong has corbienest ask as well, before a request that changed a lot ends, and max
  * also before the request's first change is made. The advice gets longer and more concrete the
  * higher it goes: the reader is a model that follows steps better than it follows advice. */
 const advisor_guidance_def ADVISOR_GUIDANCE[GUIDANCE_COUNT] = {
-    { "light",  1, 250, 32 * 1024, false, false, false, "only when the agent is stuck · 1 consultation per request · short answers" },
-    { "normal", 3, 400, 48 * 1024, false, false, true,  "when the work is hard · 3 per request" },
-    { "strong", 6, 700, 96 * 1024, true,  false, true,  "early and often · 6 per request · concrete steps · and reviews the work before a request ends" },
-    { "max",   10, 900, 96 * 1024, true,  true,  true,  "as strong, 10 per request · and checks the first change of a request before it is made" },
+    { "light",  1, 250, 32 * 1024, false, false, false, false, "only when the agent is stuck · 1 consultation per request · short answers" },
+    { "normal", 3, 400, 48 * 1024, false, false, false, true,  "when the work is hard · 3 per request" },
+    { "strong", 6, 700, 96 * 1024, true,  false, false, true,  "early and often · 6 per request · concrete steps · and reviews a request that changed a lot (40 lines or 3 files) before it ends" },
+    { "max",   10, 900, 96 * 1024, true,  true,  true,  true,  "as strong, 10 per request · reviews any change before the request ends · and checks the first change of a request before it is made" },
 };
+
+/* Changed lines of a unified diff: the lines that add or remove text, not the ---/+++ headers. */
+int diff_changed_lines(const char *d) {
+    int n = 0;
+    for (const char *p = d ? d : ""; *p; ) {
+        if ((*p == '+' && strncmp(p, "+++", 3)) || (*p == '-' && strncmp(p, "---", 3))) n++;
+        const char *nl = strchr(p, '\n');
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return n;
+}
 
 /* What counts as a tool call that failed, for the advisor stepping in: a result that is an error,
  * or a shell command whose last line says it did not exit with 0. A consultation that could not
@@ -1367,4 +1700,368 @@ const char *strip_think_block(const char *s) {
     e += 8;
     while (*e == ' ' || *e == '\n' || *e == '\r' || *e == '\t') e++;
     return e;
+}
+
+/* ---------- syntax highlighting for code in a fenced block ----------
+ * Basic and by the fence's name: keywords, strings, comments and numbers, for the usual languages. The
+ * escapes are the only thing added — the text, and so its columns, is what it was. `base` is the colour the
+ * code is printed in: each token ends by going back to it. A language not known is left as it is. */
+typedef enum { HL_NONE, HL_C, HL_PY, HL_SH, HL_JSON } hl_lang;
+static hl_lang hl_language(const char *name) {
+    static const struct { const char *n; hl_lang l; } NAMES[] = {
+        { "c", HL_C }, { "h", HL_C }, { "cpp", HL_C }, { "c++", HL_C }, { "cc", HL_C }, { "hpp", HL_C }, { "java", HL_C },
+        { "js", HL_C }, { "javascript", HL_C }, { "ts", HL_C }, { "typescript", HL_C }, { "go", HL_C }, { "rust", HL_C },
+        { "rs", HL_C }, { "cs", HL_C }, { "csharp", HL_C }, { "swift", HL_C }, { "kotlin", HL_C }, { "php", HL_C }, { "scala", HL_C },
+        { "py", HL_PY }, { "python", HL_PY }, { "python3", HL_PY },
+        { "sh", HL_SH }, { "bash", HL_SH }, { "shell", HL_SH }, { "zsh", HL_SH }, { "console", HL_SH },
+        { "json", HL_JSON }, { "jsonc", HL_JSON },
+    };
+    for (size_t i = 0; i < sizeof NAMES / sizeof *NAMES; i++)
+        if (!strcasecmp(name, NAMES[i].n)) return NAMES[i].l;
+    return HL_NONE;
+}
+static bool hl_keyword(hl_lang l, const char *w, size_t n) {
+    static const char *const C_KW[] = { "auto", "break", "case", "catch", "char", "class", "const", "continue", "default", "do", "double",
+        "else", "enum", "extern", "false", "final", "finally", "float", "for", "func", "fn", "function", "go", "if", "impl", "import",
+        "in", "int", "interface", "let", "long", "match", "mut", "new", "nil", "null", "package", "private", "protected", "public",
+        "return", "short", "signed", "sizeof", "static", "struct", "super", "switch", "this", "throw", "true", "try", "type", "typedef",
+        "union", "unsigned", "use", "var", "void", "volatile", "while", "const", "export", "from", "async", "await", "yield", "self",
+        "bool", "string", "undefined", "pub", "mod", "where", "trait", "defer", "select", "chan", "range", "readonly", NULL };
+    static const char *const PY_KW[] = { "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif",
+        "else", "except", "False", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "None", "nonlocal", "not",
+        "or", "pass", "raise", "return", "True", "try", "while", "with", "yield", "self", NULL };
+    static const char *const SH_KW[] = { "case", "do", "done", "elif", "else", "esac", "export", "fi", "for", "function", "if", "in",
+        "local", "return", "select", "then", "until", "while", "readonly", "unset", "declare", NULL };
+    static const char *const JSON_KW[] = { "true", "false", "null", NULL };
+    const char *const *list = l == HL_C ? C_KW : l == HL_PY ? PY_KW : l == HL_SH ? SH_KW : JSON_KW;
+    for (int i = 0; list[i]; i++) if (strlen(list[i]) == n && !strncmp(list[i], w, n)) return true;
+    return false;
+}
+
+void highlight_line(const char *lang, const char *line, sbuf *out, const char *base) {
+    hl_lang l = hl_language(lang ? lang : "");
+    if (l == HL_NONE || !line) { sb_puts(out, line ? line : ""); return; }
+    bool hash = l == HL_PY || l == HL_SH;          /* comments: '#' … the end of the line */
+    bool slash = l == HL_C;                        /* comments: '//' to the end, and a block comment within the line */
+    const char *p = line;
+    while (*p) {
+        if ((hash && *p == '#') || (slash && p[0] == '/' && p[1] == '/')) {
+            sb_puts(out, C_GRAY); sb_puts(out, p); sb_puts(out, C_RESET); sb_puts(out, base); return;
+        }
+        if (slash && p[0] == '/' && p[1] == '*') {
+            const char *e = strstr(p + 2, "*/"); size_t n = e ? (size_t)(e + 2 - p) : strlen(p);
+            sb_puts(out, C_GRAY); sb_append(out, p, n); sb_puts(out, C_RESET); sb_puts(out, base);
+            p += n; continue;
+        }
+        if (*p == '"' || *p == '\'') {
+            char q = *p; const char *s = p++;
+            while (*p && *p != q) { if (*p == '\\' && p[1]) p++; p++; }
+            if (*p) p++;
+            sb_puts(out, C_GREEN); sb_append(out, s, (size_t)(p - s)); sb_puts(out, C_RESET); sb_puts(out, base);
+            continue;
+        }
+        if (isdigit((unsigned char)*p) && !(p > line && (isalnum((unsigned char)p[-1]) || p[-1] == '_'))) {
+            const char *s = p;
+            while (isalnum((unsigned char)*p) || *p == '.' || *p == '_') p++;
+            sb_puts(out, C_YELLOW); sb_append(out, s, (size_t)(p - s)); sb_puts(out, C_RESET); sb_puts(out, base);
+            continue;
+        }
+        if (isalpha((unsigned char)*p) || *p == '_') {
+            const char *s = p;
+            while (isalnum((unsigned char)*p) || *p == '_') p++;
+            if (hl_keyword(l, s, (size_t)(p - s))) { sb_puts(out, C_MAGENTA); sb_append(out, s, (size_t)(p - s)); sb_puts(out, C_RESET); sb_puts(out, base); }
+            else sb_append(out, s, (size_t)(p - s));
+            continue;
+        }
+        sb_putc(out, *p++);
+    }
+}
+
+/* ---------- the git branch of a directory (the status bar's location line) ----------
+ * The .git of dir or of the nearest directory above it (a file there, as a linked worktree has, points to
+ * its git directory). Writes the branch name, or the first seven digits of the commit a detached HEAD is on,
+ * into out. 1 when dir is in a repository, else 0. Reads only: a few small files, so it can run at every redraw. */
+int git_branch(const char *dir, char *out, size_t n) {
+    char cur[4096], gitp[4200], head[4300];
+    if (!dir || !*dir || strlen(dir) >= sizeof cur) return 0;
+    snprintf(cur, sizeof cur, "%s", dir);
+    for (;;) {
+        snprintf(gitp, sizeof gitp, "%s/.git", cur);
+        /* opened once and asked through the descriptor (a stat, then an open of the name, could see another file) */
+        int fd = open(gitp, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            struct stat st;
+            if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) { close(fd); snprintf(head, sizeof head, "%s/HEAD", gitp); }
+            else {   /* "gitdir: PATH": a linked worktree */
+                FILE *f = fdopen(fd, "r"); char line[1024] = "";
+                if (!f) { close(fd); return 0; }
+                if (!fgets(line, sizeof line, f)) line[0] = 0;
+                fclose(f);
+                size_t l = strlen(line); while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
+                if (strncmp(line, "gitdir: ", 8)) return 0;
+                if (line[8] == '/') snprintf(head, sizeof head, "%s/HEAD", line + 8);
+                else snprintf(head, sizeof head, "%s/%s/HEAD", cur, line + 8);
+            }
+            break;
+        }
+        if (!strcmp(cur, "/")) return 0;   /* the root: no repository */
+        char *slash = strrchr(cur, '/');
+        if (slash == cur) strcpy(cur, "/"); else *slash = 0;
+    }
+    FILE *f = fopen(head, "r");
+    if (!f) return 0;
+    char line[512] = "";
+    if (!fgets(line, sizeof line, f)) line[0] = 0;
+    fclose(f);
+    size_t l = strlen(line); while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
+    if (!strncmp(line, "ref: refs/heads/", 16)) snprintf(out, n, "%s", line + 16);
+    else if (strlen(line) >= 7) snprintf(out, n, "%.7s", line);   /* detached: the commit */
+    else snprintf(out, n, "%s", "HEAD");
+    return 1;
+}
+
+/* The text goes on the end of a sub-agent's log, as plain text: escape sequences and control
+ * bytes other than tab and newline are dropped (a fold body is written into the model, where a
+ * CR or an ESC would move the cursor). Past `cap` bytes the front goes, cut after a line break,
+ * with a note that lines were dropped. */
+void agent_log_add(sbuf *log, const char *text, size_t cap) {
+    static const char NOTE[] = "… earlier lines dropped\n";
+    size_t nl = strlen(NOTE);
+    sbuf plain; sb_init(&plain);
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if (*p == 27) {   /* ESC [ params final, or ESC x */
+            if (!p[1]) break;
+            if (p[1] == '[') { p += 2; while (*p && (*p < 0x40 || *p > 0x7e)) p++; if (!*p) break; }
+            else p++;
+            continue;
+        }
+        if (*p == '\r' || *p == 0x7f || (*p < 0x20 && *p != '\n' && *p != '\t')) continue;
+        sb_append(&plain, (const char *)p, 1);
+    }
+    sb_append(log, plain.data ? plain.data : "", plain.len);
+    sb_free(&plain);
+    if (log->len <= cap) return;
+    size_t keep = cap > nl ? cap - nl : 0;   /* what stays, the note included, is at most cap */
+    size_t cut = log->len - keep;            /* at least one byte goes */
+    while (cut < log->len && log->data[cut - 1] != '\n') cut++;
+    memmove(log->data, log->data + cut, log->len - cut);
+    log->len -= cut;
+    sbuf b; sb_init(&b);
+    sb_append(&b, NOTE, nl); sb_append(&b, log->data, log->len);
+    sb_free(log); *log = b;
+}
+
+/* "[Pasted text #K +N lines]" at s[i..]: its K and N and the byte after it, or false */
+static bool paste_token_at(const char *s, size_t len, size_t i, int *k, int *nl, size_t *end) {
+    static const char HEAD[] = "[Pasted text #";
+    size_t h = sizeof HEAD - 1;
+    if (i + h > len || memcmp(s + i, HEAD, h)) return false;
+    size_t p = i + h; long kv = 0, nv = 0;
+    if (p >= len || s[p] < '0' || s[p] > '9') return false;
+    while (p < len && s[p] >= '0' && s[p] <= '9' && kv < 100000) kv = kv * 10 + (s[p++] - '0');
+    if (kv < 1 || p + 2 > len || memcmp(s + p, " +", 2)) return false;
+    p += 2;
+    if (p >= len || s[p] < '0' || s[p] > '9') return false;
+    while (p < len && s[p] >= '0' && s[p] <= '9' && nv < 100000) nv = nv * 10 + (s[p++] - '0');
+    if (nv < 1 || p + 7 > len || memcmp(s + p, " lines]", 7)) return false;
+    *k = (int)kv; *nl = (int)nv; *end = p + 7;
+    return true;
+}
+size_t paste_tokens(const char *s, size_t len, size_t (*sp)[2], int *ks, int *ns, size_t max) {
+    size_t n = 0;
+    for (size_t i = 0; i < len && n < max; i++) {
+        int k, nl; size_t end;
+        if (s[i] == '[' && paste_token_at(s, len, i, &k, &nl, &end)) {
+            if (sp) { sp[n][0] = i; sp[n][1] = end; }
+            if (ks) ks[n] = k;
+            if (ns) ns[n] = nl;
+            n++; i = end - 1;
+        }
+    }
+    return n;
+}
+char *paste_expand(const char *s, size_t len, const char *const *texts, const int *lines, int n) {
+    sbuf o; sb_init(&o);
+    for (size_t i = 0; i < len; i++) {
+        int k, nl; size_t end;
+        if (s[i] == '[' && paste_token_at(s, len, i, &k, &nl, &end) && k <= n && nl == lines[k - 1]) {
+            sb_puts(&o, texts[k - 1]); i = end - 1;
+        } else sb_putc(&o, s[i]);
+    }
+    return sb_detach(&o);
+}
+
+/* ---------- rate limits of a response (anthropic-ratelimit-* headers) ---------- */
+/* One header line as libcurl hands it over ("name: value", CRLF at the end); only the
+ * requests and token headers of the limits count, the tokens-* aggregate is left out. */
+void ratelimit_header(ratelimit_info *rl, const char *line, size_t n) {
+    static const char P[] = "anthropic-ratelimit-";
+    size_t pl = sizeof P - 1;
+    if (n < pl || strncasecmp(line, P, pl)) return;
+    const char *colon = memchr(line, ':', n);
+    if (!colon) return;
+    size_t nl = (size_t)(colon - line);
+    char name[64], val[64];
+    if (nl >= sizeof name) return;
+    memcpy(name, line, nl); name[nl] = 0;
+    for (char *q = name; *q; q++) *q = (char)tolower((unsigned char)*q);
+    const char *v = colon + 1; const char *end = line + n;
+    while (v < end && (*v == ' ' || *v == '\t')) v++;
+    while (end > v && (end[-1] == '\r' || end[-1] == '\n' || end[-1] == ' ' || end[-1] == '\t')) end--;
+    if ((size_t)(end - v) >= sizeof val) return;
+    memcpy(val, v, (size_t)(end - v)); val[end - v] = 0;
+    const char *what = name + pl;
+    long long *slot = NULL;
+    if (!strncmp(what, "requests-", 9)) {
+        if (!strcmp(what + 9, "limit")) slot = &rl->req_lim; else if (!strcmp(what + 9, "remaining")) slot = &rl->req_rem;
+    } else if (!strncmp(what, "input-tokens-", 13)) {
+        if (!strcmp(what + 13, "limit")) slot = &rl->in_lim; else if (!strcmp(what + 13, "remaining")) slot = &rl->in_rem;
+        else if (!strcmp(what + 13, "reset")) { snprintf(rl->reset, sizeof rl->reset, "%.39s", val); rl->have = true; return; }
+    } else if (!strncmp(what, "output-tokens-", 14)) {
+        if (!strcmp(what + 14, "limit")) slot = &rl->out_lim; else if (!strcmp(what + 14, "remaining")) slot = &rl->out_rem;
+    }
+    if (!slot) return;
+    char *e; long long x = strtoll(val, &e, 10);
+    if (e == val || *e) return;
+    *slot = x; rl->have = true;
+}
+
+/* The last rate limits seen per model this session: /usage shows them under each hosted model. */
+#define RATELIMIT_MAX 16
+static struct { char model[128]; ratelimit_info rl; } g_ratelimits[RATELIMIT_MAX];
+static int g_n_ratelimits = 0;
+void ratelimit_set(const char *model, const ratelimit_info *rl) {
+    if (!model || !rl || !rl->have) return;
+    for (int i = 0; i < g_n_ratelimits; i++)
+        if (!strcmp(g_ratelimits[i].model, model)) { g_ratelimits[i].rl = *rl; return; }
+    if (g_n_ratelimits == RATELIMIT_MAX) return;
+    snprintf(g_ratelimits[g_n_ratelimits].model, sizeof g_ratelimits[0].model, "%s", model);
+    g_ratelimits[g_n_ratelimits++].rl = *rl;
+}
+bool ratelimit_get(const char *model, ratelimit_info *out) {
+    for (int i = 0; model && i < g_n_ratelimits; i++)
+        if (!strcmp(g_ratelimits[i].model, model)) { *out = g_ratelimits[i].rl; return true; }
+    return false;
+}
+
+/* ---------- /goal: the pure half (see common.h) ---------- */
+static const char *goal_skip_space(const char *p) { while (*p == ' ' || *p == '\t') p++; return p; }
+
+bool goal_parse(const char *arg, goal_spec *g, char *err, size_t errn) {
+    memset(g, 0, sizeof *g);
+    g->rounds = 3; g->cands = ORCH_WORKERS_DEFAULT;
+    const char *p = goal_skip_space(arg);
+    if (!*p) { snprintf(err, errn, "no metric command"); return false; }
+    sbuf m; sb_init(&m);
+    if (*p == '"' || *p == '\'') {
+        char q = *p++;
+        const char *e = strchr(p, q);
+        if (!e) { sb_free(&m); snprintf(err, errn, "the metric command has no closing %c", q); return false; }
+        sb_append(&m, p, (size_t)(e - p)); p = e + 1;
+    } else {
+        const char *e = p; while (*e && *e != ' ' && *e != '\t') e++;
+        sb_append(&m, p, (size_t)(e - p)); p = e;
+    }
+    if (!m.len) { sb_free(&m); snprintf(err, errn, "no metric command"); return false; }
+    g->metric = sb_detach(&m);
+    for (;;) {   /* options, in any order, before the task */
+        p = goal_skip_space(p);
+        const char *e = p; while (*e && *e != ' ' && *e != '\t') e++;
+        size_t n = (size_t)(e - p);
+        if (n == 3 && !strncmp(p, "min", 3)) { g->lower = true; p = e; continue; }
+        if (n == 3 && !strncmp(p, "max", 3)) { g->lower = false; p = e; continue; }
+        if (n == 2 && !strncmp(p, "-m", 2)) {
+            const char *v = goal_skip_space(e), *ve = v;
+            while (*ve && *ve != ' ' && *ve != '\t') ve++;
+            if (ve == v) { snprintf(err, errn, "-m needs a list of models, a,b,c"); goal_spec_free(g); return false; }
+            int cnt = 1; for (const char *c = v; c < ve; c++) if (*c == ',') cnt++;
+            if (cnt > ORCH_WORKERS_MAX) { snprintf(err, errn, "-m: at most %d models", ORCH_WORKERS_MAX); goal_spec_free(g); return false; }
+            char **list = xmalloc(sizeof *list * (size_t)cnt); int k = 0;
+            for (const char *c = v; c <= ve; ) {
+                const char *comma = c; while (comma < ve && *comma != ',') comma++;
+                if (comma == c) { for (int j = 0; j < k; j++) free(list[j]); free(list); snprintf(err, errn, "-m: an empty model name in the list"); goal_spec_free(g); return false; }
+                list[k] = xmalloc((size_t)(comma - c) + 1); memcpy(list[k], c, (size_t)(comma - c)); list[k][comma - c] = 0; k++;
+                c = comma + 1;
+                if (comma == ve) break;
+            }
+            for (int j = 0; j < g->nmodels; j++) free(g->models[j]);
+            free(g->models);
+            g->models = list; g->nmodels = k;
+            p = ve; continue;
+        }
+        if (n == 2 && (!strncmp(p, "-n", 2) || !strncmp(p, "-k", 2))) {
+            bool rounds = p[1] == 'n';
+            const char *v = goal_skip_space(e);
+            char *end; long k = strtol(v, &end, 10);
+            if (end == v || (*end && *end != ' ' && *end != '\t')) { snprintf(err, errn, "%.2s needs a number", rounds ? "-n" : "-k"); goal_spec_free(g); return false; }
+            if (rounds && (k < 1 || k > GOAL_ROUNDS_MAX)) { snprintf(err, errn, "-n: 1 to %d rounds", GOAL_ROUNDS_MAX); goal_spec_free(g); return false; }
+            if (!rounds && (k < 2 || k > ORCH_WORKERS_MAX)) { snprintf(err, errn, "-k: 2 to %d candidates (one candidate has nothing to fight)", ORCH_WORKERS_MAX); goal_spec_free(g); return false; }
+            if (rounds) g->rounds = (int)k; else g->cands = (int)k;
+            p = end; continue;
+        }
+        break;
+    }
+    p = goal_skip_space(p);
+    while (*p == '\n' || *p == '\r') p++;
+    size_t tl = strlen(p);
+    while (tl && (p[tl - 1] == ' ' || p[tl - 1] == '\t' || p[tl - 1] == '\n' || p[tl - 1] == '\r')) tl--;
+    if (!tl) { snprintf(err, errn, "no goal: say what to reach after the options"); goal_spec_free(g); return false; }
+    g->task = xmalloc(tl + 1); memcpy(g->task, p, tl); g->task[tl] = 0;
+    return true;
+}
+
+void goal_spec_free(goal_spec *g) {
+    free(g->metric); free(g->task);
+    for (int i = 0; i < g->nmodels; i++) free(g->models[i]);
+    free(g->models);
+    memset(g, 0, sizeof *g);
+}
+
+bool goal_number(const char *out, double *v) {
+    if (!out) return false;
+    size_t n = strlen(out);
+    while (n && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' ' || out[n - 1] == '\t')) n--;
+    size_t start = n;
+    while (start > 0 && out[start - 1] != '\n') start--;   /* the last line */
+    while (start < n && (out[start] == ' ' || out[start] == '\t')) start++;
+    if (start >= n) return false;
+    char line[64];
+    if (n - start >= sizeof line) return false;
+    memcpy(line, out + start, n - start); line[n - start] = 0;
+    char *end; double d = strtod(line, &end);
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end || end == line || d != d || d - d != 0) return false;   /* nothing after the number; not nan, not inf */
+    *v = d;
+    return true;
+}
+
+bool goal_better(double v, double best, bool lower) { return lower ? v < best : v > best; }
+
+int goal_verdict(const char *report, char *why, size_t n) {
+    int found = GOAL_NONE;
+    if (why && n) why[0] = 0;
+    if (!report) return GOAL_NONE;
+    for (const char *line = report; *line; ) {
+        const char *e = strchr(line, '\n'); size_t len = e ? (size_t)(e - line) : strlen(line);
+        const char *p = line;
+        while (p < line + len && (*p == ' ' || *p == '\t' || *p == '*' || *p == '`' || *p == '#')) p++;
+        if (line + len - p >= 5 && !strncasecmp(p, "GOAL:", 5)) {
+            p = goal_skip_space(p + 5);
+            if (line + len - p >= 7 && !strncasecmp(p, "REACHED", 7)) { found = GOAL_REACHED; if (why && n) why[0] = 0; }
+            else if (line + len - p >= 10 && !strncasecmp(p, "IMPOSSIBLE", 10)) {
+                found = GOAL_IMPOSSIBLE;
+                if (why && n) {
+                    const char *r = goal_skip_space(p + 10);
+                    while (r < line + len && (*r == ':' || *r == '-' || *r == '*' || *r == ' ')) r++;
+                    const char *re = line + len;
+                    while (re > r && (re[-1] == '*' || re[-1] == '`' || re[-1] == ' ' || re[-1] == '\r')) re--;
+                    size_t k = (size_t)(re - r); if (k >= n) k = n - 1;
+                    memcpy(why, r, k); why[k] = 0;
+                }
+            }
+        }
+        if (!e) break;
+        line = e + 1;
+    }
+    return found;
 }
