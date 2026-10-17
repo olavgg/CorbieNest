@@ -1034,7 +1034,9 @@ static tool_status bg_start(const char *cmd, sbuf *out) {
     char tmp[1100]; snprintf(tmp, sizeof tmp, "%s/corbienest_bg_XXXXXX", tmpdir && *tmpdir ? tmpdir : "/tmp");
     int fd = mkstemp(tmp);
     if (fd < 0) { sb_printf(out, "error: cannot make the job's output file: %s", strerror(errno)); return TOOL_ERROR; }
+#ifdef __linux__   /* read only by the PDEATHSIG check below, which is Linux's */
     pid_t parent = getpid();
+#endif
     pid_t pid = fork();
     if (pid < 0) { close(fd); unlink(tmp); sb_printf(out, "error: fork: %s", strerror(errno)); return TOOL_ERROR; }
     if (pid == 0) {

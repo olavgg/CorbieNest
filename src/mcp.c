@@ -236,7 +236,9 @@ static bool spawn(mcp_server *m) {
     envp[ne] = NULL;
     int in[2], out[2];
     if (!cloexec_pipe(in) || !cloexec_pipe(out)) { free(prog); free(argv); free(envp); m->status = xstrdup("cannot make pipes"); m->dead = true; return false; }
+#ifdef __linux__   /* read only by the PDEATHSIG check below, which is Linux's */
     pid_t parent = getpid();
+#endif
     pid_t pid = fork();
     if (pid < 0) { free(prog); free(argv); free(envp); close(in[0]); close(in[1]); close(out[0]); close(out[1]); m->status = xstrdup("fork failed"); m->dead = true; return false; }
     if (pid == 0) {
