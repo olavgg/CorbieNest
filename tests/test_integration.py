@@ -1670,8 +1670,14 @@ check(adv.get("think") == "high" and adv["options"]["num_ctx"] == 8192, f"its ef
 s.send("/status\r"); check(s.expect("advisor    fake-big:latest"), "/status shows it")
 s.send("/cost\r"); check(s.expect("advisor       1 consultation"), f"/cost counts it: {since_send(s)[-300:]!r}")
 s.send("TOOL_ADVISOR SLOWADVICE\r"); check(s.expect("⤷ advisor"), "a slow consultation")
+_m = s.mark   # the consultation's window: from its own send
 time.sleep(0.6); s.send("never mind, do this\r")
-check(s.expect("Tool said: ADVICE", 15), f"a queued message does not stop the consultation: it runs to its end: {s.text()[-400:]!r}")
+_ok, _end = False, time.time() + 15
+while time.time() < _end and not _ok:
+    s.expect("(no such text)", 0.3)
+    _w = clean(s.out[_m:].decode("utf-8", "replace"))
+    _ok = "▸ advice" in _w and "Echo:" in _w and "never mind, do" in _w   # the consultation finished (its folded result) and the queued message got its turn
+check(_ok, "a queued message does not stop the consultation: it runs to its end (the consultation's result is folded, and the queued message is answered)")
 check(s.expect("Echo: never mind, do this", 10), "and reaches the model on its next call, after the advice")
 msgs = requests()[-1]["messages"]
 check(msgs[-2]["role"] == "tool" and "not heard out" not in msgs[-2]["content"] and "ADVICE:" in msgs[-2]["content"] and msgs[-1]["content"] == "never mind, do this", f"the conversation stays well-formed: {[m['role'] for m in msgs[-3:]]}")
