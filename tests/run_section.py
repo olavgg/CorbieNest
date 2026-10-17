@@ -46,7 +46,11 @@ def main():
     lines = open(SRC, encoding="utf-8").read().split("\n")
     starts, ends = sections(lines)
     titles = [lines[s][len('print("'):-2] for s in starts]
-    hits = [k for k, t in enumerate(titles) if args[0] in t]
+    key = args[0]
+    if key.startswith("="):   # an exact title: =test interactive: /advisor
+        hits = [k for k, t in enumerate(titles) if t == key[1:]]
+    else:
+        hits = [k for k, t in enumerate(titles) if key in t]
     if len(hits) != 1:
         print(f"{len(hits)} sections match {args[0]!r}:"); [print("  ", titles[k]) for k in hits]; return 2
     target = hits[0]
