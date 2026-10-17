@@ -1113,7 +1113,7 @@ check(requests()[-1]["messages"][0]["content"].startswith("You maintain the pers
 s.send("/memory update\r"); check(s.expect("nothing pending"), "/memory update with nothing pending")
 s.send("REMEMBER_ME at exit\r"); check(s.expect("Echo: REMEMBER_ME at exit"), "reply")
 s.send("\x04"); check(s.expect("updating memory…  (Ctrl-C skips it)"), "the exit flush says it can be skipped")
-check(seen(s, "bye", 15), "exit")   # the bye is drawn inside a repaint, which expect() skips: read the output since the key
+check(s.expect("bye"), "exit")
 s.close()
 check("at exit" in open(os.path.join(WORK, ".corbienest", "memory.md")).read(), "exit flushes the pending extraction (Ctrl-D)")
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
