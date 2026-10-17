@@ -366,6 +366,10 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "write_file", "arguments": {"path": "hello.py", "content": "def greet(name):  # say hi\n    return 'hi ' + name\n"}}}])
         yield chunk(model, done=True)
         return
+    if "TOOL_BG" in text:   # a background command, which has to end with corbienest (sleep 317 is the marker)
+        yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "sleep 317", "run_in_background": True}}}])
+        yield chunk(model, done=True)
+        return
     if "TOOL_TODO" in text:   # a task list: one task done, one in progress, one to do
         yield chunk(model, tool_calls=[{"function": {"name": "todo_write", "arguments": {"todos": [
             {"content": "read the code", "status": "completed"}, {"content": "make the change", "status": "in_progress"},

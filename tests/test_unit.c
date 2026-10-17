@@ -314,9 +314,52 @@ static void test_tools_body(void *ud) {
     CHECK(hook_match("start make", "start", NULL, &hc) && !strcmp(hc, "make") && !hook_match("stop x", "start", NULL, NULL));
     CHECK(hook_match("post edit f", "post", "edit", NULL) && !hook_match(NULL, "pre", "bash", NULL));
 
+    /* background bash: output is read in pieces, a job is stopped and its group is gone (real processes; all stopped at the end) */
+    {
+        bool saved_nc = tools_no_confirm; tools_no_confirm = true;
+        cJSON *bj = cJSON_CreateObject();
+        cJSON_AddStringToObject(bj, "command", "echo a; sleep 0.3; echo b");
+        cJSON_AddBoolToObject(bj, "run_in_background", 1);
+        sbuf o; sb_init(&o);
+        CHECK(tools_execute("bash", bj, &o) == TOOL_OK && strstr(o.data, "started background job bg"));
+        char id[16] = ""; int pid = 0;
+        const char *ip = strstr(o.data, "job bg"); if (ip) sscanf(ip + 4, "%15[^ ]", id);
+        const char *pp = strstr(o.data, "(pid "); if (pp) pid = atoi(pp + 5);
+        cJSON_Delete(bj); sb_free(&o);
+        cJSON *jj = cJSON_CreateObject();
+        cJSON_AddStringToObject(jj, "job", id); cJSON_AddStringToObject(jj, "action", "output");
+        sbuf r; sb_init(&r);
+        tools_execute("bash_job", jj, &r);
+        CHECK(strstr(r.data, "[job ") && strstr(r.data, "running") && pid > 0);   /* still going: nothing has been read yet */
+        sb_clear(&r); usleep(700000);
+        tools_execute("bash_job", jj, &r);
+        CHECK(strstr(r.data, "b\n") && strstr(r.data, "exit code 0"));
+        sb_clear(&r);
+        tools_execute("bash_job", jj, &r);   /* the next read: only what is new */
+        CHECK(strstr(r.data, "no new output") && !strstr(r.data, "b\n"));
+        sb_clear(&r); cJSON_Delete(jj);
+        /* a long job, stopped: its group is gone afterwards */
+        cJSON *sj = cJSON_CreateObject();
+        cJSON_AddStringToObject(sj, "command", "sleep 30");
+        cJSON_AddBoolToObject(sj, "run_in_background", 1);
+        tools_execute("bash", sj, &r);
+        int pid2 = 0; char id2[16] = ""; const char *q = strstr(r.data, "job bg"); if (q) sscanf(q + 4, "%15[^ ]", id2);
+        const char *pq = strstr(r.data, "(pid "); if (pq) pid2 = atoi(pq + 5);
+        sb_clear(&r); cJSON_Delete(sj);
+        cJSON *kj = cJSON_CreateObject();
+        cJSON_AddStringToObject(kj, "job", id2); cJSON_AddStringToObject(kj, "action", "kill");
+        CHECK(tools_execute("bash_job", kj, &r) == TOOL_OK && strstr(r.data, "stopped"));
+        CHECK(pid2 > 0 && kill(-pid2, 0) == -1 && errno == ESRCH);   /* the group is gone */
+        sb_clear(&r);
+        CHECK(tools_execute("bash_job", kj, &r) == TOOL_ERROR && strstr(r.data, "no background job"));   /* and the job is forgotten */
+        cJSON_Delete(kj); sb_free(&r);
+        tools_no_confirm = saved_nc;
+        tools_bg_kill_all();
+    }
+
     /* tool definitions are well-formed */
     cJSON *defs = tools_definitions();
-    CHECK(cJSON_GetArraySize(defs) == 9);   /* the seven, todo_write, and exit */
+    CHECK(cJSON_GetArraySize(defs) == 10);   /* the seven, bash_job, todo_write, and exit */
     cJSON *t; cJSON_ArrayForEach(t, defs) {
         cJSON *f = cJSON_GetObjectItem(t, "function");
         CHECK(cJSON_IsString(cJSON_GetObjectItem(f, "name")));

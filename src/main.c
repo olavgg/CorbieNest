@@ -4340,6 +4340,7 @@ static void cmd_ui(const char *arg) {
     printf(C_DIM "restarting on the %s screen, in this session…" C_RESET "\n", arg);
     fflush(stdout);
     term_restore();
+    tools_bg_kill_all();   /* exec runs no atexit: the jobs are stopped here, the new process does not know them */
     execv("/proc/self/exe", na);
     /* only reached when the restart failed: the session is saved, and the program is still running */
     fprintf(stderr, "corbienest: could not restart (%s); still on the old screen — restart it with --resume %s\n", strerror(errno), g_session_id);
@@ -5455,6 +5456,7 @@ int main(int argc, char **argv) {
     g_argc = argc; g_argv = argv;
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
     signal(SIGPIPE, SIG_IGN);
+    tools_bg_init();
     memset(&g_cfg, 0, sizeof g_cfg);
     g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.advisor_guidance = GUIDANCE_NORMAL; g_cfg.advisor_window = ADVISOR_WINDOW_DEFAULT;
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */

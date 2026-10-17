@@ -325,6 +325,27 @@ matches, for example:
   when the tool asks for its confirmation, so `deny` and `ask` still apply after a hook has passed the call.
 - Hooks are guardrails, not a sandbox, the same as the permission rules.
 
+## Background commands
+
+A dev server or a watcher does not end, so `bash` can start one and return at once:
+`run_in_background: true`. The result gives its id (`bg1`) and pid. The model reads what it prints
+with `bash_job` (`action: output`), which returns only what came since the last read (at most 32 KB
+at a time; when more has piled up, the older part is skipped and the result says how much), and says
+whether the job is still running or what its exit code was. `bash_job` with `action: kill` stops it.
+
+- The confirmation is the same as for a foreground command, and says *in the background*; the
+  allow, ask and deny rules and the hooks apply to it as to any `bash` call.
+- The output goes to a file in `TMPDIR`, not a pipe, so nothing has to be reading it while the model
+  works. The job runs in its own process group, with no terminal and no access to corbienest's
+  descriptors; Ctrl-C at the prompt does not reach it.
+- Up to 8 jobs at a time. A finished job's place is given up when a new one needs it.
+- The jobs belong to this running corbienest. `/resume` does not bring them back, `/ui` (which
+  restarts the program) stops them, and so does quitting, or a SIGTERM or SIGHUP to corbienest.
+  On Linux a SIGKILL to corbienest stops the job's shell; a process the shell started itself
+  (a node server under `npm run dev`, say) can survive that.
+- A sub-agent cannot start a background command: its conversation ends with its report, and nothing
+  would read the job.
+
 ## Tools the model can call
 
 | tool | confirmation |
@@ -334,7 +355,8 @@ matches, for example:
 | `grep(pattern, path?, include?)` | none |
 | `write_file(path, content)` | yes — shows a preview |
 | `edit_file(path, old_string, new_string, replace_all?)` | yes — shows a diff |
-| `bash(command, timeout?)` | yes — shows the command; output/exit code returned to the model |
+| `bash(command, timeout?, run_in_background?)` | yes — shows the command; output/exit code returned to the model. With `run_in_background` it starts the command and returns at once (see [Background commands](#background-commands)) |
+| `bash_job(job, action)` | none — reads the output of a background command that `bash` started (`action` `output`: what it printed since the last read, and whether it runs; `kill`: stops it). See [Background commands](#background-commands) |
 | `todo_write(todos)` | none — keeps the task list of the request, shown in the transcript and saved with the session. Send the whole list each time, with each task `pending`, `in_progress` (at most one) or `completed`; an empty list clears it. For work of three or more steps; the sub-agents do not have it |
 | `web_search(query, max_results?)` | yes — shows the query and the engine; "always allow" saves the engine's **host** |
 | `web_fetch(url, offset?, timeout?)` | yes — shows the URL; "always allow" saves the **host** |

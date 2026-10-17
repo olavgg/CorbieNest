@@ -558,6 +558,8 @@ const char *tools_hooks_get(int i);
 bool  tools_hooks_add(const char *line);
 bool  tools_hooks_remove(int i);
 void  tools_hooks_clear(void);
+void  tools_bg_init(void);            /* background jobs: atexit and SIGTERM/SIGHUP stop them */
+void  tools_bg_kill_all(void);       /* stops the running background jobs now (before a re-exec too) */
 void  tools_hook_event(const char *event);   /* "start" or "stop": runs the hooks of that event and shows what they print */
 cJSON *tools_todos_get(void);          /* the task list the model keeps with todo_write, or NULL */
 void   tools_todos_set(cJSON *list);   /* replaces it (takes the list); NULL clears it */

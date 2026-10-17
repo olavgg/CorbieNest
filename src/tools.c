@@ -13,6 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -35,7 +38,7 @@ bool tools_no_confirm = false;   /* set by the caller for user-typed "!cmd": no 
 void tools_reset_permissions(void) { g_always_write = g_always_edit = g_always_bash = g_always_fetch = false; }
 const char *tools_summary_line(void) {
     static char b[160];
-    snprintf(b, sizeof b, "read_file, write_file, edit_file, list_dir, grep, bash, todo_write, %stask%s", g_cfg.web ? "web_search, web_fetch, " : "", g_cfg.advisor ? ", advisor" : "");
+    snprintf(b, sizeof b, "read_file, write_file, edit_file, list_dir, grep, bash, bash_job, todo_write, %stask%s", g_cfg.web ? "web_search, web_fetch, " : "", g_cfg.advisor ? ", advisor" : "");
     return b;
 }
 
@@ -476,7 +479,8 @@ cJSON *tools_definitions(void) {
 
     p = cJSON_CreateObject();
     prop(p, "command", "string", "The shell command to run (executed with /bin/sh -c). Use it for git, build tools, tests, package managers, find, etc.");
-    prop(p, "timeout", "integer", "Optional timeout in seconds (default 120, max 600).");
+    prop(p, "timeout", "integer", "Optional timeout in seconds (default 120, max 600). Not used for a background command.");
+    prop(p, "run_in_background", "boolean", "Start the command and return at once, for a long-running one (a dev server, a watch). Read it with bash_job.");
     cJSON_AddItemToArray(arr, mk_tool("bash",
         "Run a shell command in the working directory and return its combined stdout/stderr and exit code. Use for git operations, running builds/tests, installing packages, and anything the other tools do not cover. Avoid interactive commands. Output is capped at 32 KB (head and tail are kept), so filter or paginate noisy commands (| tail, | head, -q flags).",
         p, (const char*[]){"command", NULL}));
@@ -497,6 +501,15 @@ cJSON *tools_definitions(void) {
             "Find documentation when you do not know its URL. Returns title, URL and snippet per result; the snippets are not the docs — web_fetch the best one, preferring the project's own domain over blogs and Q&A sites.",
             p, (const char*[]){"query", NULL}));
     }
+
+    p = cJSON_CreateObject();
+    prop(p, "job", "string", "The job's id, as bash printed it (e.g. bg1).");
+    cJSON *ap = prop(p, "action", "string", "output: what it printed since the last read, and whether it runs; kill: stop it.");
+    cJSON *ae = cJSON_AddArrayToObject(ap, "enum");
+    cJSON_AddItemToArray(ae, cJSON_CreateString("output")); cJSON_AddItemToArray(ae, cJSON_CreateString("kill"));
+    cJSON_AddItemToArray(arr, mk_tool("bash_job",
+        "Read the output of a background command that bash started (action output), or stop it (action kill). Each read gives what was printed since the last one.",
+        p, (const char*[]){"job", "action", NULL}));
 
     p = cJSON_CreateObject();
     cJSON *ts = cJSON_AddObjectToObject(p, "todos");
@@ -942,22 +955,172 @@ static void print_command(const char *cmd, bool will_ask) {
     printf("  " C_DIM "$ " C_RESET C_BOLD "%s" C_RESET "\n", cmd);
 }
 
+/* ---------- background jobs ----------
+ * bash with run_in_background starts its command and returns at once. Its output goes to a file in TMPDIR, not a pipe:
+ * nothing has to read it while the model works, and the job never blocks on it. bash_job reads what it printed since
+ * the last read, and stops it. Jobs belong to this process: /ui re-executes it and quitting stops them. The job's
+ * group is killed when corbienest exits by any way it can be told to (atexit, SIGTERM, SIGHUP); a SIGKILL of
+ * corbienest is covered on Linux by PR_SET_PDEATHSIG for the shell only. */
+#define BG_MAX 8
+#define BG_READ_MAX (32 * 1024)
+typedef struct { char id[16]; pid_t pid; char *cmd, *file; off_t off; bool done, killed; int rc; } bg_job;
+static bg_job g_bg[BG_MAX];
+static volatile pid_t g_bg_pgid[BG_MAX];   /* the groups still running, for the signal handler (async-signal-safe reads) */
+static int g_bg_next = 1;
+static bool g_in_subagent = false;
+
+static void bg_reap(bg_job *j) {
+    if (!j->cmd || j->done || j->pid <= 0) return;
+    int st = 0;
+    pid_t r = waitpid(j->pid, &st, WNOHANG);
+    if (r == 0) return;
+    j->done = true;
+    j->rc = r < 0 ? -1 : WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);   /* -1: gone, the code unknown */
+    for (int i = 0; i < BG_MAX; i++) if (&g_bg[i] == j) g_bg_pgid[i] = 0;
+}
+static void bg_sweep(void) { for (int i = 0; i < BG_MAX; i++) bg_reap(&g_bg[i]); }
+static void bg_forget(bg_job *j) {
+    if (j->file) unlink(j->file);
+    free(j->cmd); free(j->file);
+    memset(j, 0, sizeof *j);
+}
+static void bg_signal_all(int sig) {
+    for (int i = 0; i < BG_MAX; i++) { pid_t g = g_bg_pgid[i]; if (g > 0) kill(-g, sig); }
+}
+/* Stops every job still running and removes the files: at exit, and before corbienest re-executes itself. */
+void tools_bg_kill_all(void) {
+    bg_signal_all(SIGTERM);
+    for (int k = 0; k < 10; k++) {   /* up to half a second for them to go */
+        bool alive = false;
+        for (int i = 0; i < BG_MAX; i++) if (g_bg_pgid[i] > 0) { bg_reap(&g_bg[i]); if (g_bg_pgid[i] > 0) alive = true; }
+        if (!alive) break;
+        usleep(50000);
+    }
+    bg_signal_all(SIGKILL);
+    for (int i = 0; i < BG_MAX; i++) if (g_bg[i].cmd) { bg_reap(&g_bg[i]); bg_forget(&g_bg[i]); }
+}
+static void bg_on_signal(int sig) {
+    bg_signal_all(SIGKILL);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+void tools_bg_init(void) {
+    atexit(tools_bg_kill_all);
+    signal(SIGTERM, bg_on_signal);
+    signal(SIGHUP, bg_on_signal);
+}
+
+static bg_job *bg_find(const char *id) {
+    for (int i = 0; i < BG_MAX; i++) if (g_bg[i].cmd && !strcmp(g_bg[i].id, id)) return &g_bg[i];
+    return NULL;
+}
+/* A free slot; when there is none, the oldest finished job gives its place up (its output is gone with it). */
+static bg_job *bg_slot(void) {
+    for (int i = 0; i < BG_MAX; i++) if (!g_bg[i].cmd) return &g_bg[i];
+    for (int i = 0; i < BG_MAX; i++) if (g_bg[i].done) { bg_forget(&g_bg[i]); return &g_bg[i]; }
+    return NULL;
+}
+static tool_status bg_start(const char *cmd, sbuf *out) {
+    bg_sweep();
+    bg_job *j = bg_slot();
+    if (!j) { sb_printf(out, "error: %d background jobs are running; stop one with bash_job (action kill) first", BG_MAX); return TOOL_ERROR; }
+    const char *tmpdir = getenv("TMPDIR");
+    char tmp[1100]; snprintf(tmp, sizeof tmp, "%s/corbienest_bg_XXXXXX", tmpdir && *tmpdir ? tmpdir : "/tmp");
+    int fd = mkstemp(tmp);
+    if (fd < 0) { sb_printf(out, "error: cannot make the job's output file: %s", strerror(errno)); return TOOL_ERROR; }
+    pid_t parent = getpid();
+    pid_t pid = fork();
+    if (pid < 0) { close(fd); unlink(tmp); sb_printf(out, "error: fork: %s", strerror(errno)); return TOOL_ERROR; }
+    if (pid == 0) {
+        setpgid(0, 0);
+        signal(SIGINT, SIG_DFL); signal(SIGPIPE, SIG_DFL); signal(SIGTERM, SIG_DFL); signal(SIGHUP, SIG_DFL);
+#ifdef __linux__
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (getppid() != parent) _exit(1);   /* corbienest died before the job began */
+#endif
+        int dn = open("/dev/null", O_RDONLY);
+        if (dn >= 0) { dup2(dn, STDIN_FILENO); if (dn != STDIN_FILENO) close(dn); }
+        dup2(fd, STDOUT_FILENO); dup2(fd, STDERR_FILENO);
+        for (int f = 3; f < 1024; f++) close(f);   /* the job inherits none of the session's descriptors */
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    setpgid(pid, pid);   /* (the child does it too: whichever runs first) */
+    close(fd);
+    memset(j, 0, sizeof *j);
+    snprintf(j->id, sizeof j->id, "bg%d", g_bg_next++);
+    j->pid = pid; j->cmd = xstrdup(cmd); j->file = xstrdup(tmp);
+    g_bg_pgid[j - g_bg] = pid;
+    sb_printf(out, "started background job %s (pid %d): %s\nRead what it prints with bash_job (action output); it runs until it ends or you stop it with bash_job (action kill). A background job belongs to this session: /resume does not bring it back, and quitting or /ui stops it.", j->id, (int)pid, cmd);
+    return TOOL_OK;
+}
+/* One read of a job's output: what it printed since the last read (at most BG_READ_MAX of it), then its state. */
+static void bg_read(bg_job *j, sbuf *out) {
+    int fd = open(j->file, O_RDONLY);
+    if (fd < 0) { sb_printf(out, "(no output file: %s)\n", strerror(errno)); return; }
+    struct stat st;
+    off_t size = fstat(fd, &st) == 0 ? st.st_size : j->off;
+    if (size - j->off > BG_READ_MAX) { sb_printf(out, "(%lld bytes skipped)\n", (long long)(size - j->off - BG_READ_MAX)); j->off = size - BG_READ_MAX; }
+    size_t want = (size_t)(size - j->off);
+    if (want) {
+        char *buf = xmalloc(want + 1);
+        ssize_t r = pread(fd, buf, want, j->off);
+        if (r > 0) { sb_append(out, buf, (size_t)r); j->off += r; }
+        free(buf);
+    }
+    close(fd);
+    if (out->len && out->data[out->len - 1] != '\n') sb_putc(out, '\n');
+    if (!out->len) sb_puts(out, "(no new output)\n");
+}
+static tool_status t_bash_job(cJSON *args, sbuf *out) {
+    const char *id = jstr(args, "job", NULL), *action = jstr(args, "action", NULL);
+    if (!id || !action) { sb_puts(out, "error: need 'job' (e.g. bg1) and 'action' (output or kill)"); return TOOL_ERROR; }
+    bg_sweep();
+    bg_job *j = bg_find(id);
+    if (!j) { sb_printf(out, "error: no background job %s (the ones running now are listed as bgN in the bash results)", id); return TOOL_ERROR; }
+    if (!strcmp(action, "output")) {
+        bg_read(j, out);
+        if (!j->done) sb_printf(out, "[job %s: running]", id);
+        else if (j->killed) sb_printf(out, "[job %s: stopped]", id);
+        else if (j->rc < 0) sb_printf(out, "[job %s: exited, code unknown]", id);
+        else sb_printf(out, "[job %s: exit code %d]", id, j->rc);
+        return TOOL_OK;
+    }
+    if (!strcmp(action, "kill")) {
+        if (!j->done) {
+            j->killed = true;
+            kill(-j->pid, SIGTERM);
+            for (int k = 0; k < 40 && !j->done; k++) { bg_reap(j); if (!j->done) usleep(50000); }
+            if (!j->done) { kill(-j->pid, SIGKILL); for (int k = 0; k < 20 && !j->done; k++) { bg_reap(j); if (!j->done) usleep(10000); } }
+        }
+        bg_read(j, out);
+        sb_printf(out, "[job %s: %s]", id, j->killed ? "stopped" : j->rc >= 0 ? "had already exited" : "had already exited (code unknown)");
+        bg_forget(j);
+        return TOOL_OK;
+    }
+    sb_printf(out, "error: action must be output or kill, not %s", action);
+    return TOOL_ERROR;
+}
+
 static tool_status t_bash(cJSON *args, sbuf *out) {
     const char *cmd = jstr(args, "command", NULL);
     if (!cmd || !*cmd) { sb_puts(out, "error: missing 'command'"); return TOOL_ERROR; }
     int timeout = jint(args, "timeout", 120);
     if (timeout <= 0) timeout = 120;
     if (timeout > 600) timeout = 600;
+    bool bg = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(args, "run_in_background"));
+    if (bg && g_in_subagent) { sb_puts(out, "error: a sub-agent cannot start background commands; run it in the foreground"); return TOOL_ERROR; }
     bool asked = confirm_will_ask(CONF_BASH, &g_always_bash, cmd);
     print_command(cmd, asked);
     char q[256];   /* the question carries a short command in full: the approval is of what is shown */
-    if (asked && cmd_in_question(cmd)) snprintf(q, sizeof q, "Run this command?  %s", cmd);
-    else snprintf(q, sizeof q, "Run this command?");
+    if (asked && cmd_in_question(cmd)) snprintf(q, sizeof q, bg ? "Run this command in the background?  %s" : "Run this command?  %s", cmd);
+    else snprintf(q, sizeof q, bg ? "Run this command in the background?" : "Run this command?");
     char *reason = NULL;
     if (!confirm(q, CONF_BASH, &g_always_bash, cmd, &reason)) {
         sb_printf(out, "User denied running the command.%s%s", reason ? " Reason: " : "", reason ? reason : "");
         free(reason); return TOOL_DENIED;
     }
+    if (bg) return bg_start(cmd, out);
     sbuf o; sb_init(&o);
     bool intr = false;
     int rc = run_shell(cmd, timeout, &o, &intr, OUT_CAP * 2, "running command", "running");
@@ -1219,7 +1382,6 @@ static tool_status t_web_search(cJSON *args, sbuf *out) {
 
 /* ---------- task (sub-agent) ---------- */
 tools_subagent_fn tools_subagent = NULL;
-static bool g_in_subagent = false;
 static tool_status t_task(cJSON *args, sbuf *out) {
     const char *desc = jstr(args, "description", "sub-agent");
     const char *prompt = jstr(args, "prompt", NULL);
@@ -1492,6 +1654,7 @@ tool_status tools_execute(const char *name, cJSON *args, sbuf *out) {
     else if (!strcmp(name, "task")) st = t_task(args, out);
     else if (!strcmp(name, "advisor")) st = t_advisor(args, out);
     else if (!strcmp(name, "todo_write")) st = t_todo_write(args, out);
+    else if (!strcmp(name, "bash_job")) st = t_bash_job(args, out);
     else if (!strcmp(name, "exit")) st = t_exit(out);
     else { sb_printf(out, "error: unknown tool '%s'. Available tools: %s", name, tools_summary_line()); st = TOOL_ERROR; }
     if (hooked) hook_post(name, args, out);
