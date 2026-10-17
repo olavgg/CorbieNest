@@ -72,7 +72,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/skills", "list the skills · reload · new NAME" },
     { "/memory", "the project memory: on, off, clear, update, every N, idle N" },
     { "/resume", "continue an earlier session" },
-    { "/permissions", "the project's saved \"always allow\" rules: add, remove, clear" },
+    { "/permissions", "the project's saved rules: always-allow ones, and deny/ask guards on a tool and a pattern: add, remove, clear" },
     { "/init", "have the model write AGENTS.md for this project" },
     { "/cost", "tokens, model calls and time of this session" },
     { "/usage", "tokens per model, the advisor's too, and the estimated cost of the hosted ones" },
@@ -97,8 +97,8 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/web engine", "default:back to the built-in engine" },
     { "/memory", "on:keep the project memory up to date|off:stop updating it|update:run the pending update now|clear:remove the memory file|every:update every N requests|idle:update after N seconds idle at the prompt" },
     { "/memory idle", "off:wait for the next update or the exit instead" },
-    { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST|remove:remove rule N|clear:remove them all" },
-    { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host" },
+    { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST, or deny|ask TOOL PATTERN|remove:remove rule N|clear:remove them all" },
+    { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host|deny:stop a tool on a pattern (* any text)|ask:ask before a tool on a pattern" },
     { "/advisor", "off:no advisor|guidance:how much the agent leans on it|effort:how hard it thinks|window:minutes after which a long request gets its consultations again|ctx:its context window" },
     { "/subagent", "default:the model doing the work|effort:how hard the sub-agents' model thinks" },
     { "/advisor guidance", "light:consulted rarely|normal:the default — and brought in when tool calls keep failing|strong:also reviews a request that changed a lot before it ends|max:also reviews any change, and checks the first change before it is made" },
@@ -1089,7 +1089,15 @@ static int cmd_rewind(void) {
 static void cmd_permissions(const char *arg) {
     if (arg && !strncmp(arg, "add ", 4)) {
         const char *r = arg + 4; while (*r == ' ') r++;
-        if (strcmp(r, "edit") && strncmp(r, "bash ", 5) && strncmp(r, "fetch ", 6)) { printf("usage: /permissions add edit | add bash <leading words> | add fetch <host>\n"); return; }
+        bool guard = !strncmp(r, "deny ", 5) || !strncmp(r, "ask ", 4);   /* deny|ask bash|edit|fetch <pattern> */
+        if (guard) {
+            const char *g = strchr(r, ' ') + 1; while (*g == ' ') g++;
+            const char *sp = strchr(g, ' ');
+            bool known = (!strncmp(g, "bash ", 5) || !strncmp(g, "edit ", 5) || !strncmp(g, "fetch ", 6)) && sp && sp[1];
+            if (!known) { printf("usage: /permissions add deny|ask bash|edit|fetch <pattern>   (* matches any text, ? one character)\n"); return; }
+        } else if (strcmp(r, "edit") && strncmp(r, "bash ", 5) && strncmp(r, "fetch ", 6)) {
+            printf("usage: /permissions add edit | add bash <leading words> | add fetch <host> | add deny|ask bash|edit|fetch <pattern>\n"); return;
+        }
         printf(tools_permissions_add(r) ? C_GREEN "✓ added: %s" C_RESET "\n" : C_DIM "already there: %s" C_RESET "\n", r);
         return;
     }
@@ -1099,7 +1107,7 @@ static void cmd_permissions(const char *arg) {
         return;
     }
     if (arg && !strcmp(arg, "clear")) { tools_permissions_clear(); printf(C_GREEN "✓ project permissions cleared" C_RESET "\n"); return; }
-    if (arg && *arg) { printf("usage: /permissions [add edit|add bash <words>|add fetch <host>|remove N|clear]\n"); return; }
+    if (arg && *arg) { printf("usage: /permissions [add edit|add bash <words>|add fetch <host>|add deny|ask bash|edit|fetch <pattern>|remove N|clear]\n"); return; }
     int n = tools_permissions_count();
     printf(C_BOLD "project permissions" C_RESET C_DIM " (kept in %s/permissions — answers of \"always allow … in this project\")" C_RESET "\n", config_dir());
     if (!n) printf(C_DIM "  none — pick \"always allow … in this project\" (p) at a confirmation, or /permissions add bash git status" C_RESET "\n");
@@ -1107,6 +1115,12 @@ static void cmd_permissions(const char *arg) {
         const char *r = tools_permissions_get(i);
         if (!strcmp(r, "edit")) printf("  %2d. file writes and edits\n", i + 1);
         else if (!strncmp(r, "fetch ", 6)) printf("  %2d. web pages from " C_BOLD "%s" C_RESET "\n", i + 1, r + 6);
+        else if (!strncmp(r, "deny ", 5) || !strncmp(r, "ask ", 4)) {   /* a guard: "deny|ask <tool> <pattern>" */
+            bool deny = !strncmp(r, "deny ", 5);
+            const char *t = r + (deny ? 5 : 4), *sp = strchr(t, ' ');
+            if (sp) printf("  %2d. %s %.*s matching " C_BOLD "%s" C_RESET "\n", i + 1, deny ? C_RED "deny" C_RESET : C_ORANGE "ask" C_RESET, (int)(sp - t), t, sp + 1);
+            else printf("  %2d. %s\n", i + 1, r);
+        }
         else printf("  %2d. shell commands starting with " C_BOLD "%s" C_RESET "\n", i + 1, r + 5);
     }
     if (n) printf(C_DIM "  /permissions remove N · /permissions clear" C_RESET "\n");

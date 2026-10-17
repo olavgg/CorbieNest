@@ -282,6 +282,29 @@ static void test_tools_body(void *ud) {
     CHECK(tools_execute("todo_write", tl, &out) == TOOL_OK && strstr(out.data, "cleared") && tools_todos_get() && !cJSON_GetArraySize(tools_todos_get())); sb_clear(&out); cJSON_Delete(tl);
     tools_todos_set(NULL);
 
+    /* permission rules: glob patterns, and deny beats ask beats allow (pure: nothing is written to the config) */
+    CHECK(glob_match("rm *", "rm -rf b") && !glob_match("rm *", "arm x") && glob_match("a?c", "abc") && !glob_match("a?c", "ac"));
+    CHECK(glob_match("*.env", "x/y/.env") && glob_match("*", "") && glob_match("", "") && !glob_match("", "a") && glob_match("a**b", "a/x/b"));
+    CHECK(!glob_match("*x*y", "axbyz") && glob_match("*x*y", "axxy") && !glob_match("rm *", "rmdir x"));
+    CHECK(perm_rule_verdict("deny bash rm *", "bash", "rm -rf b") == VERDICT_DENY);
+    CHECK(perm_rule_verdict("deny bash rm *", "bash", "cd a && rm -rf b") == VERDICT_DENY);   /* a part of a chain */
+    CHECK(perm_rule_verdict("deny bash rm *", "bash", "X=1 rm f") == VERDICT_DENY);           /* a leading assignment */
+    CHECK(perm_rule_verdict("deny bash rm *", "bash", "/bin/rm f") == VERDICT_DENY);          /* a path in front of the program */
+    CHECK(perm_rule_verdict("deny bash rm *", "bash", "ls $(rm x)") == VERDICT_ASK);          /* a subshell the rule cannot see into */
+    CHECK(perm_rule_verdict("deny bash rm *", "bash", "ls -la") == VERDICT_NONE);
+    CHECK(perm_rule_verdict("ask bash git push*", "bash", "git push origin") == VERDICT_ASK);
+    CHECK(perm_rule_verdict("bash git status", "bash", "git status -s") == VERDICT_ALLOW);   /* the old allow rules are as they were */
+    CHECK(perm_rule_verdict("bash git status", "bash", "git status; rm x") == VERDICT_NONE);
+    CHECK(perm_rule_verdict("deny bash rm", "edit", "x") == VERDICT_NONE);                    /* a rule is for its own tool */
+    CHECK(perm_rule_verdict("deny edit .env", "edit", ".env") == VERDICT_DENY);
+    CHECK(perm_rule_verdict("deny edit *.pem", "edit", "keys/a.pem") == VERDICT_DENY);
+    CHECK(perm_rule_verdict("deny edit .env", "edit", "a.env") == VERDICT_NONE);
+    CHECK(perm_rule_verdict("edit", "edit", "a.c") == VERDICT_ALLOW);
+    CHECK(perm_rule_verdict("deny fetch *.evil.com", "fetch", "https://x.evil.com/p") == VERDICT_DENY);   /* a host pattern */
+    CHECK(perm_rule_verdict("ask fetch https://docs.x.org/*", "fetch", "https://docs.x.org/a") == VERDICT_ASK);   /* a URL pattern */
+    CHECK(perm_rule_verdict("fetch docs.x.org", "fetch", "https://docs.x.org/a") == VERDICT_ALLOW);
+    CHECK(perm_rule_verdict(NULL, "bash", "ls") == VERDICT_NONE && perm_rule_verdict("deny bash", "bash", "ls") == VERDICT_NONE);
+
     /* tool definitions are well-formed */
     cJSON *defs = tools_definitions();
     CHECK(cJSON_GetArraySize(defs) == 9);   /* the seven, todo_write, and exit */

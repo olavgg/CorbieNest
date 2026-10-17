@@ -548,6 +548,9 @@ typedef enum { TOOL_OK = 0, TOOL_DENIED = 1, TOOL_ERROR = 2 } tool_status;
 extern const char *SEARCH_URL_DEFAULT;   /* web_search engine template, %s = the query */
 cJSON *tools_definitions(void);   /* array of tool defs (Ollama/OpenAI format), caller owns */
 /* Executes tool. Returns status; writes result text into out. */
+enum { VERDICT_NONE = 0, VERDICT_ALLOW = 1, VERDICT_ASK = 2, VERDICT_DENY = 3 };   /* what a project rule says about a target */
+bool glob_match(const char *pat, const char *s);   /* * and ** match any text (a / too), ? one character; the whole string */
+int  perm_rule_verdict(const char *rule, const char *tool, const char *target);   /* one saved rule on a target of "bash", "edit" or "fetch" */
 cJSON *tools_todos_get(void);          /* the task list the model keeps with todo_write, or NULL */
 void   tools_todos_set(cJSON *list);   /* replaces it (takes the list); NULL clears it */
 void   tools_todo_render(sbuf *out);   /* the list as text: a header with the count, then a line a task */

@@ -40,11 +40,14 @@ const char *tools_summary_line(void) {
 }
 
 /* ---------- persistent project permissions ----------
- * The config directory's permissions/ file for this project (perm_path()) holds one rule per line: "edit" (file writes/edits are fine in
- * this project), "bash <words>" (shell commands whose leading words match, e.g. "bash git
- * status", "bash make") or "fetch <host>" (web_fetch may read pages from that host, e.g.
- * "fetch www.postgresql.org"). Commands with shell metacharacters (; | & $ ` > < newline)
- * never match a rule — a chained command is not "just git status". */
+ * The config directory's permissions/ file for this project (perm_path()) holds one rule per line. Allow rules:
+ * "edit" (file writes/edits are fine in this project), "bash <words>" (shell commands whose leading words match, e.g.
+ * "bash git status", "bash make") or "fetch <host>" (web_fetch may read pages from that host, e.g.
+ * "fetch www.postgresql.org"). Commands with shell metacharacters (; | & $ ` > < newline) never match an allow
+ * rule — a chained command is not "just git status". Guard rules: "deny <tool> <pattern>" and "ask <tool> <pattern>",
+ * tool bash, edit or fetch, the pattern a glob (* and ** match any text, ? one character) matched against the command
+ * (or any of its parts), the path, or the host (or the URL, when the pattern has a /). deny stops the tool in every
+ * mode; ask prompts in every mode. deny beats ask beats allow. They are guardrails for the model, not a sandbox. */
 #define PERM_MAX  200
 static char *g_perm[PERM_MAX]; static int g_perm_n = 0;
 
@@ -80,7 +83,7 @@ static void perm_save(void) {
     if (!g_perm_n) { unlink(perm_path()); return; }
     sbuf b; sb_init(&b);
     char cwd[1024]; if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, "?");
-    sb_printf(&b, "# corbienest project permissions for %s — one rule per line: \"edit\", \"bash <leading words>\" or \"fetch <host>\" (see /permissions)\n", cwd);
+    sb_printf(&b, "# corbienest project permissions for %s — one rule per line: \"edit\", \"bash <leading words>\", \"fetch <host>\", or \"deny|ask bash|edit|fetch <pattern>\" (see /permissions)\n", cwd);
     for (int i = 0; i < g_perm_n; i++) sb_printf(&b, "%s\n", g_perm[i]);
     char dir[1100]; snprintf(dir, sizeof dir, "%s/permissions", config_dir());
     mkdir_p(dir);
@@ -156,13 +159,113 @@ static bool fetch_rule_matches(const char *rule, const char *url) {
     return !strcmp(rule + 6, host);
 }
 
-static const char *perm_match(int kind, const char *cmd) {
-    for (int i = 0; i < g_perm_n; i++) {
-        if (kind == CONF_EDIT_K && !strcmp(g_perm[i], "edit")) return g_perm[i];
-        if (kind == CONF_BASH_K && cmd && bash_rule_matches(g_perm[i], cmd)) return g_perm[i];
-        if (kind == CONF_FETCH_K && cmd && fetch_rule_matches(g_perm[i], cmd)) return g_perm[i];
+/* glob: * and ** match any text (a / too), ? one character; the whole of s has to match. */
+bool glob_match(const char *p, const char *s) {
+    const char *star = NULL, *mark = NULL;   /* the last * in p, and the point in s it has taken up to */
+    while (*s) {
+        if (*p == '*') { while (*p == '*') p++; star = p; mark = s; continue; }
+        if (*p && (*p == '?' || *p == *s)) { p++; s++; continue; }
+        if (!star) return false;
+        p = star; s = ++mark;   /* the last * takes one character more */
     }
-    return NULL;
+    while (*p == '*') p++;
+    return !*p;
+}
+
+/* A bash deny/ask pattern against a command: the whole command, or any one of its parts. The parts are split at ; | &
+ * and newlines (so "cd x && rm y" has an "rm y" in it), a leading NAME=value is dropped, and a path in front of the
+ * program is cut to its name too (/bin/rm is rm). */
+static bool bash_match(const char *pat, const char *cmd) {
+    if (glob_match(pat, cmd)) return true;
+    const char *p = cmd;
+    for (;;) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char *e = p; while (*e && !strchr(";|&\n", *e)) e++;
+        const char *w = p;
+        for (;;) {   /* leading NAME=value words */
+            const char *we = w; while (we < e && *we != ' ' && *we != '\t') we++;
+            const char *eq = memchr(w, '=', (size_t)(we - w));
+            if (!eq || eq == w || !(isalpha((unsigned char)*w) || *w == '_') || memchr(w, '/', (size_t)(eq - w))) break;
+            w = we; while (w < e && (*w == ' ' || *w == '\t')) w++;
+        }
+        if (w < e) {
+            const char *fe = w; while (fe < e && *fe != ' ' && *fe != '\t') fe++;
+            const char *base = fe; while (base > w && base[-1] != '/') base--;
+            char *raw = xstrndup(w, (size_t)(e - w)), *named = xstrndup(base, (size_t)(e - base));
+            for (char *t = raw + strlen(raw); t > raw && (t[-1] == ' ' || t[-1] == '\t'); ) *--t = 0;
+            for (char *t = named + strlen(named); t > named && (t[-1] == ' ' || t[-1] == '\t'); ) *--t = 0;
+            bool hit = glob_match(pat, raw) || glob_match(pat, named);
+            free(raw); free(named);
+            if (hit) return true;
+        }
+        if (!*e) return false;
+        p = e + 1;
+    }
+}
+
+/* What one saved rule says about a target of `tool` ("bash", "edit" or "fetch"); the target is the command, the path
+ * (as perm_path_norm() gives it) or the URL. */
+int perm_rule_verdict(const char *rule, const char *tool, const char *target) {
+    if (!rule || !tool || !target) return VERDICT_NONE;
+    bool deny = !strncmp(rule, "deny ", 5), ask = !deny && !strncmp(rule, "ask ", 4);
+    if (deny || ask) {
+        const char *r = rule + (deny ? 5 : 4), *sp = strchr(r, ' ');
+        if (!sp || (size_t)(sp - r) != strlen(tool) || strncmp(r, tool, (size_t)(sp - r))) return VERDICT_NONE;
+        const char *pat = sp; while (*pat == ' ') pat++;
+        if (!*pat) return VERDICT_NONE;
+        bool hit;
+        if (!strcmp(tool, "bash")) {
+            hit = bash_match(pat, target);
+            if (!hit && (strchr(target, '`') || strstr(target, "$("))) return VERDICT_ASK;   /* a subshell the rule cannot see into */
+        } else if (!strcmp(tool, "fetch")) {
+            if (strchr(pat, '/')) hit = glob_match(pat, target);
+            else { char host[512]; hit = url_host(target, host, sizeof host) && glob_match(pat, host); }
+        } else hit = glob_match(pat, target);
+        return hit ? (deny ? VERDICT_DENY : VERDICT_ASK) : VERDICT_NONE;
+    }
+    if (!strcmp(tool, "edit")) return !strcmp(rule, "edit") ? VERDICT_ALLOW : VERDICT_NONE;
+    if (!strcmp(tool, "bash")) return bash_rule_matches(rule, target) ? VERDICT_ALLOW : VERDICT_NONE;
+    if (!strcmp(tool, "fetch")) return fetch_rule_matches(rule, target) ? VERDICT_ALLOW : VERDICT_NONE;
+    return VERDICT_NONE;
+}
+
+/* The verdict of all the project's rules on a target: deny beats ask beats allow. *rule is the rule that decided it. */
+static int perm_verdict(int kind, const char *target, const char **rule) {
+    const char *tool = kind == CONF_EDIT_K ? "edit" : kind == CONF_BASH_K ? "bash" : "fetch";
+    int best = VERDICT_NONE;
+    *rule = NULL;
+    for (int i = 0; i < g_perm_n; i++) {
+        int v = perm_rule_verdict(g_perm[i], tool, target ? target : "");
+        if (v == VERDICT_DENY) { *rule = g_perm[i]; return v; }
+        if (v == VERDICT_ASK && best != VERDICT_ASK) { best = v; *rule = g_perm[i]; }
+        else if (v == VERDICT_ALLOW && best == VERDICT_NONE) { best = v; *rule = g_perm[i]; }
+    }
+    return best;
+}
+
+/* The path a rule is matched against: ~ expanded, a .. resolved in the directory part (the file may not exist yet), the
+ * working directory and any ./ taken off, so "src/../.env" is ".env" and "/home/x/proj/a" is "a". Malloc'd. */
+static char *perm_path_norm(const char *path) {
+    char *p = expand_home(path);
+    if (strstr(p, "..")) {
+        char *slash = strrchr(p, '/');
+        const char *base = slash ? slash + 1 : p;
+        char dirp[PATH_MAX], rp[PATH_MAX];
+        if (!slash) snprintf(dirp, sizeof dirp, ".");
+        else if (slash == p) snprintf(dirp, sizeof dirp, "/");
+        else snprintf(dirp, sizeof dirp, "%.*s", (int)(slash - p), p);
+        if (realpath(dirp, rp)) {
+            char *n = xmalloc(strlen(rp) + strlen(base) + 2);
+            sprintf(n, "%s/%s", !strcmp(rp, "/") ? "" : rp, base);
+            free(p); p = n;
+        }
+    }
+    char cwd[PATH_MAX];
+    if (p[0] == '/' && getcwd(cwd, sizeof cwd) && !strncmp(p, cwd, strlen(cwd)) && p[strlen(cwd)] == '/') {
+        char *n = xstrdup(p + strlen(cwd) + 1); free(p); p = n;
+    }
+    while (p[0] == '.' && p[1] == '/') { char *n = xstrdup(p + 2); free(p); p = n; }
+    return p;
 }
 
 /* ---------- checkpoints (for /rewind) ----------
@@ -497,22 +600,47 @@ static void preview_lines(const char *text, int max_lines, const char *color, co
 
 enum { CONF_EDIT = CONF_EDIT_K, CONF_BASH = CONF_BASH_K, CONF_FETCH = CONF_FETCH_K };
 /* Would confirm() ask? The same early returns, without the output: a command that will be asked
- * about is never folded away (the user approves what they can see). Keep in step with confirm(). */
+ * about is never folded away (the user approves what they can see). Keep in step with confirm_body(). */
 static bool confirm_will_ask(int kind, bool *always_flag, const char *cmd) {
-    if (always_flag && *always_flag) return false;
     if (tools_no_confirm) return false;
+    const char *rule;
+    int v = perm_verdict(kind, cmd, &rule);
+    if (v == VERDICT_DENY) return false;
+    if (v == VERDICT_ASK) return g_cfg.interactive;
+    if (always_flag && *always_flag) return false;
     if (YOLO() || (kind == CONF_EDIT && g_cfg.mode == MODE_ACCEPT_EDITS)) return false;
     if (kind == CONF_EDIT && g_cfg.mode == MODE_PLAN) return false;
-    if (perm_match(kind, cmd)) return false;
+    if (v == VERDICT_ALLOW) return false;
     return g_cfg.interactive;
 }
 /* Confirmation prompt. Returns 1 allow, 0 deny. On deny, *reason may be set (malloc'd).
  * kind: CONF_EDIT for write/edit, CONF_BASH for shell commands, CONF_FETCH for web_fetch;
- * `cmd` is the shell command or the URL (for the project rules), NULL for edits. */
-static int confirm(const char *what, int kind, bool *always_flag, const char *cmd, char **reason) {
+ * `cmd` is the shell command or the URL, or for an edit the path (matched against the project's rules). */
+static int confirm_body(const char *what, int kind, bool *always_flag, const char *target, char **reason) {
     *reason = NULL;
+    if (tools_no_confirm) return 1;   /* the user's own !cmd: the rules guard the model, not the user */
+    const char *rule;
+    int v = perm_verdict(kind, target, &rule);
+    if (v == VERDICT_DENY) {   /* in every mode, and whatever was approved before */
+        char msg[200]; snprintf(msg, sizeof msg, "%s", rule);
+        printf("  " C_YELLOW "%s" C_RESET " " C_RED "denied (project rule: %s)" C_RESET "\n", what, msg);
+        char r[480]; snprintf(r, sizeof r, "blocked by a project rule (%s): do not retry this action or a variant of it; do the job another way, or say what is needed.", msg);
+        *reason = xstrdup(r);
+        return 0;
+    }
+    if (v == VERDICT_ASK) {   /* asked in every mode, and never remembered: the rule would win over any saved allow */
+        if (!g_cfg.interactive) {
+            printf("  " C_YELLOW "%s" C_RESET " " C_RED "denied (project rule asks, and there is no one to ask)" C_RESET "\n", what);
+            char r[480]; snprintf(r, sizeof r, "a project rule (%.200s) asks the user before this, and no one can be asked now. Do not do it; say what is needed.", rule);
+            *reason = xstrdup(r);
+            return 0;
+        }
+        term_confirm_quiet = kind == CONF_BASH;
+        int r = term_confirm(what, "Yes, this once (a project rule asks each time)", NULL, reason);
+        term_confirm_quiet = false;
+        return r > 0;
+    }
     if (always_flag && *always_flag) return 1;
-    if (tools_no_confirm) return 1;
     if (YOLO() || (kind == CONF_EDIT && g_cfg.mode == MODE_ACCEPT_EDITS)) {
         if (g_cfg.interactive && kind != CONF_BASH) printf("  " C_YELLOW "%s" C_RESET "  " C_DIM "auto-approved (%s mode)" C_RESET "\n", what, mode_name(g_cfg.mode));
         return 1;
@@ -522,8 +650,7 @@ static int confirm(const char *what, int kind, bool *always_flag, const char *cm
         *reason = xstrdup("corbienest is in plan mode (read-only): do not modify files. Present your plan as text; the user will switch modes (shift+tab) when they want it implemented.");
         return 0;
     }
-    const char *rule = perm_match(kind, cmd);
-    if (rule) {
+    if (v == VERDICT_ALLOW) {
         if (kind != CONF_BASH) printf("  " C_YELLOW "%s" C_RESET "  " C_DIM "auto-approved (project rule: %s)" C_RESET "\n", what, rule);
         return 1;
     }
@@ -536,8 +663,8 @@ static int confirm(const char *what, int kind, bool *always_flag, const char *cm
                        : kind == CONF_FETCH ? "Yes, and don't ask again for web fetches this session"
                                             : "Yes, and don't ask again for file edits this session";
     char newrule[256] = "", plabel[320] = "";
-    if (kind == CONF_BASH) { bash_rule_for(cmd, newrule, sizeof newrule); if (newrule[0]) snprintf(plabel, sizeof plabel, "Yes, and always allow `%s …` in this project", newrule + 5); }
-    else if (kind == CONF_FETCH) { fetch_rule_for(cmd, newrule, sizeof newrule); if (newrule[0]) snprintf(plabel, sizeof plabel, "Yes, and always allow fetching from %s in this project", newrule + 6); }
+    if (kind == CONF_BASH) { bash_rule_for(target, newrule, sizeof newrule); if (newrule[0]) snprintf(plabel, sizeof plabel, "Yes, and always allow `%s …` in this project", newrule + 5); }
+    else if (kind == CONF_FETCH) { fetch_rule_for(target, newrule, sizeof newrule); if (newrule[0]) snprintf(plabel, sizeof plabel, "Yes, and always allow fetching from %s in this project", newrule + 6); }
     else { snprintf(newrule, sizeof newrule, "edit"); snprintf(plabel, sizeof plabel, "Yes, and always allow file edits in this project"); }
     term_confirm_quiet = kind == CONF_BASH;
     int r = term_confirm(what, always, newrule[0] ? plabel : NULL, reason);
@@ -545,6 +672,12 @@ static int confirm(const char *what, int kind, bool *always_flag, const char *cm
     if (r == 2 && always_flag) *always_flag = true;
     if (r == 3 && newrule[0]) { tools_permissions_add(newrule); printf("  " C_DIM "saved to %s: %s" C_RESET "\n", perm_path(), newrule); }
     return r > 0;
+}
+static int confirm(const char *what, int kind, bool *always_flag, const char *cmd, char **reason) {
+    char *np = kind == CONF_EDIT && cmd ? perm_path_norm(cmd) : NULL;
+    int r = confirm_body(what, kind, always_flag, np ? np : cmd, reason);
+    free(np);
+    return r;
 }
 
 /* ---------- read_file ---------- */
@@ -600,7 +733,7 @@ static tool_status t_write_file(cJSON *args, sbuf *out) {
     const char *dot = strrchr(path, '.'), *slash = strrchr(path, '/');
     preview_lines(content, 12, C_GREEN, dot && (!slash || dot > slash) ? dot + 1 : NULL);
     char *reason = NULL;
-    if (!confirm(exists ? "Overwrite this file?" : "Create this file?", CONF_EDIT, &g_always_write, NULL, &reason)) {
+    if (!confirm(exists ? "Overwrite this file?" : "Create this file?", CONF_EDIT, &g_always_write, path, &reason)) {
         sb_printf(out, "User denied writing %s.%s%s", path, reason ? " Reason: " : "", reason ? reason : "");
         free(reason); free(p); return TOOL_DENIED;
     }
@@ -654,7 +787,7 @@ static tool_status t_edit_file(cJSON *args, sbuf *out) {
     { sbuf t; sb_init(&t); const char *q = olds; while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "- %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_RED, NULL); sb_free(&t); }
     { sbuf t; sb_init(&t); const char *q = news; if (!*q) sb_puts(&t, "+ (deleted)\n"); while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "+ %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_GREEN, NULL); sb_free(&t); }
     char *reason = NULL;
-    if (!confirm("Apply this edit?", CONF_EDIT, &g_always_edit, NULL, &reason)) {
+    if (!confirm("Apply this edit?", CONF_EDIT, &g_always_edit, path, &reason)) {
         sb_printf(out, "User denied editing %s.%s%s", path, reason ? " Reason: " : "", reason ? reason : "");
         free(reason); sb_free(&nb); free(d); free(p); return TOOL_DENIED;
     }

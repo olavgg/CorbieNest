@@ -95,7 +95,7 @@ without thinking about them: the status bar, the field, and the strip.
 | `/effort [LEVEL\|default]` | how hard **this model** thinks, in the levels it has — see [Effort](#effort). No argument opens a picker of them; `default` leaves it to the model. Kept per model, shown next to the model's name in the status bar. Given while the model works, it applies when the turn ends |
 | `/advisor [MODEL\|off]`, `/advisor guidance [LEVEL]`, `/advisor effort [LEVEL]`, `/advisor window MINUTES\|off`, `/advisor ctx N\|auto` (given while the model works: `ctx` applies at the next consultation, `guidance` and `window` when the turn ends) | a stronger model the agent may consult when the work is hard — see [The advisor](#the-advisor). No argument opens a picker of the installed models (a cloud or hosted model is set by name: `/advisor gpt-oss:120b-cloud`, `/advisor anthropic:claude-opus-5`). `guidance` says how much the agent leans on it (`light`, `normal`, `strong`, `max`), `effort` how hard it thinks |
 | `/subagent [MODEL\|default]`, `/subagent effort [LEVEL\|default]` | the model the sub-agents (`task`) run on. Default: the model doing the work. Another one is checked with its server first (a local model, Ollama's cloud, or a hosted `anthropic:`/`xai:`/`openai:` model) and then kept in the config as `subagent=`. `effort` sets how hard that model thinks, in its own levels (kept per model, as `/effort` does; the same model as the one doing the work shares its effort). Given with a model, it waits for the turn to end, like `/model`. See [Sub-agents](#sub-agents) |
-| `/permissions [add …\|remove N\|clear]` | the project's saved "always allow" rules (kept in the config directory, `permissions/`, keyed by the project's path — a file in the project itself is never read) |
+| `/permissions [add …\|remove N\|clear]` | the project's saved rules: "always allow" ones, and the guard rules `deny` and `ask` (see [Guard rules](#guard-rules-deny-and-ask)). Kept in the config directory, `permissions/`, keyed by the project's path — a file in the project itself is never read |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
 | `/ui [ansi\|notcurses]` | the screen; restarts into this session |
@@ -250,6 +250,39 @@ corbienest runs in a tmux pane like in any terminal, and nothing has to be confi
 
 Cycle with **Shift+Tab** at the prompt, or set one with `/mode NAME`, `--mode NAME`
 (`--yolo` = `--mode auto`). The mode is saved to the config file.
+
+### Guard rules: deny and ask
+
+Besides the allow rules, a project can have **guard rules** that stop or ask about what the model
+does, whatever the mode. They are `/permissions add deny|ask TOOL PATTERN`:
+
+```
+/permissions add deny bash rm *            never run an rm, in any form
+/permissions add deny edit .env            never write the .env file
+/permissions add deny edit *.pem           no key files
+/permissions add ask bash git push*        ask before every push, even under --yolo
+/permissions add deny fetch *.evil.com     no pages from that domain
+```
+
+- **TOOL** is `bash`, `edit` (write_file and edit_file) or `fetch` (web_fetch and web_search).
+- **PATTERN** is a glob: `*` (and `**`) matches any text, a `/` included, `?` one character. It has to
+  match the whole thing. For `edit` it is matched against the path (`~` expanded, `..` resolved,
+  the project's own directory and any `./` taken off, so `src/../.env` is `.env`). For `fetch` a
+  pattern without a `/` is matched against the host, one with a `/` against the whole URL. `web_search` is a fetch of the search engine's URL, so a `deny fetch` on the engine's host also stops searches.
+- **bash** patterns are matched against the whole command and against each part of it: split at
+  `;`, `|`, `&` and newlines, with a leading `NAME=value` and a path in front of the program
+  dropped, so `cd x && rm -rf y` and `/bin/rm f` both match `rm *`. A command with a `$(…)` or a
+  backquote that no pattern matches is **asked** about, since what is inside cannot be read.
+- **deny** stops the tool in every mode, `--yolo` included, and the model is told why and not to
+  retry a variant. **ask** prompts in every mode; its prompt has "yes, this once" and no "don't ask
+  again", since a saved allow would never take effect against it. Run without a terminal (`-p`, a
+  pipe), an ask is refused.
+- **Precedence**: deny beats ask beats allow. The shell commands you type yourself with `!` are not
+  checked: the rules guard the model.
+- These are guardrails, not a sandbox: a command the rules do not name still runs with your
+  permissions. A sandbox for `bash` is on the list.
+- The rules are in the same per-project file as the allow rules; `/permissions` lists them as
+  "deny bash matching …" and "ask bash matching …", and `remove N` works on them too.
 
 ## Tools the model can call
 
