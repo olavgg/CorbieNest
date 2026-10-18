@@ -9,7 +9,7 @@ consultation is one user string, and a Messages request with tools (or any other
 shape) is the model that does the work, scripted the same way and streamed as SSE
 when asked. Run standalone: python3 fake_ollama.py PORT
 """
-import json, re, ssl, sys, threading, time
+import gzip, json, re, ssl, sys, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 MODELS = [
@@ -501,7 +501,8 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass   # the client gave up waiting (Esc, a queued message)
     def _provider(self):
-        m = re.match(r"^/(xai|openai|anthropic|kimi)/v1(/.*)$", self.path) or re.match(r"^/(deepseek)(/chat/completions)$", self.path)
+        path = self.path.replace("/nogzip", "", 1)   # /nogzip/ is a host that refuses gzipped bodies: the same API otherwise
+        m = re.match(r"^/(xai|openai|anthropic|kimi)/v1(/.*)$", path) or re.match(r"^/(deepseek)(/chat/completions)$", path)
         return (m.group(1), m.group(2)) if m else (None, None)
     def _provider_auth(self, prov):
         """None if the request may go on, else the error already sent"""
@@ -640,6 +641,12 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(n) or b"{}"
+        if self.headers.get("Content-Encoding", "").lower() == "gzip":
+            if "/nogzip" in self.path:   # a server that cannot read a gzipped body says so (what the probe must see as a refusal)
+                PROVIDER_LOG.append({"provider": self._provider()[0], "path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": None, "refused": True})
+                return self._json(415, {"type": "error", "error": {"type": "invalid_request_error", "message": "Unsupported Content-Encoding: gzip"}})
+            try: raw = gzip.decompress(raw)
+            except OSError: return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "The request body is not valid gzip"}})
         try: raw.decode("utf-8")
         except UnicodeDecodeError: return self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "The request body is not valid JSON: invalid unicode code point"}})
         req = json.loads(raw)

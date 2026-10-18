@@ -1026,6 +1026,28 @@ of models behind one such API:
   why in the suggestions, as the built-in ones do. A host's OpenAI-specific request fields are
   not verified against every server: a server that refuses one shows its error in the turn.
 
+### Gzipped request bodies (`/gzip`)
+
+A request body of 4 KB or more can be sent gzipped (`Content-Encoding: gzip`) to a provider that
+takes it. Nothing is gzipped until the provider has been checked:
+
+```
+/gzip                       the list: which providers are on, and whether they are probed
+/gzip probe anthropic claude-haiku-5-5   two calls of one token each, plain and gzipped
+/gzip anthropic on          set by hand (saved); /gzip anthropic off turns it off
+```
+
+- `/gzip probe` decides from the answers: accepted (both calls succeed) turns it on, and a refusal
+  of the gzipped body (415, or a 400 that names the encoding or the JSON) turns it off. Other
+  answers (a bad key, a server error) save nothing.
+- A refusal of a real call is answered at once with the plain body, and that provider stays plain
+  for the rest of the session (the config is not changed; `/gzip` changes it).
+- Ollama is never gzipped: it is the local server, and its API takes plain bodies.
+- Needs zlib: `make` builds with it when `zlib.h` and `-lz` are there (`ZLIB=auto`); `ZLIB=0`
+  leaves it out and nothing is compressed.
+- Probed so far: Anthropic (accepted, 2026-10-17). xAI, OpenAI, DeepSeek, Kimi and added hosts
+  are not probed: each needs its key in the environment, then `/gzip probe NAME MODEL`.
+
 ## Goals
 
 `/goal "METRIC" [min|max] [-n ROUNDS] [-k CANDIDATES] [-m MODEL,…] GOAL` races candidates at a

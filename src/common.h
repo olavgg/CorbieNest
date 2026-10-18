@@ -784,9 +784,9 @@ void price_set(const char *model, double in, double out);   /* in < 0 = forget i
  * stop thinking, qwen3.8 has off/low/medium/high, most others are on or off. "off" and "on" are
  * the booleans; anything else is a level name, sent as it is. No entry = leave it to the model. */
 const char *effort_get(const char *model);                     /* NULL = nothing saved for it */
+/* gzip request bodies (zlib, WITH_ZLIB; ZLIB=0 leaves it out, and then gzip_available() is false) */
 /* standard base64 (RFC 4648, with padding) of n bytes: a new NUL-terminated string. Used for OSC 52 (the clipboard). */
 char *base64_encode(const char *in, size_t n);
-/* gzip request bodies (zlib, WITH_ZLIB; ZLIB=0 leaves it out, and then gzip_available() is false) */
 bool  gzip_available(void);
 char *gzip_body(const char *in, size_t n, size_t *out_n);   /* the gzip of in (a new buffer, not NUL-terminated), NULL if it cannot */
 bool  gzip_refused(int status, const char *answer);          /* the server could not take a gzipped body: 415, or a 400 that says so */

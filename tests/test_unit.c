@@ -1503,6 +1503,68 @@ static void test_base64(void) {
     a = base64_encode("a\0", 2);     CHECK_STR(a, "YQA="); free(a);
 }
 
+#ifdef WITH_ZLIB
+#include <zlib.h>
+/* the gzip of a body is a gzip stream (RFC 1952: the magic, deflate) that inflates back to the same bytes */
+static void test_gzip_round_trip(void) {
+    const char *plain = "{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+    size_t n = strlen(plain), zn = 0;
+    char *z = gzip_body(plain, n, &zn);
+    CHECK(z && zn > 10 && (unsigned char)z[0] == 0x1f && (unsigned char)z[1] == 0x8b && z[2] == 8);
+    /* a body that is all NULs and high bytes: the length is what travels, not a string */
+    char raw[300]; for (int i = 0; i < 300; i++) raw[i] = (char)(i % 7 == 0 ? 0 : (i * 37) & 0xff);
+    size_t zr = 0; char *zrz = gzip_body(raw, sizeof raw, &zr);
+    CHECK(zrz && zr > 0);
+    z_stream d; memset(&d, 0, sizeof d);
+    CHECK(inflateInit2(&d, 15 + 16) == Z_OK);
+    unsigned char back[400]; d.next_in = (Bytef *)zrz; d.avail_in = (uInt)zr; d.next_out = back; d.avail_out = sizeof back;
+    CHECK(inflate(&d, Z_FINISH) == Z_STREAM_END && d.total_out == sizeof raw && !memcmp(back, raw, sizeof raw));
+    inflateEnd(&d);
+    free(zrz);
+    if (z) {
+        z_stream e; memset(&e, 0, sizeof e);
+        CHECK(inflateInit2(&e, 15 + 16) == Z_OK);
+        unsigned char out[200]; e.next_in = (Bytef *)z; e.avail_in = (uInt)zn; e.next_out = out; e.avail_out = sizeof out;
+        CHECK(inflate(&e, Z_FINISH) == Z_STREAM_END && e.total_out == n && !memcmp(out, plain, n));
+        inflateEnd(&e);
+    }
+    free(z);
+    CHECK(gzip_available());
+}
+#else
+static void test_gzip_round_trip(void) { CHECK(!gzip_available()); CHECK(gzip_body("x", 1, &(size_t){0}) == NULL); }
+#endif
+
+/* which answers mean the server cannot take a gzipped body, and what the probe concludes from two answers */
+static void test_gzip_judge(void) {
+    CHECK(gzip_refused(415, NULL));
+    CHECK(gzip_refused(400, "{\"error\":{\"message\":\"Unsupported Content-Encoding: gzip\"}}"));
+    CHECK(gzip_refused(400, "The request body is not valid JSON"));
+    CHECK(!gzip_refused(400, "model: claude-x was not found"));          /* a plain 400: not about the encoding */
+    CHECK(!gzip_refused(400, "max_tokens is too large"));
+    CHECK(!gzip_refused(500, "Content-Encoding: gzip"));                  /* a server error is not a refusal */
+    CHECK(!gzip_refused(200, NULL) && !gzip_refused(401, "invalid api key"));
+    CHECK(gzip_probe_verdict(200, 200, "{}") == 1);                        /* both fine: gzip works */
+    CHECK(gzip_probe_verdict(200, 415, "") == 0);                          /* refused: off */
+    CHECK(gzip_probe_verdict(200, 400, "unsupported encoding") == 0);
+    CHECK(gzip_probe_verdict(200, 500, "") == -1);                         /* the gzipped call failed another way: no conclusion */
+    CHECK(gzip_probe_verdict(401, 200, "") == -1);                         /* the plain call failed: nothing to compare with */
+    CHECK(gzip_probe_verdict(401, 415, "") == -1);
+}
+
+/* the saved setting: round trip through the config's own lines, and a re-set replaces the entry */
+static void test_gzip_setting(void) {
+    bool on = true;
+    CHECK(!gzip_get("zz-unset", &on));
+    gzip_set("zz-host", true);
+    CHECK(gzip_get("zz-host", &on) && on);
+    gzip_set("zz-host", false);
+    CHECK(gzip_get("zz-host", &on) && !on);
+    CHECK(g_cfg.n_gzips >= 1);
+    int count = 0; for (int i = 0; i < g_cfg.n_gzips; i++) if (!strcmp(g_cfg.gzips[i].name, "zz-host")) count++;
+    CHECK(count == 1);   /* one entry per provider */
+}
+
 /* the hosts a user adds (/model add): the rules, the lookup by prefix, replacing and removing */
 static void test_hosts(void) {
     char err[200] = "";
@@ -2141,7 +2203,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
+        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

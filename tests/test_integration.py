@@ -237,6 +237,7 @@ def run_rounds(model, args):
 def preqs(): return json.loads(urllib.request.urlopen(f"{HOST}/_provider_requests").read())
 
 def last_preq(prov): return [r for r in preqs() if r["provider"] == prov][-1]
+def gzipped(r): return (r.get("headers") or {}).get("content-encoding") == "gzip"   # the request went with Content-Encoding: gzip
 
 def key_nowhere():
     """the key is never written anywhere: not the config, not a session, not the history"""
@@ -1660,6 +1661,54 @@ s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVH); s.expect("Ctrl-D t
 s.send("/model remove fakehost\r"); check(s.expect("removed host fakehost"), "/model remove takes the host out")
 s.close()
 check("host." not in open(HOSTCFG).read(), "and the config no longer has it")
+
+print("test interactive: /gzip probe: accepted turns gzip on, refused turns it off, and the config keeps it")
+CFG_Z = tempfile.mkdtemp(prefix="crowcfgz_"); os.makedirs(os.path.join(CFG_Z, "corbienest"))
+ZCFG = os.path.join(CFG_Z, "corbienest", "config")
+open(ZCFG, "w").write("memory=0\nmemory_idle=0\n")
+ENVZ = dict(ENVK, XDG_CONFIG_HOME=CFG_Z, FAKEHOST_KEY="test-key")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVZ); s.expect("Ctrl-D to quit")
+s.send(f"/model add zhost {HOST}/openai/v1 FAKEHOST_KEY\r"); check(s.expect("✓ host zhost"), "a host to probe")
+s.send(f"/model add znog {HOST}/nogzip/openai/v1 FAKEHOST_KEY\r"); check(s.expect("✓ host znog"), "a host that refuses gzip")
+s.send("/gzip probe zhost gpt-fake\r"); check(s.expect("gzip on for zhost, saved"), "a host that takes gzip is probed on")
+s.send("/gzip probe znog gpt-fake\r"); check(s.expect("gzip off for znog, saved"), "a host that refuses gzip is probed off")
+s.send("/gzip\r"); check(s.expect("zhost") and s.expect("on"), "/gzip lists the state")
+s.close()
+cfgz = open(ZCFG).read()
+check("gzip.zhost=1" in cfgz and "gzip.znog=0" in cfgz, "the config keeps both settings")
+check(any(gzipped(r) for r in preqs() if r["provider"] == "openai"), "the probe went to the host, once gzipped")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVZ); s.expect("Ctrl-D to quit")
+s.send("/gzip zhost off\r"); check(s.expect("gzip off for zhost, saved"), "/gzip NAME off saves")
+s.send("/gzip znog on\r"); check(s.expect("gzip on for znog, saved"), "/gzip NAME on saves")
+s.close()
+check("gzip.zhost=0" in open(ZCFG).read() and "gzip.znog=1" in open(ZCFG).read(), "and the next start has them")
+
+print("test interactive: a gzipped advisor call is sent gzipped; a refusal is sent again plain, once")
+CFG_G = tempfile.mkdtemp(prefix="crowcfgg_"); os.makedirs(os.path.join(CFG_G, "corbienest"))
+GCFG = os.path.join(CFG_G, "corbienest", "config")
+open(GCFG, "w").write(f"memory=0\nmemory_idle=0\ngzip.gzhost=1\nhost.gzhost={HOST}/openai/v1|FAKEHOST_KEY\ngzip.gznog=1\nhost.gznog={HOST}/nogzip/openai/v1|FAKEHOST_KEY\n")
+ENVG = dict(ENVK, XDG_CONFIG_HOME=CFG_G, FAKEHOST_KEY="test-key")
+big = "TOOL_ADVISOR please " + ("padding " * 700)   # over 4 KB: the gzip threshold
+n0 = len(preqs())
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "gzhost:gpt-fake", "--yolo", "-p", big], env=ENVG)
+got = [r for r in preqs()[n0:] if r["provider"] == "openai"]
+check(rc == 0 and got and gzipped(got[-1]), "a big advisor body to a host that takes gzip goes gzipped")
+n0 = len(preqs())
+out, rc = run(["-m", "fake-coder:latest", "--advisor", "gznog:gpt-fake", "--yolo", "-p", big], env=ENVG)
+got = [r for r in preqs()[n0:] if r["provider"] == "openai"]
+check(rc == 0 and "Tool said: ADVICE" in out, "the refused gzipped call is answered (sent again plain)")
+check(len(got) == 2 and got[0].get("refused") and not got[1].get("refused") and gzipped(got[0]) and not gzipped(got[1]), f"the refusal is followed by one plain call: {[(bool(g.get('refused')), gzipped(g)) for g in got]}")
+check("does not take gzipped request bodies" in out, "and it says so once")
+check("gzip.gznog=1" in open(GCFG).read(), "the config is not written by a request: the setting stays until /gzip")
+
+print("test interactive: a streamed turn refused as gzip is sent again plain")
+CFG_A = tempfile.mkdtemp(prefix="crowcfga_"); os.makedirs(os.path.join(CFG_A, "corbienest"))
+open(os.path.join(CFG_A, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\ngzip.anthropic=1\n")
+ENVA = dict(ENVK, XDG_CONFIG_HOME=CFG_A, ANTHROPIC_API_KEY="test-key", ANTHROPIC_BASE_URL=f"{HOST}/nogzip/anthropic")
+n0 = len(preqs())
+out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "-p", "Say hello. " + ("padding " * 700)], env=ENVA)
+got = [r for r in preqs()[n0:] if r["provider"] == "anthropic"]
+check(rc == 0 and len(got) == 2 and got[0].get("refused") and not got[1].get("refused") and gzipped(got[0]) and not gzipped(got[1]), f"the streamed turn: refused, then plain: {[(bool(g.get('refused')), gzipped(g)) for g in got]}")
 
 print("test interactive: /advisor")
 s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2); s.expect("Ctrl-D to quit")
