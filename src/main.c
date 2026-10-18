@@ -3086,7 +3086,7 @@ static bool run_turn(void) {
 }
 static bool run_turn_body(void) {
     g_turn_failed = false;
-    if (!model_set()) {   /* no model yet: say why, and take the message back out of the conversation */
+    if (!model_set() || g_model_bad) {   /* no model yet, or the configured one cannot be used: say why, and take the message back out of the conversation */
         g_turn_failed = true;
         printf(C_YELLOW "%s" C_RESET "\n", g_model_err);
         size_t n = cJSON_GetArraySize(g_messages);
@@ -6274,7 +6274,10 @@ int main(int argc, char **argv) {
         if (quiet_caps) { fprintf(stderr, "corbienest: %s\n", g_model_err); term_restore(); return 1; }
         g_cfg.model = xstrdup("");
     }
-    if (g_model_bad) { fprintf(stderr, "corbienest: %s\n", g_model_err); term_restore(); return 1; }
+    /* a configured model that cannot be used (its key is not set, the provider refused it) stops a one-shot run only:
+     * at a screen the program starts with the model as the config has it, says why, sends nothing (run_turn_body) and
+     * /model switches to another one. The configured name stays, so a later config save does not lose it */
+    if (g_model_bad && quiet_caps) { fprintf(stderr, "corbienest: %s\n", g_model_err); term_restore(); return 1; }
     if (cli_effort) {   /* only now is it known what the model offers */
         if (!strcmp(cli_effort, "default")) effort_set(g_cfg.model, NULL);
         else if (!effort_resolve(&g_model_info, cli_effort, NULL)) {
@@ -6295,6 +6298,7 @@ int main(int argc, char **argv) {
         return run_benchmark(bench_runs, oneshot, ctx_given, json_out, json_fd);
     }
     if (g_cfg.interactive && !oneshot) term_fullscreen(true);   /* alternate screen + bottom status bar */
+    if (g_model_bad) printf(C_YELLOW "%s" C_RESET "\n", g_model_err);   /* (only a screen gets here with one: the reason, where the conversation starts) */
     if (resume_latest) {
         int n; session_info *v = sessions_list(true, &n);
         if (n) session_load(v[0].id); else printf(C_DIM "no earlier session in this directory — starting fresh" C_RESET "\n");
