@@ -160,12 +160,14 @@ class Session:
     def text(self): return clean(self.out.decode("utf-8", "replace"))
     def close(self):
         """Kill it and wait: a session that is still exiting writes the config one last time,
-        and a test that writes its own config next would lose it to that write."""
+        and a test that writes its own config next would lose it to that write. The pty is closed
+        first: on macOS a process that exits with output still queued on its terminal waits for the
+        terminal to drain, which nobody reads any more, so waiting on it first hangs the suite."""
+        try: os.close(self.fd)
+        except Exception: pass
         try: os.kill(self.pid, 9)
         except Exception: pass
         try: os.waitpid(self.pid, 0)
-        except Exception: pass
-        try: os.close(self.fd)
         except Exception: pass
 
 def since_send(sess): return clean(sess.out[sess.mark:].decode("utf-8", "replace"))
