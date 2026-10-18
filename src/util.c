@@ -19,6 +19,9 @@
 #endif
 
 config_t g_cfg;
+/* The mode the config file keeps. It is what /mode saves and what the file says: a mode a session has for its run only
+ * (--yolo, --mode, Shift+Tab, /yolo) is live in g_cfg.mode and never written, so a later save does not keep it. */
+static int g_mode_saved = MODE_MANUAL;
 session_stats g_session;
 
 void *xmalloc(size_t n) { void *p = malloc(n ? n : 1); if (!p) die("out of memory"); return p; }
@@ -437,8 +440,8 @@ void config_load(void) {
             if (theme_set(v)) { free(g_cfg.theme); g_cfg.theme = xstrdup(v); }
             else fprintf(stderr, "corbienest: no theme named \"%s\" in the config: the default is used\n", v);
         }
-        else if (!strcmp(k, "yolo")) { if (atoi(v)) g_cfg.mode = MODE_AUTO; }
-        else if (!strcmp(k, "mode")) { int m = mode_parse(v); if (m >= 0) g_cfg.mode = m; }
+        else if (!strcmp(k, "yolo")) { if (atoi(v)) { g_cfg.mode = MODE_AUTO; g_mode_saved = MODE_AUTO; } }
+        else if (!strcmp(k, "mode")) { int m = mode_parse(v); if (m >= 0) { g_cfg.mode = m; g_mode_saved = m; } }
         else if (!strcmp(k, "memory")) g_cfg.memory = atoi(v) != 0;
         else if (!strcmp(k, "web")) g_cfg.web = atoi(v) != 0;
         else if (!strcmp(k, "sandbox")) g_cfg.sandbox = !strcmp(v, "bwrap") || atoi(v) != 0;
@@ -458,6 +461,8 @@ void config_load(void) {
  * (or writing it) at that moment — so it is built in memory and swapped in in one step. This
  * makes a torn or truncated config impossible; it does not merge two sessions' settings, and
  * is not meant to: whoever saved last is what the next session starts with. */
+void config_set_mode(int mode) { g_cfg.mode = mode; g_mode_saved = mode; }
+
 void config_save(void) {
     char path[1200];
     snprintf(path, sizeof path, "%s/config", config_dir());
@@ -481,7 +486,7 @@ void config_save(void) {
     if (g_cfg.advisor_window != ADVISOR_WINDOW_DEFAULT) sb_printf(&b, "advisor_window=%g\n", g_cfg.advisor_window / 60.0);   /* in minutes, as it is typed */
     if (g_cfg.advisor_guidance != GUIDANCE_NORMAL) sb_printf(&b, "advisor_guidance=%s\n", advisor_guidance()->name);
     sb_printf(&b, "show_thinking=%d\n", g_cfg.show_thinking ? 1 : 0);
-    sb_printf(&b, "mode=%s\n", mode_name(g_cfg.mode));
+    sb_printf(&b, "mode=%s\n", mode_name(g_mode_saved));
     sb_printf(&b, "max_iters=%d\n", g_cfg.max_iters);
     sb_printf(&b, "memory=%d\n", g_cfg.memory ? 1 : 0);
     sb_printf(&b, "web=%d\n", g_cfg.web ? 1 : 0);

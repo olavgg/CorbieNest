@@ -5195,7 +5195,7 @@ static int handle_slash(char *line) {
         } else {
             int m = mode_parse(arg);
             if (m < 0) printf(C_RED "unknown mode '%s'" C_RESET " — use manual, accept-edits, plan or auto\n", arg);
-            else { g_cfg.mode = m; config_save(); printf("%s✓ mode: %s" C_RESET "\n", m == MODE_AUTO ? C_RED : C_GREEN, mode_label(m)); }
+            else { config_set_mode(m); config_save(); printf("%s✓ mode: %s" C_RESET "\n", m == MODE_AUTO ? C_RED : C_GREEN, mode_label(m)); }
         }
     }
     else if (!strcmp(cmd, "/tools")) {
