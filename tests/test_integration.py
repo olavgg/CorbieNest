@@ -946,6 +946,23 @@ sub = [r for r in requests() if r["messages"][0]["role"] == "system" and "You ar
 check(sub and all(t["function"]["name"] in ("read_file", "list_dir", "grep", "bash", "web_fetch", "web_search") for t in sub[-1]["tools"]), "sub-agent got read-only tools only")
 check(sub and sum(t["function"]["name"] in ("web_fetch", "web_search") for t in sub[-1]["tools"]) == 2, "sub-agent can look documentation up")
 check("hay.txt" in sub[-1]["messages"][-1]["content"], "grep ran for real inside the sub-agent")
+print("test interactive: /parallel on runs the task calls of one reply at the same time")
+s.send("/parallel\r"); check(s.expect("parallel: off"), "/parallel alone says it is off by default")
+s.send("/parallel on\r"); check(s.expect("parallel = on") and "parallel=on" in open(CFG2_FILE).read(), "/parallel on, saved")
+urllib.request.urlopen(f"{HOST}/_inflight").read()
+s.send("TOOL_TASKS\r")
+check(s.expect("⤷ sub-agent alpha") and s.expect("⤷ sub-agent beta"), "both sub-agents start")
+check(s.expect("Both reports are in.", 30), f"the model gets both results and answers: {since_send(s)[-300:]!r}")
+most = json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"]
+check(most == 2, f"their model calls were under way at the same time: {most}")
+tool_msgs = [m for m in requests()[-1]["messages"] if m["role"] == "tool"]
+check([m["content"] for m in tool_msgs[-2:]] == ["REPORT PAUSE alpha", "REPORT PAUSE beta"], f"the results come back in the order the model asked: {[m['content'][:30] for m in tool_msgs[-2:]]}")
+s.send("/parallel off\r"); check(s.expect("parallel = off"), "/parallel off")
+urllib.request.urlopen(f"{HOST}/_inflight").read()
+s.send("TOOL_TASKS\r"); check(s.expect("Both reports are in.", 40), "off: the same reply runs the sub-agents one after another")
+check(json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"] == 0, "off: no sub-agent call went out unstreamed (the batch was not used)")
+tool_msgs = [m for m in requests()[-1]["messages"] if m["role"] == "tool"]
+check([m["content"] for m in tool_msgs[-2:]] == ["REPORT PAUSE alpha", "REPORT PAUSE beta"], "off: the results are in the same order")
 print("test interactive: ← on an empty line lists the sub-agents; the one picked shows its log")
 s.send("\x1b[D"); check(s.expect("sub-agents"), "← on an empty line opens the sub-agents list")
 check(s.expect("find the needle") and s.expect("done · 2 rounds"), "the run is listed with its state and rounds")

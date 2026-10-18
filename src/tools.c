@@ -324,6 +324,7 @@ static bool path_in_root(const char *p) {
     size_t n = strlen(root);
     return !strncmp(full, root, n) && (full[n] == '/' || full[n] == 0);
 }
+static bool g_in_subagent = false;   /* a sub-agent's calls are running (t_task, or a batch of them) */
 void tools_checkpoint_step(int step) { g_ckpt_step = step; }
 static void ckpt_free(ckpt_t *c) { free(c->path); free(c->content); g_ckpt_bytes -= c->len; }
 void tools_checkpoint_clear(void) { for (int i = 0; i < g_ckpt_n; i++) ckpt_free(&g_ckpt[i]); g_ckpt_n = 0; }
@@ -990,7 +991,6 @@ typedef struct { char id[16]; pid_t pid; char *cmd, *file; off_t off; bool done,
 static bg_job g_bg[BG_MAX];
 static volatile pid_t g_bg_pgid[BG_MAX];   /* the groups still running, for the signal handler (async-signal-safe reads) */
 static int g_bg_next = 1;
-static bool g_in_subagent = false;
 
 static void bg_reap(bg_job *j) {
     if (!j->cmd || j->done || j->pid <= 0) return;
@@ -1473,6 +1473,8 @@ static tool_status t_web_search(cJSON *args, sbuf *out) {
 }
 
 /* ---------- task (sub-agent) ---------- */
+/* the sub-agent flag of t_task, set for a batch of sub-agents that the turn loop runs (main.c) */
+void tools_in_subagent(bool on) { g_in_subagent = on; }
 tools_subagent_fn tools_subagent = NULL;
 static tool_status t_task(cJSON *args, sbuf *out) {
     const char *desc = jstr(args, "description", "sub-agent");

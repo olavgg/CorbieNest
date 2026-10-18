@@ -281,6 +281,14 @@ def script(model, messages, req):
     if messages[0]["role"] == "system" and "You are a sub-agent" in messages[0]["content"]:
         # sub-agent: one grep round, then a report — or, for a SLEEP task, one slow command,
         # so a test can type a message while the sub-agent is in the middle of a round
+        if "PAUSE" in messages[1]["content"]:   # a sub-agent of a /parallel batch: its report names its task ("PAUSE alpha: ..." -> "REPORT PAUSE alpha")
+            if last["role"] == "tool":
+                yield chunk(model, "REPORT " + messages[1]["content"].split(":")[0][:40])
+                yield chunk(model, done=True)
+                return
+            yield chunk(model, tool_calls=[{"function": {"name": "grep", "arguments": {"pattern": "needle", "path": "."}}}])
+            yield chunk(model, done=True)
+            return
         if "SLEEP" in messages[1]["content"] and last["role"] != "tool":
             yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "sleep 2; echo sub-slept"}}}])
             yield chunk(model, done=True)
@@ -320,6 +328,14 @@ def script(model, messages, req):
         results = [m for m in messages if m["role"] == "tool"]
         if len(results) >= 4 or any(m.get("tool_name") == "advisor" for m in results): yield chunk(model, "Looked at it %d times." % len(results))
         else: yield chunk(model, tool_calls=[{"function": {"name": "list_dir", "arguments": {"path": "."}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_TASKS" in text:   # two task calls in one reply: /parallel on runs them at the same time
+        if last["role"] == "tool": yield chunk(model, "Both reports are in.")
+        else:
+            yield chunk(model, tool_calls=[
+                {"function": {"name": "task", "arguments": {"description": "alpha", "prompt": "PAUSE alpha: find the needle"}}},
+                {"function": {"name": "task", "arguments": {"description": "beta", "prompt": "PAUSE beta: find the needle"}}}])
         yield chunk(model, done=True)
         return
     if last["role"] == "tool":
@@ -692,6 +708,8 @@ class H(BaseHTTPRequestHandler):
                 INFLIGHT["now"] += 1; INFLIGHT["max"] = max(INFLIGHT["max"], INFLIGHT["now"])
             try:
                 whole = {"model": model, "message": {"role": "assistant", "content": ""}, "done": True}
+                if any("PAUSE" in (m.get("content") or "") for m in msgs if m["role"] == "user"):
+                    time.sleep(1.2)   # slow enough that two such calls are under way together (/_inflight counts them)
                 for c in gen:
                     if c == "ERR": return self._json(500, {"error": "boom from fake"})
                     d = json.loads(c); m = d.get("message", {})

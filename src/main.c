@@ -59,6 +59,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/goal", "candidates in git worktrees, on one or more models, race to a metric: the best score is kept" },
     { "/btw", "a side question: answered from the conversation, and not kept in it" },
     { "/workers", "how many tasks of /orchestrate may run at the same time" },
+    { "/parallel", "task calls in one reply run as sub-agents at the same time: on or off (off by default)" },
     { "/mode", "permission mode: manual, accept-edits, plan, auto" },
     { "/yolo", "auto mode on or off: every tool call approved" },
     { "/tools", "tool calling on or off" },
@@ -625,6 +626,7 @@ static void cmd_memory(const char *arg) {
 #define SESSIONS_KEEP 100
 static void print_result_preview(const char *text, int lines);
 static void print_result_folded(const char *text, int preview_lines, const char *lead);
+static void stream_flush(void);
 static void print_task_lines(const char *text);
 static void echo_queued(const char *text);
 static void tool_arg_summary(const char *name, cJSON *args, char *out, size_t n);
@@ -2037,13 +2039,15 @@ static void agents_menu(void) {
 static int run_subagent_as(const char *description, const char *prompt, const agent_t *ag, const char *model, sbuf *out);
 /* task: a general sub-agent, or the one a file names (agents.c): its tools and role, and its model when it names one. The
  * model is a parameter of the run, not a setting: /subagent and the config are not touched. */
-static int run_subagent(const char *description, const char *prompt, const char *agent_name, sbuf *out) {
+/* the agent a task names (none: a general sub-agent): 0 when it may run, else 1 with what went wrong in out */
+static int subagent_resolve(const char *agent_name, const agent_t **ag_out, sbuf *out) {
     const agent_t *ag = NULL;
+    *ag_out = NULL;
     if (agent_name && *agent_name) {
         ag = agent_find(agent_name);
         if (!ag) {
             sb_printf(out, "error: no sub-agent named %s. The ones defined for this project:", agent_name);
-            for (int i = 0; i < agents_count(); i++) sb_printf(out, " %s", agent_get(i)->name);
+            for (int k = 0; k < agents_count(); k++) sb_printf(out, " %s", agent_get(k)->name);
             if (!agents_count()) sb_puts(out, " none");
             sb_puts(out, ". Start one of these, or do the task yourself.");
             return 1;
@@ -2053,8 +2057,77 @@ static int run_subagent(const char *description, const char *prompt, const char 
             return 1;
         }
     }
+    *ag_out = ag;
+    return 0;
+}
+static int run_subagent(const char *description, const char *prompt, const char *agent_name, sbuf *out) {
+    const agent_t *ag = NULL;
+    if (subagent_resolve(agent_name, &ag, out)) return 1;
     return run_subagent_as(description, prompt, ag, ag ? agent_model_override(ag) : NULL, out);
 }
+/* the tool calls of one sub-agent reply, run on this thread; each result is appended to msgs in the order asked.
+ * quiet: print nothing (a batch of sub-agents runs at once and prints its results when it ends). */
+static void subagent_calls(subagent_rec *rec, cJSON *msgs, cJSON *calls, bool quiet) {
+    cJSON *call;
+    cJSON_ArrayForEach(call, calls) {
+        cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
+        cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+        cJSON *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+        const char *name = cJSON_IsString(nm) ? nm->valuestring : "?";
+        cJSON *parsed = NULL;
+        if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
+        char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
+        if (!quiet) printf("    " C_DIM "⎿ %s%s%s%s" C_RESET "\n", name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
+        agent_say(rec, "› "); agent_say(rec, name); agent_say(rec, summ[0] ? "(" : ""); agent_say(rec, summ); agent_say(rec, summ[0] ? ")\n" : "\n");
+        char act[200]; snprintf(act, sizeof act, "%s%s%s%s", name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
+        agent_act(rec, act);
+        sbuf o; sb_init(&o);
+        g_session.tool_calls++;
+        tool_status ts;
+        if (!strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "task")) { sb_printf(&o, "error: %s is not available to a sub-agent (read-only)", name); ts = TOOL_ERROR; }
+        else if (!strcmp(name, "advisor")) { sb_puts(&o, "error: the advisor is not available to a sub-agent (it would be shown the wrong conversation); report what you found"); ts = TOOL_ERROR; }
+        else ts = tools_execute(name, args, &o);
+        (void)ts;
+        agent_say_result(rec, o.data);
+        cJSON_AddItemToArray(msgs, tool_result_message(name, tool_call_id(call), o.data ? o.data : ""));
+        sb_free(&o);
+        if (parsed) cJSON_Delete(parsed);
+    }
+}
+
+/* a sub-agent's conversation (its system prompt and the task) and the tools it may call: the same for a run on its own
+ * and for a run of several at once. *sp_bytes_out is the size of the system prompt in it, which the window is kept inside. */
+static void subagent_setup(const agent_t *ag, const char *prompt, cJSON **msgs_out, cJSON **tools_out, size_t *sp_bytes_out) {
+    cJSON *msgs = cJSON_CreateArray();
+    cJSON *sys = cJSON_CreateObject();
+    cJSON_AddStringToObject(sys, "role", "system");
+    sbuf sp; sb_init(&sp);
+    sb_printf(&sp, "You are a sub-agent of Corbie Nest (corbienest), a terminal coding agent. The main agent delegated one self-contained task to you.\n"
+                   "Working directory: %s\n"
+                   "You have read-only tools: read_file, list_dir, grep, bash (for read-only shell commands such as git log, find, wc; do not modify files, do not run interactive programs)%s. "
+                   "Batch independent calls: when you need several reads, searches or fetches that do not depend on each other's results, request them all in one reply rather than one per turn. "
+                   "Do the research thoroughly, then finish with ONE final message: a clear, complete report with concrete file paths, line numbers and code snippets where useful — "
+                   "the main agent sees only that final message, nothing else you did. Do not ask questions; make reasonable assumptions and state them.",
+                   g_cwd, g_cfg.web ? " and web_search/web_fetch for the documentation of external projects" : "");
+    if (ag) sb_printf(&sp, "\n\nYour role (from %s):\n%s", ag->path, ag->body);
+    if (g_project_instructions) sb_puts(&sp, g_project_instructions);
+    *sp_bytes_out = sp.len;
+    cJSON_AddStringToObject(sys, "content", sp.data); sb_free(&sp);
+    cJSON_AddItemToArray(msgs, sys);
+    cJSON *u = cJSON_CreateObject(); cJSON_AddStringToObject(u, "role", "user"); cJSON_AddStringToObject(u, "content", prompt);
+    cJSON_AddItemToArray(msgs, u);
+    cJSON *tools = cJSON_CreateArray(), *t;
+    cJSON_ArrayForEach(t, g_tools) {
+        cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
+        cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+        const char *name = cJSON_IsString(nm) ? nm->valuestring : "";
+        if ((!strcmp(name, "read_file") || !strcmp(name, "list_dir") || !strcmp(name, "grep") || !strcmp(name, "bash") ||
+            !strcmp(name, "web_fetch") || !strcmp(name, "web_search")) && (!ag || agent_allows(ag, name))) cJSON_AddItemReferenceToArray(tools, t);
+    }
+    *msgs_out = msgs;
+    *tools_out = tools;
+}
+
 static int run_subagent_as(const char *description, const char *prompt, const agent_t *ag, const char *model, sbuf *out) {
     if (ag) printf("  " C_CYAN "⤷ sub-agent %s" C_RESET " " C_BOLD "%s" C_RESET "\n", ag->name, description);
     else printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", description);
@@ -2070,32 +2143,9 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
         }
         printf(C_DIM "    on %s (/subagent)" C_RESET "\n", sm);
     }
-    cJSON *msgs = cJSON_CreateArray();
-    cJSON *sys = cJSON_CreateObject();
-    cJSON_AddStringToObject(sys, "role", "system");
-    sbuf sp; sb_init(&sp);
-    sb_printf(&sp, "You are a sub-agent of Corbie Nest (corbienest), a terminal coding agent. The main agent delegated one self-contained task to you.\n"
-                   "Working directory: %s\n"
-                   "You have read-only tools: read_file, list_dir, grep, bash (for read-only shell commands such as git log, find, wc; do not modify files, do not run interactive programs)%s. "
-                   "Batch independent calls: when you need several reads, searches or fetches that do not depend on each other's results, request them all in one reply rather than one per turn. "
-                   "Do the research thoroughly, then finish with ONE final message: a clear, complete report with concrete file paths, line numbers and code snippets where useful — "
-                   "the main agent sees only that final message, nothing else you did. Do not ask questions; make reasonable assumptions and state them.",
-                   g_cwd, g_cfg.web ? " and web_search/web_fetch for the documentation of external projects" : "");
-    if (ag) sb_printf(&sp, "\n\nYour role (from %s):\n%s", ag->path, ag->body);
-    if (g_project_instructions) sb_puts(&sp, g_project_instructions);
-    size_t sp_bytes = sp.len;
-    cJSON_AddStringToObject(sys, "content", sp.data); sb_free(&sp);
-    cJSON_AddItemToArray(msgs, sys);
-    cJSON *u = cJSON_CreateObject(); cJSON_AddStringToObject(u, "role", "user"); cJSON_AddStringToObject(u, "content", prompt);
-    cJSON_AddItemToArray(msgs, u);
-    cJSON *tools = cJSON_CreateArray(), *t;
-    cJSON_ArrayForEach(t, g_tools) {
-        cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
-        cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
-        const char *name = cJSON_IsString(nm) ? nm->valuestring : "";
-        if ((!strcmp(name, "read_file") || !strcmp(name, "list_dir") || !strcmp(name, "grep") || !strcmp(name, "bash") ||
-            !strcmp(name, "web_fetch") || !strcmp(name, "web_search")) && (!ag || agent_allows(ag, name))) cJSON_AddItemReferenceToArray(tools, t);
-    }
+    cJSON *msgs = NULL, *tools = NULL;
+    size_t sp_bytes = 0;
+    subagent_setup(ag, prompt, &msgs, &tools, &sp_bytes);
     int rc = 1, tool_rounds = 0, round_first = -1;
     bool interrupted = false;     /* the user stopped it (Esc / Ctrl-C) */
     const char *final = NULL;
@@ -2127,32 +2177,8 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
         if (aborted) { sb_puts(out, "error: sub-agent interrupted by the user"); interrupted = true; break; }
         if (!calls || cJSON_GetArraySize(calls) == 0) { final = cJSON_IsString(content) ? content->valuestring : ""; rc = 0; break; }
         if (iter == SUBAGENT_ITERS) { sb_printf(out, "error: sub-agent stopped after %d tool rounds without a report", SUBAGENT_ITERS); if (cJSON_IsString(content) && content->valuestring[0]) sb_printf(out, "\nIts last message:\n%s", content->valuestring); break; }
-        cJSON *call;
         round_first = cJSON_GetArraySize(msgs);
-        cJSON_ArrayForEach(call, calls) {
-            cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
-            cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
-            cJSON *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
-            const char *name = cJSON_IsString(nm) ? nm->valuestring : "?";
-            cJSON *parsed = NULL;
-            if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
-            char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
-            printf("    " C_DIM "⎿ %s%s%s%s" C_RESET "\n", name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
-            agent_say(rec, "› "); agent_say(rec, name); agent_say(rec, summ[0] ? "(" : ""); agent_say(rec, summ); agent_say(rec, summ[0] ? ")\n" : "\n");
-            char act[200]; snprintf(act, sizeof act, "%s%s%s%s", name, summ[0] ? "(" : "", summ, summ[0] ? ")" : "");
-            agent_act(rec, act);
-            sbuf o; sb_init(&o);
-            g_session.tool_calls++;
-            tool_status ts;
-            if (!strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "task")) { sb_printf(&o, "error: %s is not available to a sub-agent (read-only)", name); ts = TOOL_ERROR; }
-            else if (!strcmp(name, "advisor")) { sb_puts(&o, "error: the advisor is not available to a sub-agent (it would be shown the wrong conversation); report what you found"); ts = TOOL_ERROR; }
-            else ts = tools_execute(name, args, &o);
-            (void)ts;
-            agent_say_result(rec, o.data);
-            cJSON_AddItemToArray(msgs, tool_result_message(name, tool_call_id(call), o.data ? o.data : ""));
-            sb_free(&o);
-            if (parsed) cJSON_Delete(parsed);
-        }
+        subagent_calls(rec, msgs, calls, false);
         tool_rounds++;
         if (term_poll_interrupt()) { sb_puts(out, "error: sub-agent interrupted by the user"); interrupted = true; break; }
     }
@@ -2171,6 +2197,241 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
     cJSON_Delete(tools);
     cJSON_Delete(msgs);
     return rc;
+}
+
+/* ---------- parallel sub-agents (/parallel on) ----------
+ * A reply whose calls are all task calls, on local models, runs its sub-agents at the same time: each
+ * sub-agent's model call goes out on a thread of its own (http_job, as /orchestrate's workers do) and the
+ * main thread does everything else — it starts the calls, runs their tools (subagent_calls, quiet), reads the
+ * answers and keeps the strip's rows. Nothing else prints while the batch runs; each report is printed when
+ * the batch ends, in the order the model asked, and every call gets its result. Up to g_cfg.workers run at
+ * once. A reply that mixes tools, or names a remote model, runs one sub-agent after another (run_subagent). */
+enum { SR_WAITING, SR_RUNNING, SR_DONE };
+typedef struct {
+    int state;
+    int rc;                 /* 0: out is the report; else out says why it did not run or failed */
+    sbuf out;               /* the task call's result */
+    char desc[120];         /* the task's description, for its header */
+    subagent_rec *rec;      /* its row in the strip and its log */
+    const agent_t *ag;
+    const char *sm;         /* the model its calls go to (NULL: the main model) */
+    cJSON *msgs, *tools;
+    size_t sp_bytes;
+    int iter, tool_rounds, round_first;
+    http_job *job;
+    bool interrupted;
+} sub_run;
+
+static bool same_model(const char *a, const char *b) { return (!a && !b) || (a && b && !strcmp(a, b)); }
+static cJSON *call_args(cJSON *call, cJSON **parsed) {   /* the arguments object (parsed when the model sent a string) */
+    cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
+    cJSON *args = fn ? cJSON_GetObjectItemCaseSensitive(fn, "arguments") : NULL;
+    *parsed = cJSON_IsString(args) ? cJSON_Parse(args->valuestring) : NULL;
+    return *parsed ? *parsed : args;
+}
+static const char *arg_str(cJSON *args, const char *key) {
+    cJSON *v = args ? cJSON_GetObjectItemCaseSensitive(args, key) : NULL;
+    return cJSON_IsString(v) ? v->valuestring : NULL;
+}
+/* the model a task's sub-agent runs on: the same rule as run_subagent_as (NULL: the main model) */
+static const char *batch_model_of(const agent_t *ag) {
+    const char *model = ag ? agent_model_override(ag) : NULL;
+    return model ? (model_same(model, g_cfg.model) ? NULL : model) : subagent_model();
+}
+/* whether a reply's calls can run as one batch: all task calls, at least two, all on the same local model */
+static bool tasks_batchable(cJSON *calls) {
+    if (!g_cfg.parallel_tasks || cJSON_GetArraySize(calls) < 2) return false;
+    const char *first_sm = NULL; bool first = true;
+    cJSON *c;
+    cJSON_ArrayForEach(c, calls) {
+        if (strcmp(call_name(c), "task")) return false;
+        cJSON *parsed = NULL;
+        cJSON *args = call_args(c, &parsed);
+        const char *an = arg_str(args, "agent");
+        const agent_t *ag = an && *an ? agent_find(an) : NULL;
+        const char *sm = batch_model_of(ag);
+        const char *name = sm ? sm : g_cfg.model;
+        bool remote = !name || !*name || provider_find(name, NULL) != NULL;
+        if (parsed) cJSON_Delete(parsed);
+        if (remote) return false;
+        if (first) { first_sm = sm; first = false; } else if (!same_model(first_sm, sm)) return false;
+    }
+    return true;
+}
+
+/* one sub-agent's next model call goes out on a thread; false (and its result says why) if it could not */
+static bool sub_run_start(sub_run *r) {
+    if (r->round_first > 0 && g_cfg.num_ctx > 0 &&
+        (double)(r->sp_bytes + tools_bytes() + conv_bytes(r->msgs)) / g_bytes_per_token > g_cfg.num_ctx * (ELIDE_PCT / 100.0)) {
+        int first = -1;
+        elide_tool_results(r->msgs, r->round_first, &first);
+        drop_edited_thinking(r->msgs, first);
+    }
+    if (r->sm) { ollama_call.model = r->sm; ollama_call.info = &g_subagent_info; }
+    ollama_call.followup = r->iter > 0;
+    char *body = ollama_chat_request(r->msgs, g_model_tools ? r->tools : NULL);
+    ollama_call_reset();
+    r->job = body ? http_job_start(g_cfg.host, "/api/chat", body, NULL) : NULL;
+    free(body);
+    if (!r->job) {
+        sb_puts(&r->out, "error: sub-agent model call could not be started");
+        r->rc = 1; r->state = SR_DONE;
+        if (r->rec) r->rec->state = AG_FAILED;
+        return false;
+    }
+    r->state = SR_RUNNING;
+    if (r->rec) { r->rec->rounds = r->tool_rounds + 1; agent_act(r->rec, "waiting for the model"); }
+    return true;
+}
+
+/* a sub-agent's call has come back on the main thread: its answer, or its tools to run and the next call */
+static void sub_run_collect(sub_run *r) {
+    sbuf body; sb_init(&body); http_result res;
+    int rc = http_job_finish(r->job, &body, &res);
+    r->job = NULL;
+    const char *model = r->sm ? r->sm : g_cfg.model;
+    ratelimit_set(model, &res.rl);
+    chat_stats st; char err[512] = "";
+    cJSON *reply = rc == 0 ? ollama_chat_reply(body.data, res.status, true, &st, err, sizeof err) : NULL;
+    if (rc != 0) snprintf(err, sizeof err, "%s", res.err);
+    sb_free(&body);
+    if (!reply) {
+        sb_printf(&r->out, "error: sub-agent model call failed: %s", err[0] ? err : "no answer");
+        r->rc = 1; r->state = SR_DONE;
+        if (r->rec) r->rec->state = AG_FAILED;
+        return;
+    }
+    account_as(model, &st);
+    term_status_refresh();
+    cJSON_AddItemToArray(r->msgs, reply);
+    messages_note_thinking(r->msgs, cJSON_GetArraySize(r->msgs) - 1);
+    cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
+    cJSON *content = cJSON_GetObjectItemCaseSensitive(reply, "content");
+    if (!calls || cJSON_GetArraySize(calls) == 0) {
+        const char *final = cJSON_IsString(content) ? content->valuestring : "";
+        sb_printf(&r->out, "%s", *final ? final : "(the sub-agent returned an empty report)");
+        r->rc = 0; r->state = SR_DONE;
+        return;
+    }
+    if (r->iter == SUBAGENT_ITERS) {
+        sb_printf(&r->out, "error: sub-agent stopped after %d tool rounds without a report", SUBAGENT_ITERS);
+        r->rc = 1; r->state = SR_DONE;
+        return;
+    }
+    r->round_first = cJSON_GetArraySize(r->msgs);
+    subagent_calls(r->rec, r->msgs, calls, true);
+    r->tool_rounds++; r->iter++;
+    r->state = SR_WAITING;
+}
+
+/* runs the batch of a reply's task calls; every call gets its result, in order. Returns true when the user
+ * stopped it (the results are still all there: the conversation stays valid). *failed: a sub-agent failed. */
+static bool tasks_batch(cJSON *calls, bool *failed) {
+    int n = cJSON_GetArraySize(calls);
+    sub_run *rs = xmalloc(sizeof *rs * (size_t)n);
+    memset(rs, 0, sizeof *rs * (size_t)n);
+    tools_in_subagent(true);
+    int i = 0;
+    cJSON *c;
+    cJSON_ArrayForEach(c, calls) {
+        sub_run *r = &rs[i++];
+        sb_init(&r->out);
+        r->round_first = -1;
+        cJSON *parsed = NULL;
+        cJSON *args = call_args(c, &parsed);
+        const char *desc = arg_str(args, "description");
+        const char *prompt = arg_str(args, "prompt");
+        const char *an = arg_str(args, "agent");
+        snprintf(r->desc, sizeof r->desc, "%s", desc && *desc ? desc : "sub-agent");
+        if (prompt == NULL) prompt = "";
+        if (subagent_resolve(an, &r->ag, &r->out)) { r->rc = 1; r->state = SR_DONE; }
+        else {
+            r->sm = batch_model_of(r->ag);
+            if (r->ag) printf("  " C_CYAN "⤷ sub-agent %s" C_RESET " " C_BOLD "%s" C_RESET "\n", r->ag->name, r->desc);
+            else printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", r->desc);
+            r->rec = agent_begin(r->desc, r->sm);
+            agent_say(r->rec, "task: "); agent_say(r->rec, prompt); agent_say(r->rec, "\n");
+            subagent_setup(r->ag, prompt, &r->msgs, &r->tools, &r->sp_bytes);
+            r->state = SR_WAITING;
+        }
+        if (parsed) cJSON_Delete(parsed);
+    }
+    /* the model the batch runs on, checked once, as run_subagent_as checks it */
+    const char *sm = NULL; bool any = false;
+    for (i = 0; i < n && !any; i++) if (rs[i].state == SR_WAITING) { sm = rs[i].sm; any = true; }
+    if (any && sm) {
+        if (subagent_info_for(sm)) printf(C_DIM "    on %s (/subagent)" C_RESET "\n", sm);
+        else for (i = 0; i < n; i++) {
+            sub_run *r = &rs[i];
+            if (r->state != SR_WAITING) continue;
+            sb_printf(&r->out, "error: the sub-agents' model %s cannot be used: %s. Do the task with the tools yourself, or say what is missing.", sm, g_subagent_err);
+            r->rc = 1; r->state = SR_DONE;
+            if (r->rec) r->rec->state = AG_FAILED;
+        }
+    }
+    int maxpar = g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT;
+    bool aborted = false;
+    char label[64] = "";
+    for (;;) {
+        int running = 0, waiting = 0;
+        for (i = 0; i < n; i++) { if (rs[i].state == SR_RUNNING) running++; if (rs[i].state == SR_WAITING) waiting++; }
+        if (!running && !waiting) break;
+        for (i = 0; i < n && running < maxpar; i++)
+            if (rs[i].state == SR_WAITING && sub_run_start(&rs[i])) running++;
+        if (running) {
+            char now[64];
+            snprintf(now, sizeof now, running == 1 ? "sub-agent · 1 running" : "sub-agents · %d running", running);
+            if (strcmp(now, label)) { snprintf(label, sizeof label, "%s", now); term_busy(label); }
+        }
+        bool stepped = false;
+        for (i = 0; i < n; i++)
+            if (rs[i].state == SR_RUNNING && http_job_done(rs[i].job)) { sub_run_collect(&rs[i]); stepped = true; }
+        if (stepped) continue;
+        if (term_poll_interrupt()) { aborted = true; break; }
+        term_busy_tick();
+        nanosleep(&(struct timespec){ 0, 50 * 1000 * 1000 }, NULL);
+    }
+    term_busy(NULL);
+    if (aborted) {
+        for (i = 0; i < n; i++) if (rs[i].state == SR_RUNNING) http_job_cancel(rs[i].job);
+        for (i = 0; i < n; i++) {
+            sub_run *r = &rs[i];
+            if (r->state == SR_RUNNING) {
+                http_result res; http_job_finish(r->job, NULL, &res); r->job = NULL;
+                sb_puts(&r->out, "error: sub-agent interrupted by the user");
+                r->interrupted = true;
+            } else if (r->state == SR_WAITING) {
+                sb_puts(&r->out, "error: not started: the user stopped the sub-agents");
+            } else continue;
+            r->rc = 1; r->state = SR_DONE;
+        }
+        printf(C_YELLOW "⏹ the sub-agents were stopped" C_RESET "\n");
+    }
+    tools_in_subagent(false);
+    /* the results, in the order the model asked */
+    i = 0;
+    cJSON_ArrayForEach(c, calls) {
+        sub_run *r = &rs[i++];
+        const char *res = r->out.data ? r->out.data : "";
+        if (r->rec) {
+            r->rec->state = r->interrupted ? AG_STOPPED : r->rc == 0 ? AG_DONE : AG_FAILED;
+            agent_say(r->rec, r->rc == 0 ? "report:\n" : "result:\n");
+            agent_say(r->rec, res); agent_say(r->rec, "\n");
+            r->rec->activity[0] = 0;
+        }
+        printf(C_GREEN "●" C_RESET " " C_BOLD "task" C_RESET C_DIM "(%s)" C_RESET "\n", r->desc);
+        if (r->rc != 0) printf("  ⎿  " C_RED "%s" C_RESET "\n", res);
+        else print_result_folded(res, 8, NULL);
+        if (tool_result_failed("task", res, r->rc != 0)) *failed = true;
+        g_session.tool_calls++;
+        cJSON_AddItemToArray(g_messages, tool_result_message("task", tool_call_id(c), res));
+        stream_flush();
+        if (r->msgs) cJSON_Delete(r->msgs);
+        if (r->tools) cJSON_Delete(r->tools);
+        sb_free(&r->out);
+    }
+    free(rs);
+    return aborted;
 }
 
 /* ---------- the advisor (/advisor, the `advisor` tool) ----------
@@ -2919,6 +3180,15 @@ static bool run_turn_body(void) {
         cJSON *call;
         round_first = cJSON_GetArraySize(g_messages);
         bool failed = false;   /* a call of this round failed (see advisor_step_in) */
+        if (tasks_batchable(calls)) {   /* /parallel on: the sub-agents of this reply run at the same time */
+            bool stopped = tasks_batch(calls, &failed);
+            g_fail_rounds = failed ? g_fail_rounds + 1 : 0;
+            if (advisor_step_in_due()) advisor_step_in(reply);
+            printf("\n");
+            if (stopped) return true;
+            inject_queued();
+            continue;
+        }
         cJSON_ArrayForEach(call, calls) {
             cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
             cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
@@ -4102,6 +4372,7 @@ static void cmd_help(void) {
            "                        candidates in git worktrees race to the goal, each on its model; the metric's best is kept as uncommitted changes\n"
            "  /btw QUESTION         a side question: the model answers from the conversation so far; the answer is printed, not kept in it\n"
            "  /workers [N]          how many tasks of /orchestrate may run at the same time (the model calls, each on a thread; default 3, at most 20, 1 = in turn)\n"
+           "  /parallel [on|off]    task calls in one reply run as sub-agents at the same time (off by default: one after another)\n"
            "  /advisor [MODEL|off]  a stronger model the agent may consult when the work is hard (the advisor tool): a bigger local model, a cloud one\n"
            "                        (NAME-cloud, after `ollama signin`) or a hosted API: xai:MODEL, openai:MODEL, anthropic:MODEL (key from XAI_API_KEY,\n"
            "                        OPENAI_API_KEY, ANTHROPIC_API_KEY). It is shown the conversation and answers with advice; it has no tools.\n"
@@ -4846,6 +5117,15 @@ static int handle_slash(char *line) {
             printf(C_GREEN "✓ workers = %d" C_RESET C_DIM "%s" C_RESET "\n", n, n > 1 ? " — whether they overlap is the server's to say too: an Ollama with one slot (OLLAMA_NUM_PARALLEL) answers them in turn" : " — one task after another");
         }
     }
+    else if (!strcmp(cmd, "/parallel")) {
+        if (!arg) printf("parallel: %s" C_DIM " — task calls in one reply run as sub-agents at the same time%s" C_RESET "\n",
+                         g_cfg.parallel_tasks ? "on" : "off", g_cfg.parallel_tasks ? "" : " (off: one after another; /parallel on to change it)");
+        else if (!strcmp(arg, "on") || !strcmp(arg, "off")) {
+            g_cfg.parallel_tasks = !strcmp(arg, "on"); config_save();
+            printf(C_GREEN "✓ parallel = %s" C_RESET C_DIM "%s" C_RESET "\n", arg,
+                   g_cfg.parallel_tasks ? " — the task calls of one reply run together; each sub-agent is in the strip while it runs" : " — one sub-agent after another");
+        } else printf("usage: /parallel on|off\n");
+    }
     else if (!strcmp(cmd, "/ui")) cmd_ui(arg);
     else if (!strcmp(cmd, "/max_iters") || !strcmp(cmd, "/max-iters")) {
         if (!arg) printf("max_iters: %d tool rounds per request\n", g_cfg.max_iters);
@@ -4920,7 +5200,7 @@ static bool slash_waits_for_next(const char *cmd, const char *arg) {
 static bool slash_runs_while_busy(const char *cmd, const char *arg) {
     static const char *ok[] = {
         "/help", "/?", "/status", "/cost", "/usage", "/diff", "/history", "/pwd", "/skills",
-        "/mode", "/yolo", "/permissions", "/tools", "/workers", "/max_iters", "/max-iters", "/temp",
+        "/mode", "/yolo", "/permissions", "/tools", "/workers", "/parallel", "/max_iters", "/max-iters", "/temp",
         "/keepalive", "/keep-alive", "/memory", "/web", NULL };
     /* /web with an argument is not just a report: on|off rebuilds the tool list the running
      * turn is holding, and engine writes the config. Bare /web only prints. */

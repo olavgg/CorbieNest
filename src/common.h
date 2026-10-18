@@ -255,6 +255,7 @@ typedef struct {
     int   advisor_guidance; /* how much the agent leans on it, GUIDANCE_* (/advisor guidance) */
     int   advisor_window;   /* seconds after which a request's count of consultations starts again (/advisor window, given in minutes); 0 = never */
     int   workers;       /* tasks of /orchestrate that may run at the same time (/workers); 0 = ORCH_WORKERS_DEFAULT */
+    bool  parallel_tasks;/* /parallel on: the task calls of one reply run at the same time as sub-agents (default off) */
     char *build;         /* /plan: the command that builds the project after each layer (build=); NULL = detected from the project's build file */
     bool  show_thinking; /* print thinking tokens */
     int   mode;          /* permission mode, see MODE_* */
@@ -653,6 +654,7 @@ void tools_checkpoint_clear(void);
  * loop). Writes the report into out; returns 0 ok, nonzero error. */
 typedef int (*tools_subagent_fn)(const char *description, const char *prompt, const char *agent, sbuf *out);
 extern tools_subagent_fn tools_subagent;
+void tools_in_subagent(bool on);                    /* the calls made now are a sub-agent's (no sub-agent, no background command): set around a run of sub-agents */
 /* The `advisor` tool puts a question to a stronger model (/advisor); main.c provides it too, since
  * what the advisor is shown is the conversation. Writes the advice (or why there is none) into
  * out; returns 0 ok, nonzero error. Offered to the model only while g_cfg.advisor is set. */
