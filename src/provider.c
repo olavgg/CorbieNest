@@ -861,7 +861,8 @@ int provider_model_info(const char *advisor, model_info *mi, char *err, size_t n
     sbuf path; sb_init(&path); sb_printf(&path, "%s/models/%s", p->style == PROVIDER_MESSAGES ? "/v1" : "", id); free(id);
     sbuf out; sb_init(&out); http_result res;
     http_headers = hdrs; http_idle = idle_tick; http_idle_ud = NULL;
-    int idle_was = http_idle_timeout_ms; http_idle_timeout_ms = 30 * 1000;   /* a model list answers at once, or not at all */
+    int idle_was = http_idle_timeout_ms;   /* a model list answers at once, or not at all: 30 s, or less when the caller asks (the start-up check) */
+    http_idle_timeout_ms = idle_was < 30 * 1000 ? idle_was : 30 * 1000;
     term_busy("checking the model");
     int rc = http_request(provider_base_url(p), "GET", path.data, NULL, &out, NULL, NULL, &res);
     term_busy(NULL);

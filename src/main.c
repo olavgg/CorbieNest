@@ -1402,6 +1402,7 @@ static void clamp_ctx_budget(void) {
 
 /* ---------- model info ---------- */
 #define MODEL_LIST_WAIT_MS 3000   /* how long a list of models is waited for (the suggestions, the start-up check) */
+#define START_CHECK_MS 5000       /* how long the start-up checks of the model wait for a silent server (main: the idle timeout while they run) */
 static void refresh_model_caps(bool quiet) {
     g_model_bad = false; g_model_err[0] = 0;
     if (g_cfg.model && !*g_cfg.model) return;   /* no model yet: nothing to look up */
@@ -6268,12 +6269,19 @@ int main(int argc, char **argv) {
     if (g_cfg.interactive && !oneshot && !bench_runs) tools_hook_event("start");   /* the start hooks: at a terminal only */
     bool quiet_caps = oneshot != NULL || bench_runs;
     if (g_cfg.model && !*g_cfg.model) { free(g_cfg.model); g_cfg.model = NULL; }   /* an empty model= in the config is no model */
+    /* the screen first: the model checks below run on it (their wait shows in the status bar), not on a blank terminal */
+    if (g_cfg.interactive && !oneshot && !bench_runs) term_fullscreen(true);   /* alternate screen + bottom status bar */
+    /* a server that accepts the connection and says nothing is given up on after START_CHECK_MS, not after the
+     * ten minutes of an ordinary request: the program starts without its model list, as with no server */
+    int idle_was = http_idle_timeout_ms;
+    http_idle_timeout_ms = START_CHECK_MS < idle_was ? START_CHECK_MS : idle_was;
     refresh_model_caps(quiet_caps);
     if (!g_cfg.model && !hosted_fallback(quiet_caps)) {
         /* nothing to work with yet: a one-shot run cannot do anything without a model; the screen starts and says so */
         if (quiet_caps) { fprintf(stderr, "corbienest: %s\n", g_model_err); term_restore(); return 1; }
         g_cfg.model = xstrdup("");
     }
+    http_idle_timeout_ms = idle_was;
     /* a configured model that cannot be used (its key is not set, the provider refused it) stops a one-shot run only:
      * at a screen the program starts with the model as the config has it, says why, sends nothing (run_turn_body) and
      * /model switches to another one. The configured name stays, so a later config save does not lose it */
@@ -6297,7 +6305,6 @@ int main(int argc, char **argv) {
         }
         return run_benchmark(bench_runs, oneshot, ctx_given, json_out, json_fd);
     }
-    if (g_cfg.interactive && !oneshot) term_fullscreen(true);   /* alternate screen + bottom status bar */
     if (g_model_bad) printf(C_YELLOW "%s" C_RESET "\n", g_model_err);   /* (only a screen gets here with one: the reason, where the conversation starts) */
     if (resume_latest) {
         int n; session_info *v = sessions_list(true, &n);
