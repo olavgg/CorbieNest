@@ -104,6 +104,10 @@ void term_init(void) {
     trace_open();
     if (g_ui_nc) { atexit(term_restore); return; }   /* notcurses sets up its own signals and terminal */
     if (tcgetattr(STDIN_FILENO, &g_orig) == 0) g_have_orig = true;
+    /* A resize is SIGWINCH. A launcher may have blocked it, and a blocked mask is inherited across exec: then the
+     * signal stays pending, no handler runs, and the screen keeps its old size until a key. Let it through. */
+    sigset_t winch; sigemptyset(&winch); sigaddset(&winch, SIGWINCH);
+    sigprocmask(SIG_UNBLOCK, &winch, NULL);
     signal(SIGWINCH, on_winch);
     atexit(term_restore);
 }
