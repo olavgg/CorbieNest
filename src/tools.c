@@ -622,8 +622,8 @@ static void preview_folded(const char *text, const char *lang) {
     if (text && *text && text[strlen(text) - 1] != '\n') total++;   /* a last line with no newline is a line too */
     if (total <= 1) { preview_lines(text, 12, C_GREEN, lang); return; }
     size_t first = strcspn(text, "\n");
-    char head[320]; snprintf(head, sizeof head, "%.*s", (int)(first > 200 ? 200 : first), text);
-    char line[360]; snprintf(line, sizeof line, "  " C_DIM TERM_FOLD_CLOSED " %s" C_RESET C_DIM "  (+%d lines)" C_RESET, head, total - 1);
+    char head[256]; snprintf(head, sizeof head, "%.*s", (int)(first > 200 ? 200 : first), text);   /* at most 200 bytes of it */
+    char line[512]; snprintf(line, sizeof line, "  " C_DIM TERM_FOLD_CLOSED " %s" C_RESET C_DIM "  (+%d lines)" C_RESET, head, total - 1);
     if (term_fold_begin(line)) { preview_lines(text, total, C_GREEN, lang); term_fold_end(); }
     else preview_lines(text, 12, C_GREEN, lang);
 }
