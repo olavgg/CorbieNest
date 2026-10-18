@@ -1959,6 +1959,18 @@ static void test_wellformed(void) {
 }
 
 /* ---------- the notcurses frontend's pure half: SGR, the palette, the cells ---------- */
+static void test_copy_key(void) {
+    CHECK(nc_copy_key(false, 'c', true, false));    /* Ctrl+c */
+    CHECK(nc_copy_key(false, 'C', true, false));    /* Ctrl+C, notcurses' capital for a letter with Ctrl */
+    CHECK(nc_copy_key(false, 3, false, false));     /* the control character */
+    CHECK(nc_copy_key(false, 'c', false, true));    /* Cmd+c (super) */
+    CHECK(nc_copy_key(false, 'C', false, true));
+    CHECK(!nc_copy_key(true, 'c', true, false));    /* a release copies nothing: one copy per press */
+    CHECK(!nc_copy_key(false, 'c', false, false));  /* a plain c is typed */
+    CHECK(!nc_copy_key(false, 'd', true, false));   /* Ctrl+D is not copy */
+    CHECK(!nc_copy_key(false, 'v', true, false));
+}
+
 static void test_nc_pure(void) {
     nc_style st = { NC_DEFAULT, NC_DEFAULT, 0 };
     /* SGR: colours, styles, resets */
@@ -2118,7 +2130,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
+        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

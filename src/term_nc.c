@@ -173,6 +173,16 @@ int nc_text_width(const char *s) {
     return w;
 }
 
+/* Does this key copy a highlight? Ctrl+C, or Cmd+C (super), where the terminal passes it on. A letter with Ctrl
+ * comes as its capital (AGENTS.md: Ctrl+a is id 'A' + Ctrl), so both cases count. A release copies nothing. Plain
+ * data, so the unit tests reach it in both builds. */
+bool nc_copy_key(bool release, unsigned id, bool ctrl, bool super) {
+    if (release) return false;
+    bool c = id == 'c' || id == 'C';
+    if (c && (ctrl || super)) return true;
+    return id == 3;   /* Ctrl+C as the control character */
+}
+
 #ifndef WITH_NOTCURSES
 /* ---------- the stubs: this build has no notcurses frontend ---------- */
 bool   nc_compiled(void) { return false; }
@@ -249,6 +259,21 @@ static int g_ov_n = 0, g_ov_w = 0;
 static bool g_ov_on = false;
 static void nc_banner_close(void);
 static int g_pane_epoch = -1;          /* term_sb_epoch() when g_pane_line was made; -1: not made (no click acts on it) */
+/* the pane's cells: per row and column, the scrollback line and the character index in it (-1: none), made in
+ * draw_pane with the row map. A selection point is one of these, so it is the same text whatever the pane shows. */
+typedef struct { int line, idx; nc_style st; char egc[8]; } pane_cell;   /* the glyph is a copy: the line's own cells are freed after the draw */
+static pane_cell *g_pane_cells = NULL;   /* view rows x g_cols */
+static int g_pane_cells_n = 0;
+/* Mouse selection in the pane. A point is a scrollback line and a character index in it, so a selection is the
+ * same text after the pane scrolls; a change of epoch (lines dropped or cleared) clears it. The gesture is decided
+ * on the release: a press that moved is a selection and is copied; one that did not is a click (a fold's head
+ * toggles). */
+typedef struct { int line, idx; } sel_pt;
+static bool g_sel_on = false;         /* a selection exists (drawn in reverse video) */
+static bool g_sel_down = false;       /* a button is held: the gesture is in progress */
+static bool g_sel_moved = false;      /* the gesture has moved since the press */
+static sel_pt g_sel_a, g_sel_b;       /* where the gesture began and where it is now */
+static int g_sel_epoch = -1;          /* term_sb_epoch() when the selection was made */
 static int g_clear_at = 0;             /* lines before this one are not shown (/clear) */
 static bool g_pending = false;         /* output arrived that is not drawn yet */
 static double g_last_draw = 0;
@@ -393,31 +418,125 @@ static int sb_line_rows(int i) {
 }
 
 /* the wheel: the pane scrolls (draw_pane clamps the far end) */
-static void pane_scroll(int rows) { g_top += rows; if (g_top < 0) g_top = 0; nc_render_soon(); }
+/* a selection on the screen goes when the pane moves (its text is kept in the scrollback, so it is not lost) */
+static void sel_clear(void) { g_sel_on = false; g_sel_down = false; g_sel_moved = false; }
+static void pane_scroll(int rows) { g_top += rows; if (g_top < 0) g_top = 0; g_sel_on = false; nc_render_soon(); }
 
 /* A mouse report: a left click on a fold's head shows or hides that fold; the wheel scrolls the pane;
  * anything else is dropped. Acted on where the keys are read: a fold only changes the scrollback
  * model and the screen, nothing is sent. A click while a menu is open, or on rows that are not the
  * ones last painted (the lines moved since), does nothing. */
+/* the text from a to b, inclusive, read from the scrollback (not the screen): a line-to-line selection is
+ * the lines between, with their newlines; a character index is a byte of the line's text */
+static char *sel_text(sel_pt a, sel_pt b) {
+    if (a.line > b.line || (a.line == b.line && a.idx > b.idx)) { sel_pt t = a; a = b; b = t; }
+    sbuf out; sb_init(&out);
+    if (a.line < 0) return sb_detach(&out);   /* no anchor: nothing was under the press */
+    for (int i = a.line; i <= b.line && i < term_sb_nlines(); i++) {
+        if (term_sb_hidden(i)) continue;
+        const char *ln = term_sb_line(i);
+        int len = (int)strlen(ln);
+        int from = i == a.line ? a.idx : 0;
+        int to = i == b.line ? b.idx + 1 : len;
+        if (from < 0) from = 0;
+        if (to > len) to = len;
+        if (to > from) sb_append(&out, ln + from, (size_t)(to - from));
+        if (i != b.line) sb_putc(&out, '\n');
+    }
+    return sb_detach(&out);
+}
+
+/* the selection is copied two ways: OSC 52 (the terminal's clipboard, in iTerm2, kitty, WezTerm and most others)
+ * and, where the program is there (macOS), pbcopy, for the terminals that ignore OSC 52 (Terminal.app). OSC 52
+ * is written to the terminal itself: notcurses owns fd 1 here, and the
+ * sequence goes out with the frame that is being drawn, as the terminal sees it in order. */
+/* the key that copies a highlight: Ctrl+C, or Super+C (Cmd) where the terminal reports it. A release of the key is
+ * not a copy, so one press copies once. The decision is nc_copy_key() (pure, tested); this only reads the event. */
+static bool sel_copy_key(const ncinput *ni) {
+    return nc_copy_key(ni->evtype == NCTYPE_RELEASE, ni->id, (ni->modifiers & NCKEY_MOD_CTRL) != 0, (ni->modifiers & NCKEY_MOD_SUPER) != 0);
+}
+
+static void sel_copy(sel_pt a, sel_pt b) {
+    char *t = sel_text(a, b);
+    if (!t || !*t) { free(t); return; }
+    size_t n = strlen(t);
+    char *enc = base64_encode(t, n);
+    if (enc) {
+        dprintf(STDOUT_FILENO, "\x1b]52;c;%s\x07", enc);   /* the terminal's clipboard (OSC 52) */
+        free(enc);
+    }
+    if (access("/usr/bin/pbcopy", X_OK) == 0) {   /* and the macOS one, for terminals that ignore OSC 52 */
+        FILE *f = popen("/usr/bin/pbcopy", "w");
+        if (f) { fwrite(t, 1, n, f); pclose(f); }
+    }
+    free(t);
+}
+
+
+/* the pane cell under a screen position: its scrollback line and character index. False where there is no text
+ * (the field, the bar, a suggestion's row, or a view that has moved on since it was drawn). */
+static bool pane_point(int y, int x, sel_pt *out) {
+    if (y < 0 || y >= g_field_top || y >= g_pane_cap) return false;
+    if (g_pane_epoch != term_sb_epoch()) return false;
+    if (x < 0 || x >= g_cols) return false;
+    if (y * g_cols + x >= g_pane_cells_n) return false;
+    pane_cell c = g_pane_cells[y * g_cols + x];
+    if (c.line < 0) return false;
+    out->line = c.line; out->idx = c.idx;
+    return true;
+}
+
+/* A mouse report, in the pane. The gesture is decided on the release: a press and release on the same cell is a
+ * click (a fold's head toggles, as it always did); a press that moved and was released is a selection, copied
+ * and kept on the screen until the next key. Scrolling and the banner's close are as before. */
 static void nc_mouse(const ncinput *ni) {
+    if (ni->evtype == NCTYPE_RELEASE && ni->id == NCKEY_BUTTON1 && g_sel_down) {
+        g_sel_down = false;
+        if (!g_sel_moved) {
+            sel_clear();
+            if (g_pane_epoch != term_sb_epoch()) return;
+            int line = (ni->y >= 0 && ni->y < g_pane_cap) ? g_pane_line[ni->y] : -1;
+            if (line < 0) return;
+            int nb = term_fold_toggle(line);   /* the body lines flipped; -1 when the row is no fold's head */
+            if (nb < 0) return;
+            if (nb > 0 && g_top > 0) {   /* scrolled back: the head keeps its place on the screen */
+                int d = 0;
+                for (int i = line + 1; i <= line + nb; i++) d += sb_line_rows(i);
+                g_top += term_sb_hidden(line + 1) ? -d : d;
+                if (g_top < 0) g_top = 0;
+            }
+            nc_render_soon();
+            return;
+        }
+        g_sel_on = true; g_sel_epoch = term_sb_epoch();   /* the highlight stays; Ctrl+C or Cmd+C copies it again */
+        sel_copy(g_sel_a, g_sel_b);   /* and the release has copied it already: Cmd+V pastes it, no key needed */
+        nc_render_soon();
+        return;
+    }
+    if (ni->evtype == NCTYPE_PRESS && ni->id == NCKEY_BUTTON1 && g_sel_down) {   /* the drag: the button again at a new cell */
+        sel_pt p;
+        if (pane_point(ni->y, ni->x, &p)) {
+            if (g_sel_a.line < 0) g_sel_a = p;   /* the press was outside the text: the drag starts where the text is */
+            if (p.line != g_sel_a.line || p.idx != g_sel_a.idx) g_sel_moved = true;
+            g_sel_b = p; g_sel_on = true; g_sel_epoch = term_sb_epoch();
+            nc_render_soon();
+        }
+        return;
+    }
     if (ni->evtype != NCTYPE_PRESS) return;
     if (g_bn_on && ni->id == NCKEY_BUTTON1 && ni->y == g_bn_xr && ni->x >= g_bn_xc0 && ni->x <= g_bn_xc1) { nc_banner_close(); return; }
     if (g_menu_on) return;
     if (ni->id == NCKEY_SCROLL_UP) { pane_scroll(3); return; }
     if (ni->id == NCKEY_SCROLL_DOWN) { pane_scroll(-3); return; }
-    if (ni->id != NCKEY_BUTTON1 || ni->y < 0 || ni->y >= g_field_top || ni->y >= g_pane_cap) return;
-    if (g_pane_epoch != term_sb_epoch()) return;
-    int line = g_pane_line[ni->y];
-    if (line < 0) return;
-    int nb = term_fold_toggle(line);   /* the body lines flipped; -1 when the row is no fold's head */
-    if (nb < 0) return;
-    if (nb > 0 && g_top > 0) {   /* scrolled back: the head keeps its place on the screen, so the rows the body took (or gave back) move the anchor */
-        int d = 0;
-        for (int i = line + 1; i <= line + nb; i++) d += sb_line_rows(i);
-        g_top += term_sb_hidden(line + 1) ? -d : d;
-        if (g_top < 0) g_top = 0;
+    if (ni->id != NCKEY_BUTTON1) return;
+    sel_clear();
+    sel_pt p;
+    if (!pane_point(ni->y, ni->x, &p)) {   /* a press outside the text: nothing to select, but a click on a fold head still needs the row */
+        if (ni->y >= 0 && ni->y < g_field_top && ni->y < g_pane_cap) { g_sel_down = true; g_sel_moved = false; g_sel_a = (sel_pt){ -1, -1 }; }
+        return;
     }
-    nc_render_soon();
+    g_sel_down = true; g_sel_moved = false;
+    g_sel_a = p; g_sel_b = p;
 }
 
 /* ---------- bracketed paste ----------
@@ -508,13 +627,18 @@ static int nc_getkey(int ms) {
         uint32_t id = notcurses_get_nblock(g_nc, &ni);
         if (id == 0 || id == (uint32_t)-1) break;
         if (nckey_mouse_p(ni.id)) { nc_mouse(&ni); continue; }   /* a report, not a key */
-        if (ni.id == NCKEY_TAB && (ni.modifiers & NCKEY_MOD_SHIFT)) {   /* Shift+Tab cycles the mode at once, as on the ANSI screen (a key, so it is not queued) */
+        if (ni.id == NCKEY_TAB && (ni.modifiers & NCKEY_MOD_SHIFT) && ni.evtype != NCTYPE_RELEASE) {   /* Shift+Tab cycles the mode at once, as on the ANSI screen (a key, so it is not queued); a release is not a second press */
             g_cfg.mode = (g_cfg.mode + 1) % MODE_COUNT;
             nc_render_soon();
             continue;
         }
+        if (g_sel_on && sel_copy_key(&ni)) {   /* Ctrl+C (Linux) or Cmd+C (macOS, where the terminal passes it on): copy the highlight */
+            sel_copy(g_sel_a, g_sel_b);
+            continue;
+        }
         int k = nc_key_code(&ni);
         if (k == NK_SKIP || pm_feed(k)) continue;   /* a paste's markers and text are taken by pm_feed */
+        if (g_sel_on) { g_sel_on = false; nc_render_soon(); }   /* a key ends the highlight */
         key_out(k);
     }
     if (!g_pm_in && g_pm_nheld) {                   /* an Esc on its own, held for a marker: it is a key after all */
@@ -595,6 +719,8 @@ static void draw_pane(int view) {
     if (view <= 0) return;
     if (view > g_pane_cap) { g_pane_line = xrealloc(g_pane_line, sizeof *g_pane_line * (size_t)view); g_pane_cap = view; }
     for (int y = 0; y < view; y++) g_pane_line[y] = -1;
+    if (view * g_cols > g_pane_cells_n) { g_pane_cells = xrealloc(g_pane_cells, sizeof *g_pane_cells * (size_t)(view * g_cols)); g_pane_cells_n = view * g_cols; }
+    for (int k = 0; k < view * g_cols; k++) g_pane_cells[k] = (pane_cell){ -1, -1, { NC_DEFAULT, NC_DEFAULT, 0 }, "" };
     int total = term_sb_nlines();
     int start = g_clear_at < total ? g_clear_at : total;
     typedef struct { nc_cell *c; int n; int rows; int idx; } lline;
@@ -630,6 +756,7 @@ static void draw_pane(int view) {
             if (y >= 0 && y < view && col + w <= g_cols) {
                 paint(g_std, &L->c[j].st, C_TEXT, NC_DEFAULT);
                 ncplane_putstr_yx(g_std, y, col, L->c[j].egc);
+                for (int q = 0; q < w; q++) { pane_cell *pc = &g_pane_cells[y * g_cols + col + q]; pc->line = L->idx; pc->idx = j; pc->st = L->c[j].st; memcpy(pc->egc, L->c[j].egc, sizeof pc->egc); }
             }
             col += w;
         }
@@ -949,6 +1076,27 @@ static void nc_apply_base(void) {
     if (g_std) (void)ncplane_set_base(g_std, " ", 0, chans(NC_DEFAULT, NC_DEFAULT));
 }
 
+/* the selection in reverse video: the pane's cells from a to b (in reading order), read back from the plane and
+ * drawn again with the style reversed. A cell is found by its scrollback position, so a wrapped line highlights
+ * where its characters are. Drawn after the pane, before the field. */
+static void draw_selection(int view) {
+    if (!g_sel_on || g_sel_epoch != term_sb_epoch() || view <= 0) return;
+    sel_pt a = g_sel_a, b = g_sel_b;
+    if (a.line > b.line || (a.line == b.line && a.idx > b.idx)) { sel_pt t = a; a = b; b = t; }
+    for (int y = 0; y < view && y < g_pane_cap; y++) {
+        for (int x = 0; x < g_cols; x++) {
+            pane_cell c = g_pane_cells[y * g_cols + x];
+            if (c.line < 0 || !c.egc[0]) continue;
+            bool in = (c.line > a.line || (c.line == a.line && c.idx >= a.idx)) && (c.line < b.line || (c.line == b.line && c.idx <= b.idx));
+            if (!in) continue;
+            nc_style st = c.st;
+            st.styles |= NC_ST_REVERSE;
+            paint(g_std, &st, C_TEXT, NC_DEFAULT);
+            ncplane_putstr_yx(g_std, y, x, c.egc);
+        }
+    }
+}
+
 void nc_render(void) {
     nc_apply_base();
     if (!g_nc || !g_std) return;
@@ -966,6 +1114,7 @@ void nc_render(void) {
         int top = bar - fh - srows; if (top < 1) top = 1;
         g_field_top = top;
         draw_pane(top);
+        draw_selection(top);
         draw_field(top);
         draw_suggest();
         draw_strip(bar - srows, srows, strip_text);
@@ -1051,7 +1200,7 @@ bool nc_start(void) {
         return false;
     }
     g_std = notcurses_stdplane(g_nc);
-    (void)notcurses_mice_enable(g_nc, NCMICE_BUTTON_EVENT);   /* clicks (folds) and the wheel (the pane); without it the terminal keeps its own */
+    (void)notcurses_mice_enable(g_nc, NCMICE_BUTTON_EVENT | NCMICE_DRAG_EVENT);   /* drags too: a selection needs the moves while the button is held (press alone reports one cell) */   /* clicks (folds) and the wheel (the pane); without it the terminal keeps its own */
     g_top = 0; g_clear_at = 0; g_pending = false; g_kq_n = 0;
     nc_render();
     return true;

@@ -513,6 +513,7 @@ typedef struct { char egc[8]; unsigned char w; nc_style st; } nc_cell;   /* one 
 /* Parses the escape sequence at s (length n): a CSI is consumed whole (its SGR applied to st when it
  * is one); returns the bytes consumed, or 0 when s does not start a CSI. */
 size_t nc_sgr_parse(const char *s, size_t n, nc_style *st);
+bool nc_copy_key(bool release, unsigned id, bool ctrl, bool super);   /* does this key copy a highlight (Ctrl+C, Cmd+C): pure, tested */
 unsigned nc_color256(int n);                           /* the xterm 256-colour palette, 0xRRGGBB */
 /* the characters of s (SGR applied on the way, carried in st when given), written to out up to max
  * (out may be NULL to count); returns how many there are */
