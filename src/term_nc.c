@@ -1149,10 +1149,39 @@ void nc_output(void) { nc_render_soon(); }
  * the terminal is put back as it was, and the caller falls back to the ANSI UI. A child that fails at once
  * is no reason to refuse: the real init below reports that. */
 #define NC_PROBE_MS 2000
+static struct termios g_tty_orig;        /* the terminal as the program found it (nc_probe) */
+static bool g_tty_saved = false;
+
+/* Reads and drops what the terminal still sends, until it has been quiet for 250 ms (at most 2 s). Called while
+ * the tty has no echo: the replies to the probe's queries that come late are then not printed on the screen when
+ * the terminal goes back to its own mode. */
+static void tty_drain_quiet(void) {
+    double end = now_s() + 2.0;
+    for (;;) {
+        double left = end - now_s();
+        if (left <= 0) break;
+        int ms = left < 0.25 ? (int)(left * 1000) : 250;
+        fd_set rf; FD_ZERO(&rf); FD_SET(STDIN_FILENO, &rf);
+        struct timeval tv = { 0, ms * 1000 };
+        if (select(STDIN_FILENO + 1, &rf, NULL, NULL, &tv) <= 0) break;   /* quiet: done */
+        char junk[512];
+        if (read(STDIN_FILENO, junk, sizeof junk) <= 0) break;
+    }
+}
+
 static bool nc_probe(const notcurses_options *o) {
     struct termios saved;
     bool have = tcgetattr(STDIN_FILENO, &saved) == 0;
+    if (have) { g_tty_orig = saved; g_tty_saved = true; }
     fflush(NULL);   /* the child must not flush what the parent has buffered */
+    if (have) {
+        /* The child's stop puts back the tty it was given. Its queries' replies can still be in flight then, and a
+         * cooked tty with echo on prints them on the screen (as ^[ text, where the cursor is). So the child gets
+         * no echo and no line editing: its own notcurses_stop restores that state, and the parent's init sets its own. */
+        struct termios quiet = saved;
+        quiet.c_lflag &= ~(tcflag_t)(ECHO | ICANON);
+        (void)tcsetattr(STDIN_FILENO, TCSANOW, &quiet);
+    }
     pid_t pid = fork();
     if (pid < 0) return true;   /* no child to ask: start as before */
     if (pid == 0) {
@@ -1169,10 +1198,19 @@ static bool nc_probe(const notcurses_options *o) {
         if (now_s() - t0 > NC_PROBE_MS / 1000.0) break;
         usleep(10000);
     }
-    if (back) return true;   /* the child came back: notcurses starts here too */
+    if (back) {   /* the child came back: notcurses starts here too, from the terminal as it was (its init saves that for restoring) */
+        if (have) {
+            tty_drain_quiet();
+            tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+        }
+        return true;
+    }
     kill(pid, SIGKILL);
     waitpid(pid, &st, 0);
-    if (have) tcsetattr(STDIN_FILENO, TCSANOW, &saved);   /* the child left the terminal in its own state */
+    if (have) {   /* the terminal as it was: the ANSI UI runs on it */
+        tty_drain_quiet();
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+    }
     int tty = open("/dev/tty", O_WRONLY | O_NOCTTY);
     if (tty >= 0) {   /* leave the alternate screen and the keyboard mode the child pushed */
         const char undo[] = "\x1b[<u\x1b[>4m\x1b[?1049l";
@@ -1182,6 +1220,20 @@ static bool nc_probe(const notcurses_options *o) {
     fprintf(stderr, "corbienest: the terminal did not answer notcurses' start-up queries (under tmux, its DA1 reply); using the ANSI UI\n");
     return false;
 }
+
+/* A failed init has sent its queries and may have restored the terminal, so the replies come now. They are read
+ * and dropped while the tty has no echo; only then is the terminal put back as the program found it. */
+static void tty_recover(void) {
+    if (!g_tty_saved) return;
+    struct termios quiet = g_tty_orig;
+    quiet.c_lflag &= ~(tcflag_t)(ECHO | ICANON);
+    tcsetattr(STDIN_FILENO, TCSANOW, &quiet);
+    tty_drain_quiet();
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_tty_orig);
+}
+
+/* the entry notcurses uses when TERM has none here: an xterm-compatible one (the terminal is identified by its replies) */
+#define NC_STANDIN_TERM "xterm-256color"
 
 bool nc_start(void) {
     if (g_nc) return true;
@@ -1193,8 +1245,18 @@ bool nc_start(void) {
     if (fd < 0) { fprintf(stderr, "corbienest: cannot dup the terminal for notcurses; using the ANSI UI\n"); return false; }
     g_nc_out = fdopen(fd, "w");
     if (!g_nc_out) { close(fd); fprintf(stderr, "corbienest: cannot open the terminal for notcurses; using the ANSI UI\n"); return false; }
+    const char *term = getenv("TERM");
+    char *term_was = term ? xstrdup(term) : NULL;   /* notcurses writes TERM into the environment: put back what the user has */
     g_nc = notcurses_init(&o, g_nc_out);
+    if (!g_nc) {   /* no terminfo entry for TERM (xterm-ghostty without its entry, say): try once more with a stand-in */
+        tty_recover();
+        o.termtype = NC_STANDIN_TERM;
+        g_nc = notcurses_init(&o, g_nc_out);
+    }
+    if (term_was) setenv("TERM", term_was, 1); else unsetenv("TERM");
+    free(term_was);
     if (!g_nc) {
+        tty_recover();
         fclose(g_nc_out); g_nc_out = NULL;
         fprintf(stderr, "corbienest: notcurses could not start on this terminal; using the ANSI UI\n");
         return false;
@@ -1202,6 +1264,7 @@ bool nc_start(void) {
     g_std = notcurses_stdplane(g_nc);
     (void)notcurses_mice_enable(g_nc, NCMICE_BUTTON_EVENT | NCMICE_DRAG_EVENT);   /* drags too: a selection needs the moves while the button is held (press alone reports one cell) */   /* clicks (folds) and the wheel (the pane); without it the terminal keeps its own */
     g_top = 0; g_clear_at = 0; g_pending = false; g_kq_n = 0;
+    notcurses_refresh(g_nc, NULL, NULL);   /* a full repaint: notcurses redraws only what changed, and echoed text is not its */
     nc_render();
     return true;
 }
