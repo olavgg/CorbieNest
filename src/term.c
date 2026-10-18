@@ -1315,7 +1315,7 @@ void term_sgr_track(sbuf *st, const char *d, size_t len) {
  * coordinates (a line index and a byte index into the line). */
 static void sel_row_paint(sbuf *o, const char *t, int len, int line, int off) {
     int a = 0, b = 0;
-    if (g_sel_on && !g_sel_down) {
+    if (g_sel_on) {   /* during a drag too (g_sel_on is set once it has moved): the highlight follows the pointer */
         ansi_pt lo = g_sel_a, hi = g_sel_b;
         if (lo.line > hi.line || (lo.line == hi.line && lo.idx > hi.idx)) { ansi_pt q = lo; lo = hi; hi = q; }
         if (line >= lo.line && line <= hi.line) {
