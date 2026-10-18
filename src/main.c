@@ -51,7 +51,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/status", "model, context usage, settings" },
     { "/system", "extra system instructions: TEXT, or clear" },
     { "/think", "when the model thinks: on, off, auto · show or hide it" },
-    { "/effort", "how hard this model thinks" },
+    { "/effort", "how hard this model thinks; /effort parallel on|off: the sub-agents of one reply at the same time" },
     { "/advisor", "a stronger model the agent may consult: a local one, or Claude, ChatGPT, Grok by API key" },
     { "/subagent", "the model sub-agents (task) run on, and how hard it thinks" },
     { "/orchestrate", "the advisor model plans the request as tasks, this model does them, the advisor reviews each" },
@@ -59,7 +59,6 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/goal", "candidates in git worktrees, on one or more models, race to a metric: the best score is kept" },
     { "/btw", "a side question: answered from the conversation, and not kept in it" },
     { "/workers", "how many tasks of /orchestrate may run at the same time" },
-    { "/parallel", "task calls in one reply run as sub-agents at the same time: on or off (off by default)" },
     { "/mode", "permission mode: manual, accept-edits, plan, auto" },
     { "/yolo", "auto mode on or off: every tool call approved" },
     { "/tools", "tool calling on or off" },
@@ -101,6 +100,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/goal", "min:a lower score is better|max:a higher score is better (the default)|-n:rounds, 1 to 10|-k:candidates, 2 to 8|-m:models, a,b,c (round-robin)" },
     { "/mode", "manual:ask before every edit and command|accept-edits:file edits go ahead, commands still ask|plan:read-only: the model proposes a plan|auto:nothing asks (dangerous)" },
     { "/think", "on:think on every call|off:do not think|auto:think once per request, not after every tool result|show:show the thinking|hide:hide the thinking" },
+    { "/effort parallel", "on:the task calls of one reply run as sub-agents at the same time|off:one sub-agent after another (the default)" },
     { "/yolo", "on:approve every tool call (dangerous)|off:back to manual confirmations" },
     { "/tools", "on:the model may call tools|off:chat only" },
     { "/web", "on:the model may search and read the web|off:no web access|engine:the search engine: a URL with %s for the query, or default" },
@@ -2199,7 +2199,7 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
     return rc;
 }
 
-/* ---------- parallel sub-agents (/parallel on) ----------
+/* ---------- parallel sub-agents (/effort parallel on) ----------
  * A reply whose calls are all task calls, on local models, runs its sub-agents at the same time: each
  * sub-agent's model call goes out on a thread of its own (http_job, as /orchestrate's workers do) and the
  * main thread does everything else — it starts the calls, runs their tools (subagent_calls, quiet), reads the
@@ -3180,7 +3180,7 @@ static bool run_turn_body(void) {
         cJSON *call;
         round_first = cJSON_GetArraySize(g_messages);
         bool failed = false;   /* a call of this round failed (see advisor_step_in) */
-        if (tasks_batchable(calls)) {   /* /parallel on: the sub-agents of this reply run at the same time */
+        if (tasks_batchable(calls)) {   /* /effort parallel on: the sub-agents of this reply run at the same time */
             bool stopped = tasks_batch(calls, &failed);
             g_fail_rounds = failed ? g_fail_rounds + 1 : 0;
             if (advisor_step_in_due()) advisor_step_in(reply);
@@ -4364,6 +4364,7 @@ static void cmd_help(void) {
            "  /think show|hide      show or hide thinking tokens\n"
            "  /effort [LEVEL]       how hard this model thinks, in the levels it has (gpt-oss: low medium high · qwen3.8: off low medium high · most others: off on);\n"
            "                        no argument opens a picker, default leaves it to the model. Kept per model; a level is sent with every call\n"
+           "  /effort parallel [on|off]  the task calls of one reply run as sub-agents at the same time (off by default: one after another)\n"
            "  /orchestrate REQUEST  the advisor model in charge: it plans the request as tasks, this model does them as workers with a fresh context\n"
            "                        each — those that do not wait for each other at the same time — and the advisor reviews every task's report and diff\n"
            "  /plan REQUEST         /orchestrate with the plan in layers (LAYER: n): you approve it, then each layer runs and the project is built before the next.\n"
@@ -4372,7 +4373,6 @@ static void cmd_help(void) {
            "                        candidates in git worktrees race to the goal, each on its model; the metric's best is kept as uncommitted changes\n"
            "  /btw QUESTION         a side question: the model answers from the conversation so far; the answer is printed, not kept in it\n"
            "  /workers [N]          how many tasks of /orchestrate may run at the same time (the model calls, each on a thread; default 3, at most 20, 1 = in turn)\n"
-           "  /parallel [on|off]    task calls in one reply run as sub-agents at the same time (off by default: one after another)\n"
            "  /advisor [MODEL|off]  a stronger model the agent may consult when the work is hard (the advisor tool): a bigger local model, a cloud one\n"
            "                        (NAME-cloud, after `ollama signin`) or a hosted API: xai:MODEL, openai:MODEL, anthropic:MODEL (key from XAI_API_KEY,\n"
            "                        OPENAI_API_KEY, ANTHROPIC_API_KEY). It is shown the conversation and answers with advice; it has no tools.\n"
@@ -4722,7 +4722,22 @@ static void effort_command(const char *who, const char *model, const model_info 
     if (r < 0) printf(C_DIM "%seffort unchanged: %s" C_RESET "\n", who, effort_label(model, mi));
     else effort_apply(who, model, mi, items[r]);
 }
-static void cmd_effort(const char *arg) { effort_command("", g_cfg.model, &g_model_info, arg); }
+/* /effort parallel [on|off]: whether the task calls of one reply run as sub-agents at the same time (tasks_batch) */
+static bool effort_is_parallel(const char *arg) { return arg && !strncmp(arg, "parallel", 8) && (arg[8] == ' ' || !arg[8]); }
+static void effort_parallel(const char *v) {
+    while (*v == ' ') v++;
+    if (!*v) printf("parallel: %s" C_DIM " — the task calls of one reply run as sub-agents at the same time%s" C_RESET "\n",
+                    g_cfg.parallel_tasks ? "on" : "off", g_cfg.parallel_tasks ? "" : " (off: one after another; /effort parallel on to change it)");
+    else if (!strcmp(v, "on") || !strcmp(v, "off")) {
+        g_cfg.parallel_tasks = !strcmp(v, "on"); config_save();
+        printf(C_GREEN "✓ parallel = %s" C_RESET C_DIM "%s" C_RESET "\n", v,
+               g_cfg.parallel_tasks ? " — the task calls of one reply run together; each sub-agent is in the strip while it runs" : " — one sub-agent after another");
+    } else printf("usage: /effort parallel on|off\n");
+}
+static void cmd_effort(const char *arg) {
+    if (effort_is_parallel(arg)) { effort_parallel(arg + 8); return; }
+    effort_command("", g_cfg.model, &g_model_info, arg);
+}
 
 /* /subagent [MODEL|default] and /subagent effort [LEVEL|default]: the model sub-agents (task) run on, and
  * how hard it thinks. A model is asked of its server first, so a wrong name is refused there and then. */
@@ -5117,15 +5132,6 @@ static int handle_slash(char *line) {
             printf(C_GREEN "✓ workers = %d" C_RESET C_DIM "%s" C_RESET "\n", n, n > 1 ? " — whether they overlap is the server's to say too: an Ollama with one slot (OLLAMA_NUM_PARALLEL) answers them in turn" : " — one task after another");
         }
     }
-    else if (!strcmp(cmd, "/parallel")) {
-        if (!arg) printf("parallel: %s" C_DIM " — task calls in one reply run as sub-agents at the same time%s" C_RESET "\n",
-                         g_cfg.parallel_tasks ? "on" : "off", g_cfg.parallel_tasks ? "" : " (off: one after another; /parallel on to change it)");
-        else if (!strcmp(arg, "on") || !strcmp(arg, "off")) {
-            g_cfg.parallel_tasks = !strcmp(arg, "on"); config_save();
-            printf(C_GREEN "✓ parallel = %s" C_RESET C_DIM "%s" C_RESET "\n", arg,
-                   g_cfg.parallel_tasks ? " — the task calls of one reply run together; each sub-agent is in the strip while it runs" : " — one sub-agent after another");
-        } else printf("usage: /parallel on|off\n");
-    }
     else if (!strcmp(cmd, "/ui")) cmd_ui(arg);
     else if (!strcmp(cmd, "/max_iters") || !strcmp(cmd, "/max-iters")) {
         if (!arg) printf("max_iters: %d tool rounds per request\n", g_cfg.max_iters);
@@ -5192,7 +5198,7 @@ static int handle_slash(char *line) {
 static bool slash_waits_for_next(const char *cmd, const char *arg) {
     if (!arg) return false;
     if (!strcmp(cmd, "/think")) return strcmp(arg, "show") && strcmp(arg, "hide");
-    if (!strcmp(cmd, "/effort")) return true;
+    if (!strcmp(cmd, "/effort")) return !effort_is_parallel(arg);   /* the toggle only decides the next reply's batch: it runs now */
     if (!strcmp(cmd, "/advisor")) return !strncmp(arg, "window", 6) && (arg[6] == ' ' || !arg[6]);
     return false;
 }
@@ -5200,7 +5206,7 @@ static bool slash_waits_for_next(const char *cmd, const char *arg) {
 static bool slash_runs_while_busy(const char *cmd, const char *arg) {
     static const char *ok[] = {
         "/help", "/?", "/status", "/cost", "/usage", "/diff", "/history", "/pwd", "/skills",
-        "/mode", "/yolo", "/permissions", "/tools", "/workers", "/parallel", "/max_iters", "/max-iters", "/temp",
+        "/mode", "/yolo", "/permissions", "/tools", "/workers", "/max_iters", "/max-iters", "/temp",
         "/keepalive", "/keep-alive", "/memory", "/web", NULL };
     /* /web with an argument is not just a report: on|off rebuilds the tool list the running
      * turn is holding, and engine writes the config. Bare /web only prints. */
@@ -5217,7 +5223,7 @@ static bool slash_runs_while_busy(const char *cmd, const char *arg) {
             || (!strncmp(arg, "ctx", 3) && (arg[3] == ' ' || !arg[3]));   /* the window of a consultation: read by the next one */
     /* the bare forms report; with an argument /think, /effort and /advisor window wait (slash_waits_for_next) */
     if (!strcmp(cmd, "/think")) return !arg || !strcmp(arg, "show") || !strcmp(arg, "hide");
-    if (!strcmp(cmd, "/effort")) return !arg;
+    if (!strcmp(cmd, "/effort")) return !arg || effort_is_parallel(arg);
     if (!strcmp(cmd, "/subagent")) return !arg;   /* with a model: asked of its server, so it waits for the turn to end (like /model) */
     /* /ui theme NAME only sets the palette and repaints, which a resize does mid-turn too; the bare form opens a
      * picker, and /ui ansi|notcurses restart the program: none of those while busy */
@@ -5800,6 +5806,7 @@ static int suggest(const char *buf, size_t cur, size_t *from, term_sug **items) 
         if (mi->think_on) { opt[no] = "on"; why[no++] = "think"; }
         for (int i = 0; i < mi->n_think_levels; i++) { opt[no] = mi->think_levels[i]; why[no++] = i == 0 ? "the least thinking" : i == mi->n_think_levels - 1 ? "the most thinking: slowest" : ""; }
         for (int i = 0; i < no; i++) if (!strncmp(opt[i], word, wl)) sug_add(items, &n, opt[i], why[i], false);
+        if (!strncmp("parallel", word, wl)) sug_add(items, &n, "parallel", "the task calls of one reply run as sub-agents at the same time", false);
     }
     else for (size_t i = 0; i < sizeof SLASH_ARGS / sizeof *SLASH_ARGS; i++) {
         if (strcmp(SLASH_ARGS[i].after, before)) continue;

@@ -87,7 +87,7 @@ without thinking about them: the status bar, the field, and the strip.
 | `/orchestrate REQUEST` | the advisor model in charge: it plans the request as tasks, the main model does them as workers — several at a time where the plan allows — and the advisor reviews each; see [Orchestrating](#orchestrating) |
 | `/plan REQUEST` | `/orchestrate` in layers: the advisor plans the request as tasks grouped into layers (`LAYER: n`), you approve the plan, then each layer runs and the project is built before the next one starts; a failed build becomes a fix task. See [Planning in layers](#planning-in-layers-plan) |
 | `/workers [N]` | how many tasks of `/orchestrate` may run at the same time (default 3, at most 20, `1` = one after another) |
-| `/parallel [on\|off]` | the `task` calls of one reply run as sub-agents at the same time (off by default: one after another) |
+| `/effort parallel [on\|off]` | the `task` calls of one reply run as sub-agents at the same time (off by default: one after another) |
 | `/goal "METRIC" [min\|max] [-n R] [-k K] [-m MODEL,…] GOAL` | candidates in git worktrees race to a metric, each on its model; the best score is kept and applied |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
 | `/usage`, `/usage price MODEL IN OUT\|default` | tokens per model in this session — the main model, the advisor — and the **estimated cost** of the hosted ones. The providers' prompt-cache hits (`⟳ cache … read`) are priced at their cached-input rate — Anthropic's a tenth of the input price (5% or 2.5% on the newest models), OpenAI's and xAI's as their price lists give it for each model — and Anthropic's cache writes at 1.25×; they are shown on their own line, as `↑` is the input that was not from the cache. The list price per million tokens (built in, as of October 2026) or the one you set with `price`. The same estimate is on each consultation's result line (`⎿ advice · 4.2k tokens · 12s · ≈ $0.03`) and in `/cost`. An estimate: what was billed is on the provider's usage page. On a full-screen conversation `/usage` comes up as a centred window and the running request goes on underneath its output is held back until the window closes (Esc or Ctrl-C closes it); Anthropic's last reply also reports its live rate limits (`limits at its last reply: input … of … a minute`, from the `anthropic-ratelimit-*` headers). The Admin Usage & Cost API (organization totals, needs an admin key) is not used |
@@ -594,7 +594,7 @@ work. `/subagent` changes that, separately from the main model:
 /subagent default                  back to the model doing the work
 ```
 
-`/parallel on` runs the sub-agents of one reply at the same time. A reply whose calls are all
+`/effort parallel on` runs the sub-agents of one reply at the same time. A reply whose calls are all
 `task` calls (two or more), all on local models, starts them together, up to `/workers` at once;
 each one's model call goes out on its own thread, as `/orchestrate`'s workers do. The strip shows
 every running sub-agent, and the reports are printed when they are all in, in the order the model

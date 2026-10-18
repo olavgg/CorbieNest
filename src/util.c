@@ -427,7 +427,7 @@ void config_load(void) {
         else if (!strcmp(k, "advisor_ctx")) { int n = atoi(v); if (n == 0 || n >= ADVISOR_CTX_MIN) g_cfg.advisor_ctx = n; }
         else if (!strcmp(k, "subagent")) { free(g_cfg.subagent); g_cfg.subagent = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "workers")) { int n = atoi(v); if (n >= 1 && n <= ORCH_PARALLEL_MAX) g_cfg.workers = n; }
-        else if (!strcmp(k, "parallel")) g_cfg.parallel_tasks = !strcmp(v, "on") || atoi(v) != 0;   /* parallel=on, as /parallel saves it */
+        else if (!strcmp(k, "parallel")) g_cfg.parallel_tasks = !strcmp(v, "on") || atoi(v) != 0;   /* parallel=on, as /effort parallel saves it */
         else if (!strcmp(k, "build")) { free(g_cfg.build); g_cfg.build = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "advisor_window")) { double m = atof(v); if (m >= 0 && m <= 24 * 60) g_cfg.advisor_window = (int)(m * 60 + 0.5); }
         else if (!strcmp(k, "advisor_guidance")) { int n = advisor_guidance_parse(v); if (n >= 0) g_cfg.advisor_guidance = n; }

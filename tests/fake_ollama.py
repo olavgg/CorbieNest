@@ -281,7 +281,7 @@ def script(model, messages, req):
     if messages[0]["role"] == "system" and "You are a sub-agent" in messages[0]["content"]:
         # sub-agent: one grep round, then a report — or, for a SLEEP task, one slow command,
         # so a test can type a message while the sub-agent is in the middle of a round
-        if "PAUSE" in messages[1]["content"]:   # a sub-agent of a /parallel batch: its report names its task ("PAUSE alpha: ..." -> "REPORT PAUSE alpha")
+        if "PAUSE" in messages[1]["content"]:   # a sub-agent of a /effort parallel batch: its report names its task ("PAUSE alpha: ..." -> "REPORT PAUSE alpha")
             if last["role"] == "tool":
                 yield chunk(model, "REPORT " + messages[1]["content"].split(":")[0][:40])
                 yield chunk(model, done=True)
@@ -330,7 +330,7 @@ def script(model, messages, req):
         else: yield chunk(model, tool_calls=[{"function": {"name": "list_dir", "arguments": {"path": "."}}}])
         yield chunk(model, done=True)
         return
-    if "TOOL_TASKS" in text:   # two task calls in one reply: /parallel on runs them at the same time
+    if "TOOL_TASKS" in text:   # two task calls in one reply: /effort parallel on runs them at the same time
         if last["role"] == "tool": yield chunk(model, "Both reports are in.")
         else:
             yield chunk(model, tool_calls=[

@@ -255,7 +255,7 @@ typedef struct {
     int   advisor_guidance; /* how much the agent leans on it, GUIDANCE_* (/advisor guidance) */
     int   advisor_window;   /* seconds after which a request's count of consultations starts again (/advisor window, given in minutes); 0 = never */
     int   workers;       /* tasks of /orchestrate that may run at the same time (/workers); 0 = ORCH_WORKERS_DEFAULT */
-    bool  parallel_tasks;/* /parallel on: the task calls of one reply run at the same time as sub-agents (default off) */
+    bool  parallel_tasks;/* /effort parallel on: the task calls of one reply run at the same time as sub-agents (default off) */
     char *build;         /* /plan: the command that builds the project after each layer (build=); NULL = detected from the project's build file */
     bool  show_thinking; /* print thinking tokens */
     int   mode;          /* permission mode, see MODE_* */
