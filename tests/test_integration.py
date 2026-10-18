@@ -950,7 +950,7 @@ check(sub and sum(t["function"]["name"] in ("web_fetch", "web_search") for t in 
 check("hay.txt" in sub[-1]["messages"][-1]["content"], "grep ran for real inside the sub-agent")
 print("test interactive: /effort parallel on runs the task calls of one reply at the same time")
 s.send("/effort parallel\r"); check(s.expect("parallel: off"), "/effort parallel alone says it is off by default")
-s.send("/effort parallel on\r"); check(s.expect("parallel = on") and "parallel=on" in open(CFG2_FILE).read(), "/effort parallel on, saved")
+s.send("/effort parallel on\r"); check(s.expect("parallel = on") and "parallel=on" in open(os.path.join(CFG, "corbienest", "config")).read(), "/effort parallel on, saved")
 urllib.request.urlopen(f"{HOST}/_inflight").read()
 s.send("TOOL_TASKS\r")
 check(s.expect("⤷ sub-agent alpha") and s.expect("⤷ sub-agent beta"), "both sub-agents start")
