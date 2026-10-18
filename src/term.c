@@ -1341,6 +1341,7 @@ static void repaint_conv_soon(void) {
         sbuf o; sb_init(&o);
         sb_printf(&o, "[1;%dr", fs_region());
         conv_repaint(&o);
+        if (g_field_focus) field_cursor(&o);   /* the editor keeps its cursor: back in the field, not at the transcript */
         bool was = g_sb_pause; sb_pause(true);
         fwrite(o.data, 1, o.len, stdout); fflush(stdout);
         sb_pause(was);
@@ -2055,6 +2056,7 @@ static ssize_t busy_strip_key(const unsigned char *kb, ssize_t k, ssize_t i) {
     return 0;
 }
 
+static void sel_copy(void);
 int term_poll_interrupt(void) {
     if (g_ui_nc) return nc_poll_interrupt();
     unsigned char kb[256];
@@ -2065,6 +2067,7 @@ int term_poll_interrupt(void) {
         ssize_t k = in_read(kb, sizeof kb);
         if (k <= 0) return 0;
         for (ssize_t i = 0; i < k; i++) {
+            if (kb[i] == 3 && g_sel_on) { sel_copy(); continue; }                /* Ctrl-C copies a highlight: not an interrupt */
             if (kb[i] == 3) { term_overlay_close(); view_leave(); return 1; }     /* Ctrl-C */
             { ssize_t took = busy_strip_key(kb, k, i); if (took) { i += took - 1; continue; } }
             if (kb[i] == 27 && i == k - 1 && !g_ta_x10) {   /* bare Esc, or a split escape sequence? */
@@ -2188,9 +2191,11 @@ static void sel_copy(void) {
     size_t n = strlen(t);
     char *enc = base64_encode(t, n);
     if (enc) {
+        sbuf osc; sb_init(&osc);
+        sb_printf(&osc, "\x1b]52;c;%s\x07", enc);   /* the terminal's clipboard (OSC 52) */
         fflush(stdout);
-        printf("\x1b]52;c;%s\x07", enc);   /* the terminal's clipboard (OSC 52) */
-        fflush(stdout);
+        fd1_write(osc.data, osc.len);   /* to fd 1 itself: the stdout hook would record it as conversation */
+        sb_free(&osc);
         free(enc);
     }
     if (access("/usr/bin/pbcopy", X_OK) == 0) {   /* and the macOS clipboard, for terminals that ignore OSC 52 */
