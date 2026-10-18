@@ -7,6 +7,9 @@ confirmations, Ctrl-C interruption, type-ahead, slash commands and the /model
 picker. Requires only python3 (stdlib). No real Ollama needed.
 """
 import inspect, json, os, pty, re, select, shutil, socket, struct, subprocess, sys, tempfile, termios, fcntl, time, threading, urllib.request
+# a short temp root, as on Linux: macOS's per-user temp dir (/var/folders/…/T) is so long that the status bar's location line
+# cuts the test folder's path, and the checks that read the bar then miss their text. Set before the first mkdtemp.
+os.environ["TMPDIR"] = "/tmp"
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -83,7 +86,7 @@ def transcript(s): return clean(CHROME.sub("", s))
 REPAINT = re.compile(r"\x1b\[\?7l.*?(?:\x1b\[\?7h|\Z)", re.S)
 def fresh(s): return REPAINT.sub("", s)
 
-WORK = tempfile.mkdtemp(prefix="crowtest_")
+WORK = os.path.realpath(tempfile.mkdtemp(prefix="crowtest_"))   # realpath: the process reports its cwd that way (macOS /var is /private/var)
 CFG = tempfile.mkdtemp(prefix="crowcfg_")
 ENV = dict(os.environ, XDG_CONFIG_HOME=CFG, OLLAMA_HOST=HOST, TERM="xterm-256color", HOME=WORK)
 ENV.pop("CORBIENEST_MODEL", None)
@@ -2308,6 +2311,31 @@ open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nadvisor=xai:grok-fake\n")
 s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2, banner=True)
 check(s.expect("advisor: xai:grok-fake") and s.expect("XAI_API_KEY is not set"), "the banner names the saved advisor, and says when its key is missing")
 s.send("\x1b"); s.expect("(no such text)", 1); s.send("\x04"); s.close()
+print("test interactive: a missing key is said once at start-up")
+def _key_lines(sess, key):
+    """The missing-key sentence as written: with the ✗ (the working model's line) or without (the advisor's).
+    A repaint repeats a line; it does not add a second wording."""
+    text = sess.out.decode("utf-8", "replace")
+    needle = f"{key} is not set"
+    marked = bare = 0
+    start = 0
+    while True:
+        i = text.find(needle, start)
+        if i < 0: break
+        if "✗" in text[max(0, i - 16):i]: marked += 1
+        else: bare += 1
+        start = i + len(needle)
+    return marked, bare
+s = Session(["-m", "anthropic:claude-opus-5", "--advisor", "anthropic:claude-opus-5"], env=ENV2)
+check(s.expect("Ctrl-D to quit"), "it starts with the model and the advisor on the same missing key")
+m, b = _key_lines(s, "ANTHROPIC_API_KEY")
+check(m >= 1 and b == 0, f"that key is the model's one line, not reprinted and not said again for the advisor: marked {m} bare {b}")
+s.send("\x04"); s.close()
+s = Session(["-m", "anthropic:claude-opus-5", "--advisor", "xai:grok-fake"], env=ENV2)
+check(s.expect("Ctrl-D to quit"), "it starts with two hosted roles and two missing keys")
+am, ab = _key_lines(s, "ANTHROPIC_API_KEY"); xm, xb = _key_lines(s, "XAI_API_KEY")
+check(am >= 1 and ab == 0 and xm == 0 and xb >= 1, f"a different key is still said: anthropic {(am, ab)} xai {(xm, xb)}")
+s.send("\x04"); s.close()
 s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
 check("advisor: xai:grok-fake" in s.text() and "is not set" not in s.text(), "with the key there it is just named")
 np = len(preqs())

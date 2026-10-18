@@ -5639,10 +5639,15 @@ static void banner_items(bool need_ollama, int ok) {
     box_add(0, C_DIM "model:" C_RESET " %s%s" C_DIM " · ctx %s%s%s%s%s" C_RESET, model_set() ? g_cfg.model : "(none)", g_model_tools ? "" : C_DIM " (chat-only)" C_RESET,
             fmt_ctx(g_cfg.num_ctx), g_model_max_ctx > 0 ? " of " : "", g_model_max_ctx > 0 ? fmt_ctx(g_model_max_ctx) : "", eff ? " · effort " : "", eff ? eff : "");
     if (g_cfg.advisor) {
-        /* a hosted advisor without its key is one that will not answer: say so here, not at the first consultation */
+        /* a hosted advisor without its key is one that will not answer: say so here, not at the first consultation.
+         * The same variable already named for the working model is not said again. */
         const provider_def *pv = provider_find(g_cfg.advisor, NULL);
         const char *key = pv ? getenv(pv->key_env) : NULL;
-        if (pv && !(key && *key)) snprintf(g_advisor_note, sizeof g_advisor_note, C_YELLOW "%s is not set — export it before starting corbienest" C_RESET, pv->key_env);
+        if (pv && !(key && *key)) {
+            char lead[96]; snprintf(lead, sizeof lead, "%s is not set", pv->key_env);
+            if (!(g_model_bad && strstr(g_model_err, lead)))
+                snprintf(g_advisor_note, sizeof g_advisor_note, C_YELLOW "%s is not set — export it before starting corbienest" C_RESET, pv->key_env);
+        }
         box_add(0, C_DIM "advisor:" C_RESET " %s%s%s", g_cfg.advisor,
                 g_cfg.advisor_guidance != GUIDANCE_NORMAL ? C_DIM " · guidance " C_RESET : "", g_cfg.advisor_guidance != GUIDANCE_NORMAL ? advisor_guidance()->name : "");
     }
@@ -6385,8 +6390,9 @@ int main(int argc, char **argv) {
     }
     http_idle_timeout_ms = idle_was;
     /* a configured model that cannot be used (its key is not set, the provider refused it) stops a one-shot run only:
-     * at a screen the program starts with the model as the config has it, says why, sends nothing (run_turn_body) and
-     * /model switches to another one. The configured name stays, so a later config save does not lose it */
+     * at a screen the program starts with the model as the config has it. refresh_model_caps already said why, on
+     * this screen (it is drawn before the check), so it is not said again here. A send is refused (run_turn_body)
+     * and /model switches. The configured name stays, so a later config save does not lose it */
     if (g_model_bad && quiet_caps) { fprintf(stderr, "corbienest: %s\n", g_model_err); term_restore(); return 1; }
     if (cli_effort) {   /* only now is it known what the model offers */
         if (!strcmp(cli_effort, "default")) effort_set(g_cfg.model, NULL);
@@ -6407,7 +6413,6 @@ int main(int argc, char **argv) {
         }
         return run_benchmark(bench_runs, oneshot, ctx_given, json_out, json_fd);
     }
-    if (g_model_bad) printf(C_YELLOW "%s" C_RESET "\n", g_model_err);   /* (only a screen gets here with one: the reason, where the conversation starts) */
     if (resume_latest) {
         int n; session_info *v = sessions_list(true, &n);
         if (n) session_load(v[0].id); else printf(C_DIM "no earlier session in this directory — starting fresh" C_RESET "\n");
