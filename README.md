@@ -49,8 +49,8 @@ sudo dnf install gcc make cjson-devel libcurl-devel
 sudo dnf install epel-release
 sudo dnf install gcc make cjson-devel libcurl-devel
 
-# macOS
-brew install cjson                     # libcurl comes with macOS
+# macOS (Homebrew; libcurl, zlib and ncurses come with macOS)
+brew install cjson libunistring        # libunistring is for the notcurses screen
 ```
 
 ```sh
@@ -66,7 +66,52 @@ Build options:
   zlib-devel ncurses-devel`).
 - `make NOTCURSES=0` leaves the notcurses screen out even when those libraries are installed.
 - `make NOTCURSES=1` requires them and fails without them.
-- On macOS with Homebrew: `make CFLAGS="-O2 -std=gnu11 -I$(brew --prefix)/include" LDLIBS="-L$(brew --prefix)/lib -lcjson -lcurl"`.
+- On macOS, the notcurses screen is built with the steps in
+  [Building with notcurses on macOS](#building-with-notcurses-on-macos).
+
+### Building with notcurses on macOS
+
+The notcurses screen builds on macOS as it does on Linux. Only cJSON and libunistring come from
+Homebrew: libncurses (terminfo) and zlib are part of macOS.
+
+1. Make sure the command line tools are installed (`xcode-select -p` prints their path; if it fails,
+   run `xcode-select --install`).
+
+2. Install the two Homebrew libraries:
+
+   ```sh
+   brew install cjson libunistring
+   ```
+
+3. Build with the notcurses screen required. `make NOTCURSES=1` fails when a library is missing,
+   so the build does not quietly leave the screen out:
+
+   ```sh
+   make NOTCURSES=1
+   ```
+
+   The Makefile finds Homebrew through `brew --prefix` (`/opt/homebrew` on Apple silicon,
+   `/usr/local` on Intel), so no flags are needed. The notcurses core in `vendor/notcurses` is
+   compiled too, which takes a while the first time.
+
+4. Start corbienest on the notcurses screen, for one run or by default:
+
+   ```sh
+   ./corbienest --ui notcurses
+   ```
+
+   `/ui notcurses` switches to it during a session and saves the choice; `ui=notcurses` in the config
+   makes it the default. `/ui ansi` goes back.
+
+5. Run the unit tests on both builds, the notcurses one and the one without the screen:
+
+   ```sh
+   make NOTCURSES=1 test
+   make NOTCURSES=0 test
+   ```
+
+The screen is left out when `NOTCURSES=0` is given, and `make` alone builds it whenever libunistring
+and cJSON are installed.
 
 ## Quick start
 

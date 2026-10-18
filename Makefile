@@ -12,6 +12,19 @@ CFLAGS += -fsanitize=$(SAN) -fno-sanitize-recover=all -fno-omit-frame-pointer
 endif
 SAN_STAMP := .sanitize-$(or $(SAN),none)
 
+# Homebrew's cJSON sits outside the compiler's default search path. These stay
+# out of CFLAGS, so a command-line CFLAGS= (CI, `make release`) still finds it.
+ifeq ($(shell uname -s),Darwin)
+  BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
+  ifeq ($(BREW_PREFIX),)
+    BREW_PREFIX := $(shell if [ -f /opt/homebrew/include/cjson/cJSON.h ]; then echo /opt/homebrew; elif [ -f /usr/local/include/cjson/cJSON.h ]; then echo /usr/local; fi)
+  endif
+  ifneq ($(BREW_PREFIX),)
+    BREW_CPPFLAGS := -I$(BREW_PREFIX)/include
+    BREW_LDFLAGS  := -L$(BREW_PREFIX)/lib
+  endif
+endif
+
 # The notcurses frontend (src/term_nc.c) and the notcurses core it runs on (vendor/notcurses, a copy of
 # notcurses 3.0.17 with the tmux 3.4+ DA1 fix of PR #2926; see vendor/notcurses/README.md) are built
 # when the libraries the core needs are there: libunistring (headers and library), zlib and terminfo
@@ -19,8 +32,10 @@ SAN_STAMP := .sanitize-$(or $(SAN),none)
 # otherwise, so the build then needs nothing but libc, cJSON and libcurl. `make NOTCURSES=1` insists
 # on them (fails without them), `make NOTCURSES=0` leaves them out.
 NC_DIR   := vendor/notcurses
-NC_LIBS  := -lunistring -ltinfo -lz -lm
-NC_PROBE := printf '%s\n' '\#include <curses.h>' '\#include <term.h>' '\#include <zlib.h>' '\#include <unigbrk.h>' 'int main(void) { return 0; }' | $(CC) -x c - -o /dev/null $(NC_LIBS) >/dev/null 2>&1 && echo 1 || echo 0
+# terminfo is libtinfo on Linux; macOS has no libtinfo, its terminfo is in libncurses
+NC_TINFO := $(if $(filter Darwin,$(shell uname -s)),-lncurses,-ltinfo)
+NC_LIBS  := -lunistring $(NC_TINFO) -lz -lm
+NC_PROBE := printf '%s\n' '\#include <curses.h>' '\#include <term.h>' '\#include <zlib.h>' '\#include <unigbrk.h>' 'int main(void) { return 0; }' | $(CC) $(BREW_CPPFLAGS) -x c - -o /dev/null $(BREW_LDFLAGS) $(NC_LIBS) >/dev/null 2>&1 && echo 1 || echo 0
 # zlib is optional too: gzip request bodies (util.c gzip_body, WITH_ZLIB) need it. ZLIB=auto (the default) builds
 # with it when zlib.h and -lz are there; ZLIB=0 leaves it out; ZLIB=1 insists on it.
 ZLIB_PROBE := printf '%s\n' '\#include <zlib.h>' 'int main(void) { return 0; }' | $(CC) $(BREW_CPPFLAGS) -x c - -o /dev/null $(BREW_LDFLAGS) -lz >/dev/null 2>&1 && echo 1 || echo 0
@@ -33,7 +48,6 @@ ifneq ($(shell $(ZLIB_PROBE)),1)
 $(error ZLIB=1 but zlib.h or -lz is missing: install zlib1g-dev)
 endif
 ZLIB_DEFS := -DWITH_ZLIB
-LDLIBS    += -lz
 else
 ZLIB_DEFS :=
 endif
@@ -50,6 +64,12 @@ LDLIBS   += $(NC_LIBS)
 else
 NC_DEFS  :=
 endif
+# -lz once: the notcurses libraries already carry it
+ifeq ($(ZLIB),1)
+ifneq ($(NOTCURSES),1)
+LDLIBS += -lz
+endif
+endif
 
 # The vendored notcurses core (built only with the frontend): its generated headers come from the
 # templates CMake uses (tools/*.in), with the same substitutions, in build/notcurses/.
@@ -60,13 +80,15 @@ NC_VTWK  := 0
 NC_SRC   := $(wildcard $(NC_DIR)/src/lib/*.c) $(wildcard $(NC_DIR)/src/compat/*.c) $(NC_DIR)/src/media/shim.c $(NC_DIR)/src/media/none.c
 NC_OBJ   := $(if $(filter 1,$(NOTCURSES)),$(NC_SRC:.c=.o))
 NC_GEN   := build/notcurses/version.h build/notcurses/builddef.h
-NC_VFLAGS := -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -D_DEFAULT_SOURCE -I$(NC_DIR)/include -I$(NC_DIR)/src -I$(NC_DIR)/src/lib -I$(NC_DIR)/src/compat -Ibuild/notcurses -Wno-clobbered -Wno-discarded-qualifiers
+# _DARWIN_C_SOURCE is what exposes strcasecmp and friends on macOS (ignored elsewhere); the two -Wno- for
+# clang's names of the upstream GCC warnings (gcc ignores the unknown ones)
+NC_VFLAGS := -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -I$(NC_DIR)/include -I$(NC_DIR)/src -I$(NC_DIR)/src/lib -I$(NC_DIR)/src/compat -Ibuild/notcurses -Wno-clobbered -Wno-discarded-qualifiers -Wno-unknown-warning-option -Wno-incompatible-pointer-types-discards-qualifiers
 
 SRC := src/main.c src/util.c src/http.c src/term.c src/term_nc.c src/tools.c src/ollama.c src/provider.c src/skills.c src/theme.c src/mcp.c src/agents.c src/stream.c
 OBJ := $(SRC:.c=.o)
 
 corbienest: $(OBJ) $(NC_OBJ)
-	$(CC) $(CFLAGS) -o $@ $(OBJ) $(NC_OBJ) $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $(OBJ) $(NC_OBJ) $(BREW_LDFLAGS) $(LDLIBS)
 
 # A stamp per setting: switching NOTCURSES rebuilds every object (their flags differ).
 NC_STAMP := .notcurses-$(NOTCURSES)
@@ -85,7 +107,7 @@ $(ZLIB_STAMP):
 	touch $@
 
 src/%.o: src/%.c src/common.h $(NC_STAMP) $(SAN_STAMP) $(ZLIB_STAMP)
-	$(CC) $(CFLAGS) $(NC_DEFS) $(ZLIB_DEFS) -c -o $@ $<
+	$(CC) $(BREW_CPPFLAGS) $(CFLAGS) $(NC_DEFS) $(ZLIB_DEFS) -c -o $@ $<
 
 # The vendored core'"'"'s own warnings are upstream'"'"'s: the two kinds it has (-Wclobbered in unixsig.c,
 # -Wdiscarded-qualifiers in notcurses.c) are left out for it alone, so -Wall -Wextra -Werror still
@@ -100,7 +122,7 @@ build/notcurses/builddef.h: $(NC_DIR)/tools/builddef.h.in Makefile
 	sed -e 's|@CMAKE_INSTALL_FULL_DATADIR@|$(PREFIX)/share|' -e '/cmakedefine/d' $< > $@
 
 $(NC_DIR)/src/%.o: $(NC_DIR)/src/%.c $(NC_GEN) $(SAN_STAMP)
-	$(CC) $(CFLAGS) $(NC_VFLAGS) -c -o $@ $<
+	$(CC) $(BREW_CPPFLAGS) $(CFLAGS) $(NC_VFLAGS) -c -o $@ $<
 
 # Optimized, stripped binary without debug info (a clean rebuild so no -g objects sneak in).
 RELEASE_CFLAGS ?= -O2 -std=gnu11 -Wall -Wextra -DNDEBUG
@@ -116,7 +138,7 @@ install: corbienest
 LIBOBJ := $(filter-out src/main.o,$(OBJ)) $(NC_OBJ)
 
 tests/test_unit: tests/test_unit.c $(LIBOBJ) src/common.h
-	$(CC) $(CFLAGS) $(NC_DEFS) $(ZLIB_DEFS) -o $@ tests/test_unit.c $(LIBOBJ) $(LDLIBS)
+	$(CC) $(BREW_CPPFLAGS) $(CFLAGS) $(NC_DEFS) $(ZLIB_DEFS) -o $@ tests/test_unit.c $(LIBOBJ) $(BREW_LDFLAGS) $(LDLIBS)
 
 # `make test` is the unit tests: what a change has to pass, and what needs nothing but the build.
 # The integration tests drive the program through a pty (and tmux), which is timing a hosted CI
