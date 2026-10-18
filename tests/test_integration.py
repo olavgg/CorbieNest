@@ -105,8 +105,8 @@ def check(cond, msg):
     if cond: passed += 1
     else: failed += 1; print(f"  FAIL: {msg} (line {inspect.currentframe().f_back.f_lineno})")
 
-def run(args, stdin=b"", env=None):
-    p = subprocess.run([BIN] + args, cwd=WORK, env=env or ENV, input=stdin, capture_output=True, timeout=60)
+def run(args, stdin=b"", env=None, cwd=None):
+    p = subprocess.run([BIN] + args, cwd=cwd or WORK, env=env or ENV, input=stdin, capture_output=True, timeout=60)
     run.err = clean(p.stderr.decode())
     return clean(p.stdout.decode()), p.returncode
 
@@ -626,7 +626,8 @@ check(re.search(r"\x1b\[15;1H", raw) and re.search(r"\x1b\[16;1H", raw),   # pai
 sf.mark = len(sf.out)
 fcntl.ioctl(sf.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
 os.kill(sf.pid, __import__("signal").SIGWINCH)
-check(sf.expect("manual mode", 3), "a resize at an idle prompt is drawn at once, not at the next key (a tmux pane is resized all the time)")
+check(seen(sf, "manual mode", 3), "a resize at an idle prompt is drawn at once, not at the next key (a tmux pane is resized all the time)")
+time.sleep(0.5); sf.expect("(never)", 0.5)   # the redraw after the resize is written in pieces: read all of it
 raw = sf.out[sf.mark:].decode("utf-8", "replace")
 check(re.search(r"\x1b\[1;26r", raw) is not None, f"the region was re-cut for the new height: {raw[-300:]!r}")
 check(re.search(r"\x1b\[29;1H[^\n]*manual mode", raw) is not None, "the bar is on the new row above the last")
@@ -1902,14 +1903,15 @@ if work:
 check(not consult_posts(posts), "this request never consulted the advisor")
 
 print("test loop guard: a stopped request leaves no call unanswered, and the next request is accepted")
+LOOP_WORK = os.path.realpath(tempfile.mkdtemp(prefix="crowloop_"))   # its own folder: --continue resumes the newest session here, not another section's
 cfg_before = open(CFG2_FILE).read()
 open(CFG2_FILE, "w").write(cfg_before + "max_iters=2\n")   # the guard at 2 tool rounds, for this test only
 try:
     n0 = len(preqs())
-    out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "-p", "TOOL_LOOP please"], env=ENVK)
+    out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "-p", "TOOL_LOOP please"], env=ENVK, cwd=LOOP_WORK)
     check(rc == 0 and "loop guard" in out, f"the request stopped at the loop guard: {out[-300:]!r}")
     check("✗" not in out, "and nothing was refused on the way")
-    out2, rc2 = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "--continue", "-p", "continue"], env=ENVK)
+    out2, rc2 = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "--continue", "-p", "continue"], env=ENVK, cwd=LOOP_WORK)
     check(rc2 == 0 and "✗" not in out2 and "tool_use" not in out2 and "Tool said:" in out2,
           f"the next request goes through: {out2[-300:]!r}")
 finally:
@@ -2327,7 +2329,7 @@ s.send("\x04"); s.close()
 print("test interactive: /orchestrate with a hosted model, and the banner")
 open(CFG2_FILE, "w").write("memory=0\nmemory_idle=0\nadvisor=xai:grok-fake\n")
 s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2, banner=True)
-check(s.expect("advisor: xai:grok-fake") and s.expect("XAI_API_KEY is not set"), "the banner names the saved advisor, and says when its key is missing")
+check(seen(s, "advisor: xai:grok-fake", 15) and seen(s, "XAI_API_KEY is not set", 15), "the banner names the saved advisor, and says when its key is missing")   # the banner is painted in a repaint region: read as written
 s.send("\x1b"); s.expect("(no such text)", 1); s.send("\x04"); s.close()
 print("test interactive: a missing key is said once at start-up")
 def _key_lines(sess, key):
@@ -2350,7 +2352,7 @@ m, b = _key_lines(s, "ANTHROPIC_API_KEY")
 check(m >= 1 and b == 0, f"that key is the model's one line, not reprinted and not said again for the advisor: marked {m} bare {b}")
 s.send("\x04"); s.close()
 s = Session(["-m", "anthropic:claude-opus-5", "--advisor", "xai:grok-fake"], env=ENV2)
-check(s.expect("Ctrl-D to quit"), "it starts with two hosted roles and two missing keys")
+check(s.started(), "it starts with two hosted roles and two missing keys")
 am, ab = _key_lines(s, "ANTHROPIC_API_KEY"); xm, xb = _key_lines(s, "XAI_API_KEY")
 check(am >= 1 and ab == 0 and xm == 0 and xb >= 1, f"a different key is still said: anthropic {(am, ab)} xai {(xm, xb)}")
 s.send("\x04"); s.close()
@@ -2392,10 +2394,12 @@ print("test config persistence")
 cfg = open(os.path.join(CFG, "corbienest", "config")).read()
 check("keep_alive=30m" in cfg, "keep_alive saved to config")
 check("model=fake-coder:latest" in cfg, "model saved to config")
-check("mode=manual" in cfg, "mode saved to config")
+# /mode manual ran in the second session (ENV2), so its file is CFG2's
+check("mode=manual" in open(CFG2_FILE).read(), "mode saved to config")
 check("max_iters=100" in cfg, "max_iters saved to config")
 s = Session([])   # no -m: should use saved model
-check(s.expect("model: fake-coder:latest"), "saved model used")
+# the banner box carries the model; it is painted in a repaint region, which expect() skips, so read the whole output
+check(s.started() and "model: fake-coder:latest" in clean(s.out.decode("utf-8", "replace")), "saved model used")
 s.send("multi one\\\r"); s.send("two\r"); check(s.expect("Echo: multi one"), "multi-line entry")
 s.send("\x04"); check(s.expect("bye"), "exit"); s.close()
 hist = open(os.path.join(CFG, "corbienest", "history")).read()
@@ -2460,13 +2464,14 @@ shutil.rmtree(repo, ignore_errors=True); shutil.rmtree(repo2, ignore_errors=True
 
 print("test interactive: /btw answers from the conversation so far, and nothing it says is kept in it")
 b = Session(["-m", "fake-coder:latest"])
-check(b.expect("❯", 20), "btw session starts")
+check(b.started(20), "btw session starts")   # the footer: the field is live (the ❯ of the banner is no sign of it)
 b.send("first remark\r"); check(b.expect("Echo: first remark"), "a normal exchange first")
 n_before = len(requests()[-1]["messages"])
 b.send("/btw what did I say first\r")
 check(b.expect("? what did I say first") and b.expect("Echo:", 20), f"the side question is asked and answered: {since_send(b)[-300:]!r}")
 side = requests()[-1]["messages"]
-check(side[-1]["role"] == "user" and "side question" in side[-1]["content"] and len(side) == n_before + 1, f"the side call carries the conversation and the question: {len(side)} messages")
+# the conversation is what the last request held, plus the reply to it (the assistant message), plus the side question
+check(side[-1]["role"] == "user" and "side question" in side[-1]["content"] and side[-2]["role"] == "assistant" and len(side) == n_before + 2, f"the side call carries the conversation and the question: {len(side)} messages")
 check("side question" not in json.dumps(requests()[-2]["messages"]), "the answer is not in the conversation the next request sends")
 b.expect("❯", 5)
 b.send("second remark\r"); check(b.expect("Echo: second remark"), "the next message goes on from the conversation as it was")
@@ -2643,10 +2648,12 @@ print("test feature: the slash commands for the rules, hooks, MCP servers, agent
 cfg, proj, env = feat("slash")
 sess = Session([], cwd=proj, env=env)
 sess.expect("Ctrl-D to quit")
-def slash(line):   # the input field takes a fast line as it is typed; Esc closes the suggestion list before Enter
+def slash(line):   # let the start-up redraw finish first (a key sent during it is lost), then type; Enter submits.
+    # No Esc here: it closes the suggestion list, and an Enter that follows it straight away is lost.
+    sess.expect("(never)", 1.0)
     sess.mark = len(sess.out)
     for ch in line: os.write(sess.fd, ch.encode()); time.sleep(0.03)
-    time.sleep(0.6); os.write(sess.fd, b"\x1b"); time.sleep(0.4); os.write(sess.fd, b"\r")
+    time.sleep(0.6); os.write(sess.fd, b"\r")
 slash("/permissions add deny bash rm *")
 check(seen(sess, "✓ added: deny bash rm *", 8), "/permissions add accepts a guard rule")
 slash("/hooks add pre bash echo gate")
