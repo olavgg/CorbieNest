@@ -2238,7 +2238,7 @@ static int csi_key(const char *params, int fin) {
         int cb = 0, x = 0, y = 0;
         if ((fin != 'M' && fin != 'm') || sscanf(params + 1, "%d;%d;%d", &cb, &x, &y) != 3) return K_ESC;
         if (fin == 'm') {
-            if (g_sel_down) { g_sel_down = false; if (g_sel_moved) { g_sel_on = true; g_click_row = g_click_frow = 0; repaint_conv_soon(); return K_MOUSE; } }
+            if (g_sel_down) { g_sel_down = false; if (g_sel_moved) { g_sel_on = true; sel_copy(); g_click_row = g_click_frow = 0; repaint_conv_soon(); return K_MOUSE; } }   /* the release copies it: Cmd+V pastes, no key needed */
             g_click_row = g_click_frow = 0;
             return K_MOUSE;
         }
