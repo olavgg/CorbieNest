@@ -138,7 +138,16 @@ class Session:
                 except OSError: return
                 if not d: return
                 self.out += d
-        time.sleep(0.3)
+        # the banner is still animating: keep reading what it writes for a moment, or the Esc lands while it is
+        # half drawn and the footer that follows is never written (two sessions at once failed this way)
+        settle = time.time() + 1.5
+        while time.time() < settle:
+            r, _, _ = select.select([self.fd], [], [], 0.1)
+            if r:
+                try: d = os.read(self.fd, READ_MAX)
+                except OSError: break
+                if not d: break
+                self.out += d
         self.send("\x1b", wait=0.3)
         self.mark = 0
     def expect(self, pat, t=15):
@@ -157,6 +166,10 @@ class Session:
                 except OSError: return hit()
                 if not d: return hit()
                 self.out += d
+    def started(self, t=15):
+        """The footer that says the session is up. It is painted once, at start-up, but a repaint can carry it (the
+        autowrap-off region), and expect() skips repaints on purpose: so this reads what was written, not what is fresh."""
+        return self.expect("Ctrl-D to quit", t) or seen(self, "Ctrl-D to quit", 0.1)
     def send(self, s, wait=0.15):
         self.mark = len(self.out)
         os.write(self.fd, s.encode() if isinstance(s, str) else s); time.sleep(wait)
@@ -227,9 +240,11 @@ def quiet(sess, data):
     sess.send(data); sess.expect("(no such text)", 0.6); return len(sess.out) == sess.mark
 
 def listed():
-    """What the last redraw put under the input field: the list, its hint and the bar."""
+    """What the redraw since the last key put under the input field: the list, its hint and the bar. Everything since
+    the key, not one piece of it: a redraw writes the list's rows in an order that is not fixed (before or after the
+    field's edge), and a repaint may have drawn the banner again above them. The checks look for list entries only."""
     s.expect("(no such text)", 0.3)
-    return since().rsplit("─", 1)[-1]
+    return since()
 
 def thinks(rs): return [r.get("think", "absent") for r in rs]
 
@@ -1314,6 +1329,7 @@ s.send("\x15")
 s.send("see @sugsrc/twin.txt and @sugsrc/nope.tx"); s.send("t"); s.expect("(no such text)", 0.3); raw = s.out[s.mark:]
 check(b"\x1b[38;2;86;182;194m@sugsrc/twin.txt\x1b[38;2;255;241;184m" in raw and b"\x1b[38;2;86;182;194m@sugsrc/nope" not in raw, f"a mention that names a file is coloured in the input field, one that names nothing is not: {raw[-300:]!r}")
 s.send("\x7f" * 44)
+s.expect("(no such text)", 0.8)   # let the redraw of the erased field go by before the next text
 s.send("see @zebr"); s.send("a"); view = listed()
 check("sugsrc/zebra_term.c" in view and "sugsrc/deep/zebra_notes.md" in view, f"@ and part of a name finds the files it could be, wherever they are: {view!r}")
 check("twin.txt" not in view, "and only those")
@@ -1328,7 +1344,8 @@ check('<file path="sugsrc/zebra_term.c">' in content and "content of the sibling
 s.send("@sugsrc"); s.send("/"); view = listed()
 check("sugsrc/deep/" in view and "sugsrc/twin.txt" in view and "sugsrc/zebra_term.c" in view, f"a directory lists what is in it: {view!r}")
 s.send("\x15")
-s.send("/cd su"); s.send("g"); view = listed(); check("sugsrc/" in view and "zebra_term.c" not in view, f"/cd is offered the directories, and only those: {view!r}")
+s.send("/cd su"); s.send("g"); view = listed()
+check("sugsrc/" in view and "zebra_term.c" not in view.split("/cd su")[-1], f"/cd is offered the directories, and only those: {view!r}")
 s.send("\x15")
 s.send("look at @zebra_notes.md\r"); check(s.expect("Echo: look at @zebra_notes.md"), "a bare file name is sent as typed")
 check("(attached sugsrc/deep/zebra_notes.md" in since(), f"and the one file by that name is attached: {since()[-300:]!r}")
@@ -2208,16 +2225,16 @@ sc.send("/usage price anthropic:claude-fake-haiku 1 5\r"); sc.expect("price", 5)
 sc.send("CACHE hello\r"); check(sc.expect("⟳ 800", 10), f"the bar shows the cache hits: {sc.text()[-300:]!r}")
 sc.expect("tok/s", 10)
 sc.send("/usage\r")
-check(sc.expect("cache: 800 read at 10% of the input price", 10), "/usage: the cache reads, at the cache rate")
-check(sc.expect("40 written at 1.25×", 5), "/usage: the cache writes, at 1.25×")
-check(sc.expect("≈ $0.0003", 5), f"/usage: the cost is the cache-priced one (100 at 1, 800 at 0.10, 40 at 1.25, 20 out at 5 = $0.00033): {sc.text()[-400:]!r}")
+check(seen(sc, "cache: 800 read at 10% of the input price", 10), "/usage: the cache reads, at the cache rate")
+check(seen(sc, "40 written at 1.25×", 5), "/usage: the cache writes, at 1.25×")
+check(seen(sc, "≈ $0.0003", 5), f"/usage: the cost is the cache-priced one (100 at 1, 800 at 0.10, 40 at 1.25, 20 out at 5 = $0.00033): {sc.text()[-400:]!r}")
 sc.send("\x04"); sc.close()
 
 so = Session(["-m", "fake-coder:latest", "--advisor", "openai:gpt-fake", "--yolo"], env=ENVK); so.expect("Ctrl-D to quit")
-so.send("TOOL_ADVISOR CACHE please\r"); check(so.expect("⎿  ", 15), "a consultation of an OpenAI advisor")
+so.send("TOOL_ADVISOR CACHE please\r"); check(so.expect("advice · ", 15), "a consultation of an OpenAI advisor")
 so.expect("tok/s", 15)
 so.send("/usage\r")
-check(so.expect("openai:gpt-fake", 10) and so.expect("cache: 1.5k read", 5), f"the OpenAI cached prompt tokens are counted as cache reads: {so.text()[-400:]!r}")
+check(seen(so, "openai:gpt-fake", 10) and seen(so, "cache: 1.5k read", 5), f"the OpenAI cached prompt tokens are counted as cache reads: {so.text()[-400:]!r}")
 so.send("/mode manual\r"); so.expect("mode: manual")   # --yolo is saved to the shared config: back to the default for the tests after this
 so.send("\x04"); so.close()
 
@@ -2254,7 +2271,8 @@ s.send("and now?\r"); check(s.expect("Echo: and now?"), "the conversation goes o
 roles = [m["role"] for m in requests()[-1]["messages"]]
 check(roles == ["system", "user", "assistant", "user"] and "[/orchestrate:" in requests()[-1]["messages"][2]["content"] and "## Task 1 of 2: make the file — accepted" in requests()[-1]["messages"][2]["content"],
       f"in which the run is the request and one reply that says what came of each task: {roles!r}")
-s.send("/usage\r"); check(s.expect("usage") and s.expect("3 calls"), f"/usage counts the orchestrator's three calls — a plan and two reviews: {since_send(s)[-300:]!r}")
+s.send("/usage\r"); check(seen(s, "usage (this session") and seen(s, "3 calls"), f"/usage counts the orchestrator's three calls — a plan and two reviews: {since_send(s)[-300:]!r}")
+s.send("\x1b", 0.5)   # Esc closes the /usage box: the next command must reach the prompt, not the box
 os.remove(MADE)
 s.send("/orchestrate ONETASK REJECT it once\r")
 check(s.expect("plan · 1 task ·") and s.expect("⎿ sent back") and s.expect("REVIEW-FINDING"), "a task the reviewer does not accept is sent back with what it said")
@@ -2290,7 +2308,7 @@ urllib.request.urlopen(f"{HOST}/_inflight").read()
 s.send("/orchestrate PARALLEL in turn\r"); check(s.expect("orchestrated: 3 of 3 tasks accepted", 40), "with one worker the same plan runs in turn")
 check(json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"] == 1, "one call at a time")
 os.remove(MADE)
-s.send("/workers 9\r"); check(s.expect("usage: /workers N"), "a number out of range is refused")
+s.send("/workers 21\r"); check(seen(s, "usage: /workers N"), "a number out of range is refused (the limit is 20)")
 s.send("/workers 3\r"); s.expect("workers = 3")
 s.send("/clear\r"); s.expect("new conversation")
 s.send("/orchestrate PARALLEL then stop\r"); s.expect("⤷ worker 2/3"); time.sleep(0.8); s.send("\x1b")
@@ -2384,8 +2402,8 @@ hist = open(os.path.join(CFG, "corbienest", "history")).read()
 check("multi one\x1ftwo" in hist, "history saved with encoded newline")
 
 print("test two sessions at once: shared history accumulates, the config is never half-written")
-ha = Session(["-m", "fake-coder:latest"]); check(ha.expect("Ctrl-D to quit"), "session A up")
-hb = Session(["-m", "fake-coder:latest"]); check(hb.expect("Ctrl-D to quit"), "session B up, having loaded the history A is about to add to")
+ha = Session(["-m", "fake-coder:latest"]); check(ha.started(), "session A up")
+hb = Session(["-m", "fake-coder:latest"]); check(hb.started(), "session B up, having loaded the history A is about to add to")
 ha.send("alpha-in-a\r"); check(ha.expect("tok/s", 15), "A answered")
 hb.send("beta-in-b\r"); check(hb.expect("tok/s", 15), "B answered")
 ha.send("second-in-a\r"); check(ha.expect("tok/s", 15), "A again, after B had written the file")
