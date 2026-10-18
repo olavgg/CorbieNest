@@ -278,8 +278,8 @@ static void bar_build(sbuf *o, int cols) {
     /* segments in priority order: model, tokens, ctx; then the queue. The folder and branch are at the right end. */
     char seg_tok[96], seg_tok_long[192];
     snprintf(seg_tok, sizeof seg_tok, "%s tokens", ttot);
-    if (cached) { char tc[32]; fmt_tokens(cached, tc, sizeof tc); snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens (↑%s ⟳ %s ↓%s)", ttot, tin, tc, tout); }
-    else snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens (↑%s ↓%s)", ttot, tin, tout);
+    if (cached) { char tc[32]; fmt_tokens(cached, tc, sizeof tc); snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens ↑%s ⟳ %s ↓%s", ttot, tin, tc, tout); }
+    else snprintf(seg_tok_long, sizeof seg_tok_long, "%s tokens ↑%s ↓%s", ttot, tin, tout);
     #define SEP_W 3   /* " │ " */
     /* the folder and branch take the right end; the segments have what is left */
     sbuf loc; sb_init(&loc);

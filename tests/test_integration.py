@@ -565,7 +565,7 @@ check(re.search(r"\x1b\[38;1H[^\n]*❯", raw) is not None, "the prompt sits betw
 check(re.search(r"\x1b\[39;1H[^\n]*─{20}", raw) is not None, "and a rule below it")
 s.send("hello wrld"); s.send("\x1b[D\x1b[D\x1b[D"); s.send("o"); s.send("\r")
 check(s.expect("Echo: hello world"), "cursor-left insert then send"); check(s.expect("tok/s"), "stats")
-check(s.expect("168 tokens (↑123 ↓45)"), f"status bar counts session tokens: {s.text()[-200:]!r}")
+check(s.expect("168 tokens ↑123 ↓45"), f"status bar counts session tokens: {s.text()[-200:]!r}")
 s.send("\x1b[A")   # history up
 check(s.expect("❯ hello world"), f"history recall: {s.text()[-80:]!r}")
 s.send("\x15")   # ctrl-u clears
