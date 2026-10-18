@@ -850,11 +850,19 @@ static void test_queue(void) {
 }
 
 /* ---------- skills ---------- */
+/* the skills this test made: the bundled ones (the checkout's skills/, which the build reads) are left out */
+static int skills_load_unbundled(void) {
+    int n = 0;
+    skills_load();
+    for (int i = 0; i < skills_count(); i++) if (strcmp(skill_get(i)->source, "bundled")) n++;
+    return n;
+}
+
 static void test_skills(void) {
     char dir[] = "/tmp/crowtest_s_XXXXXX"; CHECK(mkdtemp(dir) != NULL);
     char old[4096]; CHECK(getcwd(old, sizeof old) != NULL); CHECK(chdir(dir) == 0);
     setenv("XDG_CONFIG_HOME", dir, 1);   /* keep user skills out of the picture */
-    CHECK(skills_load() == 0);
+    CHECK(skills_load_unbundled() == 0);   /* the checkout's own skills/ are bundled: counted apart */
     CHECK(mkdir_p(".corbienest/skills/rev") == 0);
     const char *body = "---\nname: rev\ndescription: \"Review things\"\n---\n\nReview: $ARGUMENTS\nEnd.\n";
     CHECK(write_whole_file(".corbienest/skills/rev/SKILL.md", body, strlen(body)) == 0);
@@ -863,7 +871,7 @@ static void test_skills(void) {
     CHECK(mkdir_p(".corbienest/skills/tester") == 0);   /* a role: its frontmatter names a model */
     const char *role = "---\nname: tester\ndescription: Writes the tests\nmodel: qwen3-coder:30b\n---\nWrite the tests.\n";
     CHECK(write_whole_file(".corbienest/skills/tester/SKILL.md", role, strlen(role)) == 0);
-    CHECK(skills_load() == 3);
+    CHECK(skills_load_unbundled() == 3);
     const skill_t *s = skill_find("/rev"); CHECK(s != NULL);
     if (s) CHECK(s->model == NULL);   /* no model: inherit the one in use */
     s = skill_find("tester"); CHECK(s != NULL);
@@ -884,7 +892,7 @@ static void test_skills(void) {
     char path[512]; CHECK(skill_scaffold("new-one", path, sizeof path) == 0); CHECK(is_file(path));
     CHECK(skill_scaffold("new-one", path, sizeof path) == 1);
     CHECK(skill_scaffold("bad name!", path, sizeof path) == -1);
-    CHECK(skills_load() == 4);   /* rev, plain, tester and the scaffolded one */
+    CHECK(skills_load_unbundled() == 4);   /* rev, plain, tester and the scaffolded one */
     char *sec = skills_prompt_section(); CHECK(sec && strstr(sec, "/new-one") && strstr(sec, "written in C")); free(sec);
     CHECK(chdir(old) == 0);
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}

@@ -653,6 +653,14 @@ commands are picked up as well: `.corbienest/commands/NAME.md`, `.claude/command
 `/skills` lists them, `/skills reload` rescans, `/skills new NAME` scaffolds one. The
 available skills are also listed in the system prompt so the model can pick one up itself.
 
+Corbienest ships some skills of its own (the `skills/` folder of the repository, `source`
+**bundled** in `/skills`). They are read-only: `make install` copies them to
+`$(PREFIX)/share/corbienest/skills` (replacing the old copy, so a skill removed from the
+repository goes away on reinstall), and a build also reads the checkout's own `skills/`, so a
+run from the checkout has them without installing. Nothing is copied into `~/.config`. A
+project or personal skill of the same name wins over a bundled one; a bundled skill is found
+last. To change a bundled skill, copy it to `~/.config/corbienest/skills/NAME/` and edit the copy.
+
 Skills may ship helper programs next to `SKILL.md`. Write those in **C** (build with `cc`
 or a small Makefile in the skill directory); use Rust only when a third-party library is
 genuinely needed, and Python only as a last resort. The model is told the same rule when

@@ -10,3 +10,4 @@ compile_commands.json
 build/
 .sanitize-*
 .zlib-*
+.skills-*

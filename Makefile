@@ -107,7 +107,7 @@ $(ZLIB_STAMP):
 	touch $@
 
 src/%.o: src/%.c src/common.h $(NC_STAMP) $(SAN_STAMP) $(ZLIB_STAMP)
-	$(CC) $(BREW_CPPFLAGS) $(CFLAGS) $(NC_DEFS) $(ZLIB_DEFS) -c -o $@ $<
+	$(CC) $(BREW_CPPFLAGS) $(CFLAGS) $(NC_DEFS) $(ZLIB_DEFS) $(SKILL_DEFS) -c -o $@ $<
 
 # The vendored core'"'"'s own warnings are upstream'"'"'s: the two kinds it has (-Wclobbered in unixsig.c,
 # -Wdiscarded-qualifiers in notcurses.c) are left out for it alone, so -Wall -Wextra -Werror still
@@ -131,9 +131,24 @@ release:
 	$(MAKE) corbienest CFLAGS="$(RELEASE_CFLAGS)" NOTCURSES=$(NOTCURSES) ZLIB=$(ZLIB)
 	strip corbienest
 
+# The skills that ship with corbienest (skills/, read-only, source "bundled"): make install copies them to
+# $(PREFIX)/share/corbienest/skills, and the build also names the checkout's own skills/, so a run from the
+# checkout has them without installing. The paths go into skills.o only; a stamp rebuilds it when they change.
+BUNDLED_SKILLS_DIR := $(PREFIX)/share/corbienest/skills
+SKILLS_STAMP := .skills-$(shell printf '%s' '$(BUNDLED_SKILLS_DIR)$(CURDIR)' | cksum | cut -d' ' -f1)
+$(SKILLS_STAMP):
+	rm -f .skills-*
+	touch $@
+
+src/skills.o: SKILL_DEFS := -DBUNDLED_SKILLS_DIR='"$(BUNDLED_SKILLS_DIR)"' -DBUNDLED_SKILLS_SRC='"$(CURDIR)/skills"'
+src/skills.o: $(SKILLS_STAMP)
+
 install: corbienest
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 755 corbienest $(DESTDIR)$(PREFIX)/bin/corbienest
+	rm -rf $(DESTDIR)$(BUNDLED_SKILLS_DIR)
+	install -d $(DESTDIR)$(BUNDLED_SKILLS_DIR)
+	cp -R skills/. $(DESTDIR)$(BUNDLED_SKILLS_DIR)/
 
 LIBOBJ := $(filter-out src/main.o,$(OBJ)) $(NC_OBJ)
 
@@ -167,7 +182,7 @@ test-tsan:
 	$(MAKE) SAN=thread test-unit
 
 clean:
-	rm -f $(OBJ) $(NC_SRC:.c=.o) corbienest tests/test_unit .notcurses-* .sanitize-* .zlib-*
+	rm -f $(OBJ) $(NC_SRC:.c=.o) corbienest tests/test_unit .notcurses-* .sanitize-* .zlib-* .skills-*
 	rm -rf build
 
 .PHONY: install clean test test-unit test-integration test-asan test-ubsan test-tsan release

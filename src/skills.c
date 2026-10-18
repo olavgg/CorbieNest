@@ -4,7 +4,9 @@
  *   ./.corbienest/commands/<name>.md       ./.claude/commands/<name>.md   ~/.claude/commands/<name>.md
  *   ./.claude/skills/<name>/SKILL.md     (Claude Code layout, for sharing)
  *   $XDG_CONFIG_HOME/corbienest/skills/<name>/SKILL.md   (and <name>.md)
- * Project skills shadow user skills of the same name. */
+ *   the bundled skills: $(PREFIX)/share/corbienest/skills (make install) and the checkout's skills/ (the build)
+ * Project skills shadow user skills, and user skills shadow the bundled ones, of the same name. The bundled
+ * skills are read only: nothing is copied into the user's configuration, so an upgrade refreshes them. */
 #define _GNU_SOURCE
 #include "common.h"
 #include <dirent.h>
@@ -127,6 +129,12 @@ int skills_load(void) {
     snprintf(user, sizeof user, "%s/commands", config_dir());
     scan_dir(user, "user");
     char *home = expand_home("~/.claude/commands"); scan_dir(home, "user"); free(home);
+#ifdef BUNDLED_SKILLS_DIR
+    scan_dir(BUNDLED_SKILLS_DIR, "bundled");   /* last: a user's or a project's skill of the same name wins */
+#endif
+#ifdef BUNDLED_SKILLS_SRC
+    scan_dir(BUNDLED_SKILLS_SRC, "bundled");   /* the checkout's own: the same names as the installed ones are not added twice */
+#endif
     return g_nskills;
 }
 
