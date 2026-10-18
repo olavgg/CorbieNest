@@ -1492,6 +1492,17 @@ static void test_orchestrate(void) {
     orch_tasks_free(t, n); sb_free(&many);
 }
 
+/* base64 (RFC 4648 test vectors, and bytes that are not text) */
+static void test_base64(void) {
+    char *a = base64_encode("", 0);   CHECK_STR(a, ""); free(a);
+    a = base64_encode("f", 1);        CHECK_STR(a, "Zg=="); free(a);
+    a = base64_encode("fo", 2);       CHECK_STR(a, "Zm8="); free(a);
+    a = base64_encode("foo", 3);      CHECK_STR(a, "Zm9v"); free(a);
+    a = base64_encode("foobar", 6);   CHECK_STR(a, "Zm9vYmFy"); free(a);
+    a = base64_encode("\0\xff\xfe", 3); CHECK_STR(a, "AP/+"); free(a);   /* a NUL and high bytes survive */
+    a = base64_encode("a\0", 2);     CHECK_STR(a, "YQA="); free(a);
+}
+
 /* the hosts a user adds (/model add): the rules, the lookup by prefix, replacing and removing */
 static void test_hosts(void) {
     char err[200] = "";
@@ -2130,7 +2141,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
+        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;
