@@ -1509,6 +1509,141 @@ size_t utf8_cut(const char *s, size_t len, size_t cap) {
     return n;
 }
 
+/* ---------- the running-tasks strip: one row, and how many rows fit ---------- */
+
+static int sr_cols(const char *s) {
+    int w = 0;
+    if (!s) return 0;
+    for (; *s; s++) if (((unsigned char)*s & 0xC0) != 0x80) w++;
+    return w;
+}
+/* at most `cols` columns of s. A cut ends with …, which takes one of those columns. */
+static void sr_put(sbuf *b, const char *s, int cols, bool ellip) {
+    if (cols <= 0 || !s || !*s) return;
+    if (sr_cols(s) <= cols) { sb_puts(b, s); return; }
+    int keep = ellip && cols >= 1 ? cols - 1 : cols;
+    int got = 0;
+    for (const char *p = s; *p && got < keep; ) {
+        const char *nx = p + 1;
+        while (((unsigned char)*nx & 0xC0) == 0x80) nx++;
+        sb_append(b, p, (size_t)(nx - p));
+        got++;
+        p = nx;
+    }
+    if (ellip && cols >= 1) sb_puts(b, "…");
+}
+static void sr_pad(sbuf *b, int have, int want) {
+    for (int i = have; i < want; i++) sb_putc(b, ' ');
+}
+static void sr_finish(char *out, size_t n, sbuf *b, int cols) {
+    const char *s = b && b->data ? b->data : "";
+    sbuf c; sb_init(&c);
+    sr_put(&c, s, cols, true);
+    size_t len = c.len;
+    if (len > n - 1) {
+        len = n - 1;
+        while (len > 0 && c.data && ((unsigned char)c.data[len] & 0xC0) == 0x80) len--;
+    }
+    if (c.data && len) memcpy(out, c.data, len);
+    out[len] = 0;
+    sb_free(&c);
+    sb_free(b);
+}
+
+void strip_row(char *out, size_t n, int cols, int kind, const char *name, int name_w,
+               const char *mid, int done, int total, const char *right) {
+    if (out && n) out[0] = 0;
+    if (!out || n < 2) return;
+    if (cols < 1) cols = 1;
+    if (kind == STRIP_ROW_ALL) {
+        sbuf b; sb_init(&b);
+        sb_puts(&b, "  ");
+        sb_puts(&b, name && *name ? name : "show all");
+        sr_finish(out, n, &b, cols);
+        return;
+    }
+    if (done < 0) done = 0;
+    if (total < 0) total = 0;
+    if (done > total) done = total;
+    bool prog = total > 0;
+    const char *rt = right && *right ? right : NULL;
+    const char *md = mid && *mid ? mid : NULL;
+    bool trail = prog || md || rt;
+    const char *prefix = kind == STRIP_ROW_MAIN ? "● " : "  ◯ ";
+    if (!name) name = "";
+    if (name_w < 1) name_w = sr_cols(name);
+
+    sbuf b; sb_init(&b);
+    sb_puts(&b, prefix);
+    if (!trail) {
+        int room = cols - sr_cols(prefix);
+        sr_put(&b, name, room > 0 ? room : 0, true);
+        sr_finish(out, n, &b, cols);
+        return;
+    }
+    int nw = sr_cols(name), shown = nw > name_w ? name_w : nw;
+    sr_put(&b, name, name_w, true);
+    sr_pad(&b, shown, name_w);
+    sb_puts(&b, "  ");
+    int left = sr_cols(b.data);
+
+    if (prog) {
+        char frac[32], tail[160];
+        snprintf(frac, sizeof frac, "%d/%d", done, total);
+        if (rt) snprintf(tail, sizeof tail, "%s · %s", frac, rt);
+        else snprintf(tail, sizeof tail, "%s", frac);
+        int tw = sr_cols(tail), avail = cols - left;
+        if (avail < 1) { sr_finish(out, n, &b, cols); return; }
+        int room = avail - 2 - tw;   /* two spaces between the bar and the fraction */
+        if (tw > avail || room < 4) sr_put(&b, tail, avail, true);
+        else {
+            int barw = room < 20 ? room : 20;
+            int fill = done <= 0 ? 0 : (done >= total ? barw : (done * barw) / total);
+            if (done > 0 && done < total && fill == 0) fill = 1;
+            if (done >= total) fill = barw;
+            for (int i = 0; i < barw; i++) sb_puts(&b, i < fill ? "▰" : "▱");
+            sb_puts(&b, "  ");
+            sb_puts(&b, tail);
+        }
+        sr_finish(out, n, &b, cols);
+        return;
+    }
+
+    /* activity: the text on the left, the time and tokens at the right edge */
+    int rw = rt ? sr_cols(rt) : 0, gap = rt ? 2 : 0, mid_w = cols - left - gap - rw;
+    if (rt && mid_w < 0) {
+        if (rw < cols - left) { sr_pad(&b, left, cols - rw); sb_puts(&b, rt); }
+        else sr_put(&b, md ? md : "", cols - left, true);
+        sr_finish(out, n, &b, cols);
+        return;
+    }
+    sr_put(&b, md ? md : "", mid_w > 0 ? mid_w : 0, true);
+    if (rt) { sr_pad(&b, sr_cols(b.data), cols - rw); sb_puts(&b, rt); }
+    sr_finish(out, n, &b, cols);
+}
+
+void strip_layout(int room, int total, int *rows, int *shown, bool *with_main, bool *more) {
+    int r = 0, s = 0; bool m = false, o = false;
+    if (room < 0) room = 0;
+    if (total < 0) total = 0;
+    if (total > 0 && room > 0) {
+        if (1 + total <= room) { m = true; s = total; r = 1 + total; }          /* ● main and every task */
+        else if (total <= room) { s = total; r = total; }                        /* the tasks fill the room: no main row */
+        else {
+            o = true;                                                            /* the last row is "show all" */
+            int body = room - 1;
+            if (body >= 2) { m = true; s = body - 1; }                           /* ● main, then as many tasks as fit */
+            else if (body == 1) s = 1;                                           /* one task, then "show all" */
+            if (s > total) s = total;
+            r = (m ? 1 : 0) + s + 1;
+        }
+    }
+    if (rows) *rows = r;
+    if (shown) *shown = s;
+    if (with_main) *with_main = m;
+    if (more) *more = o;
+}
+
 /* The first line of a shell command, as a fold's head: the leading blank lines and the trailing
  * whitespace go, control characters become spaces, and the line is cut to `width` columns (a
  * character is a column; the cut ends with "…"). Returns how many lines follow the first one,

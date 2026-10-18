@@ -1921,16 +1921,19 @@ enum { AG_RUNNING, AG_DONE, AG_STOPPED, AG_FAILED };
 typedef struct {
     int id;
     char *desc;
+    char *name;           /* the agent file's name, or "general" */
     char *model;          /* the model the run was on, NULL = the model doing the work */
     int state, rounds;
+    time_t started;
+    long out_tokens;      /* generated tokens of this run (the ↓ on its row) */
     char activity[200];   /* what it is doing now, or did last */
     sbuf log;
 } subagent_rec;
 static subagent_rec *g_agents[AGENTS_KEEP];   /* oldest first */
 static int g_agent_n = 0, g_agent_seq = 0;
 
-static void agent_free(subagent_rec *r) { free(r->desc); free(r->model); sb_free(&r->log); free(r); }
-static subagent_rec *agent_begin(const char *desc, const char *model) {
+static void agent_free(subagent_rec *r) { free(r->desc); free(r->name); free(r->model); sb_free(&r->log); free(r); }
+static subagent_rec *agent_begin(const char *desc, const char *model, const char *name) {
     if (g_agent_n == AGENTS_KEEP) {
         int i = 0; while (i < g_agent_n && g_agents[i]->state == AG_RUNNING) i++;
         if (i == g_agent_n) return NULL;   /* (every one running: cannot happen, runs do not nest) */
@@ -1940,8 +1943,10 @@ static subagent_rec *agent_begin(const char *desc, const char *model) {
     }
     subagent_rec *r = xmalloc(sizeof *r);
     memset(r, 0, sizeof *r);
-    r->id = ++g_agent_seq; r->desc = xstrdup(desc); r->model = model ? xstrdup(model) : NULL;
-    r->state = AG_RUNNING; sb_init(&r->log);
+    r->id = ++g_agent_seq; r->desc = xstrdup(desc ? desc : "");
+    r->name = xstrdup(name && *name ? name : "general");
+    r->model = model ? xstrdup(model) : NULL;
+    r->state = AG_RUNNING; r->started = time(NULL); sb_init(&r->log);
     g_agents[g_agent_n++] = r;
     return r;
 }
@@ -1972,44 +1977,139 @@ static const char *agent_state_word(const subagent_rec *r) {
     }
 }
 /* ← on an empty prompt line: the sub-agents of this session, newest first, and the log of the one picked */
-/* ---------- the strip: the running sub-agents, between the message box and the status bar ----------
- * One line each, newest first, as far as the strip has rows. term.c keeps the selection and draws it;
- * strip_open shows the log of the one picked (the same view as the agents menu). */
+/* ---------- the strip: the running tasks, between the message box and the status bar ----------
+ * One row each, newest first, as many as fit: ● main, then each running sub-agent (its name, what
+ * it is doing or the main agent's task progress, and how long it has run with the tokens it
+ * generated). What does not fit is a "show all" row, which opens the same list in a window that
+ * scrolls. term.c keeps the selection; Enter on a task opens its log, Enter on "show all" the list. */
 static int running_count(void) { int k = 0; for (int i = 0; i < g_agent_n; i++) if (g_agents[i]->state == AG_RUNNING) k++; return k; }
 static const subagent_rec *running_at(int idx) {
     int k = 0;
     for (int i = g_agent_n - 1; i >= 0; i--) if (g_agents[i]->state == AG_RUNNING && k++ == idx) return g_agents[i];
     return NULL;
 }
-static int strip_lines(sbuf *o, int cols, int max) {
-    int total = running_count();
-    int more = total > max ? total - (max - 1) : 0;   /* past the rows the strip has: the last row says how many are not shown */
-    int shown = more ? max - 1 : total;
-    int rows = shown + (more ? 1 : 0);
-    for (int i = 0; i < shown; i++) {
-        const subagent_rec *r = running_at(i);
-        char line[480];
-        snprintf(line, sizeof line, "◆ #%d %s · round %d · %s", r->id, r->desc, r->rounds, r->activity);
-        /* cut to the width, on a character boundary, with an ellipsis */
-        int room = cols - 4 > 1 ? cols - 4 : 1;
-        if (plain_width(line) > room) {
-            size_t cut = 0; int w = 0;
-            while (line[cut] && w < room - 1) { cut++; while ((unsigned char)line[cut] & 0x80 && ((unsigned char)line[cut] & 0xC0) == 0x80) cut++; w++; }
-            line[cut] = 0; strcat(line, "…");
-        }
-        if (i) sb_putc(o, '\n');
-        sb_printf(o, "  " C_ORANGE "%s" C_RESET, line);
+static int g_sl_rows, g_sl_shown;
+static bool g_sl_main, g_sl_more;
+
+static void one_line(char *dst, size_t n, const char *s) {
+    size_t j = 0;
+    if (!s) s = "";
+    for (size_t i = 0; s[i] && j + 1 < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '\n' || c == '\r' || c == '\t') { dst[j++] = ' '; continue; }
+        if (c < 32 || c == 127) continue;
+        dst[j++] = (char)c;
     }
-    if (more) { if (shown) sb_putc(o, '\n'); sb_printf(o, "  " C_DIM "+%d more running" C_RESET, more); }
-    return rows;
+    dst[j] = 0;
 }
-static void strip_open(int idx) {
-    const subagent_rec *r = running_at(idx);
+static void fmt_run(time_t started, char *out, size_t n) {
+    long sec = (long)difftime(time(NULL), started);
+    if (sec < 0) sec = 0;
+    long h = sec / 3600, m = (sec % 3600) / 60, s = sec % 60;
+    if (h > 0) snprintf(out, n, "%ldh %ldm %lds", h, m, s);
+    else if (m > 0) snprintf(out, n, "%ldm %lds", m, s);
+    else snprintf(out, n, "%lds", s);
+}
+static void todo_counts(int *done, int *total) {
+    *done = *total = 0;
+    cJSON *list = tools_todos_get();
+    if (!list) return;
+    cJSON *t;
+    cJSON_ArrayForEach(t, list) {
+        (*total)++;
+        cJSON *st = cJSON_GetObjectItemCaseSensitive(t, "status");
+        if (cJSON_IsString(st) && !strcmp(st->valuestring, "completed")) (*done)++;
+    }
+}
+static int strip_name_w(bool with_main, int nagents) {
+    int w = with_main ? 4 : 0;   /* "main" */
+    for (int i = 0; i < nagents; i++) {
+        const subagent_rec *r = running_at(i);
+        int nw = r && r->name ? plain_width(r->name) : 0;
+        if (nw > w) w = nw;
+    }
+    if (w > 22) w = 22;
+    if (w < 1) w = 1;
+    return w;
+}
+/* the task's description while it waits for the model, and the tool it is in otherwise */
+static void agent_mid(const subagent_rec *r, char *dst, size_t n) {
+    const char *src = r && r->desc ? r->desc : "";
+    if (r && r->activity[0] && strcmp(r->activity, "waiting for the model")) src = r->activity;
+    if (!src[0] && r) src = r->activity;
+    one_line(dst, n, src);
+}
+static void agent_right(const subagent_rec *r, int cols, char *dst, size_t n) {
+    char el[32], tok[32];
+    fmt_run(r->started, el, sizeof el);
+    fmt_tokens(r->out_tokens, tok, sizeof tok);
+    if (cols >= 100) snprintf(dst, n, "%s · ↓ %s tokens", el, tok);
+    else snprintf(dst, n, "%s · ↓ %s", el, tok);
+}
+static void open_agent_log(const subagent_rec *r) {
     if (!r) return;
     char head[400];
     snprintf(head, sizeof head, "▾ sub-agent #%d %s · %s%s%s", r->id, r->desc, agent_state_word(r),
              r->model ? " · on " : "", r->model ? r->model : "");
     term_show_block(head, r->log.len ? r->log.data : "(nothing logged yet)\n");
+}
+static void main_row(char *out, size_t n, int cols, int name_w) {
+    int done = 0, total = 0;
+    todo_counts(&done, &total);   /* the main agent's own task list, when it kept one */
+    strip_row(out, n, cols, STRIP_ROW_MAIN, "main", name_w, NULL, done, total, NULL);
+}
+static void task_row(char *out, size_t n, int cols, int name_w, const subagent_rec *r) {
+    char mid[240], right[80], nm[80];
+    one_line(nm, sizeof nm, r && r->name ? r->name : "general");
+    agent_mid(r, mid, sizeof mid);
+    agent_right(r, cols, right, sizeof right);
+    strip_row(out, n, cols, STRIP_ROW_TASK, nm, name_w, mid, 0, 0, right);
+}
+static void show_all_modal(void) {
+    int n = running_count();
+    if (n <= 0) return;
+    int cols = term_modal_cols(), name_w = strip_name_w(true, n), rows = n + 1;
+    char **lines = xmalloc(sizeof *lines * (size_t)rows);
+    char line[2048];
+    main_row(line, sizeof line, cols, name_w);
+    lines[0] = xstrdup(line);
+    for (int i = 0; i < n; i++) { task_row(line, sizeof line, cols, name_w, running_at(i)); lines[i + 1] = xstrdup(line); }
+    int pick = term_scroll_modal("running tasks", (const char **)lines, rows, rows > 1 ? 1 : 0);
+    for (int i = 0; i < rows; i++) free(lines[i]);
+    free(lines);
+    if (pick > 0) open_agent_log(running_at(pick - 1));
+}
+static int strip_lines(sbuf *o, int cols, int max) {
+    int width = cols > 1 ? cols - 1 : 1;
+    int total = running_count();
+    int rows = 0, shown = 0; bool with_main = false, more = false;
+    strip_layout(max, total, &rows, &shown, &with_main, &more);
+    g_sl_rows = rows; g_sl_shown = shown; g_sl_main = with_main; g_sl_more = more;
+    if (rows <= 0) return 0;
+    int name_w = strip_name_w(with_main, total), at = 0;
+    char line[2048];
+    if (with_main) { main_row(line, sizeof line, width, name_w); sb_puts(o, line); at++; }
+    for (int i = 0; i < shown; i++) {
+        task_row(line, sizeof line, width, name_w, running_at(i));
+        if (at) sb_putc(o, '\n');
+        sb_puts(o, line);
+        at++;
+    }
+    if (more) {
+        char lab[64];
+        snprintf(lab, sizeof lab, "show all · %d running", total);
+        strip_row(line, sizeof line, width, STRIP_ROW_ALL, lab, 0, NULL, 0, 0, NULL);
+        if (at) sb_putc(o, '\n');
+        sb_puts(o, C_DIM);   /* no reset: that would clear the selected row's background */
+        sb_puts(o, line);
+    }
+    return rows;
+}
+static void strip_open(int idx) {
+    if (g_sl_more && idx == g_sl_rows - 1) { show_all_modal(); return; }
+    int ai = idx - (g_sl_main ? 1 : 0);
+    if (ai < 0 || ai >= g_sl_shown) return;   /* ● main has no log of its own */
+    open_agent_log(running_at(ai));
 }
 
 static void agents_menu(void) {
@@ -2133,7 +2233,7 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
     if (ag) printf("  " C_CYAN "⤷ sub-agent %s" C_RESET " " C_BOLD "%s" C_RESET "\n", ag->name, description);
     else printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", description);
     const char *sm = model ? (model_same(model, g_cfg.model) ? NULL : model) : subagent_model();
-    subagent_rec *rec = agent_begin(description, sm);
+    subagent_rec *rec = agent_begin(description, sm, ag ? ag->name : NULL);
     agent_say(rec, "task: "); agent_say(rec, prompt); agent_say(rec, "\n");
     if (sm) {
         if (!subagent_info_for(sm)) {
@@ -2169,6 +2269,7 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
         cJSON *reply = model_chat(msgs, g_model_tools ? tools : NULL, &st, &aborted);
         ollama_call_reset(); ollama_quiet = false;
         account_as(sm ? sm : g_cfg.model, &st);   /* its own model's tokens: /usage prices them as that model's */
+        if (rec) rec->out_tokens += st.eval_tokens;
         term_status_refresh();
         if (!reply) { sb_puts(out, aborted ? "error: sub-agent interrupted by the user" : "error: sub-agent model call failed"); interrupted = aborted; break; }
         cJSON_AddItemToArray(msgs, reply);
@@ -2303,6 +2404,7 @@ static void sub_run_collect(sub_run *r) {
         return;
     }
     account_as(model, &st);
+    if (r->rec) r->rec->out_tokens += st.eval_tokens;
     term_status_refresh();
     cJSON_AddItemToArray(r->msgs, reply);
     messages_note_thinking(r->msgs, cJSON_GetArraySize(r->msgs) - 1);
@@ -2350,7 +2452,7 @@ static bool tasks_batch(cJSON *calls, bool *failed) {
             r->sm = batch_model_of(r->ag);
             if (r->ag) printf("  " C_CYAN "⤷ sub-agent %s" C_RESET " " C_BOLD "%s" C_RESET "\n", r->ag->name, r->desc);
             else printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", r->desc);
-            r->rec = agent_begin(r->desc, r->sm);
+            r->rec = agent_begin(r->desc, r->sm, r->ag ? r->ag->name : NULL);
             agent_say(r->rec, "task: "); agent_say(r->rec, prompt); agent_say(r->rec, "\n");
             subagent_setup(r->ag, prompt, &r->msgs, &r->tools, &r->sp_bytes);
             r->state = SR_WAITING;

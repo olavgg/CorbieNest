@@ -382,11 +382,13 @@ static int    g_sug_sel = -1;          /* the highlighted one; -1 = none, the li
 static int    g_sug_top = 0;           /* first one shown, when there are more than fit */
 static size_t g_sug_from = 0;          /* where the word they would replace starts */
 static int    g_sug_rows = 0;          /* rows of the chrome the list holds */
-/* the agents strip: the running sub-agents, one row each, between the field and the status bar (main.c
- * supplies the lines through term_agents_strip). g_strip_sel is the row the keys are on (-1: the field). */
-#define STRIP_MAX 4
+/* the agents strip: the running tasks, one row each, between the field and the status bar (main.c
+ * supplies the lines through term_agents_strip). It grows with the room under the conversation;
+ * g_strip_sel is the row the keys are on (-1: the field). */
+#define STRIP_KEEP 8   /* conversation rows left alone when the strip grows */
 static sbuf g_strip;
 static int  g_strip_rows = 0, g_strip_sel = -1;
+static int  g_strip_limit = -1;   /* notcurses sets how many rows fit this frame; -1 until it does */
 int  (*term_agents_strip)(sbuf *o, int cols, int max) = NULL;
 void (*term_agents_open)(int idx) = NULL;
 static char  *g_ta_sug_for = NULL;     /* the list is the type-ahead's (the model is working): the text it is for */
@@ -556,10 +558,25 @@ static void field_edge(sbuf *o, int row, bool top) {
     sb_puts(o, top ? "╮" : "╯");
     sb_puts(o, C_RESET);
 }
-/* the strip's lines, from the running sub-agents; the selected row is highlighted */
+/* rows the strip may take: what is left after the field, the suggestions, the bar and a conversation
+ * tall enough to read. Notcurses says how many fit (its field height is its own); 0 draws nothing. */
+void term_strip_limit(int rows) { g_strip_limit = rows < 0 ? 0 : rows; }
+static int strip_budget(void) {
+    if (g_ui_nc) return g_strip_limit < 0 ? 0 : g_strip_limit;
+    if (!g_fs || g_fs_rows < FIELD_MIN_ROWS) return 0;
+    int chrome = g_field_rows + 3 + g_sug_rows + (g_view_top >= 0);   /* the field's box, the suggestions, the bar, the scroll note */
+    int room = g_fs_rows - chrome - STRIP_KEEP;
+    int fit = g_fs_rows - chrome - 1;   /* never less than one conversation row */
+    if (fit < 1) fit = 1;
+    if (room > fit) room = fit;
+    if (room < 1) room = 1;
+    return room;
+}
+/* the strip's lines, from the running tasks; the selected row is highlighted */
 static void strip_refresh(void) {
     sb_clear(&g_strip);
-    int rows = (g_fs || g_ui_nc) && term_agents_strip ? term_agents_strip(&g_strip, term_width(), STRIP_MAX) : 0;
+    int budget = strip_budget();
+    int rows = (g_fs || g_ui_nc) && term_agents_strip && budget > 0 ? term_agents_strip(&g_strip, term_width(), budget) : 0;
     g_strip_rows = rows;
     if (g_strip_sel >= rows) g_strip_sel = rows - 1;
     if (rows == 0) g_strip_sel = -1;
@@ -1785,6 +1802,105 @@ static void ta_restore(ta_stash st) {
     for (size_t i = 0; i < tl; i++) ta_put(tmp[i]);
     free(st.data);
 }
+/* The width a modal's rows are fitted to: inset from the screen, and capped so a row of
+ * multibyte characters still fits the notcurses menu's line buffer. */
+int term_modal_cols(void) {
+    int rows, cols;
+    term_size(&rows, &cols);
+    (void)rows;
+    int maxw = cols - 8;
+    if (maxw < 16) maxw = cols > 4 ? cols - 4 : 16;
+    int w = cols - 14;
+    if (w > 140) w = 140;
+    if (w < 16) w = 16;
+    if (w > maxw) w = maxw;
+    if (w < 8) w = 8;
+    return w;
+}
+
+static int read_key(void);   /* defined with the decoder; the modal's loop calls it */
+
+/* one modal row, padded to `width` and, when selected, in reverse for the whole row */
+static void modal_line(sbuf *o, const char *s, int width, bool sel) {
+    sbuf row; sb_init(&row);
+    if (sel) sb_puts(&row, "\x1b[7m");
+    int w = s ? vis_width(s) : 0;
+    if (!s) s = "";
+    if (w > width) {
+        size_t cut = vis_offset(s, strlen(s), width > 1 ? width - 1 : 0);
+        sb_append(&row, s, cut);
+        if (width > 1) sb_puts(&row, "…");
+        w = width;
+    } else sb_puts(&row, s);
+    for (; w < width; w++) sb_putc(&row, ' ');
+    if (sel) sb_puts(&row, C_RESET);
+    sb_puts(o, row.data ? row.data : "");
+    sb_putc(o, '\n');
+    sb_free(&row);
+}
+
+static int scroll_modal_impl(const char *title, const char **lines, int n, int start) {
+    if (!g_fs || !g_sb_active || n <= 0) return -1;
+    term_raw(true);
+    ta_stash stash = ta_take();
+    view_leave();
+    bool was = g_sb_pause;
+    sb_pause(true);
+    int sel = start >= 0 && start < n ? start : 0, top = 0, result = -1;
+    bool first = true;
+    static const char HINT[] = "↑/↓ PgUp/PgDn scroll · Enter opens the log · Esc closes";
+    for (;;) {
+        layout_sync();
+        int bodyw = term_modal_cols();
+        int show = fs_region() - 6;   /* title, the count, the hint, and the box's own border */
+        if (show < 3) show = 3;
+        if (show > n) show = n;
+        if (sel < top) top = sel;
+        if (sel >= top + show) top = sel - show + 1;
+        if (top < 0) top = 0;
+        sbuf o; sb_init(&o);
+        modal_line(&o, title && *title ? title : "running tasks", bodyw, false);
+        for (int i = 0; i < show; i++) {
+            int idx = top + i;
+            modal_line(&o, idx < n ? lines[idx] : "", bodyw, idx == sel);
+        }
+        char count[64];
+        if (n > show) snprintf(count, sizeof count, "%d-%d of %d", top + 1, top + show < n ? top + show : n, n);
+        else count[0] = 0;
+        modal_line(&o, count, bodyw, false);
+        modal_line(&o, HINT, bodyw, false);
+        box_pad(&o, bodyw);
+        modal_paint(o.data, first);
+        first = false;
+        sb_free(&o);
+        int k = read_key();
+        if (k == -2 || k == -1 || k == K_ESC || k == 3) { result = -1; break; }
+        if (k == '\r' || k == '\n') { result = sel; break; }
+        if (k == K_UP || k == 'k') { if (sel > 0) sel--; }
+        else if (k == K_DOWN || k == 'j') { if (sel + 1 < n) sel++; }
+        else if (k == K_PGUP) { sel -= show; if (sel < 0) sel = 0; }
+        else if (k == K_PGDN || k == ' ') { sel += show; if (sel >= n) sel = n - 1; }
+        else if (k == K_WHEEL_UP) { sel -= 3; if (sel < 0) sel = 0; }
+        else if (k == K_WHEEL_DOWN) { sel += 3; if (sel >= n) sel = n - 1; }
+        else if (k == K_HOME || k == 'g') sel = 0;
+        else if (k == K_END || k == 'G') sel = n - 1;
+    }
+    term_overlay_close();
+    sb_pause(was);
+    term_status_refresh();
+    ta_restore(stash);
+    return result;
+}
+
+int term_scroll_modal(const char *title, const char **lines, int n, int start) {
+    if (n <= 0 || !lines) return -1;
+    if (g_ui_nc) return nc_scroll_modal(title, lines, n, start);
+    park_hold();
+    int r = scroll_modal_impl(title, lines, n, start);
+    park_free();
+    return r;
+}
+
 
 /* ---------- message queue (Enter while the model is busy) ----------
  * Like Claude Code: text typed while the model is generating or a tool runs is

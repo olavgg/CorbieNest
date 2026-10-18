@@ -66,8 +66,11 @@ without thinking about them: the status bar, the field, and the strip.
 - The status bar, on the last row, shows the model (its provider prefix and `:latest` tag dropped),
   the tokens used this session (↑ prompt · ⟳ cache hits, when a hosted model had them · ↓ generated),
   and context usage. On the right, the working folder and the git branch, in a muted pink.
-- Between the field and the status bar, a strip lists the running sub-agents. `↓` on an empty
-  line goes into it; `↑`/`↓` move, Enter opens the agent's log, Esc returns to the field.
+- Between the field and the status bar, a strip lists the running sub-agents, as many as fit.
+  Each row is the agent's name, what it is doing, and how long it has run with the tokens it
+  generated. When they do not all fit, the last row is "show all", which opens a scrollable
+  list of every running one. `↓` on an empty line goes into the strip; `↑`/`↓` move, Enter
+  opens the agent's log (or the list, on "show all"), Esc returns to the field.
 - The field grows with what you type (up to ten rows, then it scrolls). What you send moves up
   into the transcript as a `›` line.
 - On exit your shell is back exactly as it was (use `/save` to keep a transcript).
@@ -597,7 +600,7 @@ work. `/subagent` changes that, separately from the main model:
 `/effort parallel on` runs the sub-agents of one reply at the same time. A reply whose calls are all
 `task` calls (two or more), all on local models, starts them together, up to `/workers` at once;
 each one's model call goes out on its own thread, as `/orchestrate`'s workers do. The strip shows
-every running sub-agent, and the reports are printed when they are all in, in the order the model
+the running sub-agents, and the reports are printed when they are all in, in the order the model
 asked. A reply that mixes `task` with other tools, or a sub-agent on a hosted model, runs them one
 after another as before. Ctrl+C stops them all; each call still gets its result. It is off by
 default because a batch loads its model's requests side by side, which needs the memory for them.
@@ -609,11 +612,15 @@ default because a batch loads its model's requests side by side, which needs the
 - The setting is saved (`subagent=` in the config), so it holds for the next session as well.
 - Sub-agents still have no edit tools and cannot start sub-agents or ask the advisor, whatever
   model they run on.
-- **The strip** above the status bar lists the running sub-agents, one row each, with the
-  round they are on and what they are doing right now. `↓` on an empty line goes into it,
-  `↑`/`↓` move, and Enter opens the picked agent's log. Esc or a typed key returns to the field.
+- **The strip** above the status bar lists the running sub-agents, as many as fit under the
+  conversation. The first row is `● main` when there is room for it (a progress bar of the main
+  agent's task list, when it has one). Each task is `◯`, its name, what it is doing — or its
+  description, while it waits for the model — and how long it has run with the tokens it
+  generated. When they do not all fit, the last row is "show all", which opens a scrollable list
+  of every running task. `↓` on an empty line goes into the strip, `↑`/`↓` move, and Enter opens
+  the picked agent's log (or the list, on "show all"). Esc or a typed key returns to the field.
   It works while a turn runs too, where keys are read from the raw input. Notcurses shows the
-  same strip.
+  same strip and the same list.
 - **← on an empty prompt line** opens the list of this session's sub-agents (newest first, each
   with its state and rounds, or what a running one is doing now) and the main agent. Picking one
   shows its log as an open block at the top of the scrollback: its task, each tool call and the

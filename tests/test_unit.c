@@ -1364,6 +1364,96 @@ static void test_agent_log(void) {
     sb_free(&b);
 }
 
+/* the running-tasks strip: how many rows fit, and one row fitted to the width */
+static int u8cols(const char *s) {
+    int w = 0;
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++)
+        if ((*p & 0xC0) != 0x80) w++;
+    return w;
+}
+static int glyph_n(const char *s, const char *g) {
+    int n = 0; size_t gl = strlen(g);
+    for (const char *p = s; p && (p = strstr(p, g)); p += gl) n++;
+    return n;
+}
+static bool ends_with(const char *s, const char *suf) {
+    size_t n = s ? strlen(s) : 0, m = suf ? strlen(suf) : 0;
+    return n >= m && !memcmp(s + n - m, suf, m);
+}
+static void lay_check(int room, int total, int rows, int shown, bool main_row, bool more) {
+    int r = -1, s = -1; bool m = !main_row, o = !more;
+    strip_layout(room, total, &r, &s, &m, &o);
+    CHECK(r == rows && s == shown && m == main_row && o == more);
+}
+static void test_strip(void) {
+    lay_check(10, 0, 0, 0, false, false);   /* nothing running */
+    lay_check(10, 2, 3, 2, true, false);    /* ● main and both tasks */
+    lay_check(2, 2, 2, 2, false, false);    /* the tasks fill the room: no main row */
+    lay_check(4, 6, 4, 2, true, true);      /* main, two tasks, then "show all" */
+    lay_check(1, 6, 1, 0, false, true);     /* only "show all" */
+    lay_check(2, 6, 2, 1, false, true);     /* one task, then "show all" */
+    lay_check(4, 3, 4, 3, true, false);     /* main and every task */
+    lay_check(4, 4, 4, 4, false, false);    /* four tasks, no room for main */
+    lay_check(0, 6, 0, 0, false, false);
+    lay_check(-3, 6, 0, 0, false, false);
+    lay_check(5, -1, 0, 0, false, false);
+    strip_layout(4, 6, NULL, NULL, NULL, NULL);   /* the outs are optional */
+    CHECK(true);
+
+    char out[512];
+    const char *right = "12s · ↓ 0";
+    strip_row(out, sizeof out, 60, STRIP_ROW_TASK, "general", 16, "find the needle", 0, 0, right);
+    CHECK(u8cols(out) == 60);
+    CHECK(!strncmp(out, "  ◯ general", 11));
+    CHECK(strstr(out, "find the needle") != NULL);
+    CHECK(ends_with(out, right));
+    CHECK(utf8_ok(out, strlen(out)));
+
+    strip_row(out, sizeof out, 40, STRIP_ROW_TASK, "general", 16,
+              "find the needle in the haystack", 0, 0, "9s · ↓ 1");
+    CHECK(u8cols(out) == 40);
+    CHECK(strstr(out, "…") != NULL);
+    CHECK(ends_with(out, "9s · ↓ 1"));
+
+    strip_row(out, sizeof out, 80, STRIP_ROW_TASK, "lean-tracks-economy", 19, NULL, 9, 10, "1s · ↓ 1");
+    CHECK(u8cols(out) == 62 && u8cols(out) < 80);   /* the bar stays with the fraction; the row is not stretched */
+    CHECK(glyph_n(out, "▰") == 18 && glyph_n(out, "▱") == 2);
+    CHECK(strstr(out, "9/10") != NULL);
+
+    strip_row(out, sizeof out, 80, STRIP_ROW_TASK, "lean-tracks-economy", 19, NULL, 10, 10, "1s · ↓ 1");
+    CHECK(glyph_n(out, "▰") == 20 && glyph_n(out, "▱") == 0);
+    strip_row(out, sizeof out, 80, STRIP_ROW_TASK, "lean-tracks-economy", 19, NULL, 0, 10, "1s · ↓ 1");
+    CHECK(glyph_n(out, "▰") == 0 && glyph_n(out, "▱") == 20);
+    strip_row(out, sizeof out, 80, STRIP_ROW_TASK, "lean-tracks-economy", 19, NULL, 26, 29, "1s · ↓ 1");
+    CHECK(glyph_n(out, "▰") == 17 && glyph_n(out, "▱") == 3);
+    strip_row(out, sizeof out, 80, STRIP_ROW_MAIN, "main", 4, NULL, 4, 10, NULL);
+    CHECK(glyph_n(out, "▰") == 8 && glyph_n(out, "▱") == 12 && strstr(out, "4/10") != NULL);
+    strip_row(out, sizeof out, 80, STRIP_ROW_MAIN, "main", 4, NULL, 1, 100, NULL);
+    CHECK(glyph_n(out, "▰") == 1);   /* a start that would round to an empty bar still fills one cell */
+
+    strip_row(out, sizeof out, 12, STRIP_ROW_MAIN, "main", 4, NULL, 4, 10, NULL);
+    CHECK(glyph_n(out, "▰") == 0 && glyph_n(out, "▱") == 0);   /* no room for four cells: the bar is dropped */
+    CHECK(strstr(out, "4/10") != NULL && u8cols(out) <= 12);
+
+    strip_row(out, sizeof out, 40, STRIP_ROW_ALL, "show all · 8 running", 0, NULL, 0, 0, NULL);
+    CHECK_STR(out, "  show all · 8 running");
+    CHECK(u8cols(out) <= 40);
+
+    strip_row(out, sizeof out, 40, STRIP_ROW_MAIN, "main", 10, NULL, 0, 0, NULL);
+    CHECK_STR(out, "● main");
+
+    strip_row(out, sizeof out, 5, STRIP_ROW_TASK, "lean-tracks-economy", 19,
+              "doing a long thing", 0, 0, "9s · ↓ 1");
+    CHECK(u8cols(out) <= 5 && utf8_ok(out, strlen(out)));
+
+    strip_row(out, sizeof out, 40, STRIP_ROW_TASK, NULL, 0, NULL, 0, 0, NULL);
+    CHECK(u8cols(out) <= 40 && utf8_ok(out, strlen(out)));
+    strip_row(NULL, 0, 80, STRIP_ROW_TASK, "a", 4, "b", 1, 2, "c");
+    char tiny[1] = { 'x' };
+    strip_row(tiny, 1, 80, STRIP_ROW_MAIN, "main", 4, "hi", 1, 2, "x");
+    CHECK(tiny[0] == 0);
+}
+
 /* a pasted block in the prompt is a token; the text goes back in on submit, whole tokens only */
 static void test_paste(void) {
     const char *in = "look [Pasted text #1 +3 lines] and [Pasted text #2 +2 lines]!";
@@ -2211,7 +2301,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
+        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

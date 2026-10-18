@@ -208,6 +208,9 @@ int    nc_confirm(const char *question, const char *always_label, const char *pr
 int    nc_select(const char *title, const char **items, const char **descs, int n, int current) {
     (void)title; (void)items; (void)descs; (void)n; (void)current; return -1;
 }
+int    nc_scroll_modal(const char *title, const char **lines, int n, int start) {
+    (void)title; (void)lines; (void)n; (void)start; return -1;
+}
 #else
 /* ---------- the notcurses frontend ---------- */
 bool nc_compiled(void) { return true; }
@@ -1109,6 +1112,12 @@ void nc_render(void) {
     if (g_rows >= 6 && g_cols >= 10) {
         int fh = field_height();
         int bar = g_rows - 1;   /* the bar is the last row: the folder and branch are in it */
+        int room = g_rows - fh - 1 - 8;   /* the bar, and eight rows of conversation kept for reading */
+        int fit = g_rows - fh - 2;
+        if (fit < 1) fit = 1;
+        if (room > fit) room = fit;
+        if (room < 1) room = 1;
+        term_strip_limit(room);
         const char *strip_text = NULL;
         int srows = term_strip_update(&strip_text);   /* the agents strip: between the field and the bar */
         int top = bar - fh - srows; if (top < 1) top = 1;
@@ -1564,6 +1573,40 @@ int nc_confirm(const char *question, const char *always_label, const char *proje
         if (r && *r) *reason = r; else free(r);
     }
     return rc;
+}
+
+/* Every running task, in a menu: ↑/↓ and PgUp/PgDn scroll, Enter picks a row, Esc cancels.
+ * The lines are already fitted to the width. Returns the picked index, or -1. */
+int nc_scroll_modal(const char *title, const char **lines, int n, int start) {
+    if (!g_nc || n <= 0 || !lines) return -1;
+    int sel = start >= 0 && start < n ? start : 0, top = 0, result = -1;
+    for (;;) {
+        int show = g_rows > 8 ? g_rows - 6 : 3;
+        if (show > n) show = n;
+        if (show > 28) show = 28;   /* the menu holds 32 rows; the title and the hint take two */
+        if (show < 1) show = 1;
+        if (sel < top) top = sel;
+        if (sel >= top + show) top = sel - show + 1;
+        if (top < 0) top = 0;
+        char head[160];
+        snprintf(head, sizeof head, "%s · %d", title && *title ? title : "running tasks", n);
+        menu_open(head, "↑/↓ PgUp/PgDn scroll · Enter opens the log · Esc closes");
+        for (int i = 0; i < show && top + i < n; i++)
+            menu_add(lines[top + i] ? lines[top + i] : "", C_TEXT, top + i == sel);
+        nc_render();
+        int k = nc_getkey(1000);
+        if (k == NK_NONE || k == NK_SKIP) continue;
+        if (k == 27 || k == 3 || k == NK_RESIZE) { result = -1; break; }
+        if (k == 13 || k == 10) { result = sel; break; }
+        if (k == NK_UP || k == 'k') { if (sel > 0) sel--; }
+        else if (k == NK_DOWN || k == 'j') { if (sel + 1 < n) sel++; }
+        else if (k == NK_PGUP) { sel -= show; if (sel < 0) sel = 0; }
+        else if (k == NK_PGDN || k == ' ') { sel += show; if (sel >= n) sel = n - 1; }
+        else if (k == NK_HOME || k == 'g') sel = 0;
+        else if (k == NK_END || k == 'G') sel = n - 1;
+    }
+    menu_close();
+    return result;
 }
 
 int nc_select(const char *title, const char **items, const char **descs, int n, int current) {

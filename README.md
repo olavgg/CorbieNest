@@ -18,7 +18,8 @@ confirmed before it runs.
 - **Tools with confirmation.** Read, write and edit files, grep, run shell and git commands,
   and look documentation up on the web. Four permission modes, from `manual` to `auto`.
 - **Sub-agents.** A read-only agent investigates a question in its own context and reports
-  back. A strip above the status bar lists the running ones, and `↓` opens their logs.
+  back. A strip above the status bar lists the running ones; when they do not fit, "show all"
+  opens the rest. `↓` moves into the strip and Enter opens a log.
 - **Orchestration and goals.** `/orchestrate` plans a request as tasks that the advisor reviews;
   `/goal` races candidates in git worktrees against a metric.
 - **Sessions, memory, skills.** Sessions resume with `--continue` or `/resume`. The project keeps

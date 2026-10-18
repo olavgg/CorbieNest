@@ -160,6 +160,19 @@ bool   tail_incomplete(const char *buf, size_t n);   /* ends inside an escape se
 char  *utf8_fix(const char *s);                  /* malloc'd copy, each invalid byte as U+FFFD */
 size_t utf8_cut(const char *s, size_t len, size_t cap);   /* the longest prefix of s up to cap bytes that ends on a character */
 int    cmd_head(const char *cmd, int width, char *out, size_t n);   /* a shell command's first line for a fold's head; returns the lines after it */
+/* One row of the running-tasks strip, fitted to `cols` columns (a character is a column; `out` is always terminated).
+ * STRIP_ROW_MAIN is "● name", STRIP_ROW_TASK is an indented "◯ name", STRIP_ROW_ALL is "  " plus `name`
+ * ("show all"). `name_w` is the name column. A `total` above 0 draws a progress bar for done/total
+ * instead of `mid`. `right` is the time and tokens: at the right edge of an activity row, after the
+ * fraction of a progress row. */
+#define STRIP_ROW_MAIN 0
+#define STRIP_ROW_TASK 1
+#define STRIP_ROW_ALL  2
+void strip_row(char *out, size_t n, int cols, int kind, const char *name, int name_w,
+               const char *mid, int done, int total, const char *right);
+/* How `total` running tasks share `room` rows. *with_main: a ● main row. *more: the last row is
+ * "show all" because they do not all fit. *shown: how many tasks get a row. *rows: what is drawn. */
+void strip_layout(int room, int total, int *rows, int *shown, bool *with_main, bool *more);
 /* Every tool call of an assistant message gets its tool result right after it (a stopped request leaves
  * calls without one, and the server refuses the next request); invalid UTF-8 in content is fixed. Returns
  * how many were fixed. The conversation's own repair, run when a request starts. */
@@ -415,10 +428,14 @@ extern int term_idle_ms;
  * (main.c: the sub-agents of this session). term_show_block() shows a text as an open fold and
  * moves the view to its head, for the hook to show what it chose: the rest of the block is plain. */
 extern void (*term_agents_menu)(void);
-/* the agents strip (term.c's strip_draw): the running sub-agents' lines, and the open of the one picked (main.c) */
+/* the agents strip (term.c's strip_draw): the running tasks' lines, and the open of the one picked (main.c).
+ * `max` is how many rows fit above the status bar, not a fixed cap. */
 extern int  (*term_agents_strip)(sbuf *o, int cols, int max);
 extern void (*term_agents_open)(int idx);
+void term_strip_limit(int rows);             /* notcurses: how many strip rows fit this frame (before term_strip_update) */
 int  term_strip_update(const char **text);   /* the strip's rows, refreshed (notcurses draws it) */
+int  term_modal_cols(void);                  /* the width a scrollable modal's rows are fitted to */
+int  term_scroll_modal(const char *title, const char **lines, int n, int start);   /* the row Enter picked, or -1 */
 enum { STRIP_OTHER = 0, STRIP_UP, STRIP_DOWN, STRIP_ESC, STRIP_ENTER };
 int  term_strip_sel(void);                    /* the row the keys are on (-1: the field) */
 bool term_strip_key(int key, bool may_enter);   /* a key on the strip (STRIP_*); true when the strip took it */
@@ -536,6 +553,7 @@ int    nc_poll_interrupt(void);                       /* keys read while the mod
 int    nc_input_fd(void);                             /* the fd that signals keys to read (-1: none) */
 int    nc_confirm(const char *question, const char *always_label, const char *project_label, char **reason);
 int    nc_select(const char *title, const char **items, const char **descs, int n, int current);
+int    nc_scroll_modal(const char *title, const char **lines, int n, int start);   /* the row Enter picked, or -1 */
 void   nc_banner_set(const char **lines, int n, int bw, bool on);   /* the banner's modal: its lines and width, shown or not */
 bool   nc_banner_open(void);                          /* the banner's modal is up */
 void   nc_overlay_set(const char *text);              /* the overlay (/usage and the like) as a modal over the pane; NULL closes it */
