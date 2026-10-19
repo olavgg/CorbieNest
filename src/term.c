@@ -3163,14 +3163,10 @@ static void ed_hist_search(editor *e) {
 }
 
 /* ---------- pasted text ----------
- * More than three lines, or more than 800 bytes, go in as a token; the rest is typed in as it is. */
-#define PASTE_LINES 3
-#define PASTE_BYTES 800
+ * More than three lines, or more than 800 bytes, go in as a token; the rest is typed in as it is (paste_is_block). */
 static void paste_insert(editor *e, const char *t, size_t n) {
     int lines = 0;
-    for (size_t i = 0; i < n; i++) if (t[i] == '\n') lines++;
-    if (n && t[n - 1] != '\n') lines++;
-    if ((lines > PASTE_LINES || n > PASTE_BYTES) && g_paste_n < PASTE_MAX) {
+    if (paste_is_block(t, n, &lines) && g_paste_n < PASTE_MAX) {
         char tok[64]; snprintf(tok, sizeof tok, "[Pasted text #%d +%d lines]", g_paste_n + 1, lines);
         g_paste[g_paste_n].text = xstrndup(t, n); g_paste[g_paste_n].lines = lines; g_paste_n++;
         ed_insert(e, tok, strlen(tok));
@@ -3488,16 +3484,10 @@ static char *readline_impl(const char *prompt, bool in_field) {
                     sb_putc(&p, (char)c);
                     if (p.len >= 6 && !memcmp(p.data + p.len - 6, "\x1b[201~", 6)) { p.len -= 6; break; }
                 }
-                /* normalise CRLF / CR to LF, drop other control chars except tab */
-                sbuf q; sb_init(&q);
-                for (size_t i = 0; i < p.len; i++) {
-                    char c = p.data[i];
-                    if (c == '\r') { if (i + 1 < p.len && p.data[i+1] == '\n') continue; c = '\n'; }
-                    if ((unsigned char)c < 32 && c != '\n' && c != '\t') continue;
-                    sb_putc(&q, c);
-                }
-                if (q.len) paste_insert(&e, q.data, q.len);
-                sb_free(&p); sb_free(&q);
+                /* CRLF and CR become LF; other control characters and DEL are dropped, tab stays (paste_clean) */
+                size_t ql = 0; char *q = paste_clean(p.data, p.len, &ql);
+                if (ql) paste_insert(&e, q, ql);
+                free(q); sb_free(&p);
                 break; }
             case K_PGUP: case K_WHEEL_UP: {
                 int page = view_rows() - 1;

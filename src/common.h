@@ -132,6 +132,14 @@ char *shell_escape(const char *s);
  * back for the ones that are still whole: K in 1..n and N equal to lines[K-1]. */
 size_t paste_tokens(const char *s, size_t len, size_t (*sp)[2], int *ks, int *ns, size_t max);
 char  *paste_expand(const char *s, size_t len, const char *const *texts, const int *lines, int n);
+/* A pasted text is a block (shown as a token) when it has more than PASTE_LINES lines or more than PASTE_BYTES
+ * bytes; *lines gets its line count (each newline, and a last line that has no newline). paste_clean() is what
+ * a bracketed paste's bytes become as typed text: CRLF and CR are line breaks, tab stays, other controls and
+ * DEL go (so NUL goes too), and a byte that is not UTF-8 becomes U+FFFD. Malloc'd; *out_len is its length. */
+#define PASTE_LINES 3
+#define PASTE_BYTES 800
+bool   paste_is_block(const char *t, size_t n, int *lines);
+char  *paste_clean(const char *s, size_t n, size_t *out_len);
 
 /* A sub-agent's log (main.c keeps one per run, shown by ← at the prompt): plain text appended to
  * `log`, which is cut from its front, at a line, once it is past `cap` bytes. */

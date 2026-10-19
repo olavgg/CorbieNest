@@ -1536,6 +1536,88 @@ static void test_paste(void) {
     free(o);
 }
 
+/* pasted text: what makes a block, how a bracketed paste becomes text, and the token edge cases */
+static void test_paste_more(void) {
+    int lines = -1;
+    /* a block is more than 3 lines or more than 800 bytes; each newline counts, and a last line without one too */
+    CHECK(!paste_is_block("a\nb\nc", 5, &lines) && lines == 3);
+    CHECK(!paste_is_block("a\nb\nc\n", 6, &lines) && lines == 3);
+    CHECK(paste_is_block("a\nb\nc\nd", 7, &lines) && lines == 4);
+    CHECK(paste_is_block("a\nb\nc\nd\n", 8, &lines) && lines == 4);
+    CHECK(!paste_is_block("", 0, &lines) && lines == 0);
+    CHECK(!paste_is_block("x", 1, NULL));                                  /* lines may be NULL */
+    char *b801 = malloc(801); memset(b801, 'x', 801);
+    CHECK(!paste_is_block(b801, 800, &lines) && lines == 1);             /* 800 bytes, one line: typed in */
+    CHECK(paste_is_block(b801, 801, &lines) && lines == 1);              /* 801 bytes: a block */
+    free(b801);
+    /* the limit is in bytes: 266 three-byte characters are 798 bytes (typed in), 267 are 801 (a block) */
+    { size_t n = 267 * 3; char *u = malloc(n);
+      for (size_t i = 0; i < 267; i++) memcpy(u + 3 * i, "\xe6\x97\xa5", 3);   /* 日 */
+      CHECK(paste_is_block(u, n, NULL));
+      CHECK(!paste_is_block(u, 266 * 3, NULL));
+      free(u); }
+
+    /* a bracketed paste as text: CRLF and CR are line breaks; tab stays; controls, DEL and NUL go */
+    size_t n = 0; char *t;
+    t = paste_clean("a\r\nb", 4, &n); CHECK(!strcmp(t, "a\nb") && n == 3); free(t);
+    t = paste_clean("a\rb", 3, &n); CHECK(!strcmp(t, "a\nb") && n == 3); free(t);
+    t = paste_clean("a\r\r\nb", 5, &n); CHECK(!strcmp(t, "a\n\nb") && n == 4); free(t);   /* CR, then CRLF */
+    t = paste_clean("a\r", 2, &n); CHECK(!strcmp(t, "a\n") && n == 2); free(t);           /* a trailing CR */
+    t = paste_clean("a\tb", 3, &n); CHECK(!strcmp(t, "a\tb") && n == 3); free(t);         /* tab stays */
+    t = paste_clean("a\x1b[Db", 5, &n); CHECK(!strcmp(t, "a[Db") && n == 4); free(t);     /* ESC goes, the rest is text */
+    t = paste_clean("a\x7f" "b", 3, &n); CHECK(!strcmp(t, "ab") && n == 2); free(t);      /* DEL is not a backspace in text */
+    t = paste_clean("a\0b", 3, &n); CHECK(!strcmp(t, "ab") && n == 2); free(t);           /* NUL goes */
+    t = paste_clean("a\x07\x08\x0b" "b", 5, &n); CHECK(!strcmp(t, "ab") && n == 2); free(t);   /* BEL, BS, VT */
+    t = paste_clean("", 0, &n); CHECK(t && !*t && n == 0); free(t);
+    t = paste_clean("\n\n", 2, &n); CHECK(!strcmp(t, "\n\n") && n == 2); free(t);         /* newlines stay */
+    t = paste_clean("日本 🙂 é", strlen("日本 🙂 é"), &n); CHECK(!strcmp(t, "日本 🙂 é")); free(t);   /* UTF-8 is text */
+    t = paste_clean("x", 1, NULL); CHECK(!strcmp(t, "x")); free(t);                      /* out_len may be NULL */
+    t = paste_clean("a\xff" "b", 3, &n); CHECK(!strcmp(t, "a\xef\xbf\xbd" "b") && n == 5); free(t);   /* a bad byte: U+FFFD */
+    t = paste_clean("a\xe5" "x", 3, &n); CHECK(!strcmp(t, "a\xef\xbf\xbdx") && n == 5); free(t);   /* a Latin-1 å alone */
+    t = paste_clean("\xe6\x97" "x", 3, &n); CHECK(!strcmp(t, "\xef\xbf\xbd\xef\xbf\xbd" "x") && n == 7); free(t);   /* a cut character: one U+FFFD per byte */
+    { size_t big = 1u << 20; char *in = malloc(big); memset(in, 'q', big);
+      t = paste_clean(in, big, &n); CHECK(n == big && t[big - 1] == 'q'); free(t); free(in); }
+
+    /* the tokens, at their edges (every literal is measured with strlen, so no length can be miscounted) */
+    const char *texts[2] = { "a\nb\nc", "d\ne" }; const int tl[2] = { 3, 2 };
+    const char *s1;
+    char *o;
+    s1 = "[Pasted text #99999999999 +3 lines]";                       /* K with too many digits: literal */
+    o = paste_expand(s1, strlen(s1), texts, tl, 2); CHECK(!strcmp(o, s1)); free(o);
+    s1 = "[Pasted text #1 +99999999999 lines]";                       /* N with too many digits: literal */
+    o = paste_expand(s1, strlen(s1), texts, tl, 2); CHECK(!strcmp(o, s1)); free(o);
+    s1 = "[Pasted text #1 +3 lines]";                                 /* no pastes at all: literal */
+    o = paste_expand(s1, strlen(s1), texts, tl, 0); CHECK(!strcmp(o, s1)); free(o);
+    s1 = "[Pasted text #1 +3 lines][Pasted text #2 +2 lines]";       /* two in a row */
+    o = paste_expand(s1, strlen(s1), texts, tl, 2); CHECK(!strcmp(o, "a\nb\nc" "d\ne")); free(o);
+    s1 = "[Pasted text #1 +3 lines] [Pasted text #1 +3 lines]";      /* the same K twice */
+    o = paste_expand(s1, strlen(s1), texts, tl, 2); CHECK(!strcmp(o, "a\nb\nc a\nb\nc")); free(o);
+    s1 = "日[Pasted text #1 +3 lines]🙂";                              /* UTF-8 around a token */
+    o = paste_expand(s1, strlen(s1), texts, tl, 2); CHECK(!strcmp(o, "日a\nb\nc🙂")); free(o);
+    /* text that looks like a token is pasted text: it is not expanded again */
+    const char *tricky[1] = { "see [Pasted text #1 +3 lines] here" }; const int t1[1] = { 3 };
+    s1 = "[Pasted text #1 +3 lines]";
+    o = paste_expand(s1, strlen(s1), tricky, t1, 1);
+    CHECK(!strcmp(o, "see [Pasted text #1 +3 lines] here")); free(o);
+    /* a long paste expands to its full length */
+    { size_t L = 200000; char *big = malloc(L + 1); memset(big, 'z', L); big[L] = 0;
+      const char *bt[1] = { big }; const int bl[1] = { 100000 };
+      s1 = "[Pasted text #1 +100000 lines]";
+      o = paste_expand(s1, strlen(s1), bt, bl, 1);
+      CHECK(strlen(o) == L); free(o); free(big); }
+    /* twenty tokens: the scan stops at the array's size */
+    { char many[32 * 30]; size_t m = 0;
+      for (int i = 1; i <= 20; i++) m += (size_t)sprintf(many + m, "[Pasted text #%d +4 lines] ", i);
+      size_t sp[16][2]; int ks[16], ns[16];
+      CHECK(paste_tokens(many, m, sp, ks, ns, 16) == 16);
+      CHECK(paste_tokens(many, m, NULL, NULL, NULL, 40) == 20); }
+    /* a token that is the whole input, and one with text after it */
+    s1 = "[Pasted text #1 +3 lines]";
+    CHECK(paste_tokens(s1, strlen(s1), NULL, NULL, NULL, 4) == 1);
+    s1 = "[Pasted text #1 +3 lines]x";
+    CHECK(paste_tokens(s1, strlen(s1), NULL, NULL, NULL, 4) == 1);
+}
+
 static void test_goal(void) {
     char err[160], why[200];
     goal_spec g;
@@ -2404,7 +2486,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme },
+        { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

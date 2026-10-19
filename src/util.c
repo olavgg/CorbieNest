@@ -2229,6 +2229,34 @@ size_t paste_tokens(const char *s, size_t len, size_t (*sp)[2], int *ks, int *ns
     }
     return n;
 }
+bool paste_is_block(const char *t, size_t n, int *lines) {
+    int nl = 0;
+    for (size_t i = 0; i < n; i++) if (t[i] == '\n') nl++;
+    if (n && t[n - 1] != '\n') nl++;
+    if (lines) *lines = nl;
+    return nl > PASTE_LINES || n > PASTE_BYTES;
+}
+
+char *paste_clean(const char *s, size_t n, size_t *out_len) {
+    sbuf q; sb_init(&q);
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == '\r') { if (i + 1 < n && s[i + 1] == '\n') continue; c = '\n'; }
+        if ((unsigned char)c < 32 && c != '\n' && c != '\t') continue;
+        if (c == 127) continue;
+        sb_putc(&q, c);
+    }
+    if (utf8_ok(q.data ? q.data : "", q.len)) {
+        if (out_len) *out_len = q.len;
+        return sb_detach(&q);
+    }
+    /* a byte that is not UTF-8 becomes U+FFFD here, as the request path would make it (messages_repair) */
+    char *fixed = utf8_fix(q.data ? q.data : "");
+    sb_free(&q);
+    if (out_len) *out_len = strlen(fixed);
+    return fixed;
+}
+
 char *paste_expand(const char *s, size_t len, const char *const *texts, const int *lines, int n) {
     sbuf o; sb_init(&o);
     for (size_t i = 0; i < len; i++) {
