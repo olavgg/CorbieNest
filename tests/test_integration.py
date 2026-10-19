@@ -1999,6 +1999,25 @@ try:
           f"{msg_block_types(elided[0]) if elided else [msg_block_types(r) for r in sent]}")
 finally:
     open(CFG2_FILE, "w").write(cfg_before)
+print("a side call after the prompt changed (/btw in plan mode): the signed blocks are set aside, not sent")
+# its own folder and config: --continue must pick this section's session, not one an earlier section left
+SB_WORK = os.path.realpath(tempfile.mkdtemp(prefix="crowsb_"))
+SB_CFG = tempfile.mkdtemp(prefix="crowsbcfg_")
+ENVSB = dict(ENVK, XDG_CONFIG_HOME=SB_CFG, HOME=SB_WORK)
+out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "-c", "8k", "-p", "THINK_LIVE please"], env=ENVSB, cwd=SB_WORK)
+check(rc == 0 and "Live ok" in out, f"the run that signs the blocks: {out[-300:]!r}")
+n5 = len(preqs())
+sb = Session(["-m", "anthropic:claude-fake-haiku", "--yolo", "--continue", "--mode", "plan"], env=ENVSB, cwd=SB_WORK)
+sb.expect("Ctrl-D to quit")
+sb.send("/btw hello\r")
+check(sb.expect("set aside 1 thinking block"), f"plan mode changed the prompt: the blocks are set aside before /btw: {sb.text()[-300:]!r}")
+check(sb.expect("Tool said: second-done"), f"/btw is answered: {sb.text()[-300:]!r}")
+check("Invalid" not in sb.text() and "✗" not in sb.text(), f"no refused call: {sb.text()[-300:]!r}")
+sb.send("\x04"); sb.close()
+sent = [r for r in anth_since(n5) if r["body"].get("system") is not None]
+check(sent and all("signature" not in json.dumps(r["body"]["messages"]) for r in sent),
+      "the /btw request carries no signed thinking block")
+shutil.rmtree(SB_WORK, ignore_errors=True); shutil.rmtree(SB_CFG, ignore_errors=True)
 n0 = len(preqs())
 out, rc = run(["-m", "anthropic:claude-fake-haiku", "--advisor", "anthropic:claude-opus-5", "--yolo", "-p", "TOOL_ADVISOR please"], env=ENVK)
 check(rc == 0 and "Tool said: ADVICE:" in out, f"the advice came back as the tool result: {out[-400:]!r}")

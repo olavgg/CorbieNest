@@ -1373,8 +1373,11 @@ static char *build_system_prompt(void) {
     return sb_detach(&b);
 }
 
-/* messages array with system prompt prepended (references, so cheap) */
+/* messages array with system prompt prepended (references, so cheap). Every call that sends the conversation goes
+ * through here (the turn, /btw, /compact, the suggestion), so the guard runs first: a prompt that changed since the
+ * blocks were signed (a mode, the memory, the date) is refused by the server, whichever call sends it. */
 static cJSON *messages_with_system(void) {
+    guard_thinking();
     cJSON *arr = cJSON_CreateArray();
     cJSON *sys = cJSON_CreateObject();
     cJSON_AddStringToObject(sys, "role", "system");
@@ -3299,8 +3302,7 @@ static bool run_turn_body(void) {
     g_session.turns++;
     for (;;) {
         if (shrink_context(round_first >= 0 ? round_first : cJSON_GetArraySize(g_messages))) round_first = -1;
-        guard_thinking();   /* the prompt is rebuilt every call: a change mid-run (mode, memory, the date) invalidates the blocks */
-        cJSON *msgs = messages_with_system();
+        cJSON *msgs = messages_with_system();   /* guards the thinking blocks: a change mid-run (mode, memory, the date) invalidates them */
         cJSON *tools = tools_for_mode();
         size_t sent = prompt_bytes();
         chat_stats st; bool aborted = false;

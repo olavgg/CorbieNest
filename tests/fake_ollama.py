@@ -123,6 +123,20 @@ def _tool_results(req):
             out += [b.get("content") or "" for b in c if isinstance(b, dict) and b.get("type") == "tool_result"]
     return out
 
+SIG_SYSTEM = {}   # a thinking signature -> the system prompt of the request it was issued in (as the real API binds it)
+
+def _system_key(req):
+    return json.dumps(req.get("system"), sort_keys=True)
+
+def _sig_system_changed(msgs, sys_key):
+    """A thinking block replayed under a system prompt other than the one it was signed with."""
+    for m in msgs or []:
+        c = m.get("content")
+        for b in (c if isinstance(c, list) else []):
+            if isinstance(b, dict) and b.get("type") == "thinking" and b.get("signature") in SIG_SYSTEM:
+                if SIG_SYSTEM[b["signature"]] != sys_key: return True
+    return False
+
 def _has_thinking(msgs):
     """A thinking or redacted_thinking block anywhere in the turn. The real API refuses one whose signature is for another prefix."""
     for m in msgs or []:
@@ -611,6 +625,11 @@ class H(BaseHTTPRequestHandler):
         if _stale_thinking(msgs) or (typed and "RESUME_BREAK" in typed[-1] and _has_thinking(msgs)):
             return bad("messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. "
                        "Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\".")
+        if _sig_system_changed(msgs, _system_key(req)):
+            return bad("messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. "
+                       "Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\". "
+                       "That setting requires the `thinking-binding-controls-2026-08-01` value in the `anthropic-beta` header. "
+                       "The `system` prompt differs from the one this block was created with.")
         if _advisor_shape(req):
             brief = req["messages"][0]["content"]
             if "SLOWADVICE" in brief: time.sleep(3)
@@ -623,6 +642,8 @@ class H(BaseHTTPRequestHandler):
             return self._json(200, {"type": "message", "role": "assistant", "model": model, "content": blocks,
                                     "stop_reason": "max_tokens" if "CUTADVICE" in brief else "end_turn", "usage": usage})
         blocks, stop = _turn_blocks(req)
+        for b in blocks:   # the signature is bound to the system prompt of this request
+            if b.get("type") == "thinking" and b.get("signature"): SIG_SYSTEM[b["signature"]] = _system_key(req)
         cu = _cache_usage(req)
         if any("THINK_LIVE" in (t or "") for t in typed):   # a real prompt size, so the client's context estimate will elide
             cu = dict(cu, input_tokens=max(1, len(json.dumps(req)) // 4))
