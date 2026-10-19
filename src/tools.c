@@ -1025,6 +1025,7 @@ void tools_bg_kill_all(void) {
 static void bg_on_signal(int sig) {
     bg_signal_all(SIGKILL);
     mcp_kill_signal();
+    term_fatal_restore();   /* the terminal's modes too: a closed or killed run must not leave them on */
     signal(sig, SIG_DFL);
     raise(sig);
 }

@@ -378,6 +378,8 @@ char *http_url(const char *base, const char *path);   /* base + path; "host" and
 /* ---------- term.h ---------- */
 void term_init(void);
 void term_restore(void);
+void term_fatal_restore(void);   /* async-signal-safe: puts the terminal back (a crash, SIGTERM, SIGHUP) */
+void term_fatal_default(void);   /* a forked child: its fatal signals are the default ones again */
 void term_finish(void);       /* the program is ending: restores the terminal, and output after it is not the screen's */
 void term_raw(bool on);
 int  term_width(void);
@@ -551,6 +553,7 @@ int    nc_text_width(const char *s);                       /* its width in colum
 bool   nc_compiled(void);                             /* this build has the notcurses frontend */
 bool   nc_start(void);                                /* takes the screen; false (and a message on stderr) if it cannot */
 void   nc_stop(void);                                 /* gives it back; idempotent */
+void   nc_fatal_restore(void);                        /* async-signal-safe: the tty's termios as the program found it */
 bool   nc_size(int *rows, int *cols);                 /* the screen's size, when the frontend runs */
 void   nc_render(void);                               /* draws the pane, field, bar and location line now */
 void   nc_render_soon(void);                          /* the same, at most every few tens of ms */

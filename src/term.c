@@ -100,8 +100,55 @@ static ssize_t in_read(void *buf, size_t n) {
     return k;
 }
 
+/* ---------- a crash or a kill leaves the terminal as it was left ----------
+ * atexit() does not run on a fatal signal, and notcurses' own restore is off (NCOPTION_NO_QUIT_SIGHANDLERS).
+ * So the handler puts the terminal back with async-signal-safe calls only: the tty's termios, and a fixed
+ * string that turns off the modes the program sets (mouse, the kitty and modifyOtherKeys keyboard modes,
+ * bracketed paste, the alternate screen). The signal is then raised again with its default action (a core
+ * dump, or macOS's crash report). Without this, every key after a crash comes out as escape text. */
+#define FATAL_UNDO "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[<u\x1b[<u\x1b[>4m\x1b[?2004l" \
+                   "\x1b[0m\x1b[0 q\x1b[r\x1b[?25h\x1b[?1049l"
+/* SIGTERM and SIGHUP are the background jobs' (tools.c bg_on_signal), which calls term_fatal_restore() itself */
+static const int g_fatal_sigs[] = { SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGQUIT, SIGSEGV };
+static char g_altstack[64 * 1024];   /* a crash by stack overflow still runs the handler */
+/* set while the program has the terminal (raw, full screen or notcurses); cleared by term_restore(). A signal
+ * that comes when it has not (a SIGTERM before any screen, a run with -p) writes nothing. */
+static volatile sig_atomic_t g_tty_dirty = 0;
+
+void term_fatal_restore(void) {   /* async-signal-safe: tcsetattr, isatty, write */
+    if (!g_tty_dirty) return;
+    if (g_ui_nc) nc_fatal_restore();
+    else if (g_have_orig) tcsetattr(STDIN_FILENO, TCSANOW, &g_orig);
+    if (isatty(STDOUT_FILENO)) {
+        ssize_t w = write(STDOUT_FILENO, FATAL_UNDO, sizeof FATAL_UNDO - 1);
+        (void)w;   /* nothing more to do if it fails: the process is going down */
+    }
+}
+
+static void on_fatal(int sig) {
+    term_fatal_restore();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+void term_fatal_default(void) {   /* a forked child that is not ours to restore: its signals do what they do */
+    for (size_t i = 0; i < sizeof g_fatal_sigs / sizeof g_fatal_sigs[0]; i++) signal(g_fatal_sigs[i], SIG_DFL);
+}
+
+static void term_fatal_guard(void) {
+    stack_t ss; memset(&ss, 0, sizeof ss);
+    ss.ss_sp = g_altstack; ss.ss_size = sizeof g_altstack;
+    bool alt = sigaltstack(&ss, NULL) == 0;
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_fatal;
+    sa.sa_flags = SA_RESETHAND | (alt ? SA_ONSTACK : 0);
+    sigemptyset(&sa.sa_mask);
+    for (size_t i = 0; i < sizeof g_fatal_sigs / sizeof g_fatal_sigs[0]; i++) sigaction(g_fatal_sigs[i], &sa, NULL);
+}
+
 void term_init(void) {
     trace_open();
+    term_fatal_guard();   /* before the notcurses branch: a crash restores the terminal in either UI */
     if (g_ui_nc) { atexit(term_restore); return; }   /* notcurses sets up its own signals and terminal */
     if (tcgetattr(STDIN_FILENO, &g_orig) == 0) g_have_orig = true;
     /* A resize is SIGWINCH. A launcher may have blocked it, and a blocked mask is inherited across exec: then the
@@ -121,7 +168,7 @@ void term_raw(bool on) {
         /* keep OPOST/ONLCR so "\n" still becomes CRLF */
         t.c_cc[VMIN] = 1; t.c_cc[VTIME] = 0;
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &t);
-        g_raw = true;
+        g_raw = true; g_tty_dirty = 1;
     } else if (!on && g_raw) {
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig);
         g_raw = false;
@@ -129,6 +176,7 @@ void term_raw(bool on) {
 }
 
 void term_restore(void) {
+    g_tty_dirty = 0;   /* what follows puts the terminal back itself */
     if (g_ui_nc) { nc_stop(); return; }
     term_fullscreen(false);
     if (g_raw) {
@@ -859,11 +907,12 @@ void term_fullscreen(bool on) {
     if (g_ui_nc) {
         if (!on) { nc_stop(); return; }
         sb_hook_stdout();   /* the conversation is still captured: the pane is drawn from it */
-        if (nc_start()) return;
+        if (nc_start()) { g_tty_dirty = 1; return; }
         g_ui_nc = false;    /* could not start: the ANSI screen from here on (nc_start said why) */
     }
     if (on && !g_fs) {
         sb_hook_stdout();   /* start recording the conversation for PgUp */
+        g_tty_dirty = 1;
         g_fs = true; g_fs_rows = g_fs_cols = g_fs_reserved = 0; g_live_out = 0;
         g_field_rows = 1; g_field_view = 0; g_conv_row = g_conv_col = 1;
         g_sug_rows = 0; g_view_top = -1;

@@ -188,6 +188,7 @@ bool nc_copy_key(bool release, unsigned id, bool ctrl, bool super) {
 bool   nc_compiled(void) { return false; }
 bool   nc_start(void) { fprintf(stderr, "corbienest: this build has no notcurses frontend (notcurses was not installed when it was built)\n"); return false; }
 void   nc_stop(void) {}
+void   nc_fatal_restore(void) {}
 bool   nc_size(int *rows, int *cols) { (void)rows; (void)cols; return false; }
 void   nc_render(void) {}
 void   nc_render_soon(void) {}
@@ -1195,6 +1196,7 @@ static bool nc_probe(const notcurses_options *o) {
     pid_t pid = fork();
     if (pid < 0) return true;   /* no child to ask: start as before */
     if (pid == 0) {
+        term_fatal_default();   /* the child's crash is its own: it must not restore (or reset) the terminal the parent is using */
         FILE *fp = fdopen(dup(STDOUT_FILENO), "w");
         struct notcurses *nc = fp ? notcurses_init(o, fp) : NULL;
         if (nc) notcurses_stop(nc);
@@ -1229,6 +1231,11 @@ static bool nc_probe(const notcurses_options *o) {
     }
     fprintf(stderr, "corbienest: the terminal did not answer notcurses' start-up queries (under tmux, its DA1 reply); using the ANSI UI\n");
     return false;
+}
+
+/* async-signal-safe (term_fatal_restore): the tty as the program found it; the modes are written by term.c */
+void nc_fatal_restore(void) {
+    if (g_tty_saved) tcsetattr(STDIN_FILENO, TCSANOW, &g_tty_orig);
 }
 
 /* A failed init has sent its queries and may have restored the terminal, so the replies come now. They are read
