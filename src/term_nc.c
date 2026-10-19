@@ -1170,15 +1170,16 @@ void nc_output(void) { nc_render_soon(); }
 static struct termios g_tty_orig;        /* the terminal as the program found it (nc_probe) */
 static bool g_tty_saved = false;
 
-/* Reads and drops what the terminal still sends, until it has been quiet for 250 ms (at most 2 s). Called while
+/* Reads and drops what the terminal still sends, until it has been quiet for 60 ms (at most 2 s). Called while
  * the tty has no echo: the replies to the probe's queries that come late are then not printed on the screen when
- * the terminal goes back to its own mode. */
+ * the terminal goes back to its own mode. A longer quiet period (250 ms) took keys typed up to about half a second
+ * into start-up; 60 ms still caught the late replies in every kitty run here. */
 static void tty_drain_quiet(void) {
     double end = now_s() + 2.0;
     for (;;) {
         double left = end - now_s();
         if (left <= 0) break;
-        int ms = left < 0.25 ? (int)(left * 1000) : 250;
+        int ms = left < 0.06 ? (int)(left * 1000) : 60;
         fd_set rf; FD_ZERO(&rf); FD_SET(STDIN_FILENO, &rf);
         struct timeval tv = { 0, ms * 1000 };
         if (select(STDIN_FILENO + 1, &rf, NULL, NULL, &tv) <= 0) break;   /* quiet: done */
