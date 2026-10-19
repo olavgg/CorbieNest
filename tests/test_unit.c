@@ -2244,31 +2244,52 @@ static void test_nc_pure(void) {
     CHECK(n == 2 && strcmp(cells[0].egc, "h") == 0 && strcmp(cells[1].egc, "i") == 0);
 }
 
-/* menu rows: an item's label and description wrapped side by side, one row per line of the taller of the two */
+/* menu rows: a block item is its label, then its description indented under it; a one-line item puts the description
+ * in the label's column and wraps under it. Both wrap to the width. */
 static void test_menu_rows(void) {
-    sbuf lab[MENU_LINES_MAX], des[MENU_LINES_MAX];
-    /* "simple, but a crash leaves it behind" in 12 cells breaks after its words: four lines; the label fits in 10 */
-    int n = menu_item_rows("Lock file", "simple, but a crash leaves it behind", 10, 12, lab, des, MENU_LINES_MAX);
+    sbuf rows[MENU_LINES_MAX]; int kind[MENU_LINES_MAX];
+    /* block: the description is 15 cells at width 18 (the indent is 3): "simple, but a" / "crash leaves it" / "behind" */
+    int n = menu_item_rows("Lock file", "simple, but a crash leaves it behind", 18, 0, true, rows, kind, MENU_LINES_MAX);
     CHECK(n == 4);
-    CHECK_STR(lab[0].data, "Lock file ");                              /* padded to the label column */
-    CHECK_STR(des[0].data, "simple, but"); CHECK_STR(des[1].data, "a crash");
-    CHECK_STR(des[2].data, "leaves it"); CHECK_STR(des[3].data, "behind");
-    CHECK_STR(lab[1].data, "          ");                              /* blank beside the lines the label does not have */
-    for (int r = 0; r < n; r++) { sb_free(&lab[r]); sb_free(&des[r]); }
-    /* a word longer than a line is cut; a label longer than its column wraps in it */
-    n = menu_item_rows("", "abcdefghijklmnop", 4, 6, lab, des, MENU_LINES_MAX);
-    CHECK(n == 3); CHECK_STR(des[0].data, "abcdef"); CHECK_STR(des[1].data, "ghijkl"); CHECK_STR(des[2].data, "mnop");
-    for (int r = 0; r < n; r++) { sb_free(&lab[r]); sb_free(&des[r]); }
-    n = menu_item_rows("one two three", NULL, 5, 8, lab, des, MENU_LINES_MAX);
-    CHECK(n == 3); CHECK_STR(lab[0].data, "one  "); CHECK_STR(lab[1].data, "two  "); CHECK_STR(lab[2].data, "three");
-    CHECK_STR(des[0].data, ""); CHECK(des[2].len == 0 && des[1].len == 0);
-    for (int r = 0; r < n; r++) { sb_free(&lab[r]); sb_free(&des[r]); }
-    /* a short item is one row; counting alone (no sbufs) gives the same number */
-    CHECK(menu_item_rows("short", "a description", 10, 30, NULL, NULL, 0) == 1);
-    CHECK(menu_item_rows("Lock file", "simple, but a crash leaves it behind", 10, 12, NULL, NULL, 0) == 4);
-    /* a row is never wider than its columns: the description wraps at its width */
-    n = menu_item_rows("x", "the quick brown fox jumps over the lazy dog", 3, 9, lab, des, MENU_LINES_MAX);
-    for (int r = 0; r < n; r++) { CHECK(strlen(des[r].data) <= 9); sb_free(&lab[r]); sb_free(&des[r]); }
+    CHECK(kind[0] == 0 && kind[1] == 3 && kind[2] == 3 && kind[3] == 3);   /* 3: the block indent */
+    CHECK_STR(rows[0].data, "Lock file"); CHECK_STR(rows[1].data, "simple, but a");
+    CHECK_STR(rows[2].data, "crash leaves it"); CHECK_STR(rows[3].data, "behind");
+    for (int r = 0; r < n; r++) sb_free(&rows[r]);
+    CHECK(menu_item_rows("Lock file", "simple, but a crash leaves it behind", 18, 0, true, NULL, NULL, 0) == 4);   /* counting only */
+    /* block: a label that does not fit wraps into title rows */
+    n = menu_item_rows("one two three", NULL, 5, 0, true, rows, kind, MENU_LINES_MAX);
+    CHECK(n == 3 && kind[0] == 0 && kind[1] == 0 && kind[2] == 0);
+    CHECK_STR(rows[0].data, "one"); CHECK_STR(rows[1].data, "two"); CHECK_STR(rows[2].data, "three");
+    for (int r = 0; r < n; r++) sb_free(&rows[r]);
+    /* block: the description is the width less the indent: 9 cells at width 12 */
+    n = menu_item_rows("x", "the quick brown fox jumps", 12, 0, true, rows, kind, MENU_LINES_MAX);
+    CHECK(n == 4);
+    CHECK_STR(rows[1].data, "the quick"); CHECK_STR(rows[2].data, "brown fox"); CHECK_STR(rows[3].data, "jumps");
+    for (int r = 0; r < n; r++) sb_free(&rows[r]);
+    /* one line: the label in 12 cells, the description beside it in the rest (24 cells at width 30) */
+    n = menu_item_rows("Lock file", "survives a crash", 30, 12, false, rows, kind, MENU_LINES_MAX);
+    CHECK(n == 1 && kind[0] == 0);
+    CHECK_STR(rows[0].data, "Lock file    survives a crash");   /* the label padded to 12, a space, the description */
+    for (int r = 0; r < n; r++) sb_free(&rows[r]);
+    /* one line: a description too long for its column (11 cells at width 24) wraps under it, past the label column */
+    n = menu_item_rows("Lock file", "simple, but a crash leaves it behind", 24, 12, false, rows, kind, MENU_LINES_MAX);
+    CHECK(n == 4 && kind[0] == 0 && kind[1] == 13 && kind[2] == 13 && kind[3] == 13);
+    CHECK_STR(rows[0].data, "Lock file    simple, but");
+    CHECK(strspn(rows[1].data, " ") == 13); CHECK_STR(rows[1].data + 13, "a crash");
+    CHECK_STR(rows[2].data + 13, "leaves it"); CHECK_STR(rows[3].data + 13, "behind");
+    for (int r = 0; r < n; r++) sb_free(&rows[r]);
+    /* a short item with a description is two rows (block); without one, one */
+    CHECK(menu_item_rows("short", "a description", 30, 0, true, NULL, NULL, 0) == 2);
+    CHECK(menu_item_rows("short", NULL, 30, 0, true, NULL, NULL, 0) == 1);
+    CHECK(menu_item_rows("short", "", 30, 0, false, NULL, NULL, 0) == 1);
+    /* a blank row goes between two items when either has a description */
+    const char *d1[] = { "", "x" }, *d2[] = { "", "" };
+    CHECK(menu_item_sep(d1, 0, 1) && menu_item_sep(d1, 1, 0));
+    CHECK(!menu_item_sep(d2, 0, 1) && !menu_item_sep(NULL, 0, 1));
+    /* the label column: the widest label, at most 44 and half the row */
+    const char *labs[] = { "a", "a much longer label", "bb" };
+    CHECK(menu_label_width(labs, 3, 60) == 19);
+    CHECK(menu_label_width(labs, 3, 30) == 15);
 }
 
 static void test_wrap(void) {

@@ -3858,92 +3858,132 @@ static int menu_wrap(const char *s, int width, size_t (*ln)[2], int cap) {
     if (n == 0) { if (cap > 0) { ln[0][0] = 0; ln[0][1] = 0; } return 1; }
     return n;
 }
-/* One menu item as rows: its label wrapped into namew cells and its description into dw cells, side by side. Row r
- * is label line r (padded to namew) and description line r; a row past the end of one of them is blank there. The
- * rows go into lab[] and des[] (sbufs, one each per row, up to cap; the caller frees them), when they are not NULL.
- * Returns the number of rows, at least 1, whether or not they are kept. */
-int menu_item_rows(const char *label, const char *desc, int namew, int dw, sbuf *lab, sbuf *des, int cap) {
-    static const char none[] = "";
-    const char *d = desc ? desc : none;
-    size_t lr[MENU_LINES_MAX][2], dr[MENU_LINES_MAX][2];
-    int nl = menu_wrap(label, namew, lr, MENU_LINES_MAX), nd = menu_wrap(d, dw, dr, MENU_LINES_MAX);
-    int n = nl > nd ? nl : nd;
-    for (int r = 0; lab && des && r < n && r < cap; r++) {
-        sb_init(&lab[r]); sb_append(&lab[r], "", 0);
-        sb_init(&des[r]); sb_append(&des[r], "", 0);
-        int cells = 0;
-        if (r < nl) { sb_append(&lab[r], label + lr[r][0], lr[r][1]); cells = vis_width_n(label + lr[r][0], lr[r][1]); }
-        for (; cells < namew; cells++) sb_putc(&lab[r], ' ');
-        if (r < nd) sb_append(&des[r], d + dr[r][0], dr[r][1]);
-    }
-    return n;
-}
+#define MENU_DESC_INDENT 3   /* a block item's description rows start this far in from its title */
+#define MENU_MODAL_ROWS 18   /* the most rows a modal picker's list takes */
+#define MENU_LABEL_MAX 44    /* the widest label column of a one-line picker */
 
-/* ---------- interactive selector (used by /model) ---------- */
-static int select_impl(const char *title, const char **items, const char **descs, int n, int current);
-int term_select(const char *title, const char **items, const char **descs, int n, int current) {
-    if (g_ui_nc) return nc_select(title, items, descs, n, current);
-    park_hold(); int r = select_impl(title, items, descs, n, current); park_free();
-    return r;
-}
 /* s cut to `width` cells into r, the cut ended by … */
 static void cells_cut(sbuf *r, const char *s, int width) {
     if (vis_width(s) <= width) { sb_puts(r, s); return; }
     sb_append(r, s, vis_offset(s, strlen(s), width > 1 ? width - 1 : 0));
     sb_puts(r, "…");
 }
-static int select_impl(const char *title, const char **items, const char **descs, int n, int current) {
+/* The label column of a one-line picker: the widest label, at most MENU_LABEL_MAX and half the row. */
+int menu_label_width(const char **items, int n, int room) {
+    int lmax = 0;
+    for (int i = 0; i < n; i++) { int lw = vis_width(items[i]); if (lw > lmax) lmax = lw; }
+    if (lmax > MENU_LABEL_MAX) lmax = MENU_LABEL_MAX;
+    if (lmax > room / 2) lmax = room / 2;
+    return lmax < 1 ? 1 : lmax;
+}
+/* One menu item as rows, width cells wide. A one-line item (block false, with a description) puts its label in namew
+ * cells and the description beside it, the rest wrapping under it; kind 0 marks a row with the label. A block item
+ * (block true) is its label, then its description indented under it: kind 0 is a title row, kind MENU_DESC_INDENT a
+ * description row. An item without a description is its label, wrapped to width. The rows go into rows[] and kind[]
+ * (sbufs; the caller frees them) up to cap, when they are not NULL. Returns the number of rows, at least 1. */
+int menu_item_rows(const char *label, const char *desc, int width, int namew, bool block, sbuf *rows, int *kind, int cap) {
+    bool has = desc && *desc;
+    size_t lr[MENU_LINES_MAX][2], dr[MENU_LINES_MAX][2];
+    if (!has || block) {
+        int nl = menu_wrap(label, width, lr, MENU_LINES_MAX), nd = 0;
+        if (has) { int dw = width - MENU_DESC_INDENT; nd = menu_wrap(desc, dw < 8 ? 8 : dw, dr, MENU_LINES_MAX); }
+        int n = nl + nd;
+        for (int r = 0; rows && kind && r < n && r < cap; r++) {
+            sb_init(&rows[r]); sb_append(&rows[r], "", 0);
+            if (r < nl) { kind[r] = 0; sb_append(&rows[r], label + lr[r][0], lr[r][1]); }
+            else { kind[r] = MENU_DESC_INDENT; sb_append(&rows[r], desc + dr[r - nl][0], dr[r - nl][1]); }
+        }
+        return n;
+    }
+    int nw = namew < 1 ? 1 : namew;
+    if (nw > width - 9) nw = width - 9 < 1 ? 1 : width - 9;
+    int dw = width - nw - 1; if (dw < 4) dw = 4;
+    int nl = menu_wrap(label, nw, lr, MENU_LINES_MAX), nd = menu_wrap(desc, dw, dr, MENU_LINES_MAX);
+    int n = nl > nd ? nl : nd;
+    for (int r = 0; rows && kind && r < n && r < cap; r++) {
+        sb_init(&rows[r]); sb_append(&rows[r], "", 0);
+        int lw = 0;
+        if (r < nl) { sb_append(&rows[r], label + lr[r][0], lr[r][1]); lw = vis_width_n(label + lr[r][0], lr[r][1]); }
+        kind[r] = r < nl ? 0 : nw + 1;
+        if (r < nd) {   /* the label column is padded so the description starts in its column */
+            for (; lw < nw; lw++) sb_putc(&rows[r], ' ');
+            sb_putc(&rows[r], ' ');
+            sb_append(&rows[r], desc + dr[r][0], dr[r][1]);
+        }
+    }
+    return n;
+}
+/* A blank row goes between items a and b when either has a description (block pickers only). */
+bool menu_item_sep(const char **descs, int a, int b) {
+    return descs && ((descs[a] && *descs[a]) || (descs[b] && *descs[b]));
+}
+
+static int select_impl(const char *title, const char **items, const char **descs, int n, int current, int mark, bool block);
+int term_select(const char *title, const char **items, const char **descs, int n, int current) {
+    if (g_ui_nc) return nc_select(title, items, descs, n, current, false);
+    park_hold(); int r = select_impl(title, items, descs, n, current, current, false); park_free();
+    return r;
+}
+/* The picker whose items are blocks: the title, then the description under it, a blank row between items that have
+ * one, and no current marker (the start is the selection only). The options block uses it. */
+int term_select_block(const char *title, const char **items, const char **descs, int n, int start) {
+    if (g_ui_nc) return nc_select(title, items, descs, n, start, true);
+    park_hold(); int r = select_impl(title, items, descs, n, start, -1, true); park_free();
+    return r;
+}
+
+/* The picker. mark is the item that gets the current marker (-1: none); block is the layout (see menu_item_rows). */
+static int select_impl(const char *title, const char **items, const char **descs, int n, int current, int mark, bool block) {
     if (n <= 0) return -1;
     term_raw(true);
     int sel = current >= 0 && current < n ? current : 0;
     char filter[128] = {0}; int flen = 0;
     int *vis = xmalloc(sizeof(int) * (size_t)n); int nvis = 0;
-    int *ih = xmalloc(sizeof(int) * (size_t)n);   /* the rows each visible item takes at this width */
+    int *ih = xmalloc(sizeof(int) * (size_t)n);   /* the rows each visible item takes at this width, its separator too */
     int drawn = 0;            /* lines drawn last time */
-    int max_show = 12;        /* the list's budget, in rows: an item wrapped to several takes several */
+    int max_show = 12;        /* the list's budget, in rows */
     int top = 0;              /* the first item shown */
     int page = 1;             /* what PgUp/PgDn move by: the items the last paint showed */
     int result = -1;
     /* on the full-screen ANSI screen the menu is a modal over the conversation (the same box as /usage's overlay),
-     * so it does not depend on counting the lines it drew: a menu printed under the conversation misdrew when the
-     * lines above it wrapped or the window was short. Anything else keeps the menu inline. */
+     * so it does not depend on counting the lines it drew. Anything else keeps the menu inline. */
     bool modal = g_fs && g_sb_active && !g_ov_text;
-    static const char HINT[] = "type to filter · ↑/↓ move · enter select · esc cancel";
-    /* a modal's box keeps one size while the menu changes under the filter: every line is padded to bodyw (the widest
-     * row, the title or the hint, at most the window's width less the overlay's margin), and it has max_show rows
-     * whatever the filter leaves. Both are worked out on every pass, after the layout, so a resize sizes the box too.
-     * A long description wraps (menu_item_rows) to the width the box has; the label column is as wide as the labels. */
-    int bodyw = 0, labw = 44;
+    static const char HINT[] = "type to filter · ↑/↓ move · enter · esc cancel";   /* 44 cells: fits a 60-column window */
+    /* a modal's box keeps one size while the menu changes under the filter: every line is padded to bodyw, and it
+     * has max_show rows whatever the filter leaves. Both are worked out on every pass, so a resize sizes the box too. */
+    int bodyw = 0;
     bool first = true;   /* the box's first paint goes over the live screen as it is */
     view_leave();     /* a menu is drawn on the live screen */
     sb_pause(true);   /* transient: not conversation content */
     for (;;) {
+        int lead = 2 + (mark >= 0 ? 2 : 0);   /* the columns before an item's text: the selection, and the current marker */
         if (modal) {
             layout_sync();
             int limit = (g_fs_cols > 0 ? g_fs_cols : term_width()) - 8;
-            int dmax = 0, lmax = 0;   /* the widest description and label */
+            int lmax = 0, dmax = 0;   /* the widest label and description */
             for (int i = 0; i < n; i++) {
-                int dw = descs && descs[i] ? vis_width(descs[i]) : 0; if (dw > dmax) dmax = dw;
                 int lw = vis_width(items[i]); if (lw > lmax) lmax = lw;
+                int dw = descs && descs[i] ? vis_width(descs[i]) : 0; if (dw > dmax) dmax = dw;
             }
-            int lab = lmax < 44 ? lmax : 44; if (lab < 16) lab = 16;
             bodyw = vis_width(title); if (vis_width(HINT) > bodyw) bodyw = vis_width(HINT);
-            if (2 + lab + 1 + dmax > bodyw) bodyw = 2 + lab + 1 + dmax;
+            if (lead + lmax > bodyw) bodyw = lead + lmax;
+            if (dmax > 0) {
+                int need = block ? lead + MENU_DESC_INDENT + dmax : lead + (lmax < MENU_LABEL_MAX ? lmax : MENU_LABEL_MAX) + 1 + dmax;
+                if (need > bodyw) bodyw = need;
+            }
             if (bodyw < 40) bodyw = 40;
             if (bodyw > limit) bodyw = limit;
-            int brow = bodyw - 2;   /* the row's text: the label column, then the description in what is left */
-            labw = lab > brow / 2 ? brow / 2 : lab;
-            int rows = fs_region() - 7;   /* the title, the filter, the rows, the count, the hint and the box's own two */
-            max_show = rows < 3 ? 3 : rows > 12 ? 12 : rows;
+            int avail = fs_region() - 7;   /* the title, the filter, the rows, the count, the hint and the box's two */
+            max_show = avail < 3 ? 3 : avail > MENU_MODAL_ROWS ? MENU_MODAL_ROWS : avail;
         }
         int w = term_width();
-        int room = modal ? bodyw - 2 : w - 4;   /* the row's text (its marker's two cells are not in it) */
-        int namew = modal ? labw : (room >= 88 ? 44 : room / 2);
-        if (namew < 1) namew = 1;
-        int dw = room - 2 - namew - 1; if (dw < 8) dw = 8;
-        if (modal) {   /* the budget is what all the items need, at most: a short menu's box is as short, whatever the filter */
+        int room = (modal ? bodyw : w - 2) - lead;   /* the text of a row, after its marker columns */
+        if (room < 8) room = 8;
+        int namew = menu_label_width(items, n, room);
+        if (modal) {   /* the box is no taller than its items need, whatever the filter leaves */
             int all = 0;
-            for (int i = 0; i < n; i++) all += menu_item_rows(items[i], descs ? descs[i] : NULL, namew, dw, NULL, NULL, 0);
+            for (int i = 0; i < n; i++)
+                all += menu_item_rows(items[i], descs ? descs[i] : NULL, room, namew, block, NULL, NULL, 0) + (block && i > 0 && menu_item_sep(descs, i - 1, i));
             if (max_show > all) max_show = all;
         }
         /* filter */
@@ -3953,7 +3993,9 @@ static int select_impl(const char *title, const char **items, const char **descs
         int selpos = -1;
         for (int i = 0; i < nvis; i++) if (vis[i] == sel) selpos = i;
         if (selpos < 0) { selpos = 0; sel = nvis ? vis[0] : -1; }
-        for (int i = 0; i < nvis; i++) ih[i] = menu_item_rows(items[vis[i]], descs ? descs[vis[i]] : NULL, namew, dw, NULL, NULL, 0);
+        for (int i = 0; i < nvis; i++)
+            ih[i] = menu_item_rows(items[vis[i]], descs ? descs[vis[i]] : NULL, room, namew, block, NULL, NULL, 0)
+                  + (block && i > 0 && menu_item_sep(descs, vis[i - 1], vis[i]));
         /* the window: from top on, the items whose rows fit the budget; the selected one is always in it */
         if (nvis) {
             if (selpos < top) top = selpos;
@@ -3965,16 +4007,15 @@ static int select_impl(const char *title, const char **items, const char **descs
             }
         } else top = 0;
         /* draw */
-        if (!modal && layout_sync()) drawn = 0;   /* repainted: the cursor is back where the menu starts (a modal was laid out above) */
+        if (!modal && layout_sync()) drawn = 0;   /* repainted: the cursor is back where the menu starts */
         sbuf o; sb_init(&o);
         if (!modal) {
             if (drawn) sb_printf(&o, "\x1b[%dA", drawn);
             sb_puts(&o, "\r\x1b[J");
         }
         int lines = 0;
-        int mw = (g_fs_cols > 0 ? g_fs_cols : w) - 8;   /* a modal's lines fit the box the overlay makes of them: cols - 8 at most */
-        /* one row, whatever the width: a title that wraps is still counted as one, and the redraw
-         * then climbs a row too few — a stale row per key, and the transcript drawn over afterwards */
+        int mw = (g_fs_cols > 0 ? g_fs_cols : w) - 8;   /* a modal's lines fit the box the overlay makes of them */
+        /* one row, whatever the width: a title that wraps is still counted as one */
         int tw = vis_width(title);
         if (modal) { sbuf t; sb_init(&t); cells_cut(&t, title, mw); sb_printf(&o, C_BOLD "%s" C_RESET "\n", t.data ? t.data : ""); sb_free(&t); }
         else if (tw > w - 1) sb_printf(&o, C_BOLD "%.*s…" C_RESET "\n", (int)vis_offset(title, strlen(title), w > 2 ? w - 2 : 0), title);
@@ -3986,20 +4027,20 @@ static int select_impl(const char *title, const char **items, const char **descs
         for (int i = top; i < nvis; i++) {
             if (rows > 0 && rows + ih[i] > max_show) break;   /* the next item's rows do not fit: the next paint shows it */
             int idx = vis[i];
-            bool is_sel = (i == selpos);
-            /* the label column, then the description: each item's lines are rows of their own, the marker on the first */
-            sbuf lab[MENU_LINES_MAX], des[MENU_LINES_MAX];
-            int nr = menu_item_rows(items[idx], descs ? descs[idx] : NULL, namew, dw, lab, des, MENU_LINES_MAX);
-            for (int r = 0; r < nr && r < MENU_LINES_MAX && rows < max_show; r++) {
-                sbuf txt; sb_init(&txt);
-                sb_puts(&txt, r == 0 && idx == current ? "* " : "  ");
-                sb_puts(&txt, lab[r].data ? lab[r].data : ""); sb_putc(&txt, ' '); sb_puts(&txt, des[r].data ? des[r].data : "");
-                sbuf row; sb_init(&row); cells_cut(&row, txt.data ? txt.data : "", room);
-                sb_printf(&o, "%s%s %s" C_RESET "\n", is_sel && r == 0 ? C_ORANGE "❯" : " ", is_sel ? C_BOLD : "", row.data ? row.data : "");
-                sb_free(&row); sb_free(&txt);
+            bool is_sel = i == selpos;
+            if (block && i > top && menu_item_sep(descs, vis[i - 1], idx)) { sb_puts(&o, "\n"); rows++; lines++; }
+            sbuf rw[MENU_LINES_MAX]; int kind[MENU_LINES_MAX];
+            int nr = menu_item_rows(items[idx], descs ? descs[idx] : NULL, room, namew, block, rw, kind, MENU_LINES_MAX);
+            int nk = nr < MENU_LINES_MAX ? nr : MENU_LINES_MAX;
+            for (int r = 0; r < nk && rows < max_show; r++) {
+                if (kind[r] == 0) {   /* a title: the selection marker on its first row, the title in bold while selected */
+                    sb_puts(&o, is_sel && r == 0 ? C_ORANGE "❯" C_RESET " " : "  ");
+                    if (mark >= 0) sb_puts(&o, r == 0 && idx == mark ? "* " : "  ");
+                    sb_printf(&o, "%s%s" C_RESET "\n", is_sel ? C_BOLD : "", rw[r].data);
+                } else sb_printf(&o, "%*s" C_DIM "%s" C_RESET "\n", lead + kind[r], "", rw[r].data);
                 rows++; lines++;
             }
-            for (int r = 0; r < nr && r < MENU_LINES_MAX; r++) { sb_free(&lab[r]); sb_free(&des[r]); }
+            for (int r = 0; r < nk; r++) sb_free(&rw[r]);
             shown++;
         }
         if (nvis == 0) { sb_puts(&o, C_DIM "  (no matches)" C_RESET "\n"); lines++; rows++; shown++; }

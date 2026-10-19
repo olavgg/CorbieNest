@@ -485,7 +485,9 @@ void        term_line_break(void);        /* start a fresh line if output is mid
 void        term_editor_prefill(const char *text);   /* text appears in the editor at the next prompt (e.g. after /rewind) */
 char       *term_keys_to_text(const unsigned char *keys, size_t n, size_t *caret);   /* raw keystrokes typed while busy -> trimmed text (malloc'd); *caret (may be NULL): the caret's byte offset in it */
 #define MENU_LINES_MAX 64   /* the rows one menu item may wrap to (menu_item_rows) */
-int         menu_item_rows(const char *label, const char *desc, int namew, int dw, sbuf *lab, sbuf *des, int cap);   /* an item's label and description wrapped into rows (term.c) */
+int         menu_label_width(const char **items, int n, int room);   /* a one-line picker's label column (term.c) */
+int         menu_item_rows(const char *label, const char *desc, int width, int namew, bool block, sbuf *rows, int *kind, int cap);   /* an item as rows (term.c) */
+bool        menu_item_sep(const char **descs, int a, int b);   /* a blank row goes between two block items (term.c) */
 /* Simple prompt for a single line. malloc'd or NULL */
 char *term_ask_line(const char *prompt);
 /* Interactive yes / always (session) / [always (project)] / no question rendered as a
@@ -506,6 +508,7 @@ typedef struct { char *text; char *desc; bool open; } term_sug;
 extern int (*term_suggest)(const char *buf, size_t cur, size_t *from, term_sug **items);
 /* Interactive list picker: returns chosen index or -1 if cancelled. */
 int term_select(const char *title, const char **items, const char **descs, int n, int current);
+int term_select_block(const char *title, const char **items, const char **descs, int n, int start);   /* a picker of blocks: a title, its description under it (no current marker) */
 void term_repaint(void);                       /* the ANSI conversation painted again from the model (after a theme change) */
 
 /* What term_nc.c draws from, and what term.c exports for it (the ANSI UI uses none of this) */
@@ -567,7 +570,7 @@ char  *nc_readline(const char *prompt, bool in_field);
 int    nc_poll_interrupt(void);                       /* keys read while the model works: 1 = stop */
 int    nc_input_fd(void);                             /* the fd that signals keys to read (-1: none) */
 int    nc_confirm(const char *question, const char *always_label, const char *project_label, char **reason);
-int    nc_select(const char *title, const char **items, const char **descs, int n, int current);
+int    nc_select(const char *title, const char **items, const char **descs, int n, int current, bool block);
 int    nc_scroll_modal(const char *title, const char **lines, int n, int start);   /* the row Enter picked, or -1 */
 void   nc_banner_set(const char **lines, int n, int bw, bool on);   /* the banner's modal: its lines and width, shown or not */
 bool   nc_banner_open(void);                          /* the banner's modal is up */

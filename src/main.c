@@ -6071,22 +6071,20 @@ static char *options_choose(void) {
     char *chosen = NULL;
     if (n >= 2) {
         /* the last row is always "chat about this": it sends nothing, and the editor is left to the user's own words */
-        const char *items[13], *shown[13]; char *dbuf[13];
-        for (int i = 0; i < n; i++) {
-            items[i] = labels[i];
-            sbuf d; sb_init(&d); sb_puts(&d, descs[i]);
-            if (i == rec) sb_puts(&d, *descs[i] ? " · recommended" : "recommended");
-            dbuf[i] = sb_detach(&d); shown[i] = dbuf[i];
+        const char *items[13], *shown[13]; char *lbuf[13];
+        for (int i = 0; i < n; i++) {   /* the recommended option says so in its title, where it is read first */
+            lbuf[i] = NULL; items[i] = labels[i]; shown[i] = descs[i];
+            if (i == rec) { sbuf l; sb_init(&l); sb_printf(&l, "%s  (recommended)", labels[i]); lbuf[i] = sb_detach(&l); items[i] = lbuf[i]; }
         }
-        items[n] = "chat about this"; shown[n] = "talk it over with the model before choosing"; dbuf[n] = NULL;
-        int r = term_select("Implementation options", items, shown, n + 1, rec >= 0 ? rec : 0);
+        items[n] = "chat about this"; shown[n] = "talk it over with the model before choosing"; lbuf[n] = NULL;
+        int r = term_select_block("Implementation options", items, shown, n + 1, rec >= 0 ? rec : 0);
         if (r == n) printf(C_DIM "  type your question or message below" C_RESET "\n");
         else if (r >= 0) {
             sbuf c; sb_init(&c); sb_printf(&c, "Go with this: %s", labels[r]);
             if (*descs[r]) sb_printf(&c, " — %s", descs[r]);
             chosen = sb_detach(&c);
         }
-        for (int i = 0; i < n; i++) free(dbuf[i]);
+        for (int i = 0; i < n; i++) free(lbuf[i]);
     }
     for (int i = 0; i < n; i++) { free(labels[i]); free(descs[i]); }
     free(blk);
