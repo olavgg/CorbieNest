@@ -28,6 +28,8 @@ static void sb_pause(bool on);
 static bool g_sb_pause = false;         /* ... is off: what is written is not conversation output */
 static void sb_note(const char *text);
 static size_t u8_next(const char *s, size_t pos, size_t len);
+static size_t u8_prev(const char *s, size_t pos);
+static bool is_word(char c);
 static size_t vis_offset(const char *s, size_t len, int col);
 static int vis_width_n(const char *s, size_t len);
 
@@ -244,7 +246,7 @@ static int g_bn_n = 0, g_bn_bw = 0, g_bn_xr = -1, g_bn_xc0 = -1, g_bn_xc1 = -1;
 static char g_view_hint[200];               /* ... and what the line under that window says meanwhile */
 static bool field_shown(void);              /* the terminal is tall enough for the input field (else only the bar is kept) */
 
-static char *ta_pending_text(void);         /* text typed while busy, not yet submitted (malloc'd or NULL) */
+static char *ta_pending_text(size_t *caret);   /* text typed while busy, not yet submitted (malloc'd or NULL); *caret: its caret's byte offset */
 
 void fmt_tokens(long n, char *out, size_t sz) {
     if (n < 1000) snprintf(out, sz, "%ld", n);
@@ -655,7 +657,7 @@ static void strip_draw(sbuf *o, int top) {
         p = e ? e + 1 : p + len;
     }
 }
-static void field_draw(sbuf *o, const char *typed) {
+static void field_draw(sbuf *o, const char *typed, size_t caret) {
     if (!g_fs || g_fs_rows < FIELD_MIN_ROWS) return;
     int top = field_top();
     g_ta_caret_row = top + 1;   /* where the caret is when nothing is typed: after the prompt (the typed branch moves it) */
@@ -672,22 +674,39 @@ static void field_draw(sbuf *o, const char *typed) {
     if (!g_field_view) sb_puts(o, field_prompt());
     put_field_on(o);
     if (typed) {
-        /* not the editor's text: one line, tail kept, with a block for the cursor */
+        /* not the editor's text: one line, with the block for the caret where the type-ahead's caret is (the arrow keys
+         * move it). A line too long for the field keeps the caret in view: the text before it is cut at the front, with
+         * a …, and the text after it at the end. */
         int avail = width - vis_width(field_prompt()) - 2;
         char *t = xstrdup(typed);
-        for (char *p = t; *p; p++) if (*p == '\n') *p = ' ';
-        const char *p = t;
-        int tw = vis_width(t), mark = 0;
-        if (avail > 1 && tw > avail) {
-            int cut = tw - (avail - 1);
-            while (cut > 0 && *p) { if (((unsigned char)p[1] & 0xC0) != 0x80) cut--; p++; }
-            while (*p && ((unsigned char)*p & 0xC0) == 0x80) p++;
-            sb_puts(o, "…"); mark = 1;
+        for (char *p = t; *p; p++) if (*p == '\n') *p = ' ';   /* a byte for a byte: the caret's offset still holds */
+        size_t len = strlen(t), ci = caret < len ? caret : len;
+        size_t from = 0, to = len; int mark = 0;
+        if (avail > 1 && vis_width(t) + 1 > avail) {
+            /* the text after the caret keeps a third of the row (or all of it, when it is shorter), so the caret is
+             * not at the edge with nothing to edit after it; the text before it is cut at the front to make room */
+            int text_w = avail - 1, after_all = vis_width_n(t + ci, len - ci);
+            int after_cap = after_all < text_w / 3 ? after_all : text_w / 3;
+            int before_cap = text_w - after_cap - 1;   /* (one cell more for the … of a front cut) */
+            for (;;) {   /* the front cut: the text before the caret, with the … the cut shows */
+                if (from >= ci || vis_width_n(t + from, ci - from) <= before_cap) break;
+                from = u8_next(t, from, len);
+            }
+            mark = from > 0;
+            int room = avail - mark - 1 - vis_width_n(t + from, ci - from);
+            to = ci;
+            while (to < len) {   /* the text after the caret, as far as the row has room */
+                size_t nx = u8_next(t, to, len);
+                if (vis_width_n(t + ci, nx - ci) > room) break;
+                to = nx;
+            }
         }
-        size_t sp[MENTION_MAX][2]; int ns = field_mentions(t, strlen(t), sp);
-        put_mentions(o, t, (size_t)(p - t), strlen(p), sp, NULL, ns); sb_puts(o, C_DIM "▏" C_RESET); put_field_on(o);
-        /* the caret is the ▏: after the prompt, the … if any, and the tail */
-        g_ta_caret_col = FIELD_X0 + (g_field_view ? 0 : vis_width(field_prompt())) + mark + vis_width(p) + 1;
+        size_t sp[MENTION_MAX][2]; int ns = field_mentions(t, len, sp);
+        if (mark) sb_puts(o, "…");
+        put_mentions(o, t, from, ci - from, sp, NULL, ns);
+        sb_puts(o, C_DIM "▏" C_RESET); put_field_on(o);
+        put_mentions(o, t, ci, to - ci, sp, NULL, ns);
+        g_ta_caret_col = FIELD_X0 + (g_field_view ? 0 : vis_width(field_prompt())) + mark + vis_width_n(t + from, ci - from) + 1;
         free(t);
     } else if (!g_field_len && term_hint) {   /* the placeholder: muted, after the prompt; the caret stays in front of it */
         sb_puts(o, C_DIM); put_clipped(o, term_hint, width - vis_width(field_prompt()), false); sb_puts(o, C_RESET);
@@ -824,9 +843,10 @@ static void bar_draw(sbuf *o) {
 static void chrome_append(sbuf *o) {
     chrome_invalidate();   /* written in full here: the next refresh sends what differs from this */
     if (!g_fs) return;
-    char *typed = g_busy && !g_field_focus ? ta_pending_text() : NULL;
+    size_t ci = 0;
+    char *typed = g_busy && !g_field_focus ? ta_pending_text(&ci) : NULL;
     sb_puts(o, "\x1b" "7");
-    field_draw(o, typed);
+    field_draw(o, typed, ci);
     bar_draw(o);
     sb_puts(o, "\x1b" "8");
     free(typed);
@@ -846,10 +866,11 @@ void term_status_refresh(void) {
     strip_refresh();
     if (fchanged || strip_before != g_strip_rows) layout_sync();
     if (g_view_top >= 0 && g_view_stale) view_paint();
-    char *typed = g_busy && !g_field_focus ? ta_pending_text() : NULL;
+    size_t ci = 0;
+    char *typed = g_busy && !g_field_focus ? ta_pending_text(&ci) : NULL;
     sbuf o; sb_init(&o);
     if (!g_field_focus) sb_puts(&o, "\x1b" "7");
-    field_draw(&o, typed);
+    field_draw(&o, typed, ci);
     strip_draw(&o, field_top() + g_field_rows + 2 + g_sug_rows);
     bar_draw(&o);
     if (g_field_focus) field_cursor(&o); else { sb_puts(&o, "\x1b" "8"); chrome_park(&o); }
@@ -2008,48 +2029,102 @@ char *term_queue_pop_plain(void) {
     return NULL;
 }
 
-/* Turn raw keystrokes typed while busy into message text: printable bytes are
- * kept, backspace deletes, Ctrl-U clears the line, Ctrl-W deletes a word, escape
- * sequences (arrows, paste brackets, alt+key) are dropped, Alt+Enter / Ctrl-J /
- * CR inside a paste become newlines. Returns malloc'd, trimmed text (may be ""). */
-static char *keys_text(const unsigned char *b, size_t n, bool trim) {
+/* Insert n bytes at the caret c of o; the caret moves past them. */
+static void kb_insert(sbuf *o, size_t *c, const char *s, size_t n) {
+    size_t tl = o->len - *c;
+    char *tail = tl ? xstrndup(o->data + *c, tl) : NULL;
+    o->len = *c;
+    sb_append(o, s, n);
+    if (tail) sb_append(o, tail, tl);
+    free(tail);
+    *c += n;
+}
+/* Remove the bytes [from, to) of o; the caret ends at from. */
+static void kb_cut(sbuf *o, size_t *c, size_t from, size_t to) {
+    memmove(o->data + from, o->data + to, o->len - to);
+    o->len -= to - from; o->data[o->len] = 0;
+    *c = from;
+}
+/* A caret move or edit of the keys typed while busy, with the editor's meaning: 'L' left, 'R' right, 'H' line start,
+ * 'F' line end, 'W' word left, 'X' word right, 'D' delete after the caret, 'K' delete to the line's end (Ctrl-K). */
+static void kb_move(sbuf *o, size_t *c, int key) {
+    switch (key) {
+        case 'L': if (*c > 0) *c = u8_prev(o->data, *c); break;
+        case 'R': if (*c < o->len) *c = u8_next(o->data, *c, o->len); break;
+        case 'H': while (*c > 0 && o->data[*c - 1] != '\n') (*c)--; break;
+        case 'F': while (*c < o->len && o->data[*c] != '\n') (*c)++; break;
+        case 'W': { size_t p = *c; while (p > 0 && !is_word(o->data[p-1])) p--; while (p > 0 && is_word(o->data[p-1])) p--; *c = p; break; }
+        case 'X': { size_t p = *c; while (p < o->len && !is_word(o->data[p])) p++; while (p < o->len && is_word(o->data[p])) p++; *c = p; break; }
+        case 'D': if (*c < o->len) kb_cut(o, c, *c, u8_next(o->data, *c, o->len)); break;
+        case 'K': kb_cut(o, c, *c, o->len); break;
+    }
+}
+/* The keys typed while busy, as the editor would have them: printable bytes are text at the caret; backspace and
+ * Delete remove a character; the caret keys (arrows, Home, End, Ctrl-A/B/E/F, Alt+b/f, Ctrl+arrows) move it; Ctrl-U deletes
+ * from the start to the caret, Ctrl-K to the end, Ctrl-W and Alt+Backspace the word before the caret; Alt+Enter, Ctrl-J and
+ * CR are line breaks; other escape sequences are dropped (Up and Down are the history's, taken before this). Returns malloc'd text, trimmed when trim is set; *caret (when not NULL) is the
+ * caret's byte offset in it. The editor replays the same keys after the turn, so the two agree. */
+static char *keys_text(const unsigned char *b, size_t n, bool trim, size_t *caret) {
     sbuf o; sb_init(&o); sb_append(&o, "", 0);
+    size_t c = 0;
     for (size_t i = 0; i < n; i++) {
-        unsigned char c = b[i];
-        if (c == 27) {
+        unsigned char ch = b[i];
+        if (ch == 27) {
             if (i + 1 >= n) break;
             unsigned char a = b[++i];
-            if (a == '\r' || a == '\n') { sb_putc(&o, '\n'); continue; }          /* Alt+Enter */
-            if (a == '[') { while (++i < n && !(b[i] >= 0x40 && b[i] <= 0x7E)) {} continue; }   /* CSI … final */
-            if (a == 'O') { i++; continue; }                                        /* SS3 x */
-            continue;                                                               /* Alt+letter: ignore */
+            if (a == '\r' || a == '\n') { kb_insert(&o, &c, "\n", 1); continue; }   /* Alt+Enter */
+            if (a == '[') {   /* CSI params final: the caret keys, and ESC [ 3 ~ (Delete) */
+                size_t s = i + 1;
+                while (++i < n && !(b[i] >= 0x40 && b[i] <= 0x7E)) {}
+                if (i >= n) break;
+                int fin = b[i];
+                bool ctrl = i == s + 3 && b[s] == '1' && b[s + 1] == ';' && b[s + 2] == '5';   /* ESC [ 1 ; 5 x: Ctrl+arrow */
+                if (fin == 'D' || fin == 'C') kb_move(&o, &c, ctrl ? (fin == 'D' ? 'W' : 'X') : (fin == 'D' ? 'L' : 'R'));
+                else if (fin == 'H' || fin == 'F') kb_move(&o, &c, (int)fin);
+                else if (fin == '~' && i == s + 1 && b[s] == '3') kb_move(&o, &c, 'D');
+                continue;
+            }
+            if (a == 'O') {   /* SS3 x: the same keys from a terminal in application-cursor mode */
+                if (i + 1 < n) {
+                    unsigned char f = b[++i];
+                    if (f == 'D') kb_move(&o, &c, 'L'); else if (f == 'C') kb_move(&o, &c, 'R');
+                    else if (f == 'H') kb_move(&o, &c, 'H'); else if (f == 'F') kb_move(&o, &c, 'F');
+                }
+                continue;
+            }
+            if (a == 'b') kb_move(&o, &c, 'W');   /* Alt+b, Alt+f: word left and right */
+            else if (a == 'f') kb_move(&o, &c, 'X');
+            else if (a == 127 || a == 8) { size_t p = c; kb_move(&o, &p, 'W'); kb_cut(&o, &c, p, c); }   /* Alt+Backspace */
+            continue;   /* other Alt+letters: ignored */
         }
-        if (c == 127 || c == 8) { if (o.len) { size_t p = o.len - 1; while (p > 0 && ((unsigned char)o.data[p] & 0xC0) == 0x80) p--; o.len = p; o.data[o.len] = 0; } continue; }
-        if (c == 21) { sb_clear(&o); sb_append(&o, "", 0); continue; }             /* Ctrl-U */
-        if (c == 23) {                                                              /* Ctrl-W */
-            size_t p = o.len;
-            while (p > 0 && (o.data[p-1] == ' ' || o.data[p-1] == '\n')) p--;
-            while (p > 0 && o.data[p-1] != ' ' && o.data[p-1] != '\n') p--;
-            o.len = p; o.data[o.len] = 0; continue;
-        }
-        if (c == '\r' || c == '\n') { if (c == '\r' && i + 1 < n && b[i+1] == '\n') i++; sb_putc(&o, '\n'); continue; }
-        if (c < 32 && c != '\t') continue;
-        sb_putc(&o, (char)c);
+        if (ch == 127 || ch == 8) { if (c > 0) { size_t p = u8_prev(o.data, c); kb_cut(&o, &c, p, c); } continue; }   /* backspace: a whole UTF-8 char */
+        if (ch == 21) { kb_cut(&o, &c, 0, c); continue; }                                                                 /* Ctrl-U: from the start to the caret */
+        if (ch == 23) { size_t p = c; kb_move(&o, &p, 'W'); kb_cut(&o, &c, p, c); continue; }                            /* Ctrl-W: the word before the caret */
+        if (ch == 1) { kb_move(&o, &c, 'H'); continue; }      /* Ctrl-A, Ctrl-E, Ctrl-B, Ctrl-F: as the editor */
+        if (ch == 5) { kb_move(&o, &c, 'F'); continue; }
+        if (ch == 2) { kb_move(&o, &c, 'L'); continue; }
+        if (ch == 6) { kb_move(&o, &c, 'R'); continue; }
+        if (ch == 4) { kb_move(&o, &c, 'D'); continue; }      /* Ctrl-D: delete after the caret (on an empty line the editor ends the prompt; here it does nothing) */
+        if (ch == 11) { kb_move(&o, &c, 'K'); continue; }     /* Ctrl-K: delete to the end of the line */
+        if (ch == '\r' || ch == '\n') { if (ch == '\r' && i + 1 < n && b[i+1] == '\n') i++; kb_insert(&o, &c, "\n", 1); continue; }
+        if (ch < 32 && ch != '\t') continue;
+        kb_insert(&o, &c, (const char *)&b[i], 1);
     }
-    if (!trim) return sb_detach(&o);
+    if (!trim) { if (caret) *caret = c; return sb_detach(&o); }
     size_t st = 0; while (st < o.len && (o.data[st] == ' ' || o.data[st] == '\t' || o.data[st] == '\n')) st++;
     size_t en = o.len; while (en > st && (o.data[en-1] == ' ' || o.data[en-1] == '\t' || o.data[en-1] == '\n')) en--;
     char *r = xstrndup(o.data + st, en - st);
+    if (caret) *caret = c < st ? 0 : (c > en ? en : c) - st;
     sb_free(&o);
     return r;
 }
-char *term_keys_to_text(const unsigned char *b, size_t n) { return keys_text(b, n, true); }
+char *term_keys_to_text(const unsigned char *b, size_t n, size_t *caret) { return keys_text(b, n, true, caret); }
 
 /* The pending type-ahead as text, exactly as typed (a space at its end is where the next word
  * starts, which is what the suggestions go by); NULL when there is none. */
-static char *ta_text(void) {
+static char *ta_text(size_t *caret) {
     if (g_ta_pos >= g_ta_len) return NULL;
-    char *t = keys_text(g_ta + g_ta_pos, g_ta_len - g_ta_pos, false);
+    char *t = keys_text(g_ta + g_ta_pos, g_ta_len - g_ta_pos, false, caret);
     if (!*t) { free(t); return NULL; }
     return t;
 }
@@ -2059,12 +2134,14 @@ static void ta_set_text(const char *s) {
 }
 
 /* What the field shows of it: from its first letter on; NULL when there is nothing to see. */
-static char *ta_pending_text(void) {
-    char *t = ta_text();
+static char *ta_pending_text(size_t *caret) {
+    size_t c = 0;
+    char *t = ta_text(&c);
     size_t st = 0;
     while (t && (t[st] == ' ' || t[st] == '\t' || t[st] == '\n')) st++;
     if (!t || !t[st]) { free(t); return NULL; }
     memmove(t, t + st, strlen(t + st) + 1);
+    if (caret) *caret = c > st ? c - st : 0;
     return t;
 }
 
@@ -2074,7 +2151,7 @@ static char *g_ta_draft;     /* what was typed before the history browse (↓ to
  * is a slash command main.c can run right there and then (/status, /mode, …). */
 static void ta_submit(void) {
     size_t n = g_ta_len - g_ta_pos;
-    char *text = term_keys_to_text(g_ta + g_ta_pos, n);
+    char *text = term_keys_to_text(g_ta + g_ta_pos, n, NULL);
     g_ta_pos = g_ta_len = 0;
     g_ta_hist = -1; free(g_ta_draft); g_ta_draft = NULL;   /* the history browse ends with the line */
     if (*text) {
@@ -2633,7 +2710,7 @@ static void ta_hist(int k) {
     if (g_ta_hist < 0) g_ta_hist = g_hist_n;
     if (k == K_UP) {
         if (g_ta_hist == 0) return;
-        if (g_ta_hist == g_hist_n) { free(g_ta_draft); g_ta_draft = ta_text(); }
+        if (g_ta_hist == g_hist_n) { free(g_ta_draft); g_ta_draft = ta_text(NULL); }
         ta_set_text(g_hist[--g_ta_hist]);
     } else if (g_ta_hist < g_hist_n) {
         if (++g_ta_hist == g_hist_n) ta_set_text(g_ta_draft ? g_ta_draft : "");
@@ -3003,7 +3080,7 @@ static bool sug_tab(editor *e) {
  * the editor's own. */
 static void ta_sug_sync(void) {
     if (!g_fs || g_field_focus || g_ta_paste) return;
-    char *t = ta_text();
+    char *t = ta_text(NULL);
     if (!t && !g_ta_sug_for) return;
     if (t && g_ta_sug_for && !strcmp(t, g_ta_sug_for)) { free(t); return; }
     if (t) sug_fill(t, strlen(t)); else sug_clear();

@@ -483,7 +483,7 @@ void        term_fold_end(void);
 int         term_fold_toggle(int line);   /* the fold whose head is scrollback line `line`: shown or hidden; the body lines flipped, -1 if no head there */
 void        term_line_break(void);        /* start a fresh line if output is mid-line (the model may be mid-sentence) */
 void        term_editor_prefill(const char *text);   /* text appears in the editor at the next prompt (e.g. after /rewind) */
-char       *term_keys_to_text(const unsigned char *keys, size_t n);   /* raw keystrokes -> trimmed text (malloc'd) */
+char       *term_keys_to_text(const unsigned char *keys, size_t n, size_t *caret);   /* raw keystrokes typed while busy -> trimmed text (malloc'd); *caret (may be NULL): the caret's byte offset in it */
 /* Simple prompt for a single line. malloc'd or NULL */
 char *term_ask_line(const char *prompt);
 /* Interactive yes / always (session) / [always (project)] / no question rendered as a

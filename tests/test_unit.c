@@ -783,7 +783,8 @@ static void test_modes(void) { char *o = capture(test_modes_body, NULL); free(o)
 
 /* ---------- message queue: keystrokes typed while busy -> text ---------- */
 static void test_queue(void) {
-    #define KT(str) term_keys_to_text((const unsigned char *)(str), sizeof(str) - 1)
+    #define KT(str) term_keys_to_text((const unsigned char *)(str), sizeof(str) - 1, NULL)
+    #define KTC(str, cc) term_keys_to_text((const unsigned char *)(str), sizeof(str) - 1, &(cc))
     char *t;
     t = KT("hello world"); CHECK_STR(t, "hello world"); free(t);
     t = KT("  padded  \n"); CHECK_STR(t, "padded"); free(t);
@@ -791,10 +792,32 @@ static void test_queue(void) {
     t = KT("caf\xc3\xa9\x7f!"); CHECK_STR(t, "caf!"); free(t);               /* backspace removes a whole UTF-8 char */
     t = KT("wrong\x15right"); CHECK_STR(t, "right"); free(t);                  /* Ctrl-U */
     t = KT("keep this bad\x17good"); CHECK_STR(t, "keep this good"); free(t);  /* Ctrl-W */
-    t = KT("a\x1b[Db\x1b[1;5Cc\x1bOAd"); CHECK_STR(t, "abcd"); free(t);      /* arrows / CSI / SS3 dropped */
+    t = KT("a\x1b[Db\x1b[1;5Cc\x1bOAd"); CHECK_STR(t, "bacd"); free(t);      /* Left and Right move the caret, Up is dropped */
+    /* the caret: edits go where it is, and the caret's offset is reported with the text */
+    { size_t cc = 0; t = KTC("hello wrld\x1b[D\x1b[D\x1b[D" "o", cc);   /* insert before the caret */
+      CHECK_STR(t, "hello world"); CHECK(cc == 8); free(t); }
+    t = KT("abc\x1b[Hx"); CHECK_STR(t, "xabc"); free(t);                          /* Home: the line's start */
+    t = KT("abc\x1bOHx\x1bOFy"); CHECK_STR(t, "xabcy"); free(t);                  /* SS3 Home and End */
+    t = KT("abcd\x1b[D\x7f"); CHECK_STR(t, "abd"); free(t);                       /* backspace before the caret */
+    t = KT("abcd\x1b[D\x1b[D\x1b[3~"); CHECK_STR(t, "abd"); free(t);             /* Delete after the caret */
+    t = KT("one two three\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D\x17"); CHECK_STR(t, "one  three"); free(t);   /* Ctrl-W before the caret */
+    t = KT("ab\x1b[D\r"); CHECK_STR(t, "a\nb"); free(t);                          /* a line break at the caret */
+    t = KT("\x1b[D" "x\x1b[C"); CHECK_STR(t, "x"); free(t);                       /* moving left of the start stays there */
+    { size_t cc = 0; t = KTC("  xy\x1b[D", cc);                              /* trimmed: the caret moves with the trim */
+      CHECK_STR(t, "xy"); CHECK(cc == 1); free(t); }
     t = KT("line1\x1b\rline2\nline3"); CHECK_STR(t, "line1\nline2\nline3"); free(t);   /* Alt+Enter, Ctrl-J */
     t = KT("\x1b[200~pasted\r\nlines\x1b[201~"); CHECK_STR(t, "pasted\nlines"); free(t);   /* paste brackets */
-    t = KT("\x1b" "fskip"); CHECK_STR(t, "skip"); free(t);                        /* Alt+f ignored */
+    t = KT("\x1b" "fskip"); CHECK_STR(t, "skip"); free(t);                        /* Alt+f with the caret at the end: nothing to the right */
+    /* the editor's own keys, so the preview and the replay agree: Ctrl-A/E/B/F, Ctrl-D, Ctrl-K, Alt+b/f, Alt+Backspace, Ctrl+arrows */
+    t = KT("abc\x01x\x05y"); CHECK_STR(t, "xabcy"); free(t);                    /* Ctrl-A line start, Ctrl-E line end */
+    t = KT("abcd\x02\x02x\x06y"); CHECK_STR(t, "abxcyd"); free(t);             /* Ctrl-B, Ctrl-F */
+    t = KT("abcd\x02\x04"); CHECK_STR(t, "abc"); free(t);                       /* Ctrl-D deletes after the caret */
+    t = KT("abcd\x02\x02\x0b"); CHECK_STR(t, "ab"); free(t);                  /* Ctrl-K deletes to the end of the line */
+    t = KT("ab cd\x02\x02\x15"); CHECK_STR(t, "cd"); free(t);                  /* Ctrl-U deletes from the start to the caret */
+    t = KT("one two three\x1b" "bX"); CHECK_STR(t, "one two Xthree"); free(t);      /* Alt+b: the caret goes to the word's start */
+    t = KT("one two\x1b\x7f"); CHECK_STR(t, "one"); free(t);                    /* Alt+Backspace: the word before the caret */
+    t = KT("one two\x1b[1;5D\x1b[1;5DX"); CHECK_STR(t, "Xone two"); free(t);     /* Ctrl+Left twice: back past two words */
+    t = KT("one two\x1b[1;5D\x1b[1;5C!"); CHECK_STR(t, "one two!"); free(t);     /* Ctrl+Right: forward to the end */
     t = KT("   \n  "); CHECK_STR(t, ""); free(t);
     /* queue API */
     term_queue_clear(); CHECK(term_queue_count() == 0 && term_queue_pop() == NULL && term_queue_peek() == NULL);
