@@ -1279,6 +1279,7 @@ bool nc_start(void) {
         return false;
     }
     g_std = notcurses_stdplane(g_nc);
+    fputs("\x1b[?2004h", g_nc_out); fflush(g_nc_out);   /* bracketed paste on for the session: a paste comes as one marked block (see the paste section) */
     (void)notcurses_mice_enable(g_nc, NCMICE_BUTTON_EVENT | NCMICE_DRAG_EVENT);   /* drags too: a selection needs the moves while the button is held (press alone reports one cell) */   /* clicks (folds) and the wheel (the pane); without it the terminal keeps its own */
     g_top = 0; g_clear_at = 0; g_pending = false; g_kq_n = 0;
     notcurses_refresh(g_nc, NULL, NULL);   /* a full repaint: notcurses redraws only what changed, and echoed text is not its */
@@ -1288,6 +1289,7 @@ bool nc_start(void) {
 
 void nc_stop(void) {
     if (!g_nc) return;
+    if (g_nc_out) { fputs("\x1b[?2004l", g_nc_out); fflush(g_nc_out); }   /* bracketed paste off (nc_start) */
     notcurses_stop(g_nc);
     g_nc = NULL; g_std = NULL; g_hwcur = false;
     if (g_nc_out) { fclose(g_nc_out); g_nc_out = NULL; }

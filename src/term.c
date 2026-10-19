@@ -169,7 +169,11 @@ void term_raw(bool on) {
         t.c_cc[VMIN] = 1; t.c_cc[VTIME] = 0;
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &t);
         g_raw = true; g_tty_dirty = 1;
+        /* bracketed paste stays on for the whole raw session, not only while a prompt is read: a paste during a turn
+         * (type-ahead) must come as one marked block, or each of its newlines is an Enter that sends a message */
+        fputs("\x1b[?2004h", stdout); fflush(stdout);
     } else if (!on && g_raw) {
+        fputs("\x1b[?2004l", stdout); fflush(stdout);
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig);
         g_raw = false;
     }
@@ -2210,7 +2214,7 @@ bool term_strip_key(int key, bool may_enter) {
 /* While a turn runs, the agents strip takes the keys that are on it: ↓ from an empty type-ahead goes into it,
  * ↑/↓ move, Enter opens the log picked, Esc returns to the field. Returns the bytes it took (0: none). */
 static ssize_t busy_strip_key(const unsigned char *kb, ssize_t k, ssize_t i) {
-    if (!g_strip_rows) return 0;
+    if (!g_strip_rows || g_ta_paste) return 0;   /* (a paste's newlines are text, not keys) */
     int code = 0; ssize_t used = 0;
     if (kb[i] == 27 && i + 2 < k && (kb[i + 1] == '[' || kb[i + 1] == 'O') && (kb[i + 2] == 'A' || kb[i + 2] == 'B')) { code = kb[i + 2] == 'A' ? K_UP : K_DOWN; used = 3; }
     else if (kb[i] == 27 && i == k - 1) { code = K_ESC; used = 1; }
@@ -3229,8 +3233,7 @@ static char *readline_impl(const char *prompt, bool in_field) {
     e.prompt = prompt; e.plen = vis_width(prompt);
     e.in_field = in_field && g_fs;
     e.hist_idx = g_hist_n;
-    term_raw(true);
-    fputs("\x1b[?2004h", stdout);   /* bracketed paste on */
+    term_raw(true);   /* (bracketed paste is switched on with raw mode, term_raw) */
     /* Still scrolled back from the turn that just ended? A question needs the live screen, and
      * so does someone who has been typing; anyone else goes on reading (scroll_view, below). */
     if (g_view_top >= 0 && (!e.in_field || g_ta_pos < g_ta_len)) view_leave();
@@ -3448,7 +3451,6 @@ static char *readline_impl(const char *prompt, bool in_field) {
         g_field_focus = false;
         g_field_text = ""; g_field_len = g_field_cur = 0; g_field_view = 0; g_field_prompt = NULL;
         sb_pause(true);
-        fputs("\x1b[?2004l", stdout);
         printf("\x1b[%d;%dH", g_conv_row, g_conv_col);
         fflush(stdout);
         sb_pause(false);
@@ -3463,7 +3465,6 @@ static char *readline_impl(const char *prompt, bool in_field) {
         sb_pause(true);
         if (erow > crow) printf("\x1b[%dB", erow - crow);
         printf("\n\r\x1b[J");   /* next line, clear anything below (candidates, hints) */
-        fputs("\x1b[?2004l", stdout);
         term_status_refresh();   /* "\x1b[J" wiped the bar */
         sb_pause(false);
         if (result) {   /* what stays on screen: the prompt and the submitted text, on the user's ground */
