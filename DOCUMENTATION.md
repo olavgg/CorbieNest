@@ -84,6 +84,7 @@ without thinking about them: the status bar, the field, and the strip.
 | `/clear` | new conversation |
 | `/compact` | have the model summarise the conversation to free context |
 | `/memory [on\|off\|clear\|update\|every N\|idle N]` | show the project memory (`.corbienest/memory.md`), toggle its automatic update, run the pending update now, set how often it runs (default every 5 requests, plus after 15s idle at the prompt and at exit/`/clear`/`/compact`), how long the prompt must sit idle before a pending update runs (`idle off` waits for exit), or delete it |
+| `/suggest [on\|off]` | after each reply the working model proposes the user's likely next message, shown muted in the field: Tab takes it, typing clears it (one small request per reply; see [Suggested next message](#suggested-next-message)) |
 | `/status` | model, context usage, settings |
 | `/diff [git args]` | show `git diff` of the working tree (stat, patch, untracked files) for you only — nothing is added to the conversation; `/diff --staged`, `/diff HEAD~1` … pass through |
 | `/rewind` | (or **Esc Esc** at an empty prompt) pick an earlier request and go back: undo the file changes the model made since (files are checkpointed before every `write_file`/`edit_file`), truncate the conversation to just before it (the request text returns to the editor), or both |
@@ -125,6 +126,7 @@ without thinking about them: the status bar, the field, and the strip.
 
 ## Input tricks
 
+- Tab on an empty field takes the suggested next message (the muted text) into the field, to send or change; any other key clears it.
 - `!cmd` — run a shell command yourself; its output is added to the conversation. The line is
   completed the way a shell would do it: where a command goes (the first word, or after `|`,
   `;`, `&&`) the programs in `$PATH` that start with what you typed are listed, the shortest
@@ -702,6 +704,17 @@ the current directory, `--resume` opens a picker (or `--resume ID`), and `/resum
 from inside a session. The recap is followed by the conversation as it was: the last 200 messages, what you typed, the replies, and each tool result folded as it is live. The lines you typed go into the ↑ history (the ones already there are not added again). A one-shot run (`-p`) prints none of this and leaves the history alone. A session saved before this change has no record of what was typed, so every user message is shown and nothing goes into the history. `/clear` starts a
 new session; `/status` shows the current id, which is also printed when you quit.
 
+## Suggested next message
+
+When a reply finishes and the prompt sits idle for a moment, the working model is asked for the
+message you would most likely type next (one sentence, at most 15 words). The answer is shown muted
+in the empty field: Tab takes it as your text, and typing anything else clears it. It is a call of its
+own — it is not added to the conversation, the session or the memory — and it uses the conversation's
+own system prompt and tools, so a cache-capable model mostly reuses the prompt it already has. It
+is not made when you typed something meanwhile, after an interrupted reply, or when the model has
+nothing to suggest (`NO_SUGGESTION`). `/suggest off` stops it (saved to config as `suggest=0`).
+The call is one small request per reply: `/usage` counts it with the rest.
+
 ## Project memory
 
 Like Claude Code's auto-memory: corbienest keeps `.corbienest/memory.md` in the working
@@ -1115,7 +1128,7 @@ goal, and keeps the one the metric scores best.
 
 ## Config
 
-Settings changed with `/sandbox`, `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N`, `/subagent` are saved to
+Settings changed with `/sandbox`, `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N`, `/suggest on|off`, `/subagent` are saved to
 `~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`, the sub-agents' model as `subagent=`, the colour theme as `theme=`, and the command that builds the project between the layers of `/plan` as `build=`, which is set by hand in that file). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, `CORBIENEST_TRACE` (a file to record the session's drawing into, see below), and for a hosted model or advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
 
 ## Colours

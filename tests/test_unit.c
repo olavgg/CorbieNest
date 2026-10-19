@@ -1069,6 +1069,35 @@ static bool same_level(const char *a, const char *b) { return a && b ? !strcmp(a
     think_kind _k = think_decide((when), (quiet), (followup), (effort), &(mi), &_l); \
     if (_k == (kind) && same_level(_l, (lvl))) g_pass++; \
     else { g_fail++; fprintf(stderr, "  FAIL %s:%d: think_decide -> %d \"%s\", wanted %d \"%s\"\n", __FILE__, __LINE__, (int)_k, _l ? _l : "", (int)(kind), (lvl) ? (lvl) : ""); } } while (0)
+/* the suggested next message: the cleaned first line of the model's reply, or nothing */
+static void test_suggest(void) {
+    char *t;
+    t = suggest_clean("Run the tests again and show me the failures", false);
+    CHECK_STR(t, "Run the tests again and show me the failures"); free(t);
+    t = suggest_clean("  \"Now add a test for that.\"\n\nExplanation: more text", false);
+    CHECK_STR(t, "Now add a test for that."); free(t);
+    t = suggest_clean("User: yes, go ahead", false);
+    CHECK_STR(t, "yes, go ahead"); free(t);
+    t = suggest_clean("`commit it`", false);
+    CHECK_STR(t, "commit it"); free(t);
+    t = suggest_clean("ok\x1b[31m red\x07", false);            /* control bytes are dropped: the field draws them raw */
+    CHECK_STR(t, "ok[31m red"); free(t);
+    CHECK(suggest_clean("NO_SUGGESTION", false) == NULL);
+    CHECK(suggest_clean("   \n", false) == NULL);
+    CHECK(suggest_clean("", false) == NULL);
+    CHECK(suggest_clean(NULL, false) == NULL);
+    CHECK(suggest_clean("a complete sentence", true) == NULL);   /* cut off by the token cap: not offered */
+    char long_msg[400]; memset(long_msg, 'x', sizeof long_msg - 1); long_msg[sizeof long_msg - 1] = 0;
+    t = suggest_clean(long_msg, false);
+    CHECK(t && strlen(t) == SUGGEST_MAX);
+    free(t);
+    /* a multi-byte character at the cut is not split */
+    char big[300]; memset(big, 'a', 199); big[199] = (char)0xC3; big[200] = (char)0xA5; big[201] = 0;   /* å straddles byte 200 */
+    t = suggest_clean(big, false);
+    CHECK(t && strlen(t) == 199);
+    free(t);
+}
+
 static void test_effort(void) {
     model_info none  = mi_of("{\"capabilities\":[\"completion\",\"tools\"]}");
     model_info onoff = mi_of("{\"details\":{\"family\":\"qwen3\"},\"capabilities\":[\"completion\",\"thinking\"]}");
@@ -2301,7 +2330,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
+        { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

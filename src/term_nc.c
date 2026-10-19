@@ -838,6 +838,7 @@ static void draw_field(int top) {
         put_text(top, g_cols - 8, "[ready]", 7, g_theme->edge_ready, NC_DEFAULT, false, &carry);
     }
     if (first == 0) put_text(top + 1, 2, "❯", 1, C_ACCENT, C_FIELD_BG, false, NULL);   /* the prompt, inside the border */
+    if (!g_len && term_hint && first == 0) put_text(top + 1, 5, term_hint, field_text_width() - 1, C_MUTED, C_FIELD_BG, false, NULL);   /* the placeholder, muted, after the caret (term_hint) */
     {   /* the mode, on the lower rule, its last cell two columns in from the edge (as the ANSI screen puts it) */
         sbuf m; sb_init(&m);
         int mw = term_mode_text(&m, g_cols), x0 = g_cols - mw - 1;
@@ -1471,6 +1472,7 @@ static char *readline_loop(void) {
             if (left <= 0) {
                 idle_at = -1;
                 term_idle_hook();
+                if (term_idle_hook && term_idle_ms > 0) idle_at = now_s() + term_idle_ms / 1000.0;   /* the hook may ask to be called again (main.c prompt_idle) */
                 char *q = term_queue_pop();
                 if (q) return q;                       /* a message queued meanwhile is submitted now */
                 continue;
@@ -1481,6 +1483,9 @@ static char *readline_loop(void) {
         term_tick_run();
         if (k == NK_NONE || k == NK_SKIP) continue;
         idle_at = -1;                                  /* typing cancels the idle work for this prompt */
+        if (term_hint && k != 9 && k != NK_LEFT && k != NK_RIGHT && k != NK_HOME && k != NK_END && k != 27) term_hint_clear();   /* the placeholder goes with the first key that changes or leaves the field (as the ANSI one does) */
+        if (term_hint && k == 27) { term_hint_clear(); continue; }   /* Esc takes the placeholder away; it is not the clear-the-line Esc */
+        if (term_hint && g_len == 0 && k == 9) { ed_set(term_hint); term_hint_clear(); continue; }   /* Tab takes it: the text now, to send or to change */
         if (term_strip_key(strip_code(k), g_len == 0 && !g_sug_n)) continue;   /* the agents strip: ↓ from an empty line, ↑/↓, Enter opens the log, Esc returns */
         if (sug_key(k)) continue;                      /* the list's keys come first (see sug_key) */
         if (k == 13) {
@@ -1505,6 +1510,7 @@ static char *readline_loop(void) {
 char *nc_readline(const char *prompt, bool in_field) {
     (void)prompt;
     if (!g_nc) return NULL;
+    term_hint_clear();   /* the placeholder is for this prompt only: the idle work of this one sets it again */
     if (in_field && !g_pre) {   /* the text typed while the model worked is still in the field: the prompt goes on from it */
         sug_forget();           /* (the list is worked out again for it by readline_loop) */
         nc_unbrowse();

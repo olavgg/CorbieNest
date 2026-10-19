@@ -449,6 +449,7 @@ void config_load(void) {
         else if (!strcmp(k, "max_iters")) { int n = atoi(v); if (n > 0) g_cfg.max_iters = n; }
         else if (!strcmp(k, "memory_every")) { int n = atoi(v); if (n > 0) g_cfg.memory_every = n; }
         else if (!strcmp(k, "memory_idle")) { int n = atoi(v); if (n >= 0) g_cfg.memory_idle = n; }
+        else if (!strcmp(k, "suggest")) g_cfg.suggest = atoi(v) != 0;
         else if (!strcmp(k, "keep_alive")) { free(g_cfg.keep_alive); g_cfg.keep_alive = *v ? xstrdup(v) : NULL; }
     }
     fclose(f);
@@ -494,6 +495,7 @@ void config_save(void) {
     if (g_cfg.search_url) sb_printf(&b, "search_url=%s\n", g_cfg.search_url);
     sb_printf(&b, "memory_every=%d\n", g_cfg.memory_every);
     sb_printf(&b, "memory_idle=%d\n", g_cfg.memory_idle);
+    sb_printf(&b, "suggest=%d\n", g_cfg.suggest ? 1 : 0);
     sb_printf(&b, "keep_alive=%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "");
     if (g_cfg.ui) sb_printf(&b, "ui=%s\n", g_cfg.ui);
     if (g_cfg.theme) sb_printf(&b, "theme=%s\n", g_cfg.theme);
@@ -2411,4 +2413,34 @@ int goal_verdict(const char *report, char *why, size_t n) {
         line = e + 1;
     }
     return found;
+}
+
+/* A suggested next message, as the prompt shows it (see term_hint_set): the model's reply to the
+ * suggestion call, cleaned. The first line only, without the quotes or the "User:" label a model
+ * adds, no control byte (it is drawn raw into the field), at most SUGGEST_MAX bytes. NULL when there
+ * is nothing to offer: an empty reply, NO_SUGGESTION, or a reply cut off by its token cap (cut).
+ * Malloc'd. */
+char *suggest_clean(const char *raw, bool cut) {
+    if (!raw || cut) return NULL;
+    sbuf b; sb_init(&b);
+    for (const char *p = raw; *p && *p != '\n' && *p != '\r'; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 32 || c == 127) continue;
+        sb_putc(&b, (char)c);
+    }
+    const char *s = b.data; size_t n = b.len;
+    while (n && isspace((unsigned char)*s)) { s++; n--; }
+    while (n && isspace((unsigned char)s[n - 1])) n--;
+    if (n >= 5 && !strncasecmp(s, "user:", 5)) { s += 5; n -= 5; while (n && isspace((unsigned char)*s)) { s++; n--; } }
+    while (n >= 2 && strchr("\"'`", s[0]) && s[n - 1] == s[0]) { s++; n -= 2; }
+    while (n && isspace((unsigned char)*s)) { s++; n--; }
+    while (n && isspace((unsigned char)s[n - 1])) n--;
+    char *out = NULL;
+    if (n) {
+        char *line = xstrndup(s, n);
+        if (!strstr(line, "NO_SUGGESTION")) out = xstrndup(line, utf8_cut(line, n, SUGGEST_MAX));
+        free(line);
+    }
+    sb_free(&b);
+    return out;
 }

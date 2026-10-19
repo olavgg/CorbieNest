@@ -24,6 +24,8 @@ confirmed before it runs.
   `/goal` races candidates in git worktrees against a metric.
 - **Sessions, memory, skills.** Sessions resume with `--continue` or `/resume`. The project keeps
   a memory file, and skills are reusable `SKILL.md` instructions.
+- **Suggested next message.** After each reply the model proposes what you would type next, as a
+  muted placeholder in the field: Tab takes it, typing anything clears it (`/suggest off` turns it off).
 - **Full-screen terminal UI.** A rounded input field, a status bar with the model, tokens, context
   and git branch, and a conversation with folded tool output. It also has an optional notcurses
   screen.

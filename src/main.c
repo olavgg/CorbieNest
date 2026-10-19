@@ -75,6 +75,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/pwd", "show the working directory" },
     { "/skills", "list the skills · reload · new NAME" },
     { "/memory", "the project memory: on, off, clear, update, every N, idle N" },
+    { "/suggest", "the next message proposed at the prompt: on, off" },
     { "/resume", "continue an earlier session" },
     { "/hooks", "shell commands for this project: before or after a tool call, at start and at the end of a request" },
     { "/mcp", "MCP servers: tools from external programs over stdio (add, remove, reconnect; /mcp alone lists them)" },
@@ -106,6 +107,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/web", "on:the model may search and read the web|off:no web access|engine:the search engine: a URL with %s for the query, or default" },
     { "/web engine", "default:back to the built-in engine" },
     { "/memory", "on:keep the project memory up to date|off:stop updating it|update:run the pending update now|clear:remove the memory file|every:update every N requests|idle:update after N seconds idle at the prompt" },
+    { "/suggest", "on:propose the next message after each reply|off:no proposed message at the prompt" },
     { "/memory idle", "off:wait for the next update or the exit instead" },
     { "/hooks", "add:a hook line: pre|post TOOL COMMAND, start|stop COMMAND|remove:remove hook N|clear:remove them all" },
     { "/agents", "reload:read the agent files again" },
@@ -389,6 +391,11 @@ static char *unfence(const char *t) {
  * g_cfg.memory_every of them are pending, or when the conversation is about to go away
  * (exit, /clear, /compact, /cd, /resume). */
 static int g_mem_first = -1;      /* index of the first message not yet folded into memory (-1 = none pending) */
+static double g_mem_due = 0;      /* when the pending extraction runs anyway (mono_now seconds; 0 = not armed): see memory_arm_idle */
+static double mono_now(void);
+static void prompt_arm(void);
+static bool g_sug_due = false;    /* a reply finished: the next prompt's idle moment proposes the next message (suggest_next) */
+static int  g_sug_seen = -1;      /* the conversation's length when a suggestion was last tried (one try per reply) */
 static int g_mem_pending = 0;     /* finished requests since the last flush */
 static bool g_mem_exiting = false;/* the last flush, on the way out: say that Ctrl-C skips it */
 
@@ -506,6 +513,7 @@ static void memory_extract(int first) {
 
 /* Run the pending extraction now (if anything is pending). */
 static void memory_flush(void) {
+    g_mem_due = 0;
     if (!g_cfg.memory || g_mem_first < 0) { g_mem_first = -1; g_mem_pending = 0; return; }
     int first = g_mem_first;
     g_mem_first = -1; g_mem_pending = 0;
@@ -513,17 +521,13 @@ static void memory_flush(void) {
     memory_extract(first);
 }
 
-/* Called by the editor once the prompt has been idle for memory_idle seconds (see
- * term_idle_hook): the extraction happens while the reply is being read instead of on the way
- * out, so quitting is not held up by a model call. Typing cancels it, and the batch simply
- * waits for the next chance — so a user who keeps working still gets the batched cadence and
- * a warm prompt cache. */
-static void memory_idle_hook(void) { memory_flush(); }
-
 /* How long the next prompt should wait before folding a finished request into memory
  * (0 = not at all: nothing pending, or the idle flush is switched off). */
 static void memory_arm_idle(void) {
-    term_idle_ms = (g_cfg.memory && g_cfg.memory_idle > 0 && g_mem_first >= 0) ? g_cfg.memory_idle * 1000 : 0;
+    bool on = g_cfg.memory && g_cfg.memory_idle > 0 && g_mem_first >= 0;
+    if (!on) g_mem_due = 0;
+    else if (g_mem_due <= 0) g_mem_due = mono_now() + g_cfg.memory_idle;   /* counted from this prompt; a later prompt keeps it */
+    prompt_arm();
 }
 
 /* A request finished (it started at g_messages[first]): remember it for the next flush,
@@ -1381,6 +1385,98 @@ static cJSON *messages_with_system(void) {
     cJSON_AddItemToArray(arr, sys);
     cJSON *m; cJSON_ArrayForEach(m, g_messages) cJSON_AddItemReferenceToArray(arr, m);
     return arr;
+}
+
+/* ---------- the suggested next message ----------
+ * After a reply, the prompt's idle moment (prompt_idle) asks the working model for the user's
+ * likely next message; the answer is the muted placeholder of the empty prompt (term_hint_set):
+ * Tab takes it, typing anything clears it. One small call per reply, made while the prompt waits,
+ * so it never holds up typing; an interrupted call, a reply with tool calls, NO_SUGGESTION, or
+ * anything typed meanwhile gives no placeholder. It is a call of its own: g_messages, the session
+ * file and the memory are not changed by it. */
+#define SUGGEST_IDLE_S 0.6    /* the prompt is idle this long before the call is made */
+#define SUGGEST_TOKENS 60     /* a reply cap: one sentence, cut off reads as nothing (suggest_clean) */
+static const char SUGGEST_ASK[] =
+    "Predict the next message the user is likely to type to carry on with this work: in their own words, "
+    "one sentence, at most 15 words. Reply with that message only, without quotes. "
+    "If there is no obvious next message, reply with exactly NO_SUGGESTION.";
+
+static cJSON *tools_for_mode(void);
+static void suggest_next(void) {
+    int total = cJSON_GetArraySize(g_messages);
+    cJSON *last = total ? cJSON_GetArrayItem(g_messages, total - 1) : NULL;
+    cJSON *role = last ? cJSON_GetObjectItemCaseSensitive(last, "role") : NULL;
+    if (!g_cfg.suggest || !g_cfg.interactive || !model_set() || total == g_sug_seen) return;
+    if (!cJSON_IsString(role) || strcmp(role->valuestring, "assistant")) return;   /* only after a reply (not after /clear, a slash command or a refused turn) */
+    g_sug_seen = total;
+    cJSON *msgs = messages_with_system();
+    cJSON *u = cJSON_CreateObject();
+    cJSON_AddStringToObject(u, "role", "user");
+    cJSON_AddStringToObject(u, "content", SUGGEST_ASK);
+    cJSON_AddItemToArray(msgs, u);
+    /* the conversation's own prompt (system and tools), as the compaction call has it: the prefix is the one the
+     * prompt cache and the server's prompt cache already hold, so the call costs what the new words cost */
+    cJSON *tools = tools_for_mode();
+    ollama_quiet = true;
+    ollama_call.think = 0; ollama_call.followup = true; ollama_call.num_predict = SUGGEST_TOKENS; ollama_call.busy = "suggesting a message";
+    chat_stats st; bool aborted = false;
+    cJSON *reply = model_chat(msgs, tools, &st, &aborted);
+    ollama_call_reset();
+    ollama_quiet = false;
+    if (tools && tools != g_tools) cJSON_Delete(tools);
+    cJSON_Delete(msgs);
+    account(&st);
+    term_status_refresh();
+    if (!reply) return;
+    cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
+    cJSON *c = cJSON_GetObjectItemCaseSensitive(reply, "content");
+    bool cut = !strcmp(st.done_reason, "length");
+    char *text = calls && cJSON_GetArraySize(calls) > 0 ? NULL : suggest_clean(cJSON_IsString(c) ? c->valuestring : NULL, cut);
+    cJSON_Delete(reply);
+    /* the user typed (or queued) while the call ran: that is what they are writing, not the suggestion */
+    if (text && (term_typed_ahead() || term_queue_count())) { free(text); text = NULL; }
+    if (text) { term_hint_set(text); free(text); }
+}
+
+/* The idle work of the prompt (term_idle_hook): the suggestion if one is due, then the memory
+ * extraction if its idle time has passed (memory_idle seconds after the prompt came up, so a
+ * suggestion before it does not shorten it). Then the timer is set for what is still waiting. */
+static void prompt_idle(void) {
+    if (g_sug_due) { g_sug_due = false; suggest_next(); }
+    if (g_mem_due > 0 && mono_now() >= g_mem_due) memory_flush();
+    prompt_arm();
+}
+
+/* How long the prompt waits before its idle work (term_idle_ms; 0 = none): the suggestion's short
+ * wait when one is due, else what is left of memory's. Typing cancels it for the prompt (term.c). */
+static void prompt_arm(void) {
+    double want = -1;
+    if (g_sug_due && g_cfg.suggest) want = SUGGEST_IDLE_S;
+    if (g_mem_due > 0) {
+        double left = g_mem_due - mono_now();
+        if (left < 0.001) left = 0.001;
+        if (want < 0 || left < want) want = left;
+    }
+    term_idle_ms = want < 0 ? 0 : (int)(want * 1000) + 1;
+}
+
+/* /suggest [on|off]: the suggested next message at the prompt (one small call per reply) */
+static int cmd_suggest(const char *arg) {
+    if (arg && *arg) {
+        if (!strcmp(arg, "on") || !strcmp(arg, "off")) {
+            g_cfg.suggest = !strcmp(arg, "on");
+            if (!g_cfg.suggest) term_hint_clear();
+            config_save();
+            printf(C_GREEN "✓ suggestions %s" C_RESET "%s\n", g_cfg.suggest ? "on" : "off",
+                   g_cfg.suggest ? C_DIM " — after each reply the model proposes the next message; Tab takes it" C_RESET : "");
+            return 0;
+        }
+        printf(C_DIM "usage: /suggest [on|off]" C_RESET "\n");
+        return 0;
+    }
+    printf(C_DIM "suggestions %s — %s" C_RESET "\n", g_cfg.suggest ? "on" : "off",
+           g_cfg.suggest ? "after each reply the model proposes the next message (one small request); Tab takes it" : "no proposed message at the prompt");
+    return 0;
 }
 
 static void add_message(const char *role, const char *content) {
@@ -5158,6 +5254,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/plan")) return orchestrate_run(arg, true);
     else if (!strcmp(cmd, "/goal")) return cmd_goal(arg);
     else if (!strcmp(cmd, "/btw")) return cmd_btw(arg);
+    else if (!strcmp(cmd, "/suggest")) return cmd_suggest(arg);
     else if (!strcmp(cmd, "/status") || !strcmp(cmd, "/cost")) cmd_status();
     else if (!strcmp(cmd, "/system")) {
         if (!arg) printf("extra system prompt: %s\n", g_cfg.system_prompt ? g_cfg.system_prompt : C_DIM "(none)" C_RESET);
@@ -6308,7 +6405,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     tools_bg_init();
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.advisor_guidance = GUIDANCE_NORMAL; g_cfg.advisor_window = ADVISOR_WINDOW_DEFAULT;
+    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.suggest = true; g_cfg.advisor_guidance = GUIDANCE_NORMAL; g_cfg.advisor_window = ADVISOR_WINDOW_DEFAULT;
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();
@@ -6493,7 +6590,7 @@ int main(int argc, char **argv) {
         printf(C_YELLOW "trace:" C_RESET C_DIM " everything drawn and typed in this session is written to %s" C_RESET "\n\n", term_trace_path());
     hist_load();
     term_suggest = suggest;
-    term_idle_hook = memory_idle_hook;
+    term_idle_hook = prompt_idle;
     term_agents_menu = agents_menu;
     term_agents_strip = strip_lines;
     term_agents_open = strip_open;
@@ -6519,6 +6616,7 @@ int main(int argc, char **argv) {
             rc = process_input(pick);
             free(pick);
         }
+        g_sug_due = rc == 0 && g_cfg.suggest;   /* a reply that finished: the prompt that follows may propose the next message */
         if (rc == 1) break;
         if (rc == -1) term_queue_to_editor();
     }

@@ -637,6 +637,8 @@ static void field_draw(sbuf *o, const char *typed) {
         /* the caret is the ▏: after the prompt, the … if any, and the tail */
         g_ta_caret_col = FIELD_X0 + (g_field_view ? 0 : vis_width(field_prompt())) + mark + vis_width(p) + 1;
         free(t);
+    } else if (!g_field_len && term_hint) {   /* the placeholder: muted, after the prompt; the caret stays in front of it */
+        sb_puts(o, C_DIM); put_clipped(o, term_hint, width - vis_width(field_prompt()), false); sb_puts(o, C_RESET);
     } else if (g_field_len) {
         int plen = vis_width(field_prompt());
         size_t from = field_row_start(width, plen, g_field_view);
@@ -2214,6 +2216,10 @@ int term_poll_interrupt(void) {
 void (*term_idle_hook)(void) = NULL;
 void (*term_agents_menu)(void) = NULL;
 int term_idle_ms = 0;
+char *term_hint = NULL;   /* the placeholder of an empty prompt (common.h) */
+void term_hint_set(const char *s) { free(term_hint); term_hint = s && *s ? xstrdup(s) : NULL; }
+void term_hint_clear(void) { free(term_hint); term_hint = NULL; }
+bool term_typed_ahead(void) { return g_ta_len > 0; }
 
 static int read_byte_timeout(int ms) {
     int t = ta_get(); if (t >= 0) return t;
@@ -2771,6 +2777,8 @@ static void ed_refresh(editor *e) {
     sb_puts(&o, "\x1b[J");
     sb_puts(&o, e->prompt);
     if (e->buf.len) sb_append(&o, e->buf.data, e->buf.len);
+    bool hint = !e->buf.len && term_hint && vis_width(e->prompt) + vis_width(term_hint) < width - 1;
+    if (hint) sb_printf(&o, C_DIM "%s" C_RESET, term_hint);   /* the placeholder (it fits: the rows below are not counted for it) */
     sb_puts(&o, C_RESET);
     int erow, ecol; ed_pos(e, e->buf.len, width, &erow, &ecol);
     /* pending-wrap fix: if we ended exactly at column 0 due to wrapping, force newline */
@@ -2781,6 +2789,8 @@ static void ed_refresh(editor *e) {
     if (erow - crow > 0) sb_printf(&o, "\x1b[%dA", erow - crow);
     sb_puts(&o, "\r");
     if (ccol > 0) sb_printf(&o, "\x1b[%dC", ccol);
+    if (hint) sb_puts(&o, "\r");   /* (the cursor is back at the prompt, not after the placeholder) */
+    if (hint && ccol > 0) sb_printf(&o, "\x1b[%dC", ccol);
     e->prev_cursor_row = crow;
     chrome_append(&o);   /* the "\x1b[J" above wiped the status bar; the mode may have changed too */
     sb_pause(true);   /* the live editor is not conversation content (sb_note adds the submitted line) */
@@ -3192,6 +3202,19 @@ static char *readline_impl(const char *prompt, bool in_field) {
     while (!done) {
         if (g_view_top >= 0) { scroll_view(0); e.prev_cursor_row = 0; ed_refresh(&e); continue; }
         int k = read_key_prompt(idle_armed && e.buf.len == 0);
+        if (term_hint && k != K_IDLE && k != K_MOUSE && k != K_WHEEL_UP && k != K_WHEEL_DOWN && k != -2 && k != -1 && k != '\t'
+            && k != K_LEFT && k != K_RIGHT && k != K_HOME && k != K_END) {
+            /* the placeholder goes with the first key that is not a way of looking at the prompt; Esc takes it
+             * away and is not the rewind's Esc (that one counts only with nothing shown) */
+            term_hint_clear();
+            if (k == K_ESC) { ed_refresh(&e); continue; }
+            ed_refresh(&e);
+        }
+        if (term_hint && e.buf.len == 0 && k == '\t') {   /* Tab takes the placeholder: it is the text now, to send or to change */
+            ed_insert(&e, term_hint, strlen(term_hint));
+            term_hint_clear(); sug_update(&e); ed_refresh(&e);
+            continue;
+        }
         if (g_strip_rows) {   /* the agents strip: ↓ on an empty line goes into it; in it ↑/↓ move, Enter opens the log, Esc or a typed key returns to the field */
             if (g_strip_sel < 0 && k == K_DOWN && e.buf.len == 0 && !g_sug_rows) { g_strip_sel = 0; term_status_refresh(); continue; }
             if (g_strip_sel >= 0) {
@@ -3207,6 +3230,7 @@ static char *readline_impl(const char *prompt, bool in_field) {
         if (k == K_IDLE) {
             idle_armed = false;
             ed_idle_run(&e);
+            idle_armed = term_idle_hook && term_idle_ms > 0;   /* the hook may ask to be called again (main.c prompt_idle) */
             /* The idle work is a model call of its own (main.c: the memory extraction), and
              * Enter while it runs queues a message rather than reaching the editor. Nobody
              * else looks at the queue until a line is submitted here, so a message queued
@@ -3455,6 +3479,7 @@ char *term_user_band(const char *lead, const char *text) {
     return r;
 }
 char *term_readline(const char *prompt) {
+    term_hint_clear();   /* the placeholder is for this prompt only: the idle work of this one sets it again */
     g_ready = true; term_status_refresh();
     g_tick_live = g_tick_fn != NULL; g_tick_next = mono_ms() + TICK_MS;
     if (g_ui_nc) nc_leave_browse(); else ta_end_browse();   /* the turn is over: the message being written is back in the field */

@@ -159,6 +159,8 @@ bool   utf8_ok(const char *s, size_t len);
 bool   tail_incomplete(const char *buf, size_t n);   /* ends inside an escape sequence or a UTF-8 character */
 char  *utf8_fix(const char *s);                  /* malloc'd copy, each invalid byte as U+FFFD */
 size_t utf8_cut(const char *s, size_t len, size_t cap);   /* the longest prefix of s up to cap bytes that ends on a character */
+#define SUGGEST_MAX 200   /* bytes of a suggested next message (suggest_clean) */
+char *suggest_clean(const char *raw, bool cut);   /* the cleaned suggestion, or NULL: see util.c */
 int    cmd_head(const char *cmd, int width, char *out, size_t n);   /* a shell command's first line for a fold's head; returns the lines after it */
 /* One row of the running-tasks strip, fitted to `cols` columns (a character is a column; `out` is always terminated).
  * STRIP_ROW_MAIN is "● name", STRIP_ROW_TASK is an indented "◯ name", STRIP_ROW_ALL is "  " plus `name`
@@ -282,6 +284,7 @@ typedef struct {
     bool  memory;        /* keep .corbienest/memory.md up to date (see memory_every) */
     int   memory_every;  /* run the memory-extraction call after this many requests (also at exit, /clear, /compact, /cd) */
     int   memory_idle;   /* seconds idle at the prompt after which a pending extraction runs anyway (0 = only at memory_every / exit) */
+    bool  suggest;       /* after each reply, the working model proposes the next message as the prompt's placeholder (see term_hint_set) */
     char *keep_alive;    /* ollama keep_alive for the model ("30m", "-1" = forever, "0" = unload); NULL = server default */
     char *ui;            /* "ansi" (default) or "notcurses" (needs a build made with notcurses installed); NULL = ansi */
     char *theme;         /* "theme=NAME": the colour theme (theme.c); NULL = the default one */
@@ -425,6 +428,12 @@ int term_interrupt_fd(void);                /* the fd a busy wait watches for ke
  * term_idle_ms before each term_readline(); typing anything cancels it for that prompt. */
 extern void (*term_idle_hook)(void);
 extern int term_idle_ms;
+/* The muted placeholder an empty prompt shows: a suggested next message. Tab takes it, any key that
+ * edits or moves into the text clears it (not Tab, the arrows, Home, End). term_hint_set copies. */
+extern char *term_hint;
+void term_hint_set(const char *s);
+void term_hint_clear(void);
+bool term_typed_ahead(void);   /* text typed while the model worked is waiting (the type-ahead) */
 /* ← on an empty prompt line calls term_agents_menu() with the terminal as the idle hook gets it
  * (main.c: the sub-agents of this session). term_show_block() shows a text as an open fold and
  * moves the view to its head, for the hook to show what it chose: the rest of the block is plain. */
