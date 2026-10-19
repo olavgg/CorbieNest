@@ -2244,6 +2244,33 @@ static void test_nc_pure(void) {
     CHECK(n == 2 && strcmp(cells[0].egc, "h") == 0 && strcmp(cells[1].egc, "i") == 0);
 }
 
+/* menu rows: an item's label and description wrapped side by side, one row per line of the taller of the two */
+static void test_menu_rows(void) {
+    sbuf lab[MENU_LINES_MAX], des[MENU_LINES_MAX];
+    /* "simple, but a crash leaves it behind" in 12 cells breaks after its words: four lines; the label fits in 10 */
+    int n = menu_item_rows("Lock file", "simple, but a crash leaves it behind", 10, 12, lab, des, MENU_LINES_MAX);
+    CHECK(n == 4);
+    CHECK_STR(lab[0].data, "Lock file ");                              /* padded to the label column */
+    CHECK_STR(des[0].data, "simple, but"); CHECK_STR(des[1].data, "a crash");
+    CHECK_STR(des[2].data, "leaves it"); CHECK_STR(des[3].data, "behind");
+    CHECK_STR(lab[1].data, "          ");                              /* blank beside the lines the label does not have */
+    for (int r = 0; r < n; r++) { sb_free(&lab[r]); sb_free(&des[r]); }
+    /* a word longer than a line is cut; a label longer than its column wraps in it */
+    n = menu_item_rows("", "abcdefghijklmnop", 4, 6, lab, des, MENU_LINES_MAX);
+    CHECK(n == 3); CHECK_STR(des[0].data, "abcdef"); CHECK_STR(des[1].data, "ghijkl"); CHECK_STR(des[2].data, "mnop");
+    for (int r = 0; r < n; r++) { sb_free(&lab[r]); sb_free(&des[r]); }
+    n = menu_item_rows("one two three", NULL, 5, 8, lab, des, MENU_LINES_MAX);
+    CHECK(n == 3); CHECK_STR(lab[0].data, "one  "); CHECK_STR(lab[1].data, "two  "); CHECK_STR(lab[2].data, "three");
+    CHECK_STR(des[0].data, ""); CHECK(des[2].len == 0 && des[1].len == 0);
+    for (int r = 0; r < n; r++) { sb_free(&lab[r]); sb_free(&des[r]); }
+    /* a short item is one row; counting alone (no sbufs) gives the same number */
+    CHECK(menu_item_rows("short", "a description", 10, 30, NULL, NULL, 0) == 1);
+    CHECK(menu_item_rows("Lock file", "simple, but a crash leaves it behind", 10, 12, NULL, NULL, 0) == 4);
+    /* a row is never wider than its columns: the description wraps at its width */
+    n = menu_item_rows("x", "the quick brown fox jumps over the lazy dog", 3, 9, lab, des, MENU_LINES_MAX);
+    for (int r = 0; r < n; r++) { CHECK(strlen(des[r].data) <= 9); sb_free(&lab[r]); sb_free(&des[r]); }
+}
+
 static void test_wrap(void) {
     /* word wrap: a row breaks after its last space; a word longer than a row is cut */
     size_t st = 0; int r = 0, c = 0;
@@ -2356,7 +2383,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "modes", test_modes },
         { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "themes", test_theme },
+        { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

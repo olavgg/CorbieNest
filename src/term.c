@@ -3833,6 +3833,52 @@ void md_finish(md_state *m) {
     fflush(stdout);
 }
 
+/* A menu's text wrapped at word boundaries to width cells (counted in code points, as the menus count): the byte
+ * range of each line goes into ln (at most cap). Returns the number of lines, at least 1. A word longer than a
+ * line is cut. Plain text: no escapes. */
+static int menu_wrap(const char *s, int width, size_t (*ln)[2], int cap) {
+    size_t len = strlen(s), st = 0; int n = 0;
+    if (width < 1) width = 1;
+    for (;;) {
+        while (st < len && s[st] == ' ') st++;
+        if (st >= len) break;
+        size_t end = st; int w = 0;
+        while (end < len && w < width) { end = u8_next(s, end, len); w++; }
+        size_t line_end = end, next = end;
+        if (end < len && s[end] != ' ') {   /* a break inside the line: after its last space, when it has one */
+            size_t k = end;
+            while (k > st && s[k - 1] != ' ') k--;
+            if (k > st) { line_end = k - 1; next = k; }
+        }
+        while (line_end > st && s[line_end - 1] == ' ') line_end--;
+        if (n < cap) { ln[n][0] = st; ln[n][1] = line_end - st; }
+        n++;
+        st = next;
+    }
+    if (n == 0) { if (cap > 0) { ln[0][0] = 0; ln[0][1] = 0; } return 1; }
+    return n;
+}
+/* One menu item as rows: its label wrapped into namew cells and its description into dw cells, side by side. Row r
+ * is label line r (padded to namew) and description line r; a row past the end of one of them is blank there. The
+ * rows go into lab[] and des[] (sbufs, one each per row, up to cap; the caller frees them), when they are not NULL.
+ * Returns the number of rows, at least 1, whether or not they are kept. */
+int menu_item_rows(const char *label, const char *desc, int namew, int dw, sbuf *lab, sbuf *des, int cap) {
+    static const char none[] = "";
+    const char *d = desc ? desc : none;
+    size_t lr[MENU_LINES_MAX][2], dr[MENU_LINES_MAX][2];
+    int nl = menu_wrap(label, namew, lr, MENU_LINES_MAX), nd = menu_wrap(d, dw, dr, MENU_LINES_MAX);
+    int n = nl > nd ? nl : nd;
+    for (int r = 0; lab && des && r < n && r < cap; r++) {
+        sb_init(&lab[r]); sb_append(&lab[r], "", 0);
+        sb_init(&des[r]); sb_append(&des[r], "", 0);
+        int cells = 0;
+        if (r < nl) { sb_append(&lab[r], label + lr[r][0], lr[r][1]); cells = vis_width_n(label + lr[r][0], lr[r][1]); }
+        for (; cells < namew; cells++) sb_putc(&lab[r], ' ');
+        if (r < nd) sb_append(&des[r], d + dr[r][0], dr[r][1]);
+    }
+    return n;
+}
+
 /* ---------- interactive selector (used by /model) ---------- */
 static int select_impl(const char *title, const char **items, const char **descs, int n, int current);
 int term_select(const char *title, const char **items, const char **descs, int n, int current) {
@@ -3852,9 +3898,11 @@ static int select_impl(const char *title, const char **items, const char **descs
     int sel = current >= 0 && current < n ? current : 0;
     char filter[128] = {0}; int flen = 0;
     int *vis = xmalloc(sizeof(int) * (size_t)n); int nvis = 0;
+    int *ih = xmalloc(sizeof(int) * (size_t)n);   /* the rows each visible item takes at this width */
     int drawn = 0;            /* lines drawn last time */
-    int max_show = 12;
-    int top = 0;
+    int max_show = 12;        /* the list's budget, in rows: an item wrapped to several takes several */
+    int top = 0;              /* the first item shown */
+    int page = 1;             /* what PgUp/PgDn move by: the items the last paint showed */
     int result = -1;
     /* on the full-screen ANSI screen the menu is a modal over the conversation (the same box as /usage's overlay),
      * so it does not depend on counting the lines it drew: a menu printed under the conversation misdrew when the
@@ -3863,7 +3911,8 @@ static int select_impl(const char *title, const char **items, const char **descs
     static const char HINT[] = "type to filter · ↑/↓ move · enter select · esc cancel";
     /* a modal's box keeps one size while the menu changes under the filter: every line is padded to bodyw (the widest
      * row, the title or the hint, at most the window's width less the overlay's margin), and it has max_show rows
-     * whatever the filter leaves. Both are worked out on every pass, after the layout, so a resize sizes the box too. */
+     * whatever the filter leaves. Both are worked out on every pass, after the layout, so a resize sizes the box too.
+     * A long description wraps (menu_item_rows) to the width the box has; the label column is as wide as the labels. */
     int bodyw = 0, labw = 44;
     bool first = true;   /* the box's first paint goes over the live screen as it is */
     view_leave();     /* a menu is drawn on the live screen */
@@ -3872,19 +3921,30 @@ static int select_impl(const char *title, const char **items, const char **descs
         if (modal) {
             layout_sync();
             int limit = (g_fs_cols > 0 ? g_fs_cols : term_width()) - 8;
-            int dmax = 0;   /* the widest description: the row is "* " + label + " " + description */
-            for (int i = 0; i < n; i++) { int dw = descs && descs[i] ? vis_width(descs[i]) : 0; if (dw > dmax) dmax = dw; }
+            int dmax = 0, lmax = 0;   /* the widest description and label */
+            for (int i = 0; i < n; i++) {
+                int dw = descs && descs[i] ? vis_width(descs[i]) : 0; if (dw > dmax) dmax = dw;
+                int lw = vis_width(items[i]); if (lw > lmax) lmax = lw;
+            }
+            int lab = lmax < 44 ? lmax : 44; if (lab < 16) lab = 16;
             bodyw = vis_width(title); if (vis_width(HINT) > bodyw) bodyw = vis_width(HINT);
-            if (2 + 44 + 1 + dmax > bodyw) bodyw = 2 + 44 + 1 + dmax;
+            if (2 + lab + 1 + dmax > bodyw) bodyw = 2 + lab + 1 + dmax;
             if (bodyw < 40) bodyw = 40;
             if (bodyw > limit) bodyw = limit;
-            int room = bodyw - 2;   /* the label column: 44 cells, or what is left of the row once the description has its width */
-            labw = room - 3 - dmax;
-            if (labw > 44) labw = 44;
-            if (labw < (room / 2 < 16 ? room / 2 : 16)) labw = room / 2 < 16 ? room / 2 : 16;
+            int brow = bodyw - 2;   /* the row's text: the label column, then the description in what is left */
+            labw = lab > brow / 2 ? brow / 2 : lab;
             int rows = fs_region() - 7;   /* the title, the filter, the rows, the count, the hint and the box's own two */
             max_show = rows < 3 ? 3 : rows > 12 ? 12 : rows;
-            if (max_show > n) max_show = n;
+        }
+        int w = term_width();
+        int room = modal ? bodyw - 2 : w - 4;   /* the row's text (its marker's two cells are not in it) */
+        int namew = modal ? labw : (room >= 88 ? 44 : room / 2);
+        if (namew < 1) namew = 1;
+        int dw = room - 2 - namew - 1; if (dw < 8) dw = 8;
+        if (modal) {   /* the budget is what all the items need, at most: a short menu's box is as short, whatever the filter */
+            int all = 0;
+            for (int i = 0; i < n; i++) all += menu_item_rows(items[i], descs ? descs[i] : NULL, namew, dw, NULL, NULL, 0);
+            if (max_show > all) max_show = all;
         }
         /* filter */
         nvis = 0;
@@ -3893,8 +3953,17 @@ static int select_impl(const char *title, const char **items, const char **descs
         int selpos = -1;
         for (int i = 0; i < nvis; i++) if (vis[i] == sel) selpos = i;
         if (selpos < 0) { selpos = 0; sel = nvis ? vis[0] : -1; }
-        if (selpos < top) top = selpos;
-        if (selpos >= top + max_show) top = selpos - max_show + 1;
+        for (int i = 0; i < nvis; i++) ih[i] = menu_item_rows(items[vis[i]], descs ? descs[vis[i]] : NULL, namew, dw, NULL, NULL, 0);
+        /* the window: from top on, the items whose rows fit the budget; the selected one is always in it */
+        if (nvis) {
+            if (selpos < top) top = selpos;
+            for (;;) {
+                int used = 0;
+                for (int i = top; i <= selpos; i++) used += ih[i];
+                if (used <= max_show || top >= selpos) break;
+                top++;
+            }
+        } else top = 0;
         /* draw */
         if (!modal && layout_sync()) drawn = 0;   /* repainted: the cursor is back where the menu starts (a modal was laid out above) */
         sbuf o; sb_init(&o);
@@ -3903,7 +3972,6 @@ static int select_impl(const char *title, const char **items, const char **descs
             sb_puts(&o, "\r\x1b[J");
         }
         int lines = 0;
-        int w = term_width();
         int mw = (g_fs_cols > 0 ? g_fs_cols : w) - 8;   /* a modal's lines fit the box the overlay makes of them: cols - 8 at most */
         /* one row, whatever the width: a title that wraps is still counted as one, and the redraw
          * then climbs a row too few — a stale row per key, and the transcript drawn over afterwards */
@@ -3914,38 +3982,40 @@ static int select_impl(const char *title, const char **items, const char **descs
         else sb_printf(&o, C_BOLD "%s" C_RESET "  " C_DIM "%s" C_RESET "\n", title, HINT);
         lines++;
         sb_printf(&o, "  " C_DIM "filter:" C_RESET " %s" C_DIM "▏" C_RESET "\n", filter); lines++;
-        int shown = 0;   /* rows drawn */
-        for (int i = top; i < nvis && i < top + max_show; i++) {
+        int rows = 0, shown = 0;   /* the list's rows drawn, and the items they are of */
+        for (int i = top; i < nvis; i++) {
+            if (rows > 0 && rows + ih[i] > max_show) break;   /* the next item's rows do not fit: the next paint shows it */
             int idx = vis[i];
             bool is_sel = (i == selpos);
-            /* the label column is 44 cells, or half the row when the row is narrow; the description takes the rest. The row
-             * is cut by display width (a byte cut garbles a UTF-8 letter), with the … the cut shows. */
-            int room = modal ? bodyw - 2 : w - 4, namew = room >= 88 ? 44 : room / 2;
-            if (modal) namew = labw;   /* one label column for the whole menu: the descriptions keep their width */
-            sbuf txt; sb_init(&txt); sb_puts(&txt, idx == current ? "* " : "  ");
-            sbuf nm; sb_init(&nm); cells_cut(&nm, items[idx], namew);
-            sb_puts(&txt, nm.data ? nm.data : "");
-            for (int c = vis_width(nm.data ? nm.data : ""); c < namew; c++) sb_putc(&txt, ' ');
-            sb_putc(&txt, ' ');
-            if (descs && descs[idx]) sb_puts(&txt, descs[idx]);
-            sbuf row; sb_init(&row); cells_cut(&row, txt.data ? txt.data : "", room);
-            sb_printf(&o, "%s%s %s" C_RESET "\n", is_sel ? C_ORANGE "❯" : " ", is_sel ? C_BOLD : "", row.data ? row.data : ""); lines++;
-            sb_free(&row); sb_free(&nm); sb_free(&txt);
+            /* the label column, then the description: each item's lines are rows of their own, the marker on the first */
+            sbuf lab[MENU_LINES_MAX], des[MENU_LINES_MAX];
+            int nr = menu_item_rows(items[idx], descs ? descs[idx] : NULL, namew, dw, lab, des, MENU_LINES_MAX);
+            for (int r = 0; r < nr && r < MENU_LINES_MAX && rows < max_show; r++) {
+                sbuf txt; sb_init(&txt);
+                sb_puts(&txt, r == 0 && idx == current ? "* " : "  ");
+                sb_puts(&txt, lab[r].data ? lab[r].data : ""); sb_putc(&txt, ' '); sb_puts(&txt, des[r].data ? des[r].data : "");
+                sbuf row; sb_init(&row); cells_cut(&row, txt.data ? txt.data : "", room);
+                sb_printf(&o, "%s%s %s" C_RESET "\n", is_sel && r == 0 ? C_ORANGE "❯" : " ", is_sel ? C_BOLD : "", row.data ? row.data : "");
+                sb_free(&row); sb_free(&txt);
+                rows++; lines++;
+            }
+            for (int r = 0; r < nr && r < MENU_LINES_MAX; r++) { sb_free(&lab[r]); sb_free(&des[r]); }
             shown++;
         }
-        if (nvis == 0) { sb_puts(&o, C_DIM "  (no matches)" C_RESET "\n"); lines++; shown++; }
+        if (nvis == 0) { sb_puts(&o, C_DIM "  (no matches)" C_RESET "\n"); lines++; rows++; shown++; }
         if (modal) {   /* the same rows whatever the filter leaves; then the count (blank when all are shown); then the hint */
-            for (; shown < max_show; shown++) sb_puts(&o, "\n");
-            if (nvis > max_show) sb_printf(&o, C_DIM "  … %d of %d shown" C_RESET "\n", max_show, nvis); else sb_puts(&o, "\n");
+            for (; rows < max_show; rows++) sb_puts(&o, "\n");
+            if (shown < nvis) sb_printf(&o, C_DIM "  … %d of %d shown" C_RESET "\n", shown, nvis); else sb_puts(&o, "\n");
             sbuf h; sb_init(&h); cells_cut(&h, HINT, mw);
             sb_printf(&o, C_DIM "%s" C_RESET "\n", h.data ? h.data : ""); sb_free(&h);
             box_pad(&o, bodyw);
             modal_paint(o.data, first); first = false;
         } else {
-            if (nvis > max_show) { sb_printf(&o, C_DIM "  … %d of %d shown" C_RESET "\n", max_show < nvis ? max_show : nvis, nvis); lines++; }
+            if (shown < nvis) { sb_printf(&o, C_DIM "  … %d of %d shown" C_RESET "\n", shown, nvis); lines++; }
             drawn = lines;
             chrome_append(&o); fwrite(o.data, 1, o.len, stdout); fflush(stdout);
         }
+        page = shown > 0 ? shown : 1;
         sb_free(&o);
 
         int k = read_key();
@@ -3954,8 +4024,8 @@ static int select_impl(const char *title, const char **items, const char **descs
         if (k == '\r') { result = sel; break; }
         if (k == K_UP || k == 16) { if (selpos > 0) sel = vis[selpos - 1]; continue; }
         if (k == K_DOWN || k == 14) { if (selpos + 1 < nvis) sel = vis[selpos + 1]; continue; }
-        if (k == K_PGUP) { selpos -= max_show; if (selpos < 0) selpos = 0; if (nvis) sel = vis[selpos]; continue; }
-        if (k == K_PGDN) { selpos += max_show; if (selpos >= nvis) selpos = nvis - 1; if (nvis) sel = vis[selpos]; continue; }
+        if (k == K_PGUP) { selpos -= page; if (selpos < 0) selpos = 0; if (nvis) sel = vis[selpos]; continue; }
+        if (k == K_PGDN) { selpos += page; if (selpos >= nvis) selpos = nvis - 1; if (nvis) sel = vis[selpos]; continue; }
         if (k == K_HOME) { if (nvis) sel = vis[0]; continue; }
         if (k == K_END) { if (nvis) sel = vis[nvis - 1]; continue; }
         if (k == 127 || k == 8) { if (flen) filter[--flen] = 0; continue; }
@@ -3968,6 +4038,6 @@ static int select_impl(const char *title, const char **items, const char **descs
     term_status_refresh();
     fflush(stdout);
     sb_pause(false);
-    free(vis);
+    free(vis); free(ih);
     return result;
 }

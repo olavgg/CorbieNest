@@ -1648,16 +1648,40 @@ int nc_select(const char *title, const char **items, const char **descs, int n, 
             if (strstr(a, b)) vis[nvis++] = i;
         }
         if (sel >= nvis) sel = nvis > 0 ? nvis - 1 : 0;
+        /* a row's text is the label, then the description, wrapped to the width the box can have (the box is the screen
+         * less 4 and its text the box less 6): a long description takes rows of its own. The rows are as many as the
+         * menu has above the field, and the items shown are those around the selected one that fit. */
+        int tw = g_cols - 10; if (tw < 20) tw = 20;
+        int namew = tw / 2 < 44 ? tw / 2 : 44;
+        int dw = tw - namew - 1;
+        int ih[256];
+        for (int v = 0; v < nvis; v++) ih[v] = menu_item_rows(items[vis[v]], descs ? descs[vis[v]] : NULL, namew, dw, NULL, NULL, 0);
+        int budget = g_field_top - 4;   /* the box is the rows, the title, the hint and its two borders */
+        if (budget > MENU_ROWS_MAX - 2) budget = MENU_ROWS_MAX - 2;
+        if (budget < 3) budget = 3;
+        int lo = sel, hi = sel, used = nvis ? ih[sel] : 0;
+        for (bool grew = nvis > 0; grew; ) {
+            grew = false;
+            if (lo > 0 && used + ih[lo - 1] <= budget) { lo--; used += ih[lo]; grew = true; }
+            if (hi + 1 < nvis && used + ih[hi + 1] <= budget) { hi++; used += ih[hi]; grew = true; }
+        }
         char head[256];
         snprintf(head, sizeof head, "%s%s%s", title ? title : "", flen ? "  · filter: " : "", filter);
         menu_open(head, "↑/↓ move · Enter choose · type to filter · Esc cancel");
-        int first = sel - 8 > 0 ? sel - 8 : 0;
-        for (int v = first; v < nvis && v < first + 12; v++) {
-            char line[384];
+        for (int v = lo; v <= hi && nvis; v++) {
             int i = vis[v];
-            if (descs && descs[i] && *descs[i]) snprintf(line, sizeof line, "%s  \x1b[2m%s\x1b[0m", items[i], descs[i]);
-            else snprintf(line, sizeof line, "%s", items[i]);
-            menu_add(line, C_TEXT, v == sel);
+            sbuf lab[MENU_LINES_MAX], des[MENU_LINES_MAX];
+            int nr = menu_item_rows(items[i], descs ? descs[i] : NULL, namew, dw, lab, des, MENU_LINES_MAX);
+            for (int r = 0; r < nr && r < MENU_LINES_MAX; r++) {
+                char line[512];
+                if (descs && descs[i] && *descs[i] && des[r].len) snprintf(line, sizeof line, "%s \x1b[2m%s\x1b[0m", lab[r].data, des[r].data);
+                else {   /* no description on this row: the label without its padding */
+                    size_t ll = lab[r].len; while (ll && lab[r].data[ll - 1] == ' ') ll--;
+                    snprintf(line, sizeof line, "%.*s", (int)ll, lab[r].data);
+                }
+                menu_add(line, C_TEXT, v == sel && r == 0);
+                sb_free(&lab[r]); sb_free(&des[r]);
+            }
         }
         if (nvis == 0) menu_add("no match", C_MUTED, false);
         nc_render();

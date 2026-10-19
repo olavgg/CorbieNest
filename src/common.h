@@ -484,6 +484,8 @@ int         term_fold_toggle(int line);   /* the fold whose head is scrollback l
 void        term_line_break(void);        /* start a fresh line if output is mid-line (the model may be mid-sentence) */
 void        term_editor_prefill(const char *text);   /* text appears in the editor at the next prompt (e.g. after /rewind) */
 char       *term_keys_to_text(const unsigned char *keys, size_t n, size_t *caret);   /* raw keystrokes typed while busy -> trimmed text (malloc'd); *caret (may be NULL): the caret's byte offset in it */
+#define MENU_LINES_MAX 64   /* the rows one menu item may wrap to (menu_item_rows) */
+int         menu_item_rows(const char *label, const char *desc, int namew, int dw, sbuf *lab, sbuf *des, int cap);   /* an item's label and description wrapped into rows (term.c) */
 /* Simple prompt for a single line. malloc'd or NULL */
 char *term_ask_line(const char *prompt);
 /* Interactive yes / always (session) / [always (project)] / no question rendered as a
