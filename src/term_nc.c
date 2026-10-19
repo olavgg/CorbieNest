@@ -431,20 +431,27 @@ static void pane_scroll(int rows) { g_top += rows; if (g_top < 0) g_top = 0; g_s
  * model and the screen, nothing is sent. A click while a menu is open, or on rows that are not the
  * ones last painted (the lines moved since), does nothing. */
 /* the text from a to b, inclusive, read from the scrollback (not the screen): a line-to-line selection is
- * the lines between, with their newlines; a character index is a byte of the line's text */
+ * the lines between, with their newlines. A point's index is a cell of the line as the pane parses it (draw_pane
+ * writes it into g_pane_cells), so the line is parsed the same way here: the escapes (SGR, theme roles) are not
+ * text and are not copied, and a wide character's second cell (no glyph) adds nothing. */
 static char *sel_text(sel_pt a, sel_pt b) {
     if (a.line > b.line || (a.line == b.line && a.idx > b.idx)) { sel_pt t = a; a = b; b = t; }
     sbuf out; sb_init(&out);
     if (a.line < 0) return sb_detach(&out);   /* no anchor: nothing was under the press */
     for (int i = a.line; i <= b.line && i < term_sb_nlines(); i++) {
         if (term_sb_hidden(i)) continue;
-        const char *ln = term_sb_line(i);
-        int len = (int)strlen(ln);
+        const char *s = term_sb_line(i);
+        size_t len = strlen(s);
+        int n = nc_cells(s, len, NULL, 0x7fffffff, NULL);
+        nc_cell *c = xmalloc(sizeof *c * (size_t)(n ? n : 1));
+        nc_style st = { NC_DEFAULT, NC_DEFAULT, 0 };
+        n = nc_cells(s, len, c, n, &st);
         int from = i == a.line ? a.idx : 0;
-        int to = i == b.line ? b.idx + 1 : len;
+        int to = i == b.line ? b.idx + 1 : n;
         if (from < 0) from = 0;
-        if (to > len) to = len;
-        if (to > from) sb_append(&out, ln + from, (size_t)(to - from));
+        if (to > n) to = n;
+        for (int j = from; j < to; j++) sb_puts(&out, c[j].egc);
+        free(c);
         if (i != b.line) sb_putc(&out, '\n');
     }
     return sb_detach(&out);

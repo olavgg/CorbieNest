@@ -2216,6 +2216,9 @@ static void test_nc_pure(void) {
     CHECK(nc_line_rows(cells, n, 4) == 2 && nc_line_rows(cells, n, 6) == 1 && nc_line_rows(cells, 0, 4) == 1);
     n = nc_cells("abc\xe4\xb8\x80", strlen("abc\xe4\xb8\x80"), cells, 64, NULL);
     CHECK(nc_line_rows(cells, n, 4) == 2);                                        /* abc then the wide one on row 2 */
+    /* a copied line is its visible cells: the theme roles and SGR codes are not text (a copy once took them) */
+    n = nc_cells("\x1b[1002m\x1b[1001mhi\x1b[0m", strlen("\x1b[1002m\x1b[1001mhi\x1b[0m"), cells, 64, NULL);
+    CHECK(n == 2 && strcmp(cells[0].egc, "h") == 0 && strcmp(cells[1].egc, "i") == 0);
 }
 
 static void test_wrap(void) {
