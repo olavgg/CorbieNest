@@ -1251,14 +1251,23 @@ s.send("newer prompt\r"); check(s.expect("Echo: newer prompt"), "reply")
 s.send("half typed"); s.expect("half typed")
 s.send(wheel(True)); check(s.expect("scrollback · rows"), f"the wheel over the conversation scrolls it back: {s.text()[-200:]!r}")
 first = viewrange()
-check("❯ half typed" in since() and "❯ newer prompt" not in since(), f"it does not walk the prompt history: the field keeps what was typed: {since()[-300:]!r}")
+# the field is its own row (│ ❯ …): a scrolled conversation shows "› newer prompt" as a transcript line, which is not the field
+# the viewer redraws the field in a repaint region: read what was written since the wheel, not only what is fresh
+s.expect("(never)", 0.4)
+# the field is the last boxed ❯ row written: a viewer redraw may split it, so the text of the field is what is typed last
+raw_since = clean(s.out[s.mark:].decode("utf-8", "replace"))
+field = [f.lstrip("❯ ").strip() for f in re.findall(r"❯ ([^│\n]*?)\s*│", raw_since)]   # the field row: "❯ " then the text, then the border (the glyph may be drawn twice)
+check(field and field[-1] == "half typed", f"it does not walk the prompt history: the field keeps what was typed: {field[-3:]!r}")
 s.send(wheel(True)); s.expect("scrollback"); second = viewrange()
 check(first and second and second[0] == first[0] - 3, f"a notch is three rows: {first} -> {second}")
+s.send("\x1b"); s.expect("(no such text)", 0.8)   # Esc goes back to the live screen: the field wheel is judged there, not in the viewer
 check(quiet(s, wheel(True, row=38)), "over the input field the wheel does nothing")
 check(quiet(s, wheel(False, row=40)), "nor over the status bar")
 check(quiet(s, "\x1b[<0;10;5M\x1b[<0;10;5m"), "a click does nothing: it is not typed, and it does not close the viewer")
 s.send(wheel(False, n=3)); check(not scrolled(s), "scrolling down to the last row leaves the viewer")
-check("❯ half typed" in since() and "Echo: newer prompt" in since(), f"with the tail of the transcript drawn again and the field as it was: {since()[-300:]!r}")
+s.expect("(never)", 0.4)
+raw_since = clean(s.out.decode("utf-8", "replace"))[-6000:]   # the redraw after the scroll-down, which the viewer writes in pieces
+check([f.lstrip("❯ ").strip() for f in re.findall(r"❯ ([^│\n]*?)\s*│", raw_since)][-1:] == ["half typed"] and "Echo: newer prompt" in raw_since, f"with the tail of the transcript drawn again and the field as it was: {raw_since[-300:]!r}")
 check(quiet(s, wheel(False)), "at the prompt there is nothing below to scroll to")
 s.send("\x15"); s.send("\x1b[A"); check(s.expect("❯ newer prompt"), "arrow up is the prompt history, as before")
 s.send("\x1b[A"); check(s.expect("❯ older prompt"), "and again")
@@ -2395,7 +2404,7 @@ cfg = open(os.path.join(CFG, "corbienest", "config")).read()
 check("keep_alive=30m" in cfg, "keep_alive saved to config")
 check("model=fake-coder:latest" in cfg, "model saved to config")
 # /mode manual ran in the second session (ENV2), so its file is CFG2's
-check("mode=manual" in open(CFG2_FILE).read(), "mode saved to config")
+check(os.path.exists(CFG2_FILE) and "mode=manual" in open(CFG2_FILE).read(), f"mode saved to config: {open(CFG2_FILE).read()[:200] if os.path.exists(CFG2_FILE) else 'no config file in CFG2'!r}")
 check("max_iters=100" in cfg, "max_iters saved to config")
 s = Session([])   # no -m: should use saved model
 # the banner box carries the model; it is painted in a repaint region, which expect() skips, so read the whole output
