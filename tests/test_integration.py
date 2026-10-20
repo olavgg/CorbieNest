@@ -1153,6 +1153,30 @@ sp.send("\r"); sp.expect("(no such text)", 1.5)
 last_user = [m for m in [r for r in requests() if not str(r["messages"][-1].get("content", "")).startswith("Predict the next message")][-1]["messages"] if m["role"] == "user"][-1]["content"]   # not the suggestion that follows the reply
 check(all(f"line{i}" in last_user for i in range(10)) and "[Pasted text" not in last_user, f"the model got the whole paste: {last_user[:80]!r}")
 sp.close()
+print("test interactive: a large paste is one message with every line of it, sent before any compaction")
+sp = Session(["-m", "fake-coder:latest"]); sp.expect("Ctrl-D to quit")
+body = "\n".join(f"paste line {i} with some words to make it longer" for i in range(3000))
+data = ("\x1b[200~" + body + "\x1b[201~").encode()
+n0 = len(requests())
+# written in chunks, as a terminal sends a paste: one os.write may take part of it, and the child must be read meanwhile
+off, end = 0, time.time() + 60
+while off < len(data) and time.time() < end:
+    try: off += os.write(sp.fd, data[off:off + 4096])
+    except BlockingIOError: pass
+    r, _, _ = select.select([sp.fd], [], [], 0.01)
+    if r:
+        try: sp.out += os.read(sp.fd, READ_MAX)
+        except OSError: break
+check(off == len(data), f"the whole paste was written ({off} of {len(data)} bytes)")
+check(seen(sp, "[Pasted text #1 +3000 lines]", 20), "a paste of 3000 lines shows as one token")
+sp.send("\r", 0.1)   # keep draining while waiting: the app's repaints fill the pty, and a full pty stops the app from reading the Enter
+end = time.time() + 30
+while time.time() < end and not any(m["role"] == "user" and m["content"].startswith("paste line 0 ") for r in requests()[n0:] for m in r["messages"]):
+    sp.expect("(no such text)", 0.5)
+new = requests()[n0:]
+users = [m["content"] for m in new[0]["messages"] if m["role"] == "user"] if new else []
+check(bool(users) and users[-1] == body, f"the model's first request carries the whole paste, all 3000 lines: {len(users[-1]) if users else 0} of {len(body)} characters")
+sp.close()
 print("test interactive: /subagent sets the model and the effort sub-agents run on")
 open(os.path.join(WORK, "hay.txt"), "w").write("needle\n")
 s.send("/subagent fake-levels:latest\r"); check(s.expect("sub-agents run on fake-levels:latest"), "/subagent MODEL is checked and set")

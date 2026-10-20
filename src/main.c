@@ -3456,13 +3456,18 @@ static const char *pending_request(void) {
  * than the round the model is about to reason about (free), and compact only if that was not
  * enough. `keep_from` is the first message of that round. Returns true when it compacted —
  * the conversation was replaced, so every index into it is stale. */
-static bool shrink_context(int keep_from) {
+static bool shrink_context(int keep_from, bool first_call) {
     /* Eliding rewrites tool results the later thinking blocks were signed over. Drop those blocks
      * before the next call; keeping them is what makes a long tool run die with an invalid signature. */
     int first = -1;
     elide_old_tool_results(keep_from, &first);
     drop_edited_thinking(g_messages, first);
-    return maybe_auto_compact(true, pending_request());
+    /* A request this big (a pasted block, expanded) is sent as it is, before the first call of its turn: a summary
+     * would be made from the paste first and lose what the request asks. The reply comes, then the compaction
+     * at the end of the turn (run_turn_body) takes over. */
+    const char *req = pending_request();
+    if (first_call && req && strlen(req) > COMPACT_REQUEST_MAX) return false;
+    return maybe_auto_compact(true, req);
 }
 
 /* An assistant turn with neither text nor a tool call: the model generated tokens the server
@@ -3528,7 +3533,7 @@ static bool run_turn_body(void) {
     int round_first = -1;   /* where this round's tool results start (-1 before the first round) */
     g_session.turns++;
     for (;;) {
-        if (shrink_context(round_first >= 0 ? round_first : cJSON_GetArraySize(g_messages))) round_first = -1;
+        if (shrink_context(round_first >= 0 ? round_first : cJSON_GetArraySize(g_messages), iters == 0 && round_first < 0)) round_first = -1;
         cJSON *msgs = messages_with_system();   /* guards the thinking blocks: a change mid-run (mode, memory, the date) invalidates them */
         cJSON *tools = tools_for_mode();
         size_t sent = prompt_bytes();

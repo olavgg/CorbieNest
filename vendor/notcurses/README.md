@@ -39,6 +39,12 @@ and FFI bindings, the demos, tests and tools, and the man pages.
   point of its value (upstream gives U+00FF for a lone 0xFF and drops a truncated sequence). The ANSI reader
   makes the same U+FFFD (`utf8_fix`), so a pasted bad byte shows the same on both screens. Three marked changes
   (`corbienest:`): the ASCII branch, the `mbrtowc` failure, and the log line. Reapply it with the Enter change.
+- `src/lib/in.c`, `load_ncinput()`: a full input queue (`isize`, BUFSIZ events) makes the input thread wait for the
+  reader instead of dropping the key. Upstream drops it with a warning, and a paste is ~150k keys: the reader is
+  busy between drains, so a 3000-line paste lost four in five of its bytes (and with them the paste's end marker).
+  The wait is a `pthread_cond_wait` on `icond` in a cleanup-pushed loop (so a cancel still works); a drain or EOF
+  is not waited for, and the reader broadcasts `icond` when it frees a slot in `internal_get()` (marked
+  `corbienest:` in that file). Reapply it with the others.
 
 Nothing else is changed. `make` compiles these files with the flags in the top-level Makefile
 (`NC_VFLAGS`): they are not held to our `-Werror`, and the two warnings upstream's own code has

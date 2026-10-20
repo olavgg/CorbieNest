@@ -476,6 +476,8 @@ mark_pipe_ready(ipipe pipes[static 2]){
   }
 }
 
+static void cleanup_mutex(void* v);   // corbienest: load_ncinput() waits on the queue, see below
+
 // shove the assembled input |tni| into the input queue (if there's room, and
 // we're not draining, and we haven't hit EOF). send any synthesized signal as
 // the last thing we do. if Ctrl or Shift are among the modifiers, we replace
@@ -520,6 +522,15 @@ load_ncinput(inputctx* ictx, ncinput *tni){
     return;
   }
   pthread_mutex_lock(&ictx->ilock);
+  // corbienest: a full queue makes this thread wait for the reader; it does not drop the key. A paste is thousands
+  // of keys, and a dropped one loses text or the paste's end marker. A drain or EOF is not waited for.
+  if(ictx->ivalid == ictx->isize && !ictx->drain && !ictx->stdineof){
+    pthread_cleanup_push(cleanup_mutex, &ictx->ilock);
+    while(ictx->ivalid == ictx->isize && !ictx->drain && !ictx->stdineof){
+      pthread_cond_wait(&ictx->icond, &ictx->ilock);
+    }
+    pthread_cleanup_pop(0);
+  }
   if(ictx->ivalid == ictx->isize){
     pthread_mutex_unlock(&ictx->ilock);
     logwarn("dropping input 0x%08x", tni->id);
@@ -2754,6 +2765,9 @@ internal_get(inputctx* ictx, const struct timespec* ts, ncinput* ni){
     ictx->iread = 0;
   }
   bool sendsignal = false;
+  if(ictx->ivalid == ictx->isize){   // corbienest: a full queue has room now; wake the input thread that waits for it (load_ncinput)
+    pthread_cond_broadcast(&ictx->icond);
+  }
   if(ictx->ivalid-- == ictx->isize){
     sendsignal = true;
   }else{
