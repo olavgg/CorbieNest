@@ -451,6 +451,7 @@ bool term_typed_ahead(void);   /* text typed while the model worked is waiting (
 bool  term_paste_token(const char *t, size_t n, char *tok, size_t cap);
 char *term_paste_expand(const char *s, size_t n);
 void  term_paste_reset(void);
+const char *term_paste_text(int k, int *lines);   /* the text of paste K (NULL: none); its line count in *lines */
 /* ← on an empty prompt line calls term_agents_menu() with the terminal as the idle hook gets it
  * (main.c: the sub-agents of this session). term_show_block() shows a text as an open fold and
  * moves the view to its head, for the hook to show what it chose: the rest of the block is plain. */

@@ -3217,6 +3217,12 @@ char *term_paste_expand(const char *s, size_t n) {
     return r;
 }
 void term_paste_reset(void) { paste_reset(); }
+/* the text of paste K of this prompt (NULL when there is none), and its line count */
+const char *term_paste_text(int k, int *lines) {
+    if (k < 1 || k > g_paste_n || !g_paste[k - 1].text) return NULL;
+    if (lines) *lines = g_paste[k - 1].lines;
+    return g_paste[k - 1].text;
+}
 
 /* The modal for one paste: its lines, wrapped to the width, with a title row and a footer row
  * and the rest scrolled with the keys the viewer uses. Esc (or anything else) closes it; the

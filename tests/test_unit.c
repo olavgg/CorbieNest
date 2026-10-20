@@ -1621,6 +1621,9 @@ static void test_paste_more(void) {
     sent = term_paste_expand("[Pasted text #1 +5 lines]", strlen("[Pasted text #1 +5 lines]"));   /* forgotten: literal now */
     CHECK(sent && !strcmp(sent, "[Pasted text #1 +5 lines]")); free(sent);
     CHECK(term_paste_token("t\tu\n1\n2\n3", strlen("t\tu\n1\n2\n3"), tok, sizeof tok) && !strcmp(tok, "[Pasted text #1 +4 lines]"));
+    { int tl = -1; const char *pt = term_paste_text(1, &tl);   /* the paste's text and line count, for Ctrl-O and the view */
+      CHECK(pt && !strcmp(pt, "t\tu\n1\n2\n3") && tl == 4);
+      CHECK(term_paste_text(2, NULL) == NULL && term_paste_text(0, NULL) == NULL); }
     term_paste_reset();
     sent = term_paste_expand("[Pasted text #1 +4 lines]", 25); CHECK(sent && !strcmp(sent, "[Pasted text #1 +4 lines]")); free(sent);
     /* the rows the paste viewer shows (both screens): cut at the width, one column per code point, empty lines kept */

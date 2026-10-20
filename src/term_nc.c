@@ -273,6 +273,17 @@ static int g_pane_cells_n = 0;
  * on the release: a press that moved is a selection and is copied; one that did not is a click (a fold's head
  * toggles). */
 typedef struct { int line, idx; } sel_pt;
+/* the paste tokens of the field: the cells each one covers (K, 0 for none), by screen row and column; and the
+ * paste view a click on a token opens (a modal over the screen, as the ANSI viewer is) */
+static bool g_main_field = true;      /* the main prompt's field (not a question's): a block paste is a token there */
+static unsigned char *g_tokmap = NULL; static size_t g_tokmap_n = 0;
+static bool g_pv_on = false;          /* the paste view is up */
+static int g_pv_req = 0;              /* a click on token K asked for its view: readline_loop opens it */
+static int g_pv_k = 0, g_pv_lines = 0;
+static char *g_pv_text = NULL;        /* the paste as shown (tabs as spaces) */
+static size_t (*g_pv_rw)[2] = NULL; static size_t g_pv_n = 0, g_pv_top = 0;   /* its rows, the number of rows, the first shown */
+static void pv_scroll(long by);
+static int tok_at(int y, int x);
 static bool g_sel_on = false;         /* a selection exists (drawn in reverse video) */
 static bool g_sel_down = false;       /* a button is held: the gesture is in progress */
 static bool g_sel_moved = false;      /* the gesture has moved since the press */
@@ -501,6 +512,11 @@ static bool pane_point(int y, int x, sel_pt *out) {
  * click (a fold's head toggles, as it always did); a press that moved and was released is a selection, copied
  * and kept on the screen until the next key. Scrolling and the banner's close are as before. */
 static void nc_mouse(const ncinput *ni) {
+    if (g_pv_on) {   /* the paste view: the wheel scrolls it, the rest is not for it */
+        if (ni->evtype == NCTYPE_PRESS && ni->id == NCKEY_SCROLL_UP) pv_scroll(-3);
+        else if (ni->evtype == NCTYPE_PRESS && ni->id == NCKEY_SCROLL_DOWN) pv_scroll(3);
+        return;
+    }
     if (ni->evtype == NCTYPE_RELEASE && ni->id == NCKEY_BUTTON1 && g_sel_down) {
         g_sel_down = false;
         if (!g_sel_moved) {
@@ -540,6 +556,10 @@ static void nc_mouse(const ncinput *ni) {
     if (ni->id == NCKEY_SCROLL_UP) { pane_scroll(3); return; }
     if (ni->id == NCKEY_SCROLL_DOWN) { pane_scroll(-3); return; }
     if (ni->id != NCKEY_BUTTON1) return;
+    if (g_main_field && ni->y >= g_field_top) {   /* a click on a paste token in the field opens its view (as on the ANSI screen) */
+        int K = tok_at(ni->y, ni->x);
+        if (K) { g_pv_req = K; return; }
+    }
     sel_clear();
     sel_pt p;
     if (!pane_point(ni->y, ni->x, &p)) {   /* a press outside the text: nothing to select, but a click on a fold head still needs the row */
@@ -559,7 +579,6 @@ static const int PM_START[6] = { 27, '[', '2', '0', '0', '~' };
 static const int PM_END[6]   = { 27, '[', '2', '0', '1', '~' };
 #define PM_MAX 16
 static bool g_pm_in;                   /* inside the pasted text */
-static bool g_main_field = true;       /* the main prompt's field (not a question's): a block paste is a token there */
 static int g_pm_held[6], g_pm_nheld;   /* keys that may be a marker, not yet told apart */
 static sbuf g_pm_text;                 /* the text of the paste being read */
 static char *g_pq[PM_MAX];             /* the pastes, in the order their NK_PASTE keys were queued */
@@ -583,7 +602,24 @@ static void key_out(int k) {
 /* a key of the pasted text, as the bytes it would be in the terminal's stream; paste_clean makes the text of them
  * when the paste ends (CR and CRLF are line breaks, tab stays, other controls and DEL go, as on the ANSI screen) */
 static void pm_text(int k) {
-    if (k < 0 || k >= 0x110000) return;
+    if (k < 0) {   /* a cursor or editing key: notcurses has parsed its ESC [ sequence, so the text is what the ANSI reader keeps (ESC goes, the rest stays) */
+        const char *t = NULL;
+        switch (k) {
+            case NK_UP:   t = "[A"; break;
+            case NK_DOWN: t = "[B"; break;
+            case NK_RIGHT: t = "[C"; break;
+            case NK_LEFT: t = "[D"; break;
+            case NK_HOME: t = "[H"; break;
+            case NK_END:  t = "[F"; break;
+            case NK_DEL:  t = "[3~"; break;
+            case NK_PGUP: t = "[5~"; break;
+            case NK_PGDN: t = "[6~"; break;
+            default: break;
+        }
+        if (t) sb_puts(&g_pm_text, t);
+        return;
+    }
+    if (k >= 0x110000) return;
     char b[4]; int n = utf8_put((unsigned)k, b);
     sb_append(&g_pm_text, b, (size_t)n);
 }
@@ -639,7 +675,7 @@ static int nc_getkey(int ms) {
         ncinput ni; memset(&ni, 0, sizeof ni);
         uint32_t id = notcurses_get_nblock(g_nc, &ni);
         if (id == 0 || id == (uint32_t)-1) break;
-        if (nckey_mouse_p(ni.id)) { nc_mouse(&ni); continue; }   /* a report, not a key */
+        if (nckey_mouse_p(ni.id)) { nc_mouse(&ni); if (g_pv_req) return NK_NONE; continue; }   /* a report, not a key (a click for a view ends the read) */
         if (ni.id == NCKEY_TAB && (ni.modifiers & NCKEY_MOD_SHIFT) && ni.evtype != NCTYPE_RELEASE) {   /* Shift+Tab cycles the mode at once, as on the ANSI screen (a key, so it is not queued); a release is not a second press */
             g_cfg.mode = (g_cfg.mode + 1) % MODE_COUNT;
             nc_render_soon();
@@ -826,6 +862,8 @@ static void draw_field(int top) {
     /* the @files in the text that are there: the same spans the ANSI field colours (a / or ! line has none) */
     size_t ms[16][2];
     int nm = g_len && g_ed[0] != '/' && g_ed[0] != '!' ? mention_spans(g_ed, g_len, ms, 16) : 0;
+    size_t ps[PASTE_MAX][2]; int pk[PASTE_MAX];   /* the paste tokens, as the ANSI field has them (reverse video there) */
+    size_t np = g_len ? paste_tokens(g_ed, g_len, ps, pk, NULL, PASTE_MAX) : 0;
     int shown = rows > FIELD_MAX ? FIELD_MAX : rows;
     int first = cr - shown + 1 > 0 ? cr - shown + 1 : 0;      /* keep the cursor's row in view */
     if (first > rows - shown) first = rows - shown > 0 ? rows - shown : 0;
@@ -876,15 +914,92 @@ static void draw_field(int top) {
         nc_cell cell; int w = nc_cells(g_ed + at, len, &cell, 1, NULL) ? cell.w : 1;
         bool inmention = false;
         for (int q = 0; q < nm; q++) if (at >= ms[q][0] && at < ms[q][1]) { inmention = true; break; }
+        int tk = 0;
+        for (size_t q = 0; q < np; q++) if (at >= ps[q][0] && at < ps[q][1]) { tk = pk[q]; break; }
         if (shows) {
-            /* the caret is a light cell with a dark letter (reverse video does not show here, and the hardware cursor is not moved: see nc_render) */
-            nc_style st = here ? (nc_style){ C_BAR_A, C_TEXT, 0 } : (nc_style){ inmention ? C_MENTION : C_FIELD_TEXT, NC_DEFAULT, 0 };
+            /* the caret is a light cell with a dark letter (reverse video does not show here, and the hardware cursor is not moved: see nc_render); a paste token is the same look */
+            nc_style st = here ? (nc_style){ C_BAR_A, C_TEXT, 0 } : tk ? (nc_style){ C_BAR_A, C_TEXT, 0 } : (nc_style){ inmention ? C_MENTION : C_FIELD_TEXT, NC_DEFAULT, 0 };
             paint(g_std, &st, C_FIELD_TEXT, C_FIELD_BG);
             ncplane_putstr_yx(g_std, y, x, cell.egc);
+            if (tk) for (int j = 0; j < w; j++) if (y >= 0 && y < g_rows && x + j >= 0 && x + j < g_cols) g_tokmap[(size_t)y * (size_t)g_cols + (size_t)(x + j)] = (unsigned char)tk;
         }
         col += w; at += len;
     }
     free(starts);
+}
+
+/* the paste token map: cleared each frame, the field fills it (draw_field) */
+static void tok_clear(void) {
+    size_t n = (size_t)(g_rows > 0 ? g_rows : 0) * (size_t)(g_cols > 0 ? g_cols : 0);
+    if (n > g_tokmap_n) { g_tokmap = xrealloc(g_tokmap, n); g_tokmap_n = n; }
+    if (n) memset(g_tokmap, 0, n);
+}
+static int tok_at(int y, int x) {
+    if (!g_tokmap || y < 0 || x < 0 || y >= g_rows || x >= g_cols) return 0;
+    size_t i = (size_t)y * (size_t)g_cols + (size_t)x;
+    return i < g_tokmap_n ? g_tokmap[i] : 0;
+}
+
+/* The paste view (a click on a token): the whole screen, the paste's rows under a title and above a footer, as
+ * the ANSI viewer draws it. The keys scroll it; any other key (or a resize) closes it. */
+static size_t pv_body(void) { return g_rows > 2 ? (size_t)(g_rows - 2) : 1; }
+static size_t pv_maxtop(void) { size_t b = pv_body(); return g_pv_n > b ? g_pv_n - b : 0; }
+static void pv_scroll(long by) {
+    long t = (long)g_pv_top + by;
+    if (t < 0) t = 0;
+    if ((size_t)t > pv_maxtop()) t = (long)pv_maxtop();
+    g_pv_top = (size_t)t;
+}
+static void pv_open(int k) {
+    int lines = 0;
+    const char *t = term_paste_text(k, &lines);
+    if (!t) return;
+    free(g_pv_text); g_pv_text = xstrdup(t);
+    for (char *p = g_pv_text; *p; p++) if (*p == '\t') *p = ' ';   /* a tab shows as a space, as on the ANSI screen */
+    free(g_pv_rw); g_pv_rw = paste_rows(g_pv_text, g_cols > 1 ? g_cols : 1, &g_pv_n);
+    g_pv_k = k; g_pv_lines = lines; g_pv_top = 0; g_pv_on = true;
+}
+static void draw_pasteview(void) {
+    if (g_rows < 3) return;
+    size_t body = pv_body();
+    for (int y = 0; y < g_rows; y++) fill_row(y, 0, g_cols, NC_DEFAULT, false);
+    nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 };
+    char title[128];
+    snprintf(title, sizeof title, " pasted text #%d · %d lines   ", g_pv_k, g_pv_lines);
+    int used = put_text(0, 0, title, g_cols, C_TEXT, NC_DEFAULT, false, &carry);
+    put_text(0, used, "↑/↓ PgUp/PgDn Home/End scroll · Esc closes", g_cols - used, C_MUTED, NC_DEFAULT, false, &carry);
+    for (size_t i = 0; i < body; i++) {
+        size_t idx = g_pv_top + i;
+        if (idx >= g_pv_n) break;
+        char *row = xstrndup(g_pv_text + g_pv_rw[idx][0], g_pv_rw[idx][1]);
+        nc_style c2 = { NC_DEFAULT, NC_DEFAULT, 0 };
+        put_text(1 + (int)i, 0, row, g_cols, C_TEXT, NC_DEFAULT, false, &c2);
+        free(row);
+    }
+    char foot[96];
+    size_t last = g_pv_top + body < g_pv_n ? g_pv_top + body : g_pv_n;
+    snprintf(foot, sizeof foot, " rows %zu-%zu of %zu", g_pv_n ? g_pv_top + 1 : 0, last, g_pv_n);
+    put_text(g_rows - 1, 0, foot, g_cols, C_MUTED, NC_DEFAULT, false, &carry);
+}
+static void pv_run(void) {
+    while (g_pv_on) {
+        nc_render();
+        int k = nc_getkey(33);
+        if (k == NK_NONE || k == NK_SKIP) continue;
+        if (k == NK_RESIZE) break;   /* as the ANSI viewer: a resize closes it */
+        long body = (long)pv_body();
+        if (k == NK_UP || k == 'k') pv_scroll(-1);
+        else if (k == NK_DOWN || k == 'j') pv_scroll(1);
+        else if (k == NK_PGUP) pv_scroll(-(body - 1));
+        else if (k == NK_PGDN || k == ' ') pv_scroll(body - 1);
+        else if (k == NK_HOME || k == 'g') g_pv_top = 0;
+        else if (k == NK_END || k == 'G') g_pv_top = pv_maxtop();
+        else break;
+    }
+    g_pv_on = false;
+    free(g_pv_text); g_pv_text = NULL;
+    free(g_pv_rw); g_pv_rw = NULL; g_pv_n = 0; g_pv_top = 0;
+    nc_render();
 }
 
 /* the status bar and the location line: the ANSI UI's own text, parsed into cells */
@@ -1119,6 +1234,7 @@ void nc_render(void) {
     ncplane_dim_yx(g_std, &r, &c);
     g_rows = (int)r; g_cols = (int)c;
     g_caret_y = -1;
+    tok_clear();
     ncplane_erase(g_std);
     if (g_rows >= 6 && g_cols >= 10) {
         int fh = field_height();
@@ -1142,10 +1258,11 @@ void nc_render(void) {
         if (g_ov_on) draw_overlay();
         if (g_bn_on) draw_banner();
         if (g_menu_on) draw_menu();
+        if (g_pv_on) draw_pasteview();
     }
     /* the hardware cursor sits on the caret, so it blinks where the input is — also while the model
      * works (the field keeps the text typed then). A menu has its own keys: no cursor there. */
-    if (g_caret_y >= 0 && !g_menu_on && g_caret_y < g_rows && g_caret_x < g_cols) {
+    if (g_caret_y >= 0 && !g_menu_on && !g_pv_on && g_caret_y < g_rows && g_caret_x < g_cols) {
         notcurses_cursor_enable(g_nc, g_caret_y, g_caret_x); g_hwcur = true;
     } else if (g_hwcur) { notcurses_cursor_disable(g_nc); g_hwcur = false; }
     notcurses_render(g_nc);
@@ -1341,6 +1458,21 @@ static bool tok_del(bool before) {
     return false;
 }
 
+/* Ctrl-O: the paste token the caret is on (or just after) is replaced by its text, which can then be read and
+ * edited; as on the ANSI screen, the paste is still sent as it stands if the token is not in the line any more */
+static void tok_unfold(void) {
+    size_t sp[PASTE_MAX][2]; int ks[PASTE_MAX];
+    size_t n = paste_tokens(g_ed ? g_ed : "", g_len, sp, ks, NULL, PASTE_MAX);
+    for (size_t i = 0; i < n; i++) {
+        if (g_cur < sp[i][0] || g_cur > sp[i][1]) continue;
+        const char *t = term_paste_text(ks[i], NULL);
+        if (!t) return;
+        ed_delete(sp[i][0], sp[i][1]);   /* the caret goes to where the token was */
+        ed_insert(t, strlen(t));
+        return;
+    }
+}
+
 /* the keys that edit the line; the scroll keys move the pane (the wheel's are PgUp/PgDn here) */
 static void edit_key(int k) {
     char b[4];
@@ -1467,6 +1599,7 @@ int nc_poll_interrupt(void) {
     fflush(stdout);   /* output a command printed here (stdout is fully buffered) reaches the pane now */
     for (;;) {
         int k = nc_getkey(0);
+        g_pv_req = 0;                                    /* a click while the model works opens nothing */
         if (k == NK_NONE) break;
         if (k == NK_SKIP) break;                         /* drained, nothing usable: never spin on the readiness fd */
         sug_sync();                                      /* the list is for the line as it is before this key */
@@ -1516,6 +1649,7 @@ static char *readline_loop(void) {
             if (left * 1000 < wait) wait = (int)(left * 1000) + 1;
         }
         int k = nc_getkey(wait);
+        if (g_pv_req) { int K = g_pv_req; g_pv_req = 0; pv_open(K); if (g_pv_on) pv_run(); continue; }
         term_tick_run();
         if (k == NK_NONE || k == NK_SKIP) continue;
         idle_at = -1;                                  /* typing cancels the idle work for this prompt */
@@ -1537,6 +1671,7 @@ static char *readline_loop(void) {
             continue;
         }
         ctrl_c = 0;
+        if (k == 15 && g_main_field) { tok_unfold(); continue; }   /* Ctrl-O: unfold the paste token at the caret */
         if (k == 27) { ed_set(""); nc_unbrowse(); if (g_main_field) term_paste_reset(); continue; }
         if (k == NK_UP || k == NK_DOWN) { nc_hist(k, false); continue; }
         edit_key(k);

@@ -51,10 +51,14 @@ consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), 
   line through `g_pane_line`, the row map `draw_pane()` makes, valid only while `term_sb_epoch()` is the one
   it was made at (lines dropped or cleared since: no click acts until the next paint). The suggestion list's
   rows are not in the map. Selecting text with the mouse needs Shift in most terminals, as in the ANSI UI.
-- Not in the notcurses UI yet (say so when touched): the viewer (PgUp scrolls the pane), the paste modal and its
-  click, Ctrl-O (unfold a paste token), a paste token drawn without the ANSI screen's reverse video, the `←`
-  agents menu, images. A bracketed paste's ESC[ sequence loses its `[`, since notcurses parses it first; a CRLF
-  paste gives two line breaks (notcurses sends Enter for CR and LF alike, with no byte to tell them apart).
+- Not in the notcurses UI yet (say so when touched): the viewer (PgUp scrolls the pane), the `←` agents menu,
+  images. Paste tokens: a click on one opens the paste view (`draw_pasteview()`, `pv_run()`, the same keys as the
+  ANSI viewer), Ctrl-O unfolds one (`tok_unfold()`), and a token is drawn as the caret is (`draw_field()`). The
+  notcurses input layer (vendor/notcurses) hides four things from the paste reader, so they differ from the ANSI
+  reader: a CRLF paste gives two line breaks (Enter for CR and LF alike, the byte is not kept); an arrow or
+  editing key inside a paste gives its CSI text (`[D` for Left: a SS3 `ESC O D` gives `[D`, not `OD`); a byte that
+  is not UTF-8 arrives as the code point of its value (the ANSI reader gives U+FFFD); a lone Esc is held until the
+  next key in a terminal without the kitty keyboard protocol (tmux, Terminal.app), so Esc does nothing there.
 - Start-up in the notcurses UI: `nc_start()` runs `notcurses_init` in a child process first (`nc_probe()`, 2 s): a child that does not come back is killed, the terminal is restored and the ANSI UI runs. The vendored core has the DA1 fix for tmux 3.4+ (`\e[?1;2;4c`, upstream #2736, PR #2926), so under tmux the probe passes; the probe stays as the safety net for a terminal that still hangs.
 - History in the notcurses field: `g_browse` says a browse is on; `nc_unbrowse()` is the one reset. The position alone is not enough (it is set before a sent line is added to the history). The list yields ↑/↓ while browsing.
 - The notcurses field prints nothing it sent: `nc_echo_line()` (term.c) puts the line returned by `term_readline`/`term_ask_line` into the conversation, through `term_user_band()`, as the ANSI editor does.
