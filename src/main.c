@@ -4561,6 +4561,8 @@ static int cmd_goal(const char *arg) {
             if (model && !strcmp(model, g_cfg.model)) model = NULL;
             char title[200];
             snprintf(title, sizeof title, "candidate %d of %d%s%s", k + 1, K, model ? " on " : "", model ? model : "");
+            memset(&tasks[k], 0, sizeof tasks[k]);   /* a candidate has no OWNS, no ROLE and layer 1: the scheduler reads them all */
+            tasks[k].layer = 1;
             tasks[k].title = xstrdup(title);
             tasks[k].body = xstrdup("Make the goal true in your copy, as the goal describes it, and report.");
             tasks[k].after = 0;
