@@ -1131,10 +1131,12 @@ print("test interactive: ← on an empty line lists the sub-agents; the one pick
 s.send("\x1b[D"); check(s.expect("sub-agents"), "← on an empty line opens the sub-agents list")
 check(s.expect("find the needle") and s.expect("done · 2 rounds"), "the run is listed with its state and rounds")
 s.send("\x1b[B", 0.3); s.send("\r", 0.3)   # the block is painted a moment later, as the viewer's window: read the screen, not the stream
-rows = screen_when(s, lambda rs: any("▾ sub-agent #" in r and "find the needle · done" in r for r in rs))
+# the list is newest first, and earlier sections have left runs in it: the one under ↓ is whichever came last, not the needle run
+rows = screen_when(s, lambda rs: any("▾ sub-agent #" in r and "· done" in r for r in rs))
 check(rows is not None, f"the picked run opens as a block with its head: {chr(10).join(s.screen()[-26:])!r}")
-shown = "\n".join(s.screen())
-check("› grep(" in shown and "hay.txt:2:needle here" in shown and "report:" in shown, "its log has the tool call, what it returned and the report")
+head = next((i for i, r in enumerate(rows or []) if "▾ sub-agent #" in r), None)
+shown = "\n".join(rows[head:]) if head is not None else ""   # the block, from its head down
+check("› grep(" in shown and "hay.txt:2:needle here" in shown and "report:" in shown, f"its log has the tool call, what it returned and the report: {shown[-300:]!r}")
 s.send("\x1b", 0.8); check(screen_when(s, lambda rs: _note_row(rs) is None) is not None, "Esc goes back to the prompt")
 os.remove(os.path.join(WORK, "hay.txt"))
 print("test interactive: a pasted block is a token; a click opens it, Enter sends the whole text")
@@ -1240,8 +1242,7 @@ s.send("/memory on\r"); check(s.expect("memory on"), "/memory on"); check(s.expe
 s.send("/memory every 1\r"); check(s.expect("memory updated after each request"), "/memory every 1")
 s.send("nothing special\r"); check(s.expect("Echo: nothing special"), "reply")
 check(s.expect("memory: updating in the background", 10), f"the extraction runs in the background: {s.text()[-200:]!r}")
-check(wait_for(lambda: len(requests()) >= 2 and requests()[-1]["messages"][0]["content"].startswith("You maintain the persistent memory file")),
-      "extraction call made after the request")
+check(wait_for(lambda: len(mem_reqs()) >= 1), "extraction call made after the request")   # not requests()[-1]: the suggestion may be the last
 check(mem_reqs()[-1]["messages"][-1]["role"] == "user" and "NO_CHANGE" in mem_reqs()[-1]["messages"][-1]["content"], "asked for the updated file or NO_CHANGE")
 time.sleep(0.5); check(not os.path.exists(os.path.join(WORK, ".corbienest", "memory.md")), "NO_CHANGE: no file written")
 memreq = mem_reqs()[-1]
