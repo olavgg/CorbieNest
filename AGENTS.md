@@ -44,7 +44,7 @@ consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), 
 - Output: notcurses writes to its own stream (`dup(1)`), never to the captured `stdout`; in this
   build `sb_write_fn` records output and does not write fd 1.
 - Suggestions in the notcurses UI (`term_nc.c`, `sug_*`): the same `term_suggest` list as the ANSI
-  UI, drawn over the conversation above the field; refreshed by `sug_sync()` when the line or cursor
+  UI, drawn in rows of its own under the field, above the agents strip and the bar (the ANSI order; `sug_height()` gives the rows, `nc_render()` takes them from the conversation while the list is open, and a `/model`-style picker, `draw_menu()`, is still a box above the field); refreshed by `sug_sync()` when the line or cursor
   changes (each key in the busy poll, each prompt loop pass); its keys are `sug_key()` (Tab, ↓/↑,
   Enter on a row, Esc closes), shared by both loops. Not yet: the `@file` list is the same code path
   but is not tested in this UI, and the `/model` picker (`cmd_model_picker`, through `term_select` → `nc_select`) lists the Ollama

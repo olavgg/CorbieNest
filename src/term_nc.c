@@ -1137,9 +1137,10 @@ static void draw_menu(void) {
     put_text(y + h - 2, x + 2, g_menu_hint, w - 4, C_MUTED, C_MENU, false, NULL);
 }
 
-/* ---------- suggestions above the field (term_suggest) ----------
+/* ---------- suggestions under the field (term_suggest) ----------
  * The list the ANSI UI offers for the word at the cursor: worked out again when the line or the
- * cursor changes, drawn over the conversation just above the field. Its keys are sug_key(). */
+ * cursor changes, drawn in rows of their own under the field, above the agents strip and the bar (the ANSI screen's
+ * order: the conversation gives the rows up while the list is open). Its keys are sug_key(). */
 #define NSUG_ROWS 8
 static term_sug *g_sug_items = NULL;
 static int g_sug_n = 0, g_sug_sel = -1, g_sug_top = 0;   /* sel -1: only a preview; ↓ steps into it */
@@ -1172,16 +1173,22 @@ static void sug_sync(void) {
 /* the line is handed to someone else (a question asked while typing): its list is not ours */
 static void sug_forget(void) { free(g_sug_for); g_sug_for = NULL; sug_clear(); }
 
-static void draw_suggest(void) {
-    if (!g_sug_n || g_menu_on || g_field_top < 2) return;
+/* The rows the list takes under the field: its entries and the line of keys, at most `avail`; 0 when there is no list. */
+static int sug_height(int avail) {
+    if (!g_sug_n || g_menu_on) return 0;
     int show = g_sug_n < NSUG_ROWS ? g_sug_n : NSUG_ROWS;
+    if (show + 1 > avail) show = avail - 1;
+    return show >= 1 ? show + 1 : 0;
+}
+
+/* Draws the list in rows y .. y+h-1 (h from sug_height). */
+static void draw_suggest(int y, int h) {
+    if (h < 2) return;
+    int show = h - 1;
     if (g_sug_sel >= 0 && g_sug_sel < g_sug_top) g_sug_top = g_sug_sel;
     if (g_sug_sel >= g_sug_top + show) g_sug_top = g_sug_sel - show + 1;
     if (g_sug_top > g_sug_n - show) g_sug_top = g_sug_n - show;
     if (g_sug_top < 0) g_sug_top = 0;
-    int h = show + 1;                                  /* the rows, and the line of keys under them */
-    int y = g_field_top - h; if (y < 0) y = 0;
-    for (int r = 0; r < h; r++) if (y + r < g_pane_cap) g_pane_line[y + r] = -1;   /* a click on the list is no click on the conversation */
     for (int r = 0; r < h; r++) fill_row(y + r, 0, g_cols, C_MENU, false);
     int namew = 0;
     for (int i = g_sug_top; i < g_sug_top + show; i++) {
@@ -1240,20 +1247,21 @@ void nc_render(void) {
     if (g_rows >= 6 && g_cols >= 10) {
         int fh = field_height();
         int bar = g_rows - 1;   /* the bar is the last row: the folder and branch are in it */
-        int room = g_rows - fh - 1 - 8;   /* the bar, and eight rows of conversation kept for reading */
-        int fit = g_rows - fh - 2;
+        int sh = sug_height(g_rows - fh - 1 - 4);   /* the suggestion list under the field; four rows of conversation are kept */
+        int room = g_rows - fh - sh - 1 - 8;   /* the bar, and eight rows of conversation kept for reading */
+        int fit = g_rows - fh - sh - 2;
         if (fit < 1) fit = 1;
         if (room > fit) room = fit;
         if (room < 1) room = 1;
         term_strip_limit(room);
         const char *strip_text = NULL;
         int srows = term_strip_update(&strip_text);   /* the agents strip: between the field and the bar */
-        int top = bar - fh - srows; if (top < 1) top = 1;
+        int top = bar - fh - sh - srows; if (top < 1) top = 1;
         g_field_top = top;
         draw_pane(top);
         draw_selection(top);
         draw_field(top);
-        draw_suggest();
+        draw_suggest(top + fh, sh);
         draw_strip(bar - srows, srows, strip_text);
         draw_bar(bar);
         if (g_ov_on) draw_overlay();
