@@ -28,6 +28,13 @@ and FFI bindings, the demos, tests and tools, and the man pages.
   `CSI ? 1 ; 2 ; 4 c`, which 3.0.17 cannot parse, so `notcurses_init()` waits for ever; the patch
   adds that reply and, as the PR describes, keeps the `CSI ? 1 ; 3 ; 1024 S` XTSMGRAPHICS reply that tmux also sends out of the input (not tested separately here).
   Upstream has not released it as of this copy.
+- `src/lib/in.c`, `load_ncinput()`: an Enter keeps the byte it came from, CR or LF, as the key's
+  effective text (`eff_text[0]`), which upstream does not keep. The paste reader in corbienest needs it: a
+  pasted CRLF is one line break, a lone LF another. Upstream turns both into `NCKEY_ENTER` and forgets which
+  it was. Four lines, `if(ni->eff_text[0] == 0){ ni->eff_text[0] = ni->id; }` before the id is set to
+  `NCKEY_ENTER`. The key id stays `NCKEY_ENTER`; only `eff_text` of an Enter changes (CR or LF instead of the
+  key's own value), and corbienest is the only reader of it. Reapply it when the copy is updated (look for
+  `corbienest:` in that file).
 
 Nothing else is changed. `make` compiles these files with the flags in the top-level Makefile
 (`NC_VFLAGS`): they are not held to our `-Werror`, and the two warnings upstream's own code has

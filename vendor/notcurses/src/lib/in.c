@@ -533,6 +533,10 @@ load_ncinput(inputctx* ictx, ncinput *tni){
   if(ni->id == 0x7f || ni->id == 0x8){
     ni->id = NCKEY_BACKSPACE;
   }else if(ni->id == '\n' || ni->id == '\r'){
+    // corbienest: keep the byte (CR or LF) as the key's effective text, so a pasted CRLF is one line break; see README
+    if(ni->eff_text[0] == 0){
+      ni->eff_text[0] = ni->id;
+    }
     ni->id = NCKEY_ENTER;
   }else if(ni->id == ictx->backspace){
     ni->id = NCKEY_BACKSPACE;

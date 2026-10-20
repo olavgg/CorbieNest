@@ -686,6 +686,7 @@ static int nc_getkey(int ms) {
             continue;
         }
         int k = nc_key_code(&ni);
+        if (k == 13 && g_pm_in && ni.eff_text[0] == '\n') k = 10;   /* inside a paste, an LF is kept as LF (the vendored input keeps the byte; a CRLF is one break) */
         if (k == NK_SKIP || pm_feed(k)) continue;   /* a paste's markers and text are taken by pm_feed */
         if (g_sel_on) { g_sel_on = false; nc_render_soon(); }   /* a key ends the highlight */
         key_out(k);
