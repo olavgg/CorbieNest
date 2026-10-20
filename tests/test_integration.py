@@ -790,7 +790,8 @@ print("test interactive: confirmation menu — deny with reason, arrow keys, the
 s = new_session(["-m", "fake-coder:latest"])   # its own session: it stands alone
 s.send("TOOL_BASH\r")
 check(s.expect("Run this command?"), "confirmation prompt")
-check(s.expect("1. Yes") and "3. Yes, and always allow `echo …` in this project" in s.text() and "4. No, and tell the model" in s.text(), f"menu options shown: {s.text()[-400:]!r}")
+_menu = lambda rows: all(any(t in r for r in rows) for t in ("1. Yes", "3. Yes, and always allow `echo …` in this project", "4. No, and tell the model"))
+check(screen_when(s, _menu) is not None, f"menu options shown: {chr(10).join(s.screen()[-14:])!r}")   # the screen once the menu is drawn: its lines come after the question
 s.send("n"); check(s.expect("tell the model why"), "reason prompt"); s.send("because\r")
 check(s.expect("denied"), "denied shown"); check(s.expect("Tool said: User denied"), "model saw denial")
 check("because" in requests()[-1]["messages"][-1]["content"], "reason forwarded")
