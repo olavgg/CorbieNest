@@ -681,6 +681,15 @@ static int memory_worker(const char *snap_path, int fd) {
     _exit(0);
 }
 
+/* True when a worker has finished (its exit is waited for without reaping it: memory_reap collects it). */
+static bool memory_done(void) {
+    for (int i = 0; i < g_nkids; i++) {
+        siginfo_t si; memset(&si, 0, sizeof si);
+        if (waitid(P_PID, (id_t)g_kids[i].pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid == g_kids[i].pid) return true;
+    }
+    return false;
+}
+
 /* Collects the workers that have finished. Never waits: a worker still running is left for the next call. */
 static void memory_reap(void) {
     for (int i = 0; i < g_nkids; ) {
@@ -1655,7 +1664,6 @@ static void prompt_arm(void) {
         if (left < 0.001) left = 0.001;
         if (want < 0 || left < want) want = left;
     }
-    if (g_nkids > 0 && (want < 0 || want > 1.0)) want = 1.0;   /* a worker is out: collected at the prompt about a second after it ends */
     term_idle_ms = want < 0 ? 0 : (int)(want * 1000) + 1;
 }
 
@@ -6788,6 +6796,8 @@ int main(int argc, char **argv) {
     hist_load();
     term_suggest = suggest;
     term_idle_hook = prompt_idle;
+    term_bg_ready = memory_done;   /* a finished memory update is collected at the prompt, typed or not (term.c: K_BG) */
+    term_bg_run = memory_reap;
     term_agents_menu = agents_menu;
     term_agents_strip = strip_lines;
     term_agents_open = strip_open;

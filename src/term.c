@@ -2365,6 +2365,8 @@ int term_poll_interrupt(void) {
 void (*term_idle_hook)(void) = NULL;
 void (*term_agents_menu)(void) = NULL;
 int term_idle_ms = 0;
+bool (*term_bg_ready)(void) = NULL;
+void (*term_bg_run)(void) = NULL;
 char *term_hint = NULL;   /* the placeholder of an empty prompt (common.h) */
 void term_hint_set(const char *s) { free(term_hint); term_hint = s && *s ? xstrdup(s) : NULL; }
 void term_hint_clear(void) { free(term_hint); term_hint = NULL; }
@@ -2617,6 +2619,8 @@ static int read_key_raw(void) {
 
 /* read_key(), but gives up after `ms` without a byte: -3 = nothing was typed. */
 #define K_IDLE (-3)
+#define K_BG   (-4)     /* the background check of the prompt is due (common.h: term_bg_ready) */
+static long g_bg_next = 0;   /* mono_ms when that check is next due */
 /* ---------- the banner's tick ----------
  * While the top-level prompt waits (term_readline) a tick runs every TICK_MS: the banner's modal is
  * redrawn with its next frame (main.c: banner_tick, term_banner_draw). The tick gets still=true once, when
@@ -2651,11 +2655,16 @@ static int read_key_prompt(bool idle) {
             long left = deadline - mono_ms(); if (left < 0) left = 0;
             if (wait < 0 || left < wait) wait = (int)left;
         }
+        if (term_bg_ready) {
+            long left = g_bg_next - mono_ms(); if (left < 0) left = 0;
+            if (wait < 0 || left < wait) wait = (int)left;
+        }
         if (wait < 0) return read_key();
         int k = read_key_wait(wait);
         if (k != K_IDLE) return k;
         term_tick_run();
         if (deadline >= 0 && mono_ms() >= deadline) return K_IDLE;
+        if (term_bg_ready && mono_ms() >= g_bg_next) { g_bg_next = mono_ms() + TERM_BG_MS; return K_BG; }
     }
 }
 
@@ -3349,6 +3358,10 @@ static char *readline_impl(const char *prompt, bool in_field) {
     while (!done) {
         if (g_view_top >= 0) { scroll_view(0); e.prev_cursor_row = 0; ed_refresh(&e); continue; }
         int k = read_key_prompt(idle_armed && e.buf.len == 0);
+        if (k == K_BG) {   /* finished background work: collected whether or not the field has text */
+            if (term_bg_ready && term_bg_ready()) ed_hook_run(&e, term_bg_run);
+            continue;
+        }
         if (term_hint && k != K_IDLE && k != K_MOUSE && k != K_WHEEL_UP && k != K_WHEEL_DOWN && k != -2 && k != -1 && k != '\t'
             && k != K_LEFT && k != K_RIGHT && k != K_HOME && k != K_END) {
             /* the placeholder goes with the first key that is not a way of looking at the prompt; Esc takes it

@@ -440,6 +440,12 @@ int term_interrupt_fd(void);                /* the fd a busy wait watches for ke
  * term_idle_ms before each term_readline(); typing anything cancels it for that prompt. */
 extern void (*term_idle_hook)(void);
 extern int term_idle_ms;
+/* Finished background work, collected while the prompt waits whether or not the field has text (the idle
+ * hook above runs only on an empty field). Every TERM_BG_MS the prompt asks term_bg_ready(); when it says yes,
+ * term_bg_run() runs with the terminal put back as for the idle hook. Typing does not cancel it. */
+#define TERM_BG_MS 1000
+extern bool (*term_bg_ready)(void);
+extern void (*term_bg_run)(void);
 /* The muted placeholder an empty prompt shows: a suggested next message. Tab takes it, any key that
  * edits or moves into the text clears it (not Tab, the arrows, Home, End). term_hint_set copies. */
 extern char *term_hint;

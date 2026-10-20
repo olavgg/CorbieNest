@@ -1629,6 +1629,7 @@ int nc_poll_interrupt(void) {
 /* the prompt's loop: returns the line (possibly ""), or NULL at the end (Ctrl-D, or Ctrl-C twice on an empty line) */
 static char *readline_loop(void) {
     double idle_at = (term_idle_ms > 0 && term_idle_hook && g_len == 0) ? now_s() + term_idle_ms / 1000.0 : -1;   /* idle means an empty field */
+    double bg_at = now_s() + TERM_BG_MS / 1000.0;   /* the background check: whether or not the field has text (common.h) */
     int ctrl_c = 0;
     for (;;) {
         sug_sync();       /* the list follows the line, whatever changed it (a key, a recalled line) */
@@ -1648,6 +1649,11 @@ static char *readline_loop(void) {
                 continue;
             }
             if (left * 1000 < wait) wait = (int)(left * 1000) + 1;
+        }
+        if (term_bg_ready) {   /* finished background work (memory) is collected while the prompt waits, typed or not */
+            double left = bg_at - now_s();
+            if (left <= 0) { bg_at = now_s() + TERM_BG_MS / 1000.0; if (term_bg_ready()) term_bg_run(); }
+            else if (left * 1000 < wait) wait = (int)(left * 1000) + 1;
         }
         int k = nc_getkey(wait);
         if (g_pv_req) { int K = g_pv_req; g_pv_req = 0; pv_open(K); if (g_pv_on) pv_run(); continue; }
