@@ -1122,10 +1122,12 @@ check([m["content"] for m in tool_msgs[-2:]] == ["REPORT PAUSE alpha", "REPORT P
 print("test interactive: ← on an empty line lists the sub-agents; the one picked shows its log")
 s.send("\x1b[D"); check(s.expect("sub-agents"), "← on an empty line opens the sub-agents list")
 check(s.expect("find the needle") and s.expect("done · 2 rounds"), "the run is listed with its state and rounds")
-s.send("\x1b[B", 0.3); s.send("\r", 0.3); s.expect("(no such text)", 0.8)   # the block is a repaint: read it with since_send(s), as the tests about the viewer do
-check("▾ sub-agent #" in since_send(s) and "find the needle · done" in since_send(s), "the picked run opens as a block with its head")
-check("› grep(" in since_send(s) and "hay.txt:2:needle here" in since_send(s) and "report:" in since_send(s), "its log has the tool call, what it returned and the report")
-s.send("\x1b", 0.8); check("scrollback" not in since_send(s), "Esc goes back to the prompt")
+s.send("\x1b[B", 0.3); s.send("\r", 0.3)   # the block is painted a moment later, as the viewer's window: read the screen, not the stream
+rows = screen_when(s, lambda rs: any("▾ sub-agent #" in r and "find the needle · done" in r for r in rs))
+check(rows is not None, f"the picked run opens as a block with its head: {chr(10).join(s.screen()[-26:])!r}")
+shown = "\n".join(s.screen())
+check("› grep(" in shown and "hay.txt:2:needle here" in shown and "report:" in shown, "its log has the tool call, what it returned and the report")
+s.send("\x1b", 0.8); check(screen_when(s, lambda rs: _note_row(rs) is None) is not None, "Esc goes back to the prompt")
 os.remove(os.path.join(WORK, "hay.txt"))
 print("test interactive: a pasted block is a token; a click opens it, Enter sends the whole text")
 sp = Session(["-m", "fake-coder:latest"]); sp.expect("Ctrl-D to quit")
