@@ -113,13 +113,19 @@ def run(args, stdin=b"", env=None, cwd=None):
 def requests(): return json.loads(urllib.request.urlopen(f"{HOST}/_requests").read())
 def mem_reqs():   # the memory updates among the requests: a suggestion may come after one, so not requests()[-1]
     return [r for r in requests() if str(r["messages"][0].get("content", "")).startswith("You maintain the persistent memory file")]
+LIVE = []   # the sessions not closed yet (Session adds itself, close() takes it out)
+
 def wait_for(pred, t=15):   # a background memory update finishes on its own: poll for what it does
+    """Poll pred for up to t seconds. The live sessions' terminals are read meanwhile: a program writes after /clear and after
+    each reply, and on macOS a pty holds little (Linux 64 KB), so one that nobody reads blocks in write() and never gets to
+    the request the check is waiting for."""
     end = time.time() + t
     while time.time() < end:
         try:
             if pred(): return True
         except Exception: pass
-        time.sleep(0.1)
+        for sess in list(LIVE): sess.drain(0.02, 0.1)
+        time.sleep(0.05)
     return False
 
 # ---------- non-interactive ----------
@@ -215,6 +221,7 @@ class Screen:
 class Session:
     def __init__(self, args=(), cols=100, rows=40, env=None, cwd=None, banner=False):
         self.pid, self.fd = pty.fork()
+        if self.pid: LIVE.append(self)
         if self.pid == 0:
             os.chdir(cwd or WORK)
             signal.signal(signal.SIGINT, signal.SIG_DFL)   # a suite started in the background (nohup, &) has it ignored, and so would the program
@@ -297,6 +304,7 @@ class Session:
         and a test that writes its own config next would lose it to that write. The pty is closed
         first: on macOS a process that exits with output still queued on its terminal waits for the
         terminal to drain, which nobody reads any more, so waiting on it first hangs the suite."""
+        if self in LIVE: LIVE.remove(self)
         try: os.close(self.fd)
         except Exception: pass
         try: os.kill(self.pid, 9)
@@ -1306,7 +1314,7 @@ s.send("/memory idle off\r"); check(s.expect("memory idle update off"), "/memory
 s.send("/memory every 5\r"); s.expect("every 5 requests")
 s.send("pending one\r"); check(s.expect("Echo: pending one"), "reply")
 time.sleep(2); check(not s.expect("memory: updating in the background", 1), "idle off: the pending extraction stays pending")
-s.send("/clear\r"); check(s.expect("new conversation"), "/clear")
+s.send("/clear\r"); check(s.expect("✓ new conversation"), "/clear")   # the ✓: the suggestion list for /clear says "new conversation" too
 check(wait_for(lambda: any("pending one" in m["content"] for m in mem_reqs()[-1]["messages"])), "/clear flushes the pending extraction first")
 s.send("/memory update\r"); check(s.expect("nothing pending"), "/memory update with nothing pending")
 s.send("REMEMBER_ME at exit\r"); check(s.expect("Echo: REMEMBER_ME at exit"), "reply")
