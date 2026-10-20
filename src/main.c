@@ -66,7 +66,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/yolo", "auto mode on or off: every tool call approved" },
     { "/tools", "tool calling on or off" },
     { "/web", "web_search and web_fetch: on, off, engine URL" },
-    { "/max_iters", "tool rounds one request may run" },
+    { "/max_iters", "tool rounds before the loop guard asks the model to review" },
     { "/ui", "the screen: ansi, or notcurses (restarts into this session); theme: the colours" },
     { "/ctx", "context window: a size, max, default — or a picker" },
     { "/temp", "temperature (-1 = the server's default)" },
@@ -1274,6 +1274,14 @@ static void cmd_diff(const char *arg) {
     if (hidden) printf(C_DIM "… %d more lines (run !git diff %s for everything)" C_RESET "\n", hidden, arg && *arg ? arg : "");
 }
 
+/* The loop guard's note to the model (see run_turn): a user message the app wrote, so /rewind does not offer it as a request. */
+#define LOOP_NOTE_PREFIX "[loop guard] "
+#define LOOP_GUARD_CHECKS 3   /* the model is asked this many times in one request; a request that still runs after that is stopped */
+static bool is_loop_note(const cJSON *m) {
+    const cJSON *c = cJSON_GetObjectItemCaseSensitive(m, "content");
+    return cJSON_IsString(c) && !strncmp(c->valuestring, LOOP_NOTE_PREFIX, sizeof LOOP_NOTE_PREFIX - 1);
+}
+
 /* ---------- /rewind (also Esc Esc at an empty prompt) ----------
  * Pick an earlier request; then restore the files changed since it, truncate the
  * conversation to just before it (the request text comes back into the editor), or both. */
@@ -1283,7 +1291,7 @@ static int cmd_rewind(void) {
     for (int i = 0; i < total && n < 256; i++) {
         cJSON *m = cJSON_GetArrayItem(g_messages, i);
         cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role");
-        if (cJSON_IsString(r) && !strcmp(r->valuestring, "user")) idx[n++] = i;
+        if (cJSON_IsString(r) && !strcmp(r->valuestring, "user") && !is_loop_note(m)) idx[n++] = i;
     }
     if (!n) { printf(C_DIM "nothing to rewind: the conversation is empty" C_RESET "\n"); return 0; }
     if (!g_cfg.interactive) { printf(C_DIM "/rewind needs an interactive session" C_RESET "\n"); return 0; }
@@ -3413,6 +3421,19 @@ static int inject_queued(void) {
     return n;
 }
 
+/* The loop guard's question, as the next user message (after the results of the round that crossed the limit). It asks
+ * for a short review and for what should change, and says the work is not over: the model's answer is shown like any text. */
+static void add_loop_note(int rounds) {
+    char note[1024];
+    snprintf(note, sizeof note, LOOP_NOTE_PREFIX "This request has now used %d tool rounds. Nothing has been stopped. "
+             "Before you continue, answer briefly, in two or three sentences: are you making progress on the user's request, "
+             "or are you repeating yourself or stuck? If something should change — your approach, a command, a file, an "
+             "assumption, or something you need from the user — say what, and make that change. Then carry on with the work. "
+             "If you are blocked on something only the user can give, say so and end your reply with a question instead of "
+             "calling a tool.", rounds);
+    add_message("user", note);
+}
+
 /* ---------- the agent loop ---------- */
 static bool maybe_auto_compact(bool resuming, const char *request);
 static bool compact_conversation(bool resuming, const char *request);
@@ -3502,6 +3523,8 @@ static bool run_turn_body(void) {
         return false;
     }
     int iters = 0, shrinks = 0, empties = 0, think_retries = 0;
+    int total_rounds = 0, guard_checks = 0;   /* rounds of the whole request; how often the loop guard asked the model to review */
+    bool guard_note = false;                  /* the guard fired on this round: its note goes in once the round's results are in */
     int round_first = -1;   /* where this round's tool results start (-1 before the first round) */
     g_session.turns++;
     for (;;) {
@@ -3575,12 +3598,21 @@ static bool run_turn_body(void) {
             if (!aborted) { check_model_placement(false); maybe_auto_compact(false, NULL); }
             return aborted;
         }
-        if (++iters > g_cfg.max_iters) {
-            printf(C_YELLOW "⚠ stopped after %d tool rounds (loop guard). Send a message to continue." C_RESET "\n", g_cfg.max_iters);
-            /* the reply that asked for these calls is already in the conversation: answer them, or the next request is refused */
-            answer_calls_unrun(calls, "not run: this request reached its tool-round limit (/max_iters) before the call ran. "
-                                      "The user's next message follows; call the tool again if it is still needed.");
-            return false;
+        iters++; total_rounds++;
+        if (iters > g_cfg.max_iters) {
+            /* The guard does not stop the work: the round runs, and the model is asked how it is going and whether anything
+             * should change, then it carries on with a new count. Only a request that has been asked LOOP_GUARD_CHECKS
+             * times and is still going is stopped, so a model that ignores the question cannot run for ever. */
+            if (++guard_checks > LOOP_GUARD_CHECKS) {
+                printf(C_YELLOW "⚠ stopped after %d tool rounds (loop guard: the model was asked %d times to review its progress and is still going). Send a message to continue." C_RESET "\n",
+                       total_rounds - 1, LOOP_GUARD_CHECKS);
+                /* the reply that asked for these calls is already in the conversation: answer them, or the next request is refused */
+                answer_calls_unrun(calls, "not run: this request reached its tool-round limit (/max_iters) before the call ran. "
+                                          "The user's next message follows; call the tool again if it is still needed.");
+                return false;
+            }
+            printf(C_YELLOW "⚠ %d tool rounds so far (loop guard): asking the model to review its progress; the work goes on" C_RESET "\n", total_rounds - 1);
+            guard_note = true; iters = 1;
         }
         cJSON *call;
         round_first = cJSON_GetArraySize(g_messages);
@@ -3591,6 +3623,7 @@ static bool run_turn_body(void) {
             if (advisor_step_in_due()) advisor_step_in(reply);
             printf("\n");
             if (stopped) return true;
+            if (guard_note) { add_loop_note(total_rounds); guard_note = false; }
             inject_queued();
             continue;
         }
@@ -3645,6 +3678,7 @@ static bool run_turn_body(void) {
         g_fail_rounds = failed ? g_fail_rounds + 1 : 0;
         if (advisor_step_in_due()) advisor_step_in(reply);
         printf("\n");
+        if (guard_note) { add_loop_note(total_rounds); guard_note = false; }
         inject_queued();   /* messages the user queued meanwhile go in before the next model call (they never stop a call) */
     }
 }
@@ -4793,7 +4827,7 @@ static void cmd_help(void) {
            "  /web [on|off|engine URL]  let the model look documentation up with web_search/web_fetch (on by default); set the search engine\n"
            "  /yolo [on|off]        shortcut for /mode auto / /mode manual (dangerous!)\n"
            "  /tools on|off         enable/disable tool calling\n"
-           "  /max_iters [N]        tool rounds one request may run before the loop guard stops it (default 100); takes effect at once, even mid-turn\n"
+           "  /max_iters [N]        tool rounds before the loop guard asks the model to review its progress and carry on (default 100; it stops a request only after three such questions); takes effect at once, even mid-turn\n"
            "  /ui [ansi|notcurses]  the screen: ansi (default) or notcurses (needs notcurses installed at build time); restarts into this session\n"
            "  /ctx [N|Nk|max]       context window: no argument opens a size picker; N/64k/max/default set it\n"
            "  /temp X               set temperature (-1 = server default)\n"
@@ -5543,7 +5577,7 @@ static int handle_slash(char *line) {
         if (!arg) printf("max_iters: %d tool rounds per request\n", g_cfg.max_iters);
         else {
             int n = atoi(arg);
-            if (n < 1) printf("usage: /max_iters N   (N ≥ 1: tool rounds one request may run before the loop guard stops it)\n");
+            if (n < 1) printf("usage: /max_iters N   (N ≥ 1: tool rounds before the loop guard asks the model to review its progress)\n");
             else { g_cfg.max_iters = n; config_save(); printf(C_GREEN "✓ max_iters = %d" C_RESET C_DIM " tool rounds per request" C_RESET "\n", n); }
         }
     }

@@ -2072,14 +2072,22 @@ if work:
     check(any(has_tool_result(r) for r in work[1:]), "the next call carries the tool_result")
 check(not consult_posts(posts), "this request never consulted the advisor")
 
-print("test loop guard: a stopped request leaves no call unanswered, and the next request is accepted")
+print("test loop guard: the model is asked to review and the work goes on; one that ignores it is stopped, leaving no call unanswered")
 LOOP_WORK = os.path.realpath(tempfile.mkdtemp(prefix="crowloop_"))   # its own folder: --continue resumes the newest session here, not another section's
 cfg_before = open(CFG2_FILE).read()
 open(CFG2_FILE, "w").write(cfg_before + "max_iters=2\n")   # the guard at 2 tool rounds, for this test only
 try:
     n0 = len(preqs())
     out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "-p", "TOOL_LOOP please"], env=ENVK, cwd=LOOP_WORK)
-    check(rc == 0 and "loop guard" in out, f"the request stopped at the loop guard: {out[-300:]!r}")
+    check(rc == 0 and "asking the model to review its progress" in out and "stopped after" not in out, f"the guard did not stop the request: {out[-400:]!r}")
+    check("Review: I was repeating one command" in out, f"the model's answer to the question is shown and ends the request: {out[-300:]!r}")
+    notes = [m for r in preqs()[n0:] if r["provider"] == "anthropic" for m in r["body"].get("messages", [])
+             if m["role"] == "user" and "[loop guard]" in json.dumps(m["content"])]
+    check(len(notes) == 1 and "making progress" in json.dumps(notes[0]["content"]) and "something should change" in json.dumps(notes[0]["content"]), f"the question reached the model once, asking for progress and for what should change: {len(notes)} message(s)")
+    check("✗" not in out, "and nothing was refused on the way")
+    # a model that does not answer the question is asked three times and then stopped
+    out, rc = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "-p", "TOOL_LOOP_DEAF please"], env=ENVK, cwd=LOOP_WORK)
+    check(rc == 0 and out.count("asking the model to review") == 3 and "stopped after" in out and "loop guard" in out, f"asked three times, then stopped: {out[-500:]!r}")
     check("✗" not in out, "and nothing was refused on the way")
     out2, rc2 = run(["-m", "anthropic:claude-fake-haiku", "--yolo", "--continue", "-p", "continue"], env=ENVK, cwd=LOOP_WORK)
     check(rc2 == 0 and "✗" not in out2 and "tool_use" not in out2 and "Tool said:" in out2,

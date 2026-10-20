@@ -285,7 +285,7 @@ build must be warning-free with `-Wall -Wextra`.
 - A request body must be valid JSON, and every tool call needs its result right after it: the
   Messages API refuses both, and so does the fake (`_messages`, `do_POST`). Every tool output is made
   valid UTF-8 in `tools_execute()` and `tool_result_message()`; a cut of text goes through `utf8_cut()`,
-  never a byte offset. A stopped request (loop guard, interrupt) answers the calls it did not run
+  never a byte offset. The loop guard does not stop a request when `/max_iters` rounds have run: that round runs, `add_loop_note()` adds a user message that starts with `[loop guard]` (asking for a short review and for what should change), and the count starts again; `/rewind` skips such notes (`is_loop_note()`). A request still going after `LOOP_GUARD_CHECKS` (3) questions is stopped. A stopped request (that backstop, interrupt) answers the calls it did not run
   (`answer_calls_unrun()`), and `begin_request()` runs `messages_repair()` for a conversation that
   already has a gap (an old session). `make test` covers the helpers (`wellformed`); the integration
   suite covers the whole path (loop guard, then `--continue`; binary output).

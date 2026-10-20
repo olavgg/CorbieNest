@@ -162,7 +162,11 @@ def _turn_blocks(req):
     """The same keywords as script(), as Messages content blocks. A tool_result is answered
     before the keyword that produced the call is seen again, or the model never stops."""
     typed = [t for t in (_typed(m) for m in (req.get("messages") or [])) if t is not None]   # what the user typed (a merged turn's text only)
-    if typed and "TOOL_LOOP" in typed[-1]:  # the user's own message asks for it: a call every time, until the loop guard stops it
+    real = [t for t in typed if not t.startswith("[loop guard]")]   # the loop guard's own notes are not what the user asked
+    if real and "TOOL_LOOP" in real[-1]:  # the user's own message asks for it: a call every time, until the loop guard stops it
+        if typed[-1].startswith("[loop guard]") and "TOOL_LOOP_DEAF" not in real[-1]:
+            # the guard asked for a review: answer it, and the request ends (TOOL_LOOP_DEAF ignores the question and goes on)
+            return [{"type": "text", "text": "Review: I was repeating one command, so I am changing my approach and finishing."}], "end_turn"
         return [{"type": "tool_use", "id": "toolu_loop", "name": "bash", "input": {"command": "echo looping"}}], "tool_use"
     results = _tool_results(req)
     if typed and "THINK_LIVE" in typed[-1]:   # a long tool run: each reply carries a signed thinking block, until the result is elided
