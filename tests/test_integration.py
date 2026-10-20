@@ -6,7 +6,7 @@ config/env handling, and — via a pseudo-terminal — the interactive editor,
 confirmations, Ctrl-C interruption, type-ahead, slash commands and the /model
 picker. Requires only python3 (stdlib). No real Ollama needed.
 """
-import codecs, inspect, json, os, pty, re, select, shutil, socket, struct, subprocess, sys, tempfile, termios, fcntl, time, threading, urllib.request
+import codecs, inspect, json, os, pty, re, signal, select, shutil, socket, struct, subprocess, sys, tempfile, termios, fcntl, time, threading, urllib.request
 # a short temp root, as on Linux: macOS's per-user temp dir (/var/folders/…/T) is so long that the status bar's location line
 # cuts the test folder's path, and the checks that read the bar then miss their text. Set before the first mkdtemp.
 os.environ["TMPDIR"] = "/tmp"
@@ -217,6 +217,7 @@ class Session:
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(cwd or WORK)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)   # a suite started in the background (nohup, &) has it ignored, and so would the program
             # the child inherits the shell's environment: a hosted key the shell exports must not reach it unless the test gives one
             for k in ("XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
                 if k not in (env or ENV): os.environ.pop(k, None)
@@ -2755,6 +2756,44 @@ out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_BG please"], env)
 check("started background job bg" in out, f"the job is started and announced: {out[-200:]!r}")
 check(len(procs("sleep 317")) == before, "the job is gone when the run ends")
 shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test signals: a signal from outside leaves the terminal as it was and stops the command that was running")
+def _pids(pat):
+    o = subprocess.run(["ps", "-axo", "pid,args"], capture_output=True, text=True).stdout
+    return [int(l.split()[0]) for l in o.splitlines() if pat in l and "ps -axo" not in l and "grep" not in l]
+def _modes_left(raw):
+    """The terminal modes still on at the end of what was written: the alternate screen, the mouse, bracketed paste."""
+    on = {}
+    for m in re.finditer(rb"\x1b\[\?([0-9;]+)([hl])", raw):
+        for n in m.group(1).split(b";"): on[int(n)] = m.group(2) == b"h"
+    return sorted(k for k in (1049, 1000, 1002, 1003, 1006, 2004) if on.get(k))
+for _name, _sig in (("SIGINT", signal.SIGINT), ("SIGTERM", signal.SIGTERM), ("SIGHUP", signal.SIGHUP)):
+    ss = Session(["-m", "fake-coder:latest"])
+    for _l in _pids("sleep 733"): os.kill(_l, 9)   # one a failed run left
+    ss.send("!sleep 733\r")
+    for _ in range(100):   # the prompt may still be waiting for the start-up checks: the keys are read when it is up
+        if _pids("sleep 733"): break
+        ss.expect("(no such text)", 0.1)
+    time.sleep(0.3)
+    check(len(_pids("sleep 733")) >= 1, f"{_name}: the command is running: {ss.text()[-300:]!r}")
+    os.kill(ss.pid, _sig); ss.expect("(no such text)", 1.5)
+    _st = None
+    for _ in range(40):
+        _p, _st = os.waitpid(ss.pid, os.WNOHANG)
+        if _p: break
+        time.sleep(0.1)
+    else: _st = None
+    ss.drain(0.1, 0.5)
+    check(_st is not None and os.WIFSIGNALED(_st) and os.WTERMSIG(_st) == _sig, f"{_name}: it ends by that signal, not hung or exited some other way: {_st}")
+    check(_modes_left(ss.out) == [], f"{_name}: the alternate screen, mouse and paste modes are off again: {_modes_left(ss.out)}")
+    try: _tio = termios.tcgetattr(ss.fd); _cooked = bool(_tio[3] & termios.ECHO) and bool(_tio[3] & termios.ICANON) and bool(_tio[3] & termios.ISIG)
+    except Exception: _cooked = False
+    check(_cooked, f"{_name}: the tty is cooked again (echo, line editing and signals on)")
+    time.sleep(0.3)
+    left = _pids("sleep 733")
+    check(not left, f"{_name}: the command that was running is stopped, not left behind: {left}")
+    for _l in left: os.kill(_l, 9)
+    ss.close()
 
 print("test feature: stream-json: one JSON object per line on stdout, tool calls matched to results")
 cfg, proj, env = feat("stream")

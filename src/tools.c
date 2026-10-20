@@ -869,6 +869,10 @@ static tool_status t_list_dir(cJSON *args, sbuf *out) {
 }
 
 /* ---------- shell runner ---------- */
+/* The process group of the command run_shell() is waiting for (0: none). It is a group of its own, so a signal that
+ * ends corbienest does not reach it: the handler below kills it, or it would run on with nobody to read it. */
+static volatile pid_t g_fg_pgid = 0;
+
 /* Runs cmd via /bin/sh -c, capturing stdout+stderr. Returns exit code (or -1 on failure,
  * 124 on timeout, 130 if interrupted by user). A message queued meanwhile does not stop it.
  * `cap` bounds what is kept while it streams (a runaway command cannot eat the heap);
@@ -896,6 +900,7 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
     }
     close(pfd[1]);
     setpgid(pid, pid);
+    g_fg_pgid = pid;
     struct pollfd fds[2] = { { pfd[0], POLLIN, 0 }, { g_cfg.interactive ? term_interrupt_fd() : -1, POLLIN, 0 } };
     long remaining_ms = (long)timeout_s * 1000;
     bool timed_out = false;
@@ -935,6 +940,7 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
     close(pfd[0]);
     int status = 0;
     waitpid(pid, &status, 0);
+    g_fg_pgid = 0;
     if (timed_out) return 124;
     if (*interrupted) return 130;
     if (WIFEXITED(status)) return WEXITSTATUS(status);
@@ -1009,6 +1015,7 @@ static void bg_forget(bg_job *j) {
 }
 static void bg_signal_all(int sig) {
     for (int i = 0; i < BG_MAX; i++) { pid_t g = g_bg_pgid[i]; if (g > 0) kill(-g, sig); }
+    pid_t fg = g_fg_pgid; if (fg > 0) kill(-fg, sig);   /* the command being waited for, if any */
 }
 /* Stops every job still running and removes the files: at exit, and before corbienest re-executes itself. */
 void tools_bg_kill_all(void) {
@@ -1033,6 +1040,9 @@ void tools_bg_init(void) {
     atexit(tools_bg_kill_all);
     signal(SIGTERM, bg_on_signal);
     signal(SIGHUP, bg_on_signal);
+    /* SIGINT from outside (kill -INT, a parent, an IDE): the keys never raise it, raw mode has ISIG off. Without this it
+     * ended the program on the alternate screen with the mouse reporting on and the tty raw. */
+    signal(SIGINT, bg_on_signal);
 }
 
 static bg_job *bg_find(const char *id) {
