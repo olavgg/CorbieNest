@@ -1062,10 +1062,17 @@ os.remove(os.path.join(WORK, "AGENTS.md")); s.send("/mode manual\r"); s.expect("
 
 print("test interactive: /cost")
 s.send("/cost\r"); check(s.expect("session cost"), "/cost header")
-check(s.expect("model calls") and re.search(r"model calls   \d+  \(\d+ requests", s.text()) is not None, f"calls and requests counted: {s.text()[-400:]!r}")
-check(re.search(r"tokens        [\d.]+k?  \(↑", s.text()) is not None, "token totals shown")
+def text_has(sess, pat, t=10):
+    """The report is read as it arrives: a pattern is looked for in everything read so far, and more is read until it is there or t seconds pass"""
+    end = time.time() + t
+    while True:
+        if re.search(pat, sess.text()): return True
+        if time.time() >= end: return False
+        sess.expect("(no such text)", 0.3)
+check(s.expect("model calls") and text_has(s, r"model calls   \d+  \(\d+ requests"), f"calls and requests counted: {s.text()[-400:]!r}")
+check(text_has(s, r"tokens        [\d.]+k?  \(↑"), "token totals shown")
 seen(s, "wall time", 10)   # the last lines of the report are painted after the first ones
-check(re.search(r"wall time     \d", s.text()) is not None and "tok/s" in s.text(), f"wall time and tok/s shown: {s.text()[-300:]!r}")
+check(text_has(s, r"wall time     \d") and "tok/s" in s.text(), f"wall time and tok/s shown: {s.text()[-300:]!r}")
 
 print("test interactive: /diff")
 s.send("/diff\r"); check(s.expect("not inside a git repository"), "/diff outside git")
@@ -1623,10 +1630,12 @@ s.send("\t\t"); check(s.expect("❯ !zzcorbie-tool sugsrc/zebra_term.c"), "Tab s
 s.send("\r"); check(s.expect("ran-zzcorbie-tool sugsrc/zebra_term.c"), "and the line runs as it stands")
 s.send("!"); view = listed(); check("zzcorbie-tool sugsrc/zebra_term.c" in view, f"a bare ! lists the lines that were run before, the newest first: {view!r}")
 s.send("\x1b[B\r"); check(s.expect("❯ !zzcorbie-tool sugsrc/zebra_term.c"), "and one of them is taken whole")
-s.send("\x15")
-s.send("!cat ebra_ter"); s.send("m"); check("zebra" not in listed(), "only the start of a name counts here: most words of a command are not files")
-s.send("\x15")
-s.send('!echo "zebr'); s.send("a"); check("zebra_term" not in listed(), "and inside quotes nothing is offered: that is text")
+s.send("\x15"); s.expect("(no such text)", 0.8)   # let the line clear and the list of the last command settle: its repaints are not this key's
+s.send("!cat ebra_ter"); s.send("m"); view = listed(); tail = view[view.rfind("!cat ebra_term"):]   # the list is drawn under the field: what comes after its last echo
+check("zebra" not in tail, f"only the start of a name counts here: most words of a command are not files: {tail[:300]!r}")
+s.send("\x15"); s.expect("(no such text)", 0.8)
+s.send('!echo "zebr'); s.send("a"); view = listed(); tail = view[view.rfind('!echo "zebra'):]
+check("zebra_term" not in tail, f"and inside quotes nothing is offered: that is text: {tail[:300]!r}")
 s.send("\x15")
 s.send("!true | zzcor"); s.send("b"); check("zzcorbie-tool" in listed(), "after a pipe a command goes again")
 s.send("\x15")
@@ -2325,10 +2334,13 @@ check(key_nowhere() is None, f"still nowhere: {key_nowhere()!r}")
 
 print("test interactive: /model completes a local name and an Anthropic one")
 s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
-s.send("/model fake-co"); s.send("d"); view = listed()
-check("fake-coder:latest" in view and "fake-chat" not in view and "xai:" not in view and "openai:" not in view,
-      f"a local name is completed as it is typed, and an advisor-only provider is not offered: {view!r}")
-s.send("\t\r"); check(s.expect("model set to fake-coder:latest"), "Tab completes the name, Enter sets it")
+s.send("\x15"); s.expect("(no such text)", 0.5)
+s.send("/model fake-co"); s.send("\t"); check(s.expect("/model fake-coder:latest", 5), "a typed local name is completed by Tab, and the list is not needed for it")
+s.send("\x15"); s.expect("(no such text)", 0.5)
+s.send("/model xai"); s.send("\t"); s.expect("(no such text)", 0.8)
+check("xai:grok" not in since_send(s) and "grok-fake" not in since_send(s), f"an advisor-only provider is not offered on /model: {since_send(s)[-200:]!r}")
+s.send("\x15"); s.expect("(no such text)", 0.5)
+s.send("/model fake-co"); s.send("\t\r"); check(s.expect("model set to fake-coder:latest"), "Enter sets it")
 s.send("/model "); view = listed()
 check("anthropic:" in view and "fake-coder:latest" in view and "the model that does the work" in view and "xai:" not in view and "openai:" not in view,
       f"a bare argument offers Anthropic and the installed models: {view!r}")
@@ -2620,7 +2632,7 @@ check(s.started(), "it starts with two hosted roles and two missing keys")
 am, ab = _key_lines(s, "ANTHROPIC_API_KEY"); xm, xb = _key_lines(s, "XAI_API_KEY")
 check(am >= 1 and ab == 0 and xm == 0 and xb >= 1, f"a different key is still said: anthropic {(am, ab)} xai {(xm, xb)}")
 s.send("\x04"); s.close()
-s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.expect("Ctrl-D to quit")
+s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVK); s.started()
 check("advisor: xai:grok-fake" in s.text() and "is not set" not in s.text(), "with the key there it is just named")
 np = len(preqs())
 s.send("/orchestrate ONETASK through the API\r")
