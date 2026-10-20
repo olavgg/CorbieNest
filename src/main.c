@@ -721,6 +721,7 @@ static void memory_arm_idle(void) {
     prompt_arm();
 }
 
+#define SUGGEST_IDLE_S 0.6    /* the prompt is idle this long before the suggestion call is made (suggest_next) */
 /* A request finished (it started at g_messages[first]): remember it for the next flush,
  * and flush when enough have accumulated. Aborted requests are not counted but stay
  * covered by the range. One-shot runs flush at once (the process is about to exit). */
@@ -731,7 +732,10 @@ static void memory_note(int first, bool aborted) {
     if (g_mem_first < 0 || first < g_mem_first) g_mem_first = first;
     if (aborted) return;
     g_mem_pending++;
-    if (!g_cfg.interactive || g_mem_pending >= g_cfg.memory_every) memory_flush();
+    if (!g_cfg.interactive) { memory_flush(); return; }
+    if (g_mem_pending < g_cfg.memory_every) return;
+    if (g_cfg.suggest && g_cfg.memory_idle > 0) g_mem_due = mono_now() + SUGGEST_IDLE_S;   /* prompt_idle: the suggestion first, then this */
+    else memory_flush();
 }
 
 /* "# fact" typed at the prompt: append a bullet to a section of the memory file without a
@@ -1588,7 +1592,6 @@ static cJSON *messages_with_system(void) {
  * so it never holds up typing; an interrupted call, a reply with tool calls, NO_SUGGESTION, or
  * anything typed meanwhile gives no placeholder. It is a call of its own: g_messages, the session
  * file and the memory are not changed by it. */
-#define SUGGEST_IDLE_S 0.6    /* the prompt is idle this long before the call is made */
 #define SUGGEST_TOKENS 60     /* a reply cap: one sentence, cut off reads as nothing (suggest_clean) */
 static const char SUGGEST_ASK[] =
     "Predict the next message the user is likely to type to carry on with this work: in their own words, "
