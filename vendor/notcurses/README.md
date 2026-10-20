@@ -35,6 +35,10 @@ and FFI bindings, the demos, tests and tools, and the man pages.
   `NCKEY_ENTER`. The key id stays `NCKEY_ENTER`; only `eff_text` of an Enter changes (CR or LF instead of the
   key's own value), and corbienest is the only reader of it. Reapply it when the copy is updated (look for
   `corbienest:` in that file).
+- `src/lib/in.c`, `process_input()`: a byte that is not UTF-8 is U+FFFD, one for each invalid byte, not the code
+  point of its value (upstream gives U+00FF for a lone 0xFF and drops a truncated sequence). The ANSI reader
+  makes the same U+FFFD (`utf8_fix`), so a pasted bad byte shows the same on both screens. Three marked changes
+  (`corbienest:`): the ASCII branch, the `mbrtowc` failure, and the log line. Reapply it with the Enter change.
 
 Nothing else is changed. `make` compiles these files with the flags in the top-level Makefile
 (`NC_VFLAGS`): they are not held to our `-Werror`, and the two warnings upstream's own code has

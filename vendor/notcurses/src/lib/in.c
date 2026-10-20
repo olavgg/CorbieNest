@@ -2334,7 +2334,9 @@ process_input(const unsigned char* buf, int buflen, ncinput* ni){
     logwarn("invalid UTF8 initiator on input (0x%02x)", *buf);
     return -1;
   }else if(cpointlen == 1){ // pure ascii can't show up mid-utf8-character
-    ni->id = buf[0];
+    // corbienest: a byte that is not ASCII here is not UTF-8 (a stray continuation byte, or 0xc0/0xc1, 0xf5..0xff):
+    // it is U+FFFD, one per byte, as the ANSI reader makes it, not the code point of its value
+    ni->id = buf[0] < 0x80 ? buf[0] : 0xFFFD;
     return 1;
   }
   if(cpointlen > buflen){
@@ -2347,8 +2349,10 @@ process_input(const unsigned char* buf, int buflen, ncinput* ni){
   // FIXME how the hell does this work with 16-bit wchar_t?
   size_t r = mbrtowc(&w, (const char*)buf, cpointlen, &mbstate);
   if(r == (size_t)-1 || r == (size_t)-2){
-    logerror("invalid utf8 prefix (%dB) on input", cpointlen);
-    return -1;
+    // corbienest: an invalid sequence is U+FFFD for its first byte only; the bytes after it are read as they come
+    logwarn("invalid utf8 prefix (%dB) on input: U+FFFD", cpointlen);
+    ni->id = 0xFFFD;
+    return 1;
   }
   ni->id = w;
   return cpointlen;
