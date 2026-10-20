@@ -111,6 +111,16 @@ def run(args, stdin=b"", env=None, cwd=None):
     return clean(p.stdout.decode()), p.returncode
 
 def requests(): return json.loads(urllib.request.urlopen(f"{HOST}/_requests").read())
+def mem_reqs():   # the memory updates among the requests: a suggestion may come after one, so not requests()[-1]
+    return [r for r in requests() if str(r["messages"][0].get("content", "")).startswith("You maintain the persistent memory file")]
+def wait_for(pred, t=15):   # a background memory update finishes on its own: poll for what it does
+    end = time.time() + t
+    while time.time() < end:
+        try:
+            if pred(): return True
+        except Exception: pass
+        time.sleep(0.1)
+    return False
 
 # ---------- non-interactive ----------
 class Session:
@@ -1094,15 +1104,19 @@ s.send("/memory\r"); check(s.expect("auto-update is off"), "/memory shows state"
 s.send("/memory on\r"); check(s.expect("memory on"), "/memory on"); check(s.expect("every 5 requests"), "default cadence: every 5 requests")
 s.send("/memory every 1\r"); check(s.expect("memory updated after each request"), "/memory every 1")
 s.send("nothing special\r"); check(s.expect("Echo: nothing special"), "reply")
-check(s.expect("memory: no change ·", 10), f"the extraction call ran after the request: {s.text()[-200:]!r}")
-check(requests()[-1]["messages"][0]["content"].startswith("You maintain the persistent memory file"), "extraction call made after the request")
-check(requests()[-1]["messages"][-1]["role"] == "user" and "NO_CHANGE" in requests()[-1]["messages"][-1]["content"], "asked for the updated file or NO_CHANGE")
+check(s.expect("memory: updating in the background", 10), f"the extraction runs in the background: {s.text()[-200:]!r}")
+check(wait_for(lambda: len(requests()) >= 2 and requests()[-1]["messages"][0]["content"].startswith("You maintain the persistent memory file")),
+      "extraction call made after the request")
+check(mem_reqs()[-1]["messages"][-1]["role"] == "user" and "NO_CHANGE" in mem_reqs()[-1]["messages"][-1]["content"], "asked for the updated file or NO_CHANGE")
 time.sleep(0.5); check(not os.path.exists(os.path.join(WORK, ".corbienest", "memory.md")), "NO_CHANGE: no file written")
-memreq = requests()[-1]
+memreq = mem_reqs()[-1]
 check("think" not in memreq and memreq["options"]["num_predict"] == 6144, "memory call: no think key for a non-thinking model, num_predict capped")
-s.send("CUT_MEMORY please\r"); check(s.expect("memory: reply too long, ignored"), f"length-cut reply ignored: {s.text()[-200:]!r}")
+n_before = len(requests())
+s.send("CUT_MEMORY please\r"); check(s.expect("Echo: CUT_MEMORY please"), "reply to the cut-off case")
+check(wait_for(lambda: len(requests()) >= n_before + 2), "extraction call made for the cut-off reply")
 time.sleep(0.3); check(not os.path.exists(os.path.join(WORK, ".corbienest", "memory.md")), "truncated memory reply is never written")
-s.send("REMEMBER_ME the user prefers tabs\r"); check(s.expect("memory updated"), f"memory written: {s.text()[-200:]!r}")
+s.send("REMEMBER_ME the user prefers tabs\r"); check(s.expect("Echo: REMEMBER_ME"), "reply to the fact")
+check(s.expect("memory updated", 15), f"memory written, and said at the prompt: {s.text()[-200:]!r}")
 mem = open(os.path.join(WORK, ".corbienest", "memory.md")).read()
 check(mem.startswith("# Project memory") and "- the user prefers tabs" in mem and "```" not in mem, f"file content (fence stripped): {mem!r}")
 s.send("what now\r"); check(s.expect("Echo: what now"), "next request")
@@ -1111,8 +1125,9 @@ check("# Project memory (from .corbienest/memory.md)" in sysmsg and "the user pr
 s.send("/memory\r"); check(s.expect("the user prefers tabs"), "/memory prints it")
 s.send("/model fake-thinker:latest\r"); check(s.expect("model set to fake-thinker"), "switch to a thinking model")
 s.send("hello thinker\r"); check(s.expect("Echo: hello thinker"), "reply")
-check(s.expect("memory: no change ·", 10), "extraction call ran")
-check(requests()[-1]["think"] is False and "think" not in requests()[-2], "memory call turns thinking off on a thinking model; the main call leaves it to the server")
+check(wait_for(lambda: len(requests()) >= 2 and "You maintain the persistent memory file" in requests()[-1]["messages"][0]["content"]), "extraction call ran")
+main_call = [r for r in requests() if r["messages"][-1]["content"] == "hello thinker"][-1]
+check(mem_reqs()[-1]["think"] is False and "think" not in main_call, "memory call turns thinking off on a thinking model; the main call leaves it to the server")
 s.send("/model fake-coder:latest\r"); s.expect("model set to fake-coder")
 s.send("/status\r"); check(s.expect("memory.md loaded"), "/status shows memory")
 s.send("# always run make test\r"); check(s.expect("under which section?"), "# fact opens the section menu")
@@ -1126,15 +1141,17 @@ mem = open(os.path.join(WORK, ".corbienest", "memory.md")).read()
 check("## Project\n\n- second note\n" in mem or "## Project\n- second note\n" in mem, f"second fact under Project: {mem!r}")
 check("Echo: # " not in s.text(), "# lines were not sent to the model")
 s.send("/memory off\r"); check(s.expect("memory off"), "/memory off")
+n_mem = len(mem_reqs())
 s.send("REMEMBER_ME ignored\r"); check(s.expect("Echo: REMEMBER_ME ignored"), "reply")
-check(requests()[-1]["messages"][-1]["content"] == "REMEMBER_ME ignored", "no extraction call when off")
+time.sleep(0.5); check(len(mem_reqs()) == n_mem, "no extraction call when off")
 # batched cadence: the extraction call only runs every N requests, or when the conversation goes away
 s.send("/memory on\r"); s.expect("memory on"); s.send("/memory every 2\r"); check(s.expect("every 2 requests"), "/memory every 2")
+n_mem = len(mem_reqs())
 s.send("first of two\r"); check(s.expect("Echo: first of two"), "reply")
-check(requests()[-1]["messages"][-1]["content"] == "first of two", "no extraction after the first request")
+time.sleep(0.5); check(len(mem_reqs()) == n_mem, "no extraction after the first request")
 s.send("/memory\r"); check(s.expect("1 request pending extraction"), "/memory shows the pending count")
 s.send("REMEMBER_ME batched fact\r"); check(s.expect("memory updated"), f"extraction after the second request: {s.text()[-200:]!r}")
-memreq = requests()[-1]
+memreq = mem_reqs()[-1]
 check(memreq["messages"][0]["content"].startswith("You maintain the persistent memory file") and any("first of two" in m["content"] for m in memreq["messages"]), "the batched call covers both requests")
 check("batched fact" in open(os.path.join(WORK, ".corbienest", "memory.md")).read(), "batched fact written")
 # idle flush: a request left pending is folded in while the prompt sits untouched, so that
@@ -1151,25 +1168,24 @@ s.send("still here\r"); check(s.expect("Echo: still here"), "the prompt still wo
 # a message typed while the idle extraction runs is queued (the prompt is busy): it must run
 # as soon as the memory write is done, not sit in the queue waiting for another Enter
 s.send("MEMWAIT please\r"); check(s.expect("Echo: MEMWAIT please"), "reply")
-check(s.expect("updating memory", 5), f"the idle extraction started: {s.text()[-200:]!r}")
-s.send("queued during the memory write\r")
-check(s.expect("1 queued", 3), f"the message was queued while memory was being written: {s.text()[-200:]!r}")
-check(s.expect("memory updated", 10), f"the extraction still finished: {s.text()[-200:]!r}")
+check(s.expect("memory: updating in the background", 5), f"the idle extraction started: {s.text()[-200:]!r}")
+s.send("typed during the memory write\r")   # the prompt is free: the line runs at once, the update goes on in its worker
+check(s.expect("Echo: typed during the memory write", 5), f"a line typed while the update runs is taken at once: {s.text()[-300:]!r}")
+check(s.expect("memory updated", 15), f"the extraction finished and was said at the prompt: {s.text()[-200:]!r}")
 check("slow fact" in open(os.path.join(WORK, ".corbienest", "memory.md")).read(), "the slow extraction was written")
-check(s.expect("Echo: queued during the memory write", 10), f"the queued message ran once memory was written: {s.text()[-300:]!r}")
 s.expect("(no such text)", 3)   # drain: let the extraction pending after that request run
 s.send("/memory idle off\r"); check(s.expect("memory idle update off"), "/memory idle off")
 s.send("/memory every 5\r"); s.expect("every 5 requests")
 s.send("pending one\r"); check(s.expect("Echo: pending one"), "reply")
-time.sleep(2); check(not s.expect("updating memory", 1), "idle off: the pending extraction stays pending")
+time.sleep(2); check(not s.expect("memory: updating in the background", 1), "idle off: the pending extraction stays pending")
 s.send("/clear\r"); check(s.expect("new conversation"), "/clear")
-check(requests()[-1]["messages"][0]["content"].startswith("You maintain the persistent memory file") and any("pending one" in m["content"] for m in requests()[-1]["messages"]), "/clear flushes the pending extraction first")
+check(wait_for(lambda: any("pending one" in m["content"] for m in mem_reqs()[-1]["messages"])), "/clear flushes the pending extraction first")
 s.send("/memory update\r"); check(s.expect("nothing pending"), "/memory update with nothing pending")
 s.send("REMEMBER_ME at exit\r"); check(s.expect("Echo: REMEMBER_ME at exit"), "reply")
-s.send("\x04"); check(s.expect("updating memory…  (Ctrl-C skips it)"), "the exit flush says it can be skipped")
-check(s.expect("bye"), "exit")
+s.send("\x04"); check(s.expect("memory: updating in the background"), "the exit flush goes to the background")
+check(s.expect("bye"), "exit does not wait for the extraction")
 s.close()
-check("at exit" in open(os.path.join(WORK, ".corbienest", "memory.md")).read(), "exit flushes the pending extraction (Ctrl-D)")
+check(wait_for(lambda: "at exit" in open(os.path.join(WORK, ".corbienest", "memory.md")).read()), "the worker finishes the pending extraction after exit (Ctrl-D)")
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
 s.send("/memory off\r"); s.expect("memory off")
 s.send("/memory clear\r"); check(s.expect("removed .corbienest/memory.md"), "/memory clear")

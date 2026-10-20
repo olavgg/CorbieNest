@@ -10,7 +10,10 @@
 #include <string.h>
 #include <strings.h>
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/utsname.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -343,14 +346,16 @@ static int begin_request(void) {
 #define MEMORY_MAX    (24 * 1024)     /* larger files are cut when loaded; the model is told to keep it short */
 #define MEMORY_MAX_TOKENS 6144   /* num_predict cap for the memory-update call (a full MEMORY_MAX file fits) */
 
-static void load_memory(void) {
-    free(g_memory); g_memory = NULL;
-    if (!is_file(MEMORY_PATH)) return;
+/* The file as the model is shown it (at most MEMORY_MAX bytes, whole lines). NULL: no file. Malloc'd. */
+static char *memory_read(void) {
+    if (!is_file(MEMORY_PATH)) return NULL;
     size_t n; char *d = read_whole_file(MEMORY_PATH, &n, MEMORY_MAX);
-    if (!d) return;
+    if (!d) return NULL;
     if (n >= MEMORY_MAX) { char *nl = strrchr(d, '\n'); if (nl) *nl = 0; }
-    g_memory = d;
+    return d;
 }
+
+static void load_memory(void) { free(g_memory); g_memory = memory_read(); }
 
 static const char *MEMORY_TEMPLATE =
     "# Project memory\n\n"
@@ -368,18 +373,6 @@ static const char *MEMORY_RULES =
     "or anything only relevant to the current conversation. Update or delete facts that turned out wrong; merge duplicates. "
     "Keep the whole file under ~80 lines, one bullet per fact.";
 
-/* Strip an optional ```markdown fence around the model's reply. Returns a malloc'd string. */
-static char *unfence(const char *t) {
-    while (*t == ' ' || *t == '\n' || *t == '\r' || *t == '\t') t++;
-    size_t n = strlen(t);
-    while (n && (t[n-1] == ' ' || t[n-1] == '\n' || t[n-1] == '\r' || t[n-1] == '\t')) n--;
-    if (n >= 6 && !strncmp(t, "```", 3) && !strncmp(t + n - 3, "```", 3)) {
-        const char *b = strchr(t, '\n'); if (!b || b >= t + n - 3) return xstrndup(t, n);
-        b++; size_t e = n - 3; while (e > (size_t)(b - t) && (t[e-1] == '\n' || t[e-1] == ' ')) e--;
-        return xstrndup(b, e - (size_t)(b - t));
-    }
-    return xstrndup(t, n);
-}
 
 /* Ask the model (quietly, without tools) to fold anything worth remembering from the
  * exchanges since g_messages[first] into the memory file. In one-shot (-p) runs the file is
@@ -389,15 +382,24 @@ static char *unfence(const char *t) {
  * next request re-evaluates the whole context: that is why it is not run after every request
  * but batched — memory_note() counts finished requests and memory_flush() runs the call once
  * g_cfg.memory_every of them are pending, or when the conversation is about to go away
- * (exit, /clear, /compact, /cd, /resume). */
+ * (exit, /clear, /compact, /cd, /resume).
+ *
+ * The update does not hold the prompt. An interactive run hands it to a worker process
+ * (memory_spawn: `corbienest --memory-worker SNAPSHOT FD`, started with setsid and no terminal, which
+ * nothing waits for; memory_worker() below), and memory_reap() collects it at the prompt: its usage is
+ * counted, and a file it wrote is loaded and said so. A one-shot run does it here, because its process
+ * ends right after. Either way the update takes a lock (memory_lock) for the read, the call and the write,
+ * so two updates never interleave, and it writes only if the file is still what it read: a `# fact` or an
+ * edit made meanwhile wins, and this update's exchange is then not learned from. */
 static int g_mem_first = -1;      /* index of the first message not yet folded into memory (-1 = none pending) */
 static double g_mem_due = 0;      /* when the pending extraction runs anyway (mono_now seconds; 0 = not armed): see memory_arm_idle */
 static double mono_now(void);
 static void prompt_arm(void);
+static void refresh_model_caps(bool quiet);
+static const char *self_exe_path(void);
 static bool g_sug_due = false;    /* a reply finished: the next prompt's idle moment proposes the next message (suggest_next) */
 static int  g_sug_seen = -1;      /* the conversation's length when a suggestion was last tried (one try per reply) */
 static int g_mem_pending = 0;     /* finished requests since the last flush */
-static bool g_mem_exiting = false;/* the last flush, on the way out: say that Ctrl-C skips it */
 
 /* The model that does the work is a local one, or Anthropic (anthropic:MODEL / claude:MODEL).
  * xAI, OpenAI, DeepSeek and Kimi stay advisors here: a turn never sends their prefix to Ollama, and the sub-agents
@@ -432,17 +434,45 @@ static cJSON *model_chat(cJSON *messages, cJSON *tools, chat_stats *stats, bool 
     return ollama_chat(messages, tools, stats, aborted);
 }
 
-static void memory_extract(int first) {
-    if (!g_cfg.interactive && !is_dir(".corbienest")) return;
-    int total = cJSON_GetArraySize(g_messages);
-    if (first < 0 || first >= total) first = 0;   /* e.g. auto-compact replaced the conversation */
-    if (total - first < 2) return;                 /* no reply: nothing to learn */
+/* What one update did: whether the model was called (its usage is counted), and whether the file was written. */
+typedef struct { bool called, written; chat_stats st; } mem_result;
+
+/* Strip an optional ```markdown fence around the model's reply. Returns a malloc'd string. */
+static char *unfence(const char *t) {
+    while (*t == ' ' || *t == '\n' || *t == '\r' || *t == '\t') t++;
+    size_t n = strlen(t);
+    while (n && (t[n-1] == ' ' || t[n-1] == '\n' || t[n-1] == '\r' || t[n-1] == '\t')) n--;
+    if (n >= 6 && !strncmp(t, "```", 3) && !strncmp(t + n - 3, "```", 3)) {
+        const char *b = strchr(t, '\n'); if (!b || b >= t + n - 3) return xstrndup(t, n);
+        b++; size_t e = n - 3; while (e > (size_t)(b - t) && (t[e-1] == '\n' || t[e-1] == ' ')) e--;
+        return xstrndup(b, e - (size_t)(b - t));
+    }
+    return xstrndup(t, n);
+}
+
+/* The lock of this project's memory update: a file in the config directory, named by a hash of the working
+ * directory. The memory file itself cannot hold it, since each write replaces it. -1 when there is none
+ * (the update then runs without one). */
+static int memory_lock(void) {
+    char dir[1100]; snprintf(dir, sizeof dir, "%s/memory-locks", config_dir());
+    if (mkdir_p(dir) != 0) return -1;
+    unsigned long long h = 1469598103934665603ULL;   /* FNV-1a */
+    for (const char *p = g_cwd; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+    char path[1200]; snprintf(path, sizeof path, "%s/%016llx.lock", dir, h);
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    while (flock(fd, LOCK_EX) != 0) if (errno != EINTR) { close(fd); return -1; }
+    return fd;
+}
+
+/* The messages of the extraction call: the rules and the file as it is, then the exchange since g_messages[first]. */
+static cJSON *memory_messages(int first, int total, const char *base) {
     cJSON *msgs = cJSON_CreateArray();
     cJSON *sys = cJSON_CreateObject();
     cJSON_AddStringToObject(sys, "role", "system");
     sbuf sp; sb_init(&sp);
     sb_printf(&sp, "You maintain the persistent memory file %s of a coding assistant. You are shown the exchange that just finished. %s\n\n"
-                   "Current memory file:\n\n%s", MEMORY_PATH, MEMORY_RULES, g_memory ? g_memory : MEMORY_TEMPLATE);
+                   "Current memory file:\n\n%s", MEMORY_PATH, MEMORY_RULES, base ? base : MEMORY_TEMPLATE);
     cJSON_AddStringToObject(sys, "content", sp.data); sb_free(&sp);
     cJSON_AddItemToArray(msgs, sys);
     for (int i = first; i < total; i++) {
@@ -476,54 +506,215 @@ static void memory_extract(int first) {
         "If nothing is worth saving, reply with exactly NO_CHANGE. Otherwise reply with the complete updated memory file "
         "in markdown, keeping the existing headings, and nothing else.");
     cJSON_AddItemToArray(msgs, u);
+    return msgs;
+}
 
-    if (g_cfg.interactive) { printf(C_DIM "✎ updating memory…%s" C_RESET, g_mem_exiting ? "  (Ctrl-C skips it)" : ""); fflush(stdout); }
-    chat_stats st; bool ab = false;
+/* The one model call of an update, with no terminal in it (the worker runs it too): one unstreamed request to the
+ * model that does the work, Ollama's /api/chat or a Messages provider. NULL: no answer (*aborted if it was stopped). */
+static cJSON *memory_call(cJSON *msgs, chat_stats *st, bool *aborted) {
+    memset(st, 0, sizeof *st); *aborted = false;
+    const char *model = g_cfg.model;
+    char err[512] = ""; http_result res; sbuf out; sb_init(&out);
+    cJSON *reply = NULL;
     /* a background call: no thinking (it only adds latency here), a hard cap on the reply so a
-     * runaway generation cannot hang the prompt, and an honest status-bar label */
-    ollama_quiet = true;
+     * runaway generation cannot hang the prompt */
     ollama_call.think = 0; ollama_call.num_predict = MEMORY_MAX_TOKENS; ollama_call.busy = "updating memory";
-    cJSON *reply = model_chat(msgs, NULL, &st, &ab);
+    const provider_def *p = provider_find(model, NULL);
+    if (p && p->style == PROVIDER_MESSAGES) {
+        char *body = provider_turn_request(msgs, NULL);
+        const char *hdrs[4]; sbuf keep;
+        bool ok = body && provider_call_headers(model, hdrs, &keep, err, sizeof err);
+        if (ok) {
+            http_headers = hdrs;
+            int rc = http_request(provider_base_url(p), "POST", provider_chat_path(p), body, &out, NULL, NULL, &res);
+            http_headers = NULL;
+            if (rc == 0) { *aborted = res.aborted; if (!*aborted) reply = provider_turn_reply(model, out.data, res.status, st, err, sizeof err); }
+            else snprintf(err, sizeof err, "%s", res.err);
+            sb_free(&keep);
+        } else if (!body) snprintf(err, sizeof err, "the request could not be built");
+        free(body);
+    } else {
+        char *body = ollama_chat_request(msgs, NULL);
+        if (body) {
+            int rc = http_request(g_cfg.host, "POST", "/api/chat", body, &out, NULL, NULL, &res);
+            if (rc == 0) { *aborted = res.aborted; if (!*aborted) reply = ollama_chat_reply(out.data, res.status, true, st, err, sizeof err); }
+            else snprintf(err, sizeof err, "%s", res.err);
+        } else snprintf(err, sizeof err, "the request could not be built");
+        free(body);
+    }
     ollama_call_reset();
-    ollama_quiet = false;
+    sb_free(&out);
+    return reply;
+}
+
+/* One update, in this process: the file as it is under the lock, the exchange since g_messages[first] folded into
+ * it by one call, and the result written if the file has not changed meanwhile. Prints only when interactive. */
+static void memory_work(int first, mem_result *r) {
+    memset(r, 0, sizeof *r);
+    int total = cJSON_GetArraySize(g_messages);
+    if (first < 0 || first >= total) first = 0;   /* e.g. auto-compact replaced the conversation */
+    if (total - first < 2) return;                 /* no reply: nothing to learn */
+    char *base = memory_read();
+    cJSON *msgs = memory_messages(first, total, base);
+    if (g_cfg.interactive) { printf(C_DIM "✎ updating memory…" C_RESET); fflush(stdout); }
+    bool ab = false;
+    cJSON *reply = memory_call(msgs, &r->st, &ab);
+    r->called = true;
     cJSON_Delete(msgs);
-    account(&st);
     if (g_cfg.interactive) { fputs("\r\x1b[2K", stdout); term_status_refresh(); }
-    if (!reply) return;
+    if (!reply) { free(base); return; }
     cJSON *c = cJSON_GetObjectItemCaseSensitive(reply, "content");
     char *text = unfence(cJSON_IsString(c) ? c->valuestring : "");
     cJSON_Delete(reply);
-    bool cut = !strcmp(st.done_reason, "length");   /* hit num_predict: never write a truncated file */
+    bool cut = !strcmp(r->st.done_reason, "length");   /* hit num_predict: never write a truncated file */
     bool nochange = ab || cut || !*text || strstr(text, "NO_CHANGE") || *text != '#' || strlen(text) > 2 * MEMORY_MAX;
-    bool written = false;
-    if (!nochange && (!g_memory || strcmp(text, g_memory))) {
+    if (!nochange && (!base || strcmp(text, base))) {
+        /* the lock is ours, so only a write that did not take it (a `# fact`, an edit_file) can have changed the file */
+        char *now = memory_read();
+        bool same = now ? (base && !strcmp(now, base)) : !base;
+        free(now);
         size_t n = strlen(text);
-        if (n && text[n-1] != '\n') { text = xrealloc(text, n + 2); text[n++] = '\n'; text[n] = 0; }
-        if (mkdir_p(".corbienest") == 0 && write_whole_file_atomic(MEMORY_PATH, text, n) == 0) {
-            load_memory(); written = true;
-            printf(C_DIM "✎ memory updated (%s) · %.1fs" C_RESET "\n", MEMORY_PATH, st.total_seconds);
+        if (same && n && text[n-1] != '\n') { text = xrealloc(text, n + 2); text[n++] = '\n'; text[n] = 0; }
+        if (same && mkdir_p(".corbienest") == 0 && write_whole_file_atomic(MEMORY_PATH, text, n) == 0) {
+            r->written = true;
+            if (g_cfg.interactive) printf(C_DIM "✎ memory updated (%s) · %.1fs" C_RESET "\n", MEMORY_PATH, r->st.total_seconds);
         }
     }
     /* show what this step cost, so a slow turn is never a mystery */
-    if (!written && g_cfg.interactive && st.total_seconds > 0)
-        printf(C_GRAY "✎ memory: %s · %.1fs%s" C_RESET "\n", cut ? "reply too long, ignored" : "no change", st.total_seconds,
-               st.total_seconds >= 15 ? "  (slow? /memory off skips this step)" : "");
+    if (!r->written && g_cfg.interactive && r->st.total_seconds > 0)
+        printf(C_GRAY "✎ memory: %s · %.1fs%s" C_RESET "\n", cut ? "reply too long, ignored" : "no change", r->st.total_seconds,
+               r->st.total_seconds >= 15 ? "  (slow? /memory off skips this step)" : "");
+    free(text); free(base);
+}
+
+/* A one-shot run's update: here, and the usage is counted at once. */
+static void memory_here(int first) {
+    int lock = memory_lock();
+    mem_result r;
+    memory_work(first, &r);
+    if (lock >= 0) close(lock);
+    if (r.called) account(&r.st);
+    if (r.written) load_memory();
+    if (g_cfg.interactive) term_status_refresh();
+}
+
+/* The workers started and not yet collected: the pid, the read end of its result pipe, and the model it was called on. */
+#define MEM_KIDS 8
+typedef struct { pid_t pid; int rfd; char model[160]; } mem_kid;
+static mem_kid g_kids[MEM_KIDS];
+static int g_nkids = 0;
+
+/* Hands the update to a worker and returns at once. False when none could be started (the caller then runs it here). */
+static bool memory_spawn(int first) {
+    if (g_nkids == MEM_KIDS) return false;
+    int total = cJSON_GetArraySize(g_messages);
+    if (first < 0 || first >= total) first = 0;
+    /* the snapshot: what the worker needs of this process — the directory (the memory file is relative to it), the
+     * model and host as they are now, and the messages from `first` on */
+    cJSON *snap = cJSON_CreateObject();
+    cJSON_AddStringToObject(snap, "cwd", g_cwd);
+    cJSON_AddStringToObject(snap, "model", g_cfg.model);
+    cJSON_AddStringToObject(snap, "host", g_cfg.host);
+    cJSON *msgs = cJSON_AddArrayToObject(snap, "messages");
+    for (int i = first; i < total; i++) cJSON_AddItemToArray(msgs, cJSON_Duplicate(cJSON_GetArrayItem(g_messages, i), 1));
+    char *text = cJSON_PrintUnformatted(snap);
+    cJSON_Delete(snap);
+    char dir[1100]; snprintf(dir, sizeof dir, "%s/memory-jobs", config_dir());
+    static int seq = 0;
+    char snap_path[1200]; snprintf(snap_path, sizeof snap_path, "%s/%ld-%d.json", dir, (long)getpid(), ++seq);
+    if (!text || mkdir_p(dir) != 0 || write_whole_file_atomic(snap_path, text, strlen(text)) != 0) { free(text); return false; }
     free(text);
+    int fds[2];
+    if (pipe(fds) != 0) { unlink(snap_path); return false; }
+    fcntl(fds[1], F_SETFD, FD_CLOEXEC);   /* the child clears it again, just before its exec */
+    /* everything the child execs with is made here: after fork only async-signal-safe calls */
+    const char *self = self_exe_path();
+    char fdarg[16]; snprintf(fdarg, sizeof fdarg, "%d", fds[1]);
+    char *av[] = { (char *)self, "--memory-worker", snap_path, fdarg, NULL };
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); unlink(snap_path); return false; }
+    if (pid == 0) {
+        setsid();   /* its own session: no terminal signal reaches it, and it outlives this process */
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) { dup2(dn, STDIN_FILENO); dup2(dn, STDOUT_FILENO); dup2(dn, STDERR_FILENO); }
+        long maxfd = sysconf(_SC_OPEN_MAX);
+        if (maxfd < 0 || maxfd > 4096) maxfd = 4096;
+        for (int fd = 3; fd < maxfd; fd++) if (fd != fds[1]) close(fd);   /* the terminal, the tools' pipes, the servers' */
+        fcntl(fds[1], F_SETFD, 0);
+        execv(self, av);
+        _exit(127);
+    }
+    close(fds[1]);
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    mem_kid *k = &g_kids[g_nkids++];
+    k->pid = pid; k->rfd = fds[0];
+    snprintf(k->model, sizeof k->model, "%s", g_cfg.model);
+    return true;
+}
+
+/* `corbienest --memory-worker SNAPSHOT FD`: the update memory_spawn() asked for, run with no terminal (the worker is
+ * a process of its own: it loads the config like any start, reads the snapshot and writes its result to FD). */
+static int memory_worker(const char *snap_path, int fd) {
+    size_t n; char *text = read_whole_file(snap_path, &n, 512u * 1024u * 1024u);
+    unlink(snap_path);
+    cJSON *snap = text ? cJSON_Parse(text) : NULL;
+    free(text);
+    const cJSON *cwd = snap ? cJSON_GetObjectItemCaseSensitive(snap, "cwd") : NULL;
+    const cJSON *model = snap ? cJSON_GetObjectItemCaseSensitive(snap, "model") : NULL;
+    const cJSON *host = snap ? cJSON_GetObjectItemCaseSensitive(snap, "host") : NULL;
+    if (!cwd || !cJSON_IsString(cwd) || !model || !cJSON_IsString(model) || !host || !cJSON_IsString(host) || chdir(cwd->valuestring) != 0) _exit(1);
+    snprintf(g_cwd, sizeof g_cwd, "%s", cwd->valuestring);
+    free(g_cfg.model); g_cfg.model = xstrdup(model->valuestring);
+    free(g_cfg.host); g_cfg.host = xstrdup(host->valuestring);
+    g_cfg.interactive = false;
+    g_messages = cJSON_DetachItemFromObject(snap, "messages");
+    cJSON_Delete(snap);
+    if (!g_messages || !cJSON_IsArray(g_messages)) { g_messages = cJSON_CreateArray(); _exit(1); }
+    refresh_model_caps(true);   /* the model's limits and capabilities, as a start reads them */
+    int lock = memory_lock();
+    mem_result r;
+    memory_work(0, &r);
+    if (lock >= 0) close(lock);
+    const char *p = (const char *)&r; size_t left = sizeof r;
+    while (left > 0) { ssize_t k = write(fd, p, left); if (k <= 0) break; p += k; left -= (size_t)k; }
+    close(fd);
+    _exit(0);
+}
+
+/* Collects the workers that have finished. Never waits: a worker still running is left for the next call. */
+static void memory_reap(void) {
+    for (int i = 0; i < g_nkids; ) {
+        int st;
+        if (waitpid(g_kids[i].pid, &st, WNOHANG) != g_kids[i].pid) { i++; continue; }
+        mem_result r; memset(&r, 0, sizeof r);
+        char *p = (char *)&r; size_t got = 0;
+        while (got < sizeof r) { ssize_t k = read(g_kids[i].rfd, p + got, sizeof r - got); if (k <= 0) break; got += (size_t)k; }
+        close(g_kids[i].rfd);
+        mem_kid gone = g_kids[i];
+        g_kids[i] = g_kids[--g_nkids];
+        if (got != sizeof r) continue;   /* it died before it reported */
+        if (r.called) { account_as(gone.model, &r.st); if (g_cfg.interactive) term_status_refresh(); }
+        if (r.written) { load_memory(); if (g_cfg.interactive) printf(C_DIM "✎ memory updated (%s) · %.1fs" C_RESET "\n", MEMORY_PATH, r.st.total_seconds); }
+    }
 }
 
 /* Run the pending extraction now (if anything is pending). */
 static void memory_flush(void) {
     g_mem_due = 0;
     if (!g_cfg.memory || g_mem_first < 0) { g_mem_first = -1; g_mem_pending = 0; return; }
+    if (g_nkids == MEM_KIDS) return;   /* workers pile up only when the server hangs: the requests stay pending for the next flush */
     int first = g_mem_first;
     g_mem_first = -1; g_mem_pending = 0;
     if (first >= cJSON_GetArraySize(g_messages)) return;   /* rewound past it: nothing left to learn */
-    memory_extract(first);
+    if (!g_cfg.interactive && !is_dir(".corbienest")) return;   /* -p leaves no litter in a project that has no memory yet */
+    if (g_cfg.interactive && memory_spawn(first)) { printf(C_DIM "✎ memory: updating in the background" C_RESET "\n"); return; }
+    memory_here(first);
 }
 
 /* How long the next prompt should wait before folding a finished request into memory
  * (0 = not at all: nothing pending, or the idle flush is switched off). */
 static void memory_arm_idle(void) {
+    memory_reap();
     bool on = g_cfg.memory && g_cfg.memory_idle > 0 && g_mem_first >= 0;
     if (!on) g_mem_due = 0;
     else if (g_mem_due <= 0) g_mem_due = mono_now() + g_cfg.memory_idle;   /* counted from this prompt; a later prompt keeps it */
@@ -1445,6 +1636,7 @@ static void suggest_next(void) {
  * extraction if its idle time has passed (memory_idle seconds after the prompt came up, so a
  * suggestion before it does not shorten it). Then the timer is set for what is still waiting. */
 static void prompt_idle(void) {
+    memory_reap();
     if (g_sug_due) { g_sug_due = false; suggest_next(); }
     if (g_mem_due > 0 && mono_now() >= g_mem_due) memory_flush();
     prompt_arm();
@@ -1460,6 +1652,7 @@ static void prompt_arm(void) {
         if (left < 0.001) left = 0.001;
         if (want < 0 || left < want) want = left;
     }
+    if (g_nkids > 0 && (want < 0 || want > 1.0)) want = 1.0;   /* a worker is out: collected at the prompt about a second after it ends */
     term_idle_ms = want < 0 ? 0 : (int)(want * 1000) + 1;
 }
 
@@ -6409,6 +6602,7 @@ int main(int argc, char **argv) {
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();
+    if (argc == 4 && !strcmp(argv[1], "--memory-worker")) return memory_worker(argv[2], atoi(argv[3]));   /* a memory update, see memory_spawn() */
     const char *env_host = getenv("OLLAMA_HOST");
     if (env_host && *env_host && !g_cfg.host) g_cfg.host = xstrdup(env_host);
     if (!g_cfg.host) g_cfg.host = xstrdup("http://127.0.0.1:11434");
@@ -6621,8 +6815,7 @@ int main(int argc, char **argv) {
         if (rc == -1) term_queue_to_editor();
     }
     hist_save();
-    g_mem_exiting = true;
-    memory_flush();   /* whatever the idle flush did not get to runs before we leave (Ctrl-C skips it) */
+    memory_flush();   /* whatever the idle flush did not get to goes to a worker, which finishes after we leave */
     session_save();
     term_finish();    /* leaves the alternate screen: say goodbye on the normal one */
     printf(C_DIM "bye" C_RESET " · corbienest used %ld tokens this session (%ld in · %ld out) with %s\n",
