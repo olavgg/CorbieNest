@@ -1194,6 +1194,42 @@ s.send("\x04"); s.close()
 out, rc = run(["-m", "fake-coder:latest", "-p", "REMEMBER_ME oneshot"])
 check(not os.path.exists(os.path.join(WORK, ".corbienest", "memory.md")), "one-shot run does not create the memory file (memory off in config)")
 
+print("test interactive: the suggestion reaches the server before the memory update, with the same num_ctx")
+s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
+s.send("/memory on\r"); s.expect("memory on")
+s.send("/memory every 1\r"); s.expect("memory updated after each request")
+s.send("/memory idle 2\r"); s.expect("after 2s idle at the prompt")
+s.send("/suggest on\r"); s.expect("suggestions on")
+n0 = len(requests())
+def sent_since(): return requests()[n0:]
+def is_sug(r): return str(r["messages"][-1].get("content", "")).startswith("Predict the next message")
+def is_mem(r): return str(r["messages"][0].get("content", "")).startswith("You maintain the persistent memory file")
+s.send("ORDER_CHECK first\r"); check(s.expect("Echo: ORDER_CHECK first"), "reply")
+check(wait_for(lambda: any(is_sug(r) for r in sent_since()) and any(is_mem(r) for r in sent_since())),
+      "the suggestion and the memory update both reached the server")
+new = sent_since()
+chat = [r for r in new if r["messages"][-1]["content"] == "ORDER_CHECK first"][0]
+sug = [r for r in new if is_sug(r)][0]; mem = [r for r in new if is_mem(r)][0]
+check(new.index(sug) < new.index(mem), f"the suggestion went out first: {[r['messages'][-1]['content'][:20] for r in new]}")
+check(sug["options"].get("num_ctx") == chat["options"].get("num_ctx") and sug["options"].get("num_predict") == 60,
+      f"the suggestion carries the chat's num_ctx: {sug['options']!r} against {chat['options']!r}")
+s.send("/memory off\r"); s.expect("memory off")
+s.send("\x04"); s.close()
+
+print("test interactive: a memory update that finishes while the prompt has text is shown then, and the text stays")
+s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
+s.send("/memory on\r"); s.expect("memory on")
+s.send("/memory every 1\r"); s.expect("memory updated after each request")
+s.send("/memory idle off\r"); s.expect("memory idle update off")
+s.send("/suggest off\r"); s.expect("suggestions off")
+s.send("MEMWAIT REMEMBER_ME typed meanwhile\r"); check(s.expect("Echo: MEMWAIT REMEMBER_ME typed meanwhile"), "reply")
+check(s.expect("memory: updating in the background", 10), "the extraction runs in the background")
+s.send("half a line")   # the field has text while the (slow) extraction runs
+check(s.expect("memory updated", 15), f"the finished update is shown with text in the field: {s.text()[-200:]!r}")
+check(s.expect("half a line"), "and the text is still in the field")
+s.send("\x15"); s.send("/memory off\r"); s.expect("memory off")
+s.send("\x04"); s.close()
+
 print("test interactive: old tool results are elided once the context is half full")
 s = Session(["-m", "fake-coder:latest", "--yolo"]); s.expect("Ctrl-D to quit")
 s.send("TOOL_BIG one\r"); check(s.expect("Tool said:", 10), "first tool round")
