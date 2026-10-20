@@ -1626,7 +1626,10 @@ check(os.stat(TRACE).st_mode & 0o777 == 0o600, "it holds the conversation: reada
 p = subprocess.run(REPLAY + ["--fast", "--no-hold"], capture_output=True, timeout=30)
 check(p.returncode == 0 and b"\x1b[?1049h" in p.stdout and "Echo: " in clean(p.stdout.decode("utf-8", "replace")) and "traced words" in clean(p.stdout.decode("utf-8", "replace")), "the replay writes what the session wrote, escapes and all")
 p = subprocess.run(REPLAY + ["--info"], capture_output=True, timeout=30)
-check(b"rows=40 cols=100" in p.stdout and b"traced words" in p.stdout and b"wheel up at row 5, column 10" in p.stdout, f"--info lists the layout, what was typed and what the mouse sent: {p.stdout[-300:]!r}")
+info = p.stdout.decode("utf-8", "replace")
+# one write of the keys can be read in two pieces, so the typed words are the "in" lines put together, as the line above does for the raw trace
+typed = "".join(l.split(None, 2)[2].split("   (")[0] for l in info.splitlines() if len(l.split(None, 2)) == 3 and l.split(None, 2)[1] == "in")
+check("rows=40 cols=100" in info and "traced words\\r" in typed and "wheel up at row 5, column 10" in info, f"--info lists the layout, what was typed and what the mouse sent: {info[-300:]!r}")
 p = subprocess.run(REPLAY + ["--excerpt", "0", "0.05"], capture_output=True, timeout=30)
 check(p.stdout.startswith(lines[0].encode()) and len(p.stdout) < os.path.getsize(TRACE), "--excerpt cuts a stretch of it out, to paste")
 
