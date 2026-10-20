@@ -326,6 +326,20 @@ def click_rows(sess, rows=40):
     time.sleep(0.5); sess.expect("(no such text)", 0.3)
     return clean(sess.out[at:].decode("utf-8", "replace"))
 
+def screen_when(sess, pred, t=5):
+    """Poll the screen (see Screen) until pred(rows) holds, up to t seconds; the rows then, or None. What a check reads is
+    what is shown once the redraw is done, not whichever bytes had arrived when the key's first sign was seen."""
+    end = time.time() + t
+    while True:
+        rows = sess.screen()
+        if pred(rows): return rows
+        if time.time() >= end: return None
+        sess.expect("(no such text)", 0.1)
+
+def _note_row(rows):
+    """The row of the viewer's line that says where the window is (None: the conversation is not scrolled back)."""
+    return next((i for i, r in enumerate(rows) if "scrollback · rows" in r), None)
+
 def scrolled(sess):
     """Whether the chrome as last drawn says the conversation is scrolled back: the line for that
     is drawn right above the input field's upper rule. (The status bar says nothing about it —
@@ -1388,8 +1402,13 @@ for pfx in "abcd":
     s.send("!seq -f '%s-%%02g' 1 30\r" % pfx); check(s.expect(pfx + "-30", 10), "30 rows printed")
 s.send("hello before\r"); check(s.expect("Echo: hello before"), "reply")
 s.send("\x1b[5~"); check(s.expect("scrollback · rows"), f"PgUp opens the viewer: {s.text()[-200:]!r}")
+def _bar_under_note(rows):
+    i = _note_row(rows)
+    below = "\n".join(rows[i + 1:]) if i is not None else ""
+    return "manual mode" in below and "tokens" in below
+rows = screen_when(s, _bar_under_note)
 view = since(); first = viewrange()
-check("manual mode" in view.split("scrollback · rows")[-1] and "tokens" in view.split("scrollback · rows")[-1], f"where the window is has a line of its own: the status bar stays what it is: {view[-300:]!r}")
+check(rows is not None, f"where the window is has a line of its own, and the status bar under it stays what it is: {chr(10).join(s.screen()[-6:])!r}")
 check("c-05" in view and "d-30" not in view and "hello before" not in view, f"viewer shows an earlier window: {view[-400:]!r}")
 s.send("\x1b[5~"); s.expect("scrollback"); second = viewrange()
 check(first and second and second[0] < first[0], f"PgUp again scrolls further up: {first} -> {second}")
@@ -1401,7 +1420,8 @@ check("hello before" in tail and "Echo: hello before" in tail and "d-30" in tail
 s.send("after view\r"); check(s.expect("Echo: after view"), "the editor works after the viewer")
 s.send("\x1b[5~"); s.expect("scrollback")
 for _ in range(6): s.send("\x1b[6~", wait=0.3)
-check(s.expect("❯"), "prompt back"); time.sleep(0.2)
+rows = screen_when(s, lambda rs: _note_row(rs) is None and any("❯" in r for r in rs[-4:]))   # the viewer closes on one of the presses, not necessarily the last
+check(rows is not None, f"PgDn at the bottom leaves the viewer, and the prompt is back: {chr(10).join(s.screen()[-6:])!r}")
 check(not scrolled(s), "PgDn at the bottom leaves the viewer")
 s.send("typed\r"); check(s.expect("Echo: typed"), "prompt usable again")
 s.send("\x04"); s.close()
@@ -1450,7 +1470,8 @@ s = new_session(["-m", "fake-coder:latest"])   # its own session: it stands alon
 s.send("/help\r"); s.expect("(no such text)", 2)   # some history longer than the screen, so there is something to scroll back to
 s.send("SLOW please\r"); check(s.expect("one"), "the reply starts")
 s.send(wheel(True, n=2)); check(s.expect("scrollback · rows"), f"the wheel scrolls back while the reply streams: {s.text()[-200:]!r}")
-check("manual mode" in since(), "the bar is still the bar: the mode is shown while the reply streams (the spinner stops once the reply has begun)")
+check(screen_when(s, lambda rs: _note_row(rs) is not None and "manual mode" in "\n".join(rs[_note_row(rs) + 1:])) is not None,
+      f"the bar is still the bar: the mode is shown while the reply streams (the spinner stops once the reply has begun): {chr(10).join(s.screen()[-6:])!r}")
 time.sleep(1.3); s.expect("(no such text)", 0.2)
 check("four" not in since(), f"what arrives meanwhile is recorded, not painted over the window: {since()[-200:]!r}")
 s.send("\x1b"); check(s.expect("eight") and s.expect("tok/s"), "Esc goes back to the output, and the reply runs to its end")
