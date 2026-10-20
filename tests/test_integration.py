@@ -6,7 +6,7 @@ config/env handling, and — via a pseudo-terminal — the interactive editor,
 confirmations, Ctrl-C interruption, type-ahead, slash commands and the /model
 picker. Requires only python3 (stdlib). No real Ollama needed.
 """
-import inspect, json, os, pty, re, select, shutil, socket, struct, subprocess, sys, tempfile, termios, fcntl, time, threading, urllib.request
+import codecs, inspect, json, os, pty, re, select, shutil, socket, struct, subprocess, sys, tempfile, termios, fcntl, time, threading, urllib.request
 # a short temp root, as on Linux: macOS's per-user temp dir (/var/folders/…/T) is so long that the status bar's location line
 # cuts the test folder's path, and the checks that read the bar then miss their text. Set before the first mkdtemp.
 os.environ["TMPDIR"] = "/tmp"
@@ -123,6 +123,95 @@ def wait_for(pred, t=15):   # a background memory update finishes on its own: po
     return False
 
 # ---------- non-interactive ----------
+class Screen:
+    """What a terminal shows, worked out from the bytes the program wrote: text, cursor moves, erases and the
+    save/restore pair. Colours and other attributes are ignored, and nothing scrolls (the chrome is written with
+    absolute moves). A row is kept as its cells, so an erase takes its cells away. Checks that read a list or a
+    field read this, not the stream: a row that did not change is not drawn again, and a frame of an earlier key
+    is not what is on the screen now."""
+    def __init__(self, cols=100, rows=40):
+        self.cols, self.rows = cols, rows
+        self.cells = {}                       # row -> {col: char}
+        self.top, self.bot = 1, rows          # the scroll region (DECSTBM)
+        self.r = self.c = self.sr = self.sc = 1
+        self.pending = ""                     # an escape sequence that the next chunk completes
+        self.dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.at = 0                           # bytes of the output read so far
+    def feed(self, data):
+        self.at += len(data)
+        s = self.pending + self.dec.decode(data); self.pending = ""
+        i, n = 0, len(s)
+        while i < n:
+            ch = s[i]
+            if ch == "\x1b":
+                if i + 1 >= n: self.pending = s[i:]; break
+                nx = s[i + 1]
+                if nx == "[":
+                    j = i + 2
+                    while j < n and (s[j] in "0123456789;?"): j += 1
+                    if j >= n: self.pending = s[i:]; break
+                    self.csi(s[i + 2:j], s[j]); i = j + 1; continue
+                if nx == "]":                 # OSC: up to BEL
+                    j = s.find("\x07", i + 2)
+                    if j < 0: self.pending = s[i:]; break
+                    i = j + 1; continue
+                if nx in "()":                # a character set: three bytes
+                    i += 3; continue
+                if nx == "7": self.sr, self.sc = self.r, self.c
+                elif nx == "8": self.r, self.c = self.sr, self.sc
+                i += 2; continue
+            if ch == "\r": self.c = 1
+            elif ch == "\n":
+                if self.r == self.bot: self.scroll_up()
+                else: self.r = min(self.r + 1, self.rows)
+            elif ch == "\b": self.c = max(1, self.c - 1)
+            elif ch >= " " and ch != "\x7f":
+                self.cells.setdefault(self.r, {})[self.c] = ch
+                if self.c < self.cols: self.c += 1
+            i += 1
+    def scroll_up(self):
+        """A line feed on the region's last row: its rows move up one, and the bottom one is empty."""
+        for r in range(self.top, self.bot):
+            if r + 1 in self.cells: self.cells[r] = self.cells[r + 1]
+            else: self.cells.pop(r, None)
+        self.cells.pop(self.bot, None)
+    def csi(self, params, final):
+        if params.startswith("?"): return     # private modes (autowrap, the alternate screen): not modelled
+        nums = [int(x) if x else 0 for x in params.split(";")] if params else []
+        n = nums[0] if nums else 0
+        if final == "r":
+            self.top = min(max(nums[0] if nums and nums[0] else 1, 1), self.rows)
+            self.bot = min(max(nums[1] if len(nums) > 1 and nums[1] else self.rows, self.top), self.rows)
+            self.r = self.c = 1
+        elif final in "Hf":
+            self.r = min(max(nums[0] if nums and nums[0] else 1, 1), self.rows)
+            self.c = min(max(nums[1] if len(nums) > 1 and nums[1] else 1, 1), self.cols)
+        elif final == "A": self.r = max(self.r - (n or 1), 1)
+        elif final == "B": self.r = min(self.r + (n or 1), self.rows)
+        elif final == "C": self.c = min(self.c + (n or 1), self.cols)
+        elif final == "D": self.c = max(self.c - (n or 1), 1)
+        elif final == "G": self.c = min(max(n or 1, 1), self.cols)
+        elif final == "K":
+            row = self.cells.get(self.r, {})
+            if n == 2: row.clear()
+            elif n == 1: [row.pop(k) for k in list(row) if k <= self.c]
+            else: [row.pop(k) for k in list(row) if k >= self.c]
+        elif final == "J":
+            if n in (2, 3): self.cells.clear()
+            else:
+                for r in list(self.cells):
+                    if (n == 0 and r > self.r) or (n == 1 and r < self.r): del self.cells[r]
+                row = self.cells.get(self.r, {})
+                if n == 0: [row.pop(k) for k in list(row) if k >= self.c]
+                else: [row.pop(k) for k in list(row) if k <= self.c]
+    def rows_text(self):
+        """The screen's rows, top to bottom, trailing blanks dropped."""
+        out = []
+        for r in range(1, self.rows + 1):
+            row = self.cells.get(r, {})
+            out.append("".join(row.get(c, " ") for c in range(1, self.cols + 1)).rstrip())
+        return out
+
 class Session:
     def __init__(self, args=(), cols=100, rows=40, env=None, cwd=None, banner=False):
         self.pid, self.fd = pty.fork()
@@ -135,6 +224,7 @@ class Session:
             os.execv(BIN, ["corbienest"] + list(args))
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self.out = b""; self.mark = 0
+        self.scr = Screen(cols, rows)
         if not banner: self.close_banner()
     def close_banner(self):
         """The start-up banner is a modal: while it is up, the output is kept for the scrollback and not written to the
@@ -181,9 +271,26 @@ class Session:
         autowrap-off region), and expect() skips repaints on purpose: so this reads what was written, not what is fresh."""
         return self.expect("Ctrl-D to quit", t) or seen(self, "Ctrl-D to quit", 0.1)
     def send(self, s, wait=0.15):
+        # what the keys before this one drew is read first: a read that waits until the mark is set would count
+        # their late frames as this key's output (listed() then saw the previous word's list)
+        self.drain()
         self.mark = len(self.out)
         os.write(self.fd, s.encode() if isinstance(s, str) else s); time.sleep(wait)
+    def drain(self, quiet=0.05, cap=0.5):
+        """Read what the pty has, until it is quiet for `quiet` seconds (at most `cap`): output that is already on its way."""
+        end = time.time() + cap
+        while time.time() < end:
+            r, _, _ = select.select([self.fd], [], [], quiet)
+            if not r: return
+            try: d = os.read(self.fd, READ_MAX)
+            except OSError: return
+            if not d: return
+            self.out += d
     def text(self): return clean(self.out.decode("utf-8", "replace"))
+    def screen(self):
+        """The rows as the terminal shows them now (see Screen)."""
+        self.scr.feed(self.out[self.scr.at:])
+        return self.scr.rows_text()
     def close(self):
         """Kill it and wait: a session that is still exiting writes the config one last time,
         and a test that writes its own config next would lose it to that write. The pty is closed
@@ -250,11 +357,13 @@ def quiet(sess, data):
     sess.send(data); sess.expect("(no such text)", 0.6); return len(sess.out) == sess.mark
 
 def listed():
-    """What the redraw since the last key put under the input field: the list, its hint and the bar. Everything since
-    the key, not one piece of it: a redraw writes the list's rows in an order that is not fixed (before or after the
-    field's edge), and a repaint may have drawn the banner again above them. The checks look for list entries only."""
+    """The list under the input field as the screen shows it now, from the field's upper edge down: the entries, the
+    hint line and the bar. The screen, not the bytes since the key: a row the list did not change is not drawn again,
+    and a frame of an earlier key is not what is shown now."""
     s.expect("(no such text)", 0.3)
-    return since()
+    rows = s.screen()
+    tops = [i for i, r in enumerate(rows) if "╭" in r]
+    return "\n".join(rows[tops[-1]:]) if tops else ""
 
 def thinks(rs): return [r.get("think", "absent") for r in rs]
 
@@ -1013,7 +1122,7 @@ sp.send("\x1b[6~", 0.6); sp.expect("(no such text)", 0.6)
 sp.send("\x1b", 0.8); sp.expect("(no such text)", 0.6)
 check("pasted text #1" not in since_send(sp), "Esc closes it")
 sp.send("\r"); sp.expect("(no such text)", 1.5)
-last_user = [m for m in requests()[-1]["messages"] if m["role"] == "user"][-1]["content"]
+last_user = [m for m in [r for r in requests() if not str(r["messages"][-1].get("content", "")).startswith("Predict the next message")][-1]["messages"] if m["role"] == "user"][-1]["content"]   # not the suggestion that follows the reply
 check(all(f"line{i}" in last_user for i in range(10)) and "[Pasted text" not in last_user, f"the model got the whole paste: {last_user[:80]!r}")
 sp.close()
 print("test interactive: /subagent sets the model and the effort sub-agents run on")
@@ -1137,6 +1246,7 @@ mem = open(os.path.join(WORK, ".corbienest", "memory.md")).read()
 check("## Feedback\n\n- always run make test\n" in mem or "## Feedback\n- always run make test\n" in mem, f"bullet placed under Feedback: {mem!r}")
 check("- the user prefers tabs" in mem, "existing facts kept")
 s.send("# second note\r"); s.expect("under which section?"); s.send("\r")
+check(s.expect("remembered under Project"), "the second fact is saved under Project")   # the file is written on the way to this line
 mem = open(os.path.join(WORK, ".corbienest", "memory.md")).read()
 check("## Project\n\n- second note\n" in mem or "## Project\n- second note\n" in mem, f"second fact under Project: {mem!r}")
 check("Echo: # " not in s.text(), "# lines were not sent to the model")
@@ -1834,9 +1944,7 @@ check(s.expect("Select advisor"), "/advisor opens a picker"); check(s.expect("No
 check(seen(s, "┌") and seen(s, "│ Select advisor"), "the picker is a box over the conversation on the full screen, not a list printed under the lines above it")
 s.send("\x1b"); check(s.expect("advisor unchanged: none"), "Esc leaves it")
 s.send("/advisor fake-bi"); s.send("g"); seen(s, "fake-big:latest", 5)
-_w = since_send(s)   # a repaint of the old transcript comes first; the list is drawn after each field row that changes it
-_segs = [g for g in re.split(r"(?=❯ /advisor )", _w) if "tab complete" in g]
-view = _segs[-1] if _segs else ""
+view = listed()   # what the screen shows under the field now
 check("fake-big:latest" in view and "fake-chat" not in view, f"the installed models are suggested as a name is typed: {view!r}")
 s.send("\t\r"); check(s.expect("advisor: fake-big:latest"), "Tab completes the name, Enter sets it")
 s.send("/advisor "); s.send("o"); s.expect("(no such text)", 2); view = since()   # the list is drawn under the field: read it, then everything since the key
@@ -2156,7 +2264,7 @@ s.send("/model claude:"); s.send("c"); view = listed()
 check("claude:claude-fake-opus" in view and "claude:claude-fake-haiku" in view and "grok-fake" not in view,
       f"claude: is the same list, under the name that was typed: {view!r}")
 s.send("\x03"); s.send("/model xai"); s.send(":"); view = listed()
-check("grok-fake" not in view and "xai:" not in view, f"xai: is not completed on /model: {view!r}")
+check("grok-fake" not in view and "xai:grok" not in view, f"xai: is not completed on /model: {view!r}")   # (the typed "xai:" is on the field's line)
 s.send("\x03"); s.send("/model\r"); check(s.expect("Select model"), "Enter with no name still opens the local picker")
 s.send("think"); time.sleep(0.2); s.send("\r"); check(s.expect("model set to fake-thinker:latest"), "and typing in it still filters")
 s.send("\x04"); s.close()
@@ -2427,7 +2535,7 @@ def _key_lines(sess, key):
         start = i + len(needle)
     return marked, bare
 s = Session(["-m", "anthropic:claude-opus-5", "--advisor", "anthropic:claude-opus-5"], env=ENV2)
-check(s.expect("Ctrl-D to quit"), "it starts with the model and the advisor on the same missing key")
+check(s.started(), "it starts with the model and the advisor on the same missing key")
 m, b = _key_lines(s, "ANTHROPIC_API_KEY")
 check(m >= 1 and b == 0, f"that key is the model's one line, not reprinted and not said again for the advisor: marked {m} bare {b}")
 s.send("\x04"); s.close()
@@ -2446,7 +2554,6 @@ check(len(bodies) == 2 and "You are the orchestrator" in bodies[0][0]["content"]
 check(key_nowhere() is None, f"and the key was written nowhere: {key_nowhere()!r}")
 s.send("\x04"); s.close()
 os.remove(MADE)
-shutil.rmtree(CFG2, ignore_errors=True)
 
 # ---------- https: Ollama behind TLS, and a hosted API over it ----------
 print("test https: the same client over TLS, with the certificate checked")
@@ -2474,7 +2581,10 @@ print("test config persistence")
 cfg = open(os.path.join(CFG, "corbienest", "config")).read()
 check("keep_alive=30m" in cfg, "keep_alive saved to config")
 check("model=fake-coder:latest" in cfg, "model saved to config")
-# /mode manual ran in the second session (ENV2), so its file is CFG2's
+# /mode is saved to the config of the session that set it (ENV2's folder, CFG2)
+ms = Session(["-m", "fake-coder:latest"], env=ENV2); ms.started()
+ms.send("/mode manual\r"); check(ms.expect("mode: manual"), "/mode manual answered")
+ms.send("\x04"); ms.close()
 check(os.path.exists(CFG2_FILE) and "mode=manual" in open(CFG2_FILE).read(), f"mode saved to config: {open(CFG2_FILE).read()[:200] if os.path.exists(CFG2_FILE) else 'no config file in CFG2'!r}")
 check("max_iters=100" in cfg, "max_iters saved to config")
 s = Session([])   # no -m: should use saved model
@@ -2521,7 +2631,7 @@ check(score == "9\n", f"the kept result is applied to the working tree: {score!r
 wt = subprocess.run(["git", "-C", repo, "worktree", "list"], capture_output=True, text=True).stdout.strip().splitlines()
 check(len(wt) == 1, f"no candidate's worktree is left behind: {wt}")
 br = subprocess.run(["git", "-C", repo, "branch", "--list", "corbie-goal/*"], capture_output=True, text=True).stdout.strip()
-check(br.startswith("* ") or br.startswith("  corbie-goal/"), f"the kept result is kept as a branch: {br!r}")
+check("corbie-goal/" in br and "\n" not in br, f"the kept result is kept as a branch: {br!r}")
 left = os.listdir(os.path.join(CFG, "corbienest", "goals")) if os.path.isdir(os.path.join(CFG, "corbienest", "goals")) else []
 check(left == [], f"the goal's folder is removed: {left}")
 xai = [r for r in provider_requests() if r.get("provider") == "xai" and "tools" in r.get("body", {})]
