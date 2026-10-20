@@ -1299,6 +1299,9 @@ static void chrome_send(sbuf *o) {
                 if (hit >= 0 && g_chrome[hit].n == grp.len && !memcmp(g_chrome[hit].text, grp.data, grp.len)) sent = false; \
                 else if (hit < 0 && g_chrome_n >= CHROME_KEYS) { } \
                 else { int i = hit >= 0 ? hit : g_chrome_n++; free(g_chrome[i].text); g_chrome[i].row = grow; g_chrome[i].col = 0; g_chrome[i].text = xmalloc(grp.len); g_chrome[i].n = grp.len; memcpy(g_chrome[i].text, grp.data, grp.len); } \
+            } else if (grow >= 0) { /* an erase with no text: the row is blank now, whatever the cache held. Forget it, or the next \
+                                       text that equals the old one is skipped and the row stays blank (the busy list's hint) */ \
+                for (int i = 0; i < g_chrome_n; i++) if (g_chrome[i].row == grow) g_chrome[i].n = 0; \
             } \
             if (sent) { sb_puts(&out, C_RESET); sb_append(&out, grp.data, grp.len); } \
             sb_clear(&grp); grow = -1; gtext = false; \
