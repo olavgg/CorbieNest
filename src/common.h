@@ -138,6 +138,7 @@ char  *paste_expand(const char *s, size_t len, const char *const *texts, const i
  * DEL go (so NUL goes too), and a byte that is not UTF-8 becomes U+FFFD. Malloc'd; *out_len is its length. */
 #define PASTE_LINES 3
 #define PASTE_BYTES 800
+#define PASTE_MAX 16          /* pasted blocks kept per prompt (the ANSI editor and the notcurses field) */
 bool   paste_is_block(const char *t, size_t n, int *lines);
 char  *paste_clean(const char *s, size_t n, size_t *out_len);
 
@@ -444,6 +445,11 @@ extern char *term_hint;
 void term_hint_set(const char *s);
 void term_hint_clear(void);
 bool term_typed_ahead(void);   /* text typed while the model worked is waiting (the type-ahead) */
+/* pasted text in the notcurses field (term.c keeps the store, shared with the ANSI editor): a block becomes a
+ * token; the sent text has its tokens put back, and the prompt's pastes are forgotten */
+bool  term_paste_token(const char *t, size_t n, char *tok, size_t cap);
+char *term_paste_expand(const char *s, size_t n);
+void  term_paste_reset(void);
 /* ← on an empty prompt line calls term_agents_menu() with the terminal as the idle hook gets it
  * (main.c: the sub-agents of this session). term_show_block() shows a text as an open fold and
  * moves the view to its head, for the hook to show what it chose: the rest of the block is plain. */

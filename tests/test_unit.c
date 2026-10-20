@@ -1611,6 +1611,18 @@ static void test_paste_more(void) {
       size_t sp[16][2]; int ks[16], ns[16];
       CHECK(paste_tokens(many, m, sp, ks, ns, 16) == 16);
       CHECK(paste_tokens(many, m, NULL, NULL, NULL, 40) == 20); }
+    /* the notcurses field's paste store (term.c, shared with the ANSI editor): a block is a token, the sent text has
+     * its tokens put back, and the prompt's pastes are forgotten at the submit */
+    char tok[64];
+    CHECK(term_paste_token("a\nb\nc\nd\ne", 9, tok, sizeof tok) && !strcmp(tok, "[Pasted text #1 +5 lines]"));
+    CHECK(!term_paste_token("a\nb\nc", 5, tok, sizeof tok));              /* three lines: typed in, no token */
+    char *sent = term_paste_expand("x [Pasted text #1 +5 lines] y", strlen("x [Pasted text #1 +5 lines] y"));
+    CHECK(sent && !strcmp(sent, "x a\nb\nc\nd\ne y")); free(sent);
+    sent = term_paste_expand("[Pasted text #1 +5 lines]", strlen("[Pasted text #1 +5 lines]"));   /* forgotten: literal now */
+    CHECK(sent && !strcmp(sent, "[Pasted text #1 +5 lines]")); free(sent);
+    CHECK(term_paste_token("t\tu\n1\n2\n3", strlen("t\tu\n1\n2\n3"), tok, sizeof tok) && !strcmp(tok, "[Pasted text #1 +4 lines]"));
+    term_paste_reset();
+    sent = term_paste_expand("[Pasted text #1 +4 lines]", 25); CHECK(sent && !strcmp(sent, "[Pasted text #1 +4 lines]")); free(sent);
     /* a token that is the whole input, and one with text after it */
     s1 = "[Pasted text #1 +3 lines]";
     CHECK(paste_tokens(s1, strlen(s1), NULL, NULL, NULL, 4) == 1);

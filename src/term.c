@@ -561,7 +561,6 @@ static bool field_sync_rows(void) {
 
 /* A paste of more than a few lines is shown in the field as a token, "[Pasted text #K +N lines]",
  * and the text is kept here until the prompt is submitted (paste_expand() puts it back). */
-#define PASTE_MAX 16
 typedef struct { char *text; int lines; } paste_rec;
 static paste_rec g_paste[PASTE_MAX]; static int g_paste_n = 0;   /* this prompt's pastes, K = index + 1 */
 static void paste_reset(void) { for (int i = 0; i < g_paste_n; i++) free(g_paste[i].text); g_paste_n = 0; }
@@ -3164,14 +3163,16 @@ static void ed_hist_search(editor *e) {
 
 /* ---------- pasted text ----------
  * More than three lines, or more than 800 bytes, go in as a token; the rest is typed in as it is (paste_is_block). */
-static void paste_insert(editor *e, const char *t, size_t n) {
+bool term_paste_token(const char *t, size_t n, char *tok, size_t cap) {
     int lines = 0;
-    if (paste_is_block(t, n, &lines) && g_paste_n < PASTE_MAX) {
-        char tok[64]; snprintf(tok, sizeof tok, "[Pasted text #%d +%d lines]", g_paste_n + 1, lines);
-        g_paste[g_paste_n].text = xstrndup(t, n); g_paste[g_paste_n].lines = lines; g_paste_n++;
-        ed_insert(e, tok, strlen(tok));
-        return;
-    }
+    if (!paste_is_block(t, n, &lines) || g_paste_n >= PASTE_MAX) return false;
+    snprintf(tok, cap, "[Pasted text #%d +%d lines]", g_paste_n + 1, lines);
+    g_paste[g_paste_n].text = xstrndup(t, n); g_paste[g_paste_n].lines = lines; g_paste_n++;
+    return true;
+}
+static void paste_insert(editor *e, const char *t, size_t n) {
+    char tok[64];
+    if (term_paste_token(t, n, tok, sizeof tok)) { ed_insert(e, tok, strlen(tok)); return; }
     ed_insert(e, t, n);
 }
 /* Ctrl-O unfolds the paste token the caret is on (or just after): its text goes into the field in its place,
@@ -3207,6 +3208,15 @@ static char *paste_result(const editor *e) {
     for (int i = 0; i < g_paste_n; i++) { t[i] = g_paste[i].text; l[i] = g_paste[i].lines; }
     return paste_expand(e->buf.data, e->buf.len, t, l, g_paste_n);
 }
+/* The same for the notcurses field: the sent text with its tokens put back, the prompt's pastes forgotten (malloc'd) */
+char *term_paste_expand(const char *s, size_t n) {
+    const char *t[PASTE_MAX]; int l[PASTE_MAX];
+    for (int i = 0; i < g_paste_n; i++) { t[i] = g_paste[i].text; l[i] = g_paste[i].lines; }
+    char *r = paste_expand(s, n, t, l, g_paste_n);
+    paste_reset();
+    return r;
+}
+void term_paste_reset(void) { paste_reset(); }
 
 /* The modal for one paste: its lines, wrapped to the width, with a title row and a footer row
  * and the rest scrolled with the keys the viewer uses. Esc (or anything else) closes it; the

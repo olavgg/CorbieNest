@@ -559,6 +559,7 @@ static const int PM_START[6] = { 27, '[', '2', '0', '0', '~' };
 static const int PM_END[6]   = { 27, '[', '2', '0', '1', '~' };
 #define PM_MAX 16
 static bool g_pm_in;                   /* inside the pasted text */
+static bool g_main_field = true;       /* the main prompt's field (not a question's): a block paste is a token there */
 static int g_pm_held[6], g_pm_nheld;   /* keys that may be a marker, not yet told apart */
 static sbuf g_pm_text;                 /* the text of the paste being read */
 static char *g_pq[PM_MAX];             /* the pastes, in the order their NK_PASTE keys were queued */
@@ -579,18 +580,19 @@ static void key_out(int k) {
     if (g_kq_n < KQ_MAX) g_kq[(g_kq_head + g_kq_n++) % KQ_MAX] = k;
 }
 
-/* a key of the pasted text: a newline or a return is a line break, a tab a space, other controls are dropped */
+/* a key of the pasted text, as the bytes it would be in the terminal's stream; paste_clean makes the text of them
+ * when the paste ends (CR and CRLF are line breaks, tab stays, other controls and DEL go, as on the ANSI screen) */
 static void pm_text(int k) {
-    if (k == 13 || k == 10) { sb_putc(&g_pm_text, '\n'); return; }
-    if (k == 9) { sb_putc(&g_pm_text, ' '); return; }
-    if (k < 32 || k == 127 || k >= 0x110000) return;
+    if (k < 0 || k >= 0x110000) return;
     char b[4]; int n = utf8_put((unsigned)k, b);
     sb_append(&g_pm_text, b, (size_t)n);
 }
 
 static void pm_queue_paste(void) {
     if (g_pq_n >= PM_MAX || g_kq_n >= KQ_MAX) return;   /* no room: the paste is dropped */
-    g_pq[(g_pq_head + g_pq_n++) % PM_MAX] = xstrdup(g_pm_text.data ? g_pm_text.data : "");
+    size_t cl = 0;
+    char *text = paste_clean(g_pm_text.data ? g_pm_text.data : "", g_pm_text.data ? g_pm_text.len : 0, &cl);
+    g_pq[(g_pq_head + g_pq_n++) % PM_MAX] = text;
     g_kq[(g_kq_head + g_kq_n++) % KQ_MAX] = NK_PASTE;
 }
 
@@ -1330,6 +1332,15 @@ void nc_prefill(const char *text) {
 /* ---------- keys while a line is typed, or while the model works ---------- */
 static int pane_rows(void) { return g_field_top > 1 ? g_field_top : 1; }
 
+/* Backspace (before the caret) or Delete (after it) on a whole paste token takes the whole token */
+static bool tok_del(bool before) {
+    size_t sp[PASTE_MAX][2];
+    size_t n = paste_tokens(g_ed ? g_ed : "", g_len, sp, NULL, NULL, PASTE_MAX);
+    for (size_t i = 0; i < n; i++)
+        if (before ? sp[i][1] == g_cur : sp[i][0] == g_cur) { ed_delete(sp[i][0], sp[i][1]); return true; }
+    return false;
+}
+
 /* the keys that edit the line; the scroll keys move the pane (the wheel's are PgUp/PgDn here) */
 static void edit_key(int k) {
     char b[4];
@@ -1341,12 +1352,20 @@ static void edit_key(int k) {
         case NK_END:
         case 5:        g_cur = ed_line_end(g_cur); break;                  /* End, Ctrl-E */
         case 127:
-        case 8:        if (g_cur > 0) ed_delete(ed_prev(g_cur), g_cur); break;
-        case NK_DEL:   if (g_cur < g_len) ed_delete(g_cur, ed_next(g_cur)); break;
+        case 8:        if (!tok_del(true) && g_cur > 0) ed_delete(ed_prev(g_cur), g_cur); break;
+        case NK_DEL:   if (!tok_del(false) && g_cur < g_len) ed_delete(g_cur, ed_next(g_cur)); break;
         case 11: { size_t e = ed_line_end(g_cur); if (e > g_cur) ed_delete(g_cur, e); break; }   /* Ctrl-K */
         case 21: { size_t s = ed_line_start(g_cur); if (s < g_cur) ed_delete(s, g_cur); break; } /* Ctrl-U */
         case 10:       ed_insert("\n", 1); break;                            /* Ctrl-J: a newline in the line */
-        case NK_PASTE: { char *t = paste_take(); if (t) { ed_insert(t, strlen(t)); free(t); } break; }   /* a bracketed paste: its text, newlines kept */
+        case NK_PASTE: {   /* a bracketed paste: its text, newlines kept; in the main field a block is a token (as on the ANSI screen) */
+            char *t = paste_take();
+            if (t) {
+                char tok[64];
+                if (g_main_field && term_paste_token(t, strlen(t), tok, sizeof tok)) ed_insert(tok, strlen(tok));
+                else ed_insert(t, strlen(t));
+                free(t);
+            }
+            break; }
         case NK_PGUP:  g_top += pane_rows() / 2; nc_render(); break;
         case NK_PGDN:  g_top -= pane_rows() / 2; if (g_top < 0) g_top = 0; nc_render(); break;
         default:
@@ -1458,7 +1477,7 @@ int nc_poll_interrupt(void) {
         if (k == 13) {                                   /* Enter while busy: the line is queued for the model */
             if (g_len) {
                 /* a slash command main.c can run right there (/status, /mode, …) runs now, as in the ANSI UI */
-                char *text = xstrdup(g_ed);
+                char *text = g_main_field ? term_paste_expand(g_ed, g_len) : xstrdup(g_ed);
                 if (!(text[0] == '/' && term_run_while_busy && term_run_while_busy(text))) term_queue_push(text);
                 free(text);
             }
@@ -1506,7 +1525,7 @@ static char *readline_loop(void) {
         if (term_strip_key(strip_code(k), g_len == 0 && !g_sug_n)) continue;   /* the agents strip: ↓ from an empty line, ↑/↓, Enter opens the log, Esc returns */
         if (sug_key(k)) continue;                      /* the list's keys come first (see sug_key) */
         if (k == 13) {
-            char *line = xstrdup(g_ed ? g_ed : "");
+            char *line = g_main_field ? term_paste_expand(g_ed ? g_ed : "", g_len) : xstrdup(g_ed ? g_ed : "");
             ed_set("");
             nc_unbrowse();
             return line;
@@ -1514,17 +1533,25 @@ static char *readline_loop(void) {
         if (k == 4 && g_len == 0) return NULL;         /* Ctrl-D on an empty line */
         if (k == 3) {
             if (g_len == 0) { if (++ctrl_c >= 2) return NULL; }
-            else { ctrl_c = 0; ed_set(""); nc_unbrowse(); }
+            else { ctrl_c = 0; ed_set(""); nc_unbrowse(); if (g_main_field) term_paste_reset(); }
             continue;
         }
         ctrl_c = 0;
-        if (k == 27) { ed_set(""); nc_unbrowse(); continue; }
+        if (k == 27) { ed_set(""); nc_unbrowse(); if (g_main_field) term_paste_reset(); continue; }
         if (k == NK_UP || k == NK_DOWN) { nc_hist(k, false); continue; }
         edit_key(k);
     }
 }
 
+static char *nc_readline_run(const char *prompt, bool in_field);
 char *nc_readline(const char *prompt, bool in_field) {
+    bool was = g_main_field;
+    g_main_field = in_field;   /* a question's field takes no tokens and its line is sent as typed */
+    char *r = nc_readline_run(prompt, in_field);
+    g_main_field = was;
+    return r;
+}
+static char *nc_readline_run(const char *prompt, bool in_field) {
     (void)prompt;
     if (!g_nc) return NULL;
     term_hint_clear();   /* the placeholder is for this prompt only: the idle work of this one sets it again */
