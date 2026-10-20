@@ -1623,6 +1623,17 @@ static void test_paste_more(void) {
     CHECK(term_paste_token("t\tu\n1\n2\n3", strlen("t\tu\n1\n2\n3"), tok, sizeof tok) && !strcmp(tok, "[Pasted text #1 +4 lines]"));
     term_paste_reset();
     sent = term_paste_expand("[Pasted text #1 +4 lines]", 25); CHECK(sent && !strcmp(sent, "[Pasted text #1 +4 lines]")); free(sent);
+    /* the rows the paste viewer shows (both screens): cut at the width, one column per code point, empty lines kept */
+    { size_t n = 0; size_t (*r)[2];
+      r = paste_rows("abcdef", 4, &n); CHECK(n == 2 && r[0][0] == 0 && r[0][1] == 4 && r[1][0] == 4 && r[1][1] == 2); free(r);
+      r = paste_rows("ab\n\ncd", 10, &n); CHECK(n == 3 && r[1][1] == 0 && r[2][0] == 4 && r[2][1] == 2); free(r);   /* an empty line is a row */
+      r = paste_rows("ab\n", 10, &n); CHECK(n == 2 && r[1][1] == 0); free(r);                                    /* a trailing newline: an empty last row */
+      r = paste_rows("", 10, &n); CHECK(n == 1 && r[0][1] == 0); free(r);
+      r = paste_rows("日本語", 2, &n); CHECK(n == 2 && r[0][1] == 6 && r[1][1] == 3); free(r);                    /* two code points a row, the bytes kept whole */
+      r = paste_rows("🙂🙂🙂", 1, &n); CHECK(n == 3 && r[1][0] == 4 && r[2][1] == 4); free(r);                    /* a 4-byte character is one column */
+      r = paste_rows("abc", 0, &n); CHECK(n == 3); free(r);                                                       /* width below 1 is 1 */
+      char *big = malloc(5001); memset(big, 'x', 5000); big[5000] = 0;
+      r = paste_rows(big, 80, &n); CHECK(n == 63 && r[62][0] + r[62][1] == 5000); free(r); free(big); }
     /* a token that is the whole input, and one with text after it */
     s1 = "[Pasted text #1 +3 lines]";
     CHECK(paste_tokens(s1, strlen(s1), NULL, NULL, NULL, 4) == 1);

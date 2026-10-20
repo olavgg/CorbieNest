@@ -2257,6 +2257,35 @@ char *paste_clean(const char *s, size_t n, size_t *out_len) {
     return fixed;
 }
 
+/* The rows a pasted text shows in a window `width` columns wide: one column per code point (as the ANSI viewer always
+ * counted), each line cut where the width runs out. Returns a malloc'd array of {offset, length} into t, *nout rows;
+ * an empty line is one empty row. Both screens show a paste with this, so they wrap it the same way. */
+static size_t paste_char_len(unsigned char c) {
+    return c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+}
+size_t (*paste_rows(const char *t, int width, size_t *nout))[2] {
+    if (width < 1) width = 1;
+    size_t cap = 64, n = 0, len = strlen(t);
+    size_t (*rw)[2] = xmalloc(sizeof *rw * cap);
+    for (size_t off = 0; ; ) {
+        const char *nl = strchr(t + off, '\n');
+        size_t ll = nl ? (size_t)(nl - (t + off)) : len - off;
+        size_t st = 0;
+        do {
+            size_t i = st; int w = 0;
+            while (i < ll && w < width) { size_t k = paste_char_len((unsigned char)t[off + i]); i += k; w++; }
+            if (i > ll) i = ll;
+            if (n == cap) { cap *= 2; rw = xrealloc(rw, sizeof *rw * cap); }
+            rw[n][0] = off + st; rw[n][1] = i - st; n++;
+            st = i;
+        } while (st < ll);
+        if (!nl) break;
+        off += ll + 1;
+    }
+    *nout = n;
+    return rw;
+}
+
 char *paste_expand(const char *s, size_t len, const char *const *texts, const int *lines, int n) {
     sbuf o; sb_init(&o);
     for (size_t i = 0; i < len; i++) {

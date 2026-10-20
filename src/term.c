@@ -3232,21 +3232,7 @@ static void paste_modal_impl(int k, const char *text, int lines) {
     char *t = xstrdup(text);
     for (char *p = t; *p; p++) if (*p == '\t') *p = ' ';
     int width = g_fs_cols > 1 ? g_fs_cols : 1, body = region - 2;
-    size_t cap = 256, n = 0; size_t (*rw)[2] = xmalloc(sizeof *rw * cap);   /* visual rows: (offset, length) */
-    size_t len = strlen(t);
-    for (size_t off = 0; off <= len; ) {
-        const char *nl = strchr(t + off, '\n');
-        size_t ll = nl ? (size_t)(nl - (t + off)) : len - off, st = 0;
-        do {
-            size_t e2 = ll ? vis_offset(t + off + st, ll - st, width) + st : 0;
-            if (e2 <= st) e2 = ll;   /* (a character wider than the window: one row for it) */
-            if (n == cap) { cap *= 2; rw = xrealloc(rw, sizeof *rw * cap); }
-            rw[n][0] = off + st; rw[n][1] = e2 - st; n++;
-            st = e2;
-        } while (st < ll);
-        if (!nl) break;
-        off += ll + 1;
-    }
+    size_t n = 0; size_t (*rw)[2] = paste_rows(t, width, &n);   /* visual rows: (offset, length), as the notcurses view has them */
     size_t top = 0, maxtop = n > (size_t)body ? n - body : 0;
     for (;;) {
         sbuf o; sb_init(&o);

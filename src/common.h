@@ -132,6 +132,7 @@ char *shell_escape(const char *s);
  * back for the ones that are still whole: K in 1..n and N equal to lines[K-1]. */
 size_t paste_tokens(const char *s, size_t len, size_t (*sp)[2], int *ks, int *ns, size_t max);
 char  *paste_expand(const char *s, size_t len, const char *const *texts, const int *lines, int n);
+size_t (*paste_rows(const char *t, int width, size_t *nout))[2];   /* the rows of a pasted text in `width` columns (malloc'd) */
 /* A pasted text is a block (shown as a token) when it has more than PASTE_LINES lines or more than PASTE_BYTES
  * bytes; *lines gets its line count (each newline, and a last line that has no newline). paste_clean() is what
  * a bracketed paste's bytes become as typed text: CRLF and CR are line breaks, tab stays, other controls and
