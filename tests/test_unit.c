@@ -807,6 +807,19 @@ static void test_queue(void) {
       CHECK_STR(t, "xy"); CHECK(cc == 1); free(t); }
     t = KT("line1\x1b\rline2\nline3"); CHECK_STR(t, "line1\nline2\nline3"); free(t);   /* Alt+Enter, Ctrl-J */
     t = KT("\x1b[200~pasted\r\nlines\x1b[201~"); CHECK_STR(t, "pasted\nlines"); free(t);   /* paste brackets */
+    /* a paste while the model works is text, as the ANSI reader makes it: DEL, escape sequences and a second start do not act as keys */
+    t = KT("\x1b[200~a\x7f" "b\x1b[201~"); CHECK_STR(t, "ab"); free(t);              /* DEL is not a backspace */
+    t = KT("\x1b[200~ab\x1b[Dc\x1b[201~"); CHECK_STR(t, "ab[Dc"); free(t);          /* a left arrow in the paste is text */
+    t = KT("\x1b[200~ab\x1b[201~\x1b[Dc"); CHECK_STR(t, "acb"); free(t);            /* a left arrow after the paste moves the caret */
+    t = KT("x\x1b[200~y\x1b[201~\x7f"); CHECK_STR(t, "x"); free(t);                  /* a real backspace after the paste */
+    t = KT("\x1b[200~a\r\nb\rc\x1b[201~"); CHECK_STR(t, "a\nb\nc"); free(t);       /* CRLF and CR are line breaks */
+    t = KT("\x1b[200~a\tb\x1b[201~"); CHECK_STR(t, "a\tb"); free(t);                 /* tab stays */
+    t = KT("\x1b[200~\x07\x1bxy\x00z\x1b[201~"); CHECK_STR(t, "xyz"); free(t);     /* controls and ESC go, the letters stay */
+    t = KT("\x1b[200~日本 🙂\x1b[201~"); CHECK_STR(t, "日本 🙂"); free(t);             /* UTF-8 */
+    t = KT("\x1b[200~a\xff" "b\x1b[201~"); CHECK_STR(t, "a\xef\xbf\xbd" "b"); free(t);   /* a bad byte is U+FFFD, as in the editor */
+    t = KT("\x1b[200~ \n \x1b[201~"); CHECK_STR(t, ""); free(t);                   /* only whitespace: nothing */
+    t = KT("\x1b[200~abc"); CHECK_STR(t, "abc"); free(t);                           /* unfinished: to the end */
+    t = KT("\x1b[200~a\x1b[201~b\x1b[201~"); CHECK_STR(t, "ab"); free(t);          /* a stray end marker is dropped */
     t = KT("\x1b" "fskip"); CHECK_STR(t, "skip"); free(t);                        /* Alt+f with the caret at the end: nothing to the right */
     /* the editor's own keys, so the preview and the replay agree: Ctrl-A/E/B/F, Ctrl-D, Ctrl-K, Alt+b/f, Alt+Backspace, Ctrl+arrows */
     t = KT("abc\x01x\x05y"); CHECK_STR(t, "xabcy"); free(t);                    /* Ctrl-A line start, Ctrl-E line end */

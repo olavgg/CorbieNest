@@ -1849,12 +1849,20 @@ static void fold_click(void) {
 
 /* Type-ahead: bytes typed while the model was generating are kept here so
  * they are not lost; read_key() consumes them before touching stdin. */
-static unsigned char g_ta[8192];
-static size_t g_ta_len = 0, g_ta_pos = 0;
+/* It grows as it fills (a paste of tens of KB while the model works must not be cut); TA_MAX is the one limit. */
+#define TA_MAX ((size_t)16 << 20)
+static unsigned char *g_ta = NULL;
+static size_t g_ta_cap = 0, g_ta_len = 0, g_ta_pos = 0;
 static int ta_get(void) { return g_ta_pos < g_ta_len ? g_ta[g_ta_pos++] : -1; }
 static void ta_put(unsigned char c) {
     if (g_ta_pos == g_ta_len) g_ta_pos = g_ta_len = 0;
-    if (g_ta_len < sizeof g_ta) g_ta[g_ta_len++] = c;
+    if (g_ta_len == g_ta_cap) {
+        if (g_ta_cap >= TA_MAX) return;
+        size_t nc = g_ta_cap ? g_ta_cap * 2 : 8192;
+        g_ta = xrealloc(g_ta, nc);
+        g_ta_cap = nc;
+    }
+    g_ta[g_ta_len++] = c;
 }
 /* Set the pending type-ahead aside (so it cannot answer a question the user
  * has not seen yet) and bring it back afterwards for the next prompt. */
@@ -1872,13 +1880,14 @@ static ta_stash ta_take(void) {
 }
 static void ta_restore(ta_stash st) {
     if (!st.data) return;
-    /* whatever was typed during the question comes first, then the older text */
+    /* the text set aside was typed before the question; what was typed during it comes after, so the order is kept */
     size_t cur = g_ta_len - g_ta_pos;
-    unsigned char tmp[sizeof g_ta]; size_t tl = 0;
-    if (cur) { memcpy(tmp, g_ta + g_ta_pos, cur); tl = cur; }
+    unsigned char *tmp = cur ? xmalloc(cur) : NULL;
+    if (cur) memcpy(tmp, g_ta + g_ta_pos, cur);
     g_ta_pos = g_ta_len = 0;
     for (size_t i = 0; i < st.len; i++) ta_put(st.data[i]);
-    for (size_t i = 0; i < tl; i++) ta_put(tmp[i]);
+    for (size_t i = 0; i < cur; i++) ta_put(tmp[i]);
+    free(tmp);
     free(st.data);
 }
 /* The width a modal's rows are fitted to: inset from the screen, and capped so a row of
@@ -2068,6 +2077,17 @@ static char *keys_text(const unsigned char *b, size_t n, bool trim, size_t *care
     size_t c = 0;
     for (size_t i = 0; i < n; i++) {
         unsigned char ch = b[i];
+        /* a bracketed paste is text, not keys: its bytes are cleaned as the ANSI reader cleans a paste, so an escape
+         * sequence or DEL in it does not move the caret or delete. An unfinished paste runs to the end. */
+        if (ch == 27 && n - i >= 6 && !memcmp(b + i, "\x1b[200~", 6)) {
+            size_t s = i + 6, e = s;
+            while (e < n && !(n - e >= 6 && !memcmp(b + e, "\x1b[201~", 6))) e++;
+            size_t cl = 0; char *t = paste_clean((const char *)b + s, e - s, &cl);
+            kb_insert(&o, &c, t, cl);
+            free(t);
+            i = e < n ? e + 5 : n;      /* the loop's i++ steps past the end marker */
+            continue;
+        }
         if (ch == 27) {
             if (i + 1 >= n) break;
             unsigned char a = b[++i];
@@ -2150,7 +2170,7 @@ static char *g_ta_draft;     /* what was typed before the history browse (↓ to
  * is a slash command main.c can run right there and then (/status, /mode, …). */
 static void ta_submit(void) {
     size_t n = g_ta_len - g_ta_pos;
-    char *text = term_keys_to_text(g_ta + g_ta_pos, n, NULL);
+    char *text = n ? term_keys_to_text(g_ta + g_ta_pos, n, NULL) : xstrdup("");   /* (g_ta may be empty: NULL) */
     g_ta_pos = g_ta_len = 0;
     g_ta_hist = -1; free(g_ta_draft); g_ta_draft = NULL;   /* the history browse ends with the line */
     if (*text) {
