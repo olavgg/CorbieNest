@@ -1981,7 +1981,11 @@ s = Session(["-m", "fake-coder:latest", "--yolo"], env=ENV2); s.expect("Ctrl-D t
 s.send("/advisor\r"); check(s.expect("ollama signin") and s.expect("anthropic:claude-opus-5") and s.expect("ANTHROPIC_API_KEY"), "/advisor says how a cloud and a hosted model are set up")
 check(s.expect("/advisor guidance LEVEL") and s.expect("when the work is hard · 3 per request · current") and s.expect("brought in, unasked, when tool calls keep failing") and s.expect("/advisor effort LEVEL"), "and what guidance and effort do")
 check(s.expect("Select advisor"), "/advisor opens a picker"); check(s.expect("No advisor"), "with 'No advisor' first")
-check(seen(s, "┌") and seen(s, "│ Select advisor"), "the picker is a box over the conversation on the full screen, not a list printed under the lines above it")
+rows = screen_when(s, lambda rs: any("Select advisor" in r for r in rs) and any("type to filter" in r for r in rs)   # the whole picker, and the field drawn once (the old one is erased when the rows move)
+                   and sum("╭" in r for r in rs) == 1)
+_ft = max((i for i, r in enumerate(rows or []) if "╭" in r), default=-1); _sel = next((i for i, r in enumerate(rows or []) if "Select advisor" in r), -1)
+check(rows is not None and _ft >= 0 and _sel > _ft and not any("┌" in r or "│ Select advisor" in r for r in rows),
+      f"the picker is in rows under the input field, not a box over the conversation: {chr(10).join((rows or s.screen())[-12:])!r}")
 s.send("\x1b"); check(s.expect("advisor unchanged: none"), "Esc leaves it")
 s.send("/advisor fake-bi"); s.send("g"); seen(s, "fake-big:latest", 5)
 view = listed()   # what the screen shows under the field now
@@ -2405,7 +2409,7 @@ check("it also checks the first change of a request before it is made" in rs[0][
 
 print("test interactive: /advisor guidance")
 s = Session(["-m", "fake-coder:latest", "--advisor", "fake-big:latest"], env=ENVK); s.expect("Ctrl-D to quit")
-s.send("/advisor guidance\r"); check(s.expect("Advisor guidance: how much the agent leans on it"), "a picker"); check(s.expect("normal") and "current" in since_send(s), "on the current level")
+s.send("/advisor guidance\r"); check(s.expect("Advisor guidance: how much the agent leans on it"), "a picker"); check(s.expect("normal") and screen_when(s, lambda rs: any("normal" in r and "current" in r for r in rs)) is not None, "on the current level")
 s.send("stro"); time.sleep(0.2); s.send("\r"); check(s.expect("advisor guidance: strong"), "picked by filter")
 check("advisor_guidance=strong" in open(CFG2_FILE).read(), "saved")
 s.send("/advisor guidance bogus\r"); check(s.expect("usage: /advisor guidance"), "a level that is not one")

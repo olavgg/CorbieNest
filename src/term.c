@@ -238,7 +238,7 @@ static bool g_sel_moved = false;     /* the gesture has moved since the press */
 static ansi_pt g_sel_a, g_sel_b;     /* where the gesture began and where it is now */
 static bool g_view_stale = false;           /* ... and its window has to be painted again (the geometry changed) */
 static char *g_ov_text = NULL;              /* the overlay's text (term_overlay_show): a centred window over the conversation; NULL = none */
-static int g_ov_geo[4] = { -1, -1, -1, -1 };   /* the box last painted: top, left, height, width (-1: none), see modal_paint() */
+static int g_ov_geo[4] = { -1, -1, -1, -1 };   /* the box last painted: top, left, height, width (-1: none) */
 /* the banner's modal (term_banner_show): the box's lines, drawn as they are, with the close button at (g_bn_xr, g_bn_xc) */
 static bool g_banner_on = false;
 static sbuf *g_bn = NULL;
@@ -440,6 +440,12 @@ static int    g_sug_sel = -1;          /* the highlighted one; -1 = none, the li
 static int    g_sug_top = 0;           /* first one shown, when there are more than fit */
 static size_t g_sug_from = 0;          /* where the word they would replace starts */
 static int    g_sug_rows = 0;          /* rows of the chrome the list holds */
+/* A menu under the field (the pickers, the task list, the permission question): the lines of its text, held in rows of
+ * the chrome between the field and the bar, where the suggestion list goes (and instead of it: a menu has the keys). The
+ * height is fixed when it opens, so a filter that narrows the items does not move the conversation. */
+static char  *g_band_text = NULL;      /* the menu's lines, each ended by \n, with their escapes */
+static int    g_band_n = 0;            /* … and their number */
+static int    g_band_rows = 0;         /* rows of the chrome it holds: its lines, cut to the room there is */
 /* the agents strip: the running tasks, one row each, between the field and the status bar (main.c
  * supplies the lines through term_agents_strip). It grows with the room under the conversation;
  * g_strip_sel is the row the keys are on (-1: the field). */
@@ -451,6 +457,10 @@ int  (*term_agents_strip)(sbuf *o, int cols, int max) = NULL;
 void (*term_agents_open)(int idx) = NULL;
 static char  *g_ta_sug_for = NULL;     /* the list is the type-ahead's (the model is working): the text it is for */
 static void sug_draw(sbuf *o, int row);
+static void band_draw(sbuf *o, int row);
+static int band_room(void);
+static void band_set(const char *text);
+static void band_clear(void);
 static void sug_clear(void);
 static void put_clipped(sbuf *o, const char *s, int w, bool keep_tail);
 static void ta_sug_sync(void);
@@ -461,7 +471,7 @@ static bool ta_sug_key(int k);
  * (view_note). On a terminal too short to spare them, only the bar is kept. */
 #define FIELD_MIN_ROWS 6
 static bool field_shown(void) { return g_fs && g_fs_rows >= FIELD_MIN_ROWS; }
-static int fs_reserved_for(int rows) { return g_fs && rows >= FIELD_MIN_ROWS ? g_field_rows + 3 + g_sug_rows + g_strip_rows + (g_view_top >= 0) : 1; }
+static int fs_reserved_for(int rows) { return g_fs && rows >= FIELD_MIN_ROWS ? g_field_rows + 3 + g_sug_rows + g_band_rows + g_strip_rows + (g_view_top >= 0) : 1; }
 static int fs_reserved(void) { return fs_reserved_for(g_fs_rows); }
 /* last row of the scrolling region (the conversation) */
 static int fs_region(void) { int r = g_fs_rows - fs_reserved(); return r < 1 ? 1 : r; }
@@ -547,15 +557,19 @@ static bool field_sync_rows(void) {
     if (g_field_view < 0) g_field_view = 0;
     /* The suggestions get what the terminal can spare beyond that. While the list is up it does
      * not shrink again: the field would jump with every letter that narrows it down. */
-    int sug = 0;
-    if (g_sug_n > 0) {
+    int sug = 0, band = 0;
+    if (g_band_n > 0) {   /* a menu is up: it has the rows and the keys, no suggestions meanwhile */
+        band = g_band_n;
+        if (band > g_fs_rows - FIELD_MIN_ROWS - rows) band = g_fs_rows - FIELD_MIN_ROWS - rows;
+        if (band < 2) band = 0;
+    } else if (g_sug_n > 0) {
         sug = (g_sug_n < SUG_MAX_ROWS ? g_sug_n : SUG_MAX_ROWS) + 1;   /* + the row that says which keys work */
         if (sug < g_sug_rows) sug = g_sug_rows;
         if (sug > g_fs_rows - FIELD_MIN_ROWS - rows) sug = g_fs_rows - FIELD_MIN_ROWS - rows;
         if (sug < 2) sug = 0;
     }
-    if (rows == g_field_rows && sug == g_sug_rows) return false;
-    g_field_rows = rows; g_sug_rows = sug;
+    if (rows == g_field_rows && sug == g_sug_rows && band == g_band_rows) return false;
+    g_field_rows = rows; g_sug_rows = sug; g_band_rows = band;
     return true;
 }
 
@@ -577,7 +591,7 @@ static void view_note(sbuf *o, int row) {
     sb_puts(o, C_RESET "\x1b[K");
 }
 
-static int field_top(void) { return g_fs_rows - g_field_rows - 2 - g_sug_rows - g_strip_rows; }   /* row of the upper rule (the bar is the last row, below the field's lower rule and the suggestions) */
+static int field_top(void) { return g_fs_rows - g_field_rows - 2 - g_sug_rows - g_band_rows - g_strip_rows; }   /* row of the upper rule (the bar is the last row, below the field's lower rule and the suggestions) */
 
 /* Append text[from, from + n) with the "@path" mentions that name something that is there in
  * colour: a mention that took is one the message will carry, and one that did not is a typo
@@ -621,7 +635,7 @@ void term_strip_limit(int rows) { g_strip_limit = rows < 0 ? 0 : rows; }
 static int strip_budget(void) {
     if (g_ui_nc) return g_strip_limit < 0 ? 0 : g_strip_limit;
     if (!g_fs || g_fs_rows < FIELD_MIN_ROWS) return 0;
-    int chrome = g_field_rows + 3 + g_sug_rows + (g_view_top >= 0);   /* the field's box, the suggestions, the bar, the scroll note */
+    int chrome = g_field_rows + 3 + g_sug_rows + g_band_rows + (g_view_top >= 0);   /* the field's box, the suggestions or a menu, the bar, the scroll note */
     int room = g_fs_rows - chrome - STRIP_KEEP;
     int fit = g_fs_rows - chrome - 1;   /* never less than one conversation row */
     if (fit < 1) fit = 1;
@@ -750,6 +764,7 @@ static void field_draw(sbuf *o, const char *typed, size_t caret) {
         sb_free(&m);
     }
     sug_draw(o, top + g_field_rows + 2);
+    band_draw(o, top + g_field_rows + 2);
 }
 
 /* Where conversation output continues on screen, without asking the terminal: the
@@ -802,7 +817,7 @@ static bool layout_sync(void) {
     if (rows == g_fs_rows && cols == g_fs_cols && reserved == g_fs_reserved) return false;
     chrome_invalidate();   /* a resize: the screen is not what the chrome last sent */
     g_fs_rows = rows; g_fs_cols = cols; g_fs_reserved = reserved;
-    trace_note('L', "rows=%d cols=%d region=1-%d chrome=%d field=%d suggestions=%d view=%d", rows, cols, fs_region(), reserved, g_field_rows, g_sug_rows, g_view_top);
+    trace_note('L', "rows=%d cols=%d region=1-%d chrome=%d field=%d suggestions=%d view=%d", rows, cols, fs_region(), reserved, g_field_rows, g_sug_rows + g_band_rows, g_view_top);
     sbuf o; sb_init(&o);
     sb_printf(&o, "\x1b[1;%dr", fs_region());
     if (g_view_top >= 0) g_view_stale = true;   /* scrolled back: the window shown is the viewer's to paint */
@@ -870,7 +885,7 @@ void term_status_refresh(void) {
     sbuf o; sb_init(&o);
     if (!g_field_focus) sb_puts(&o, "\x1b" "7");
     field_draw(&o, typed, ci);
-    strip_draw(&o, field_top() + g_field_rows + 2 + g_sug_rows);
+    strip_draw(&o, field_top() + g_field_rows + 2 + g_sug_rows + g_band_rows);
     bar_draw(&o);
     if (g_field_focus) field_cursor(&o); else { sb_puts(&o, "\x1b" "8"); chrome_park(&o); }
     chrome_send(&o);
@@ -939,7 +954,7 @@ void term_fullscreen(bool on) {
         g_tty_dirty = 1;
         g_fs = true; g_fs_rows = g_fs_cols = g_fs_reserved = 0; g_live_out = 0;
         g_field_rows = 1; g_field_view = 0; g_conv_row = g_conv_col = 1;
-        g_sug_rows = 0; g_view_top = -1;
+        g_sug_rows = 0; g_band_rows = 0; g_view_top = -1;
         theme_paint_window(true);
         fputs("\x1b[?1049h", stdout);
         fputs(theme_base_sgr(), stdout);             /* the window's ground, before the clear (an erase takes it) */
@@ -1685,45 +1700,6 @@ void term_banner_hide(void) {
 }
 bool term_banner_open(void) { return g_ui_nc ? nc_banner_open() : g_banner_on; }
 
-/* a box's text, each line cut or padded to `width` cells: the box keeps its size while what is in it changes */
-static void box_pad(sbuf *o, int width) {
-    sbuf p; sb_init(&p);
-    const char *s = o->data ? o->data : "";
-    while (*s) {
-        const char *e = strchr(s, '\n');
-        size_t len = e ? (size_t)(e - s) : strlen(s);
-        int w = vis_width_n(s, len);
-        if (w > width) { len = vis_offset(s, len, width); w = width; }
-        sb_append(&p, s, len); sb_puts(&p, C_RESET);
-        for (; w < width; w++) sb_putc(&p, ' ');
-        sb_putc(&p, '\n');
-        s = e ? e + 1 : s + len;
-    }
-    sb_free(o); *o = p;
-}
-/* The picker's modal (select_impl): the same box, with the picker's text again on each key. The box is painted
- * over the live screen, which is not repainted for it: a key only paints the box. Only a box that moved or changed
- * size (a resize, a new width) repaints the conversation under it, which is what clears the old box; the first
- * paint is the box alone too, so its text is written as it is (a repaint is not: it sits between ?7l and ?7h). */
-static void modal_paint(const char *text, bool first) {
-    fflush(stdout);   /* what was printed before the box is on the screen before it */
-    free(g_ov_text); g_ov_text = xstrdup(text);
-    int old[4]; memcpy(old, g_ov_geo, sizeof old);
-    bool was = g_sb_pause; sb_pause(true);
-    sbuf o; sb_init(&o);
-    overlay_box(&o);   /* the box as it is now: this sets g_ov_geo */
-    if (g_ov_geo[0] > 0 && (first || !memcmp(old, g_ov_geo, sizeof old))) {
-        fwrite(o.data, 1, o.len, stdout);
-    } else {
-        sb_free(&o); sb_init(&o);
-        conv_repaint(&o);
-        fwrite(o.data, 1, o.len, stdout);
-        term_status_refresh();   /* (the repaint took the chrome with it) */
-    }
-    fflush(stdout); sb_free(&o);
-    sb_pause(was);
-}
-
 bool term_overlay_show(const char *text) {
     if (g_ui_nc) { if (!text) return false; nc_overlay_set(text); return true; }   /* the notcurses UI draws it as a modal too */
     if (!g_fs || !g_sb_active || !text) return false;
@@ -1931,20 +1907,20 @@ static void modal_line(sbuf *o, const char *s, int width, bool sel) {
 }
 
 static int scroll_modal_impl(const char *title, const char **lines, int n, int start) {
-    if (!g_fs || !g_sb_active || n <= 0) return -1;
+    if (!g_fs || !g_sb_active || n <= 0 || band_room() < 5) return -1;
     term_raw(true);
     ta_stash stash = ta_take();
     view_leave();
     bool was = g_sb_pause;
     sb_pause(true);
     int sel = start >= 0 && start < n ? start : 0, top = 0, result = -1;
-    bool first = true;
     static const char HINT[] = "↑/↓ PgUp/PgDn scroll · Enter opens the log · Esc closes";
     for (;;) {
         layout_sync();
-        int bodyw = term_modal_cols();
-        int show = fs_region() - 6;   /* title, the count, the hint, and the box's own border */
-        if (show < 3) show = 3;
+        int bodyw = (g_fs_cols > 0 ? g_fs_cols : term_width()) - 3;   /* the menu is under the field: the whole width */
+        if (bodyw < 20) bodyw = 20;
+        int show = band_room() - 3;   /* the rows it may have, less the title, the count and the hint */
+        if (show < 1) show = 1;
         if (show > n) show = n;
         if (sel < top) top = sel;
         if (sel >= top + show) top = sel - show + 1;
@@ -1960,9 +1936,8 @@ static int scroll_modal_impl(const char *title, const char **lines, int n, int s
         else count[0] = 0;
         modal_line(&o, count, bodyw, false);
         modal_line(&o, HINT, bodyw, false);
-        box_pad(&o, bodyw);
-        modal_paint(o.data, first);
-        first = false;
+        band_set(o.data);
+        term_status_refresh();
         sb_free(&o);
         int k = read_key();
         if (k == -2 || k == -1 || k == K_ESC || k == 3) { result = -1; break; }
@@ -1976,9 +1951,9 @@ static int scroll_modal_impl(const char *title, const char **lines, int n, int s
         else if (k == K_HOME || k == 'g') sel = 0;
         else if (k == K_END || k == 'G') sel = n - 1;
     }
-    term_overlay_close();
-    sb_pause(was);
+    band_clear();
     term_status_refresh();
+    sb_pause(was);
     ta_restore(stash);
     return result;
 }
@@ -3060,6 +3035,38 @@ static void sug_draw(sbuf *o, int row) {
     sb_puts(o, C_RESET);
 }
 
+/* ---------- a menu under the field ----------
+ * The pickers, the task list and the permission question are drawn in the band (g_band_*): rows of the chrome between
+ * the field and the bar. band_set() takes the menu's text, its lines each ended by \n and with their escapes; the
+ * caller refreshes the chrome (term_status_refresh()), which sizes the band, re-cuts the region and draws it. */
+static int band_room(void) {   /* the most rows a menu can have here: what is left of the screen after the field and a conversation to read */
+    if (!g_fs || !g_sb_active || g_fs_rows < FIELD_MIN_ROWS) return 0;
+    int r = g_fs_rows - FIELD_MIN_ROWS - g_field_rows;
+    return r < 0 ? 0 : r;
+}
+static void band_set(const char *text) {
+    free(g_band_text); g_band_text = xstrdup(text ? text : "");
+    g_band_n = 0;
+    for (const char *p = g_band_text; *p; p++) if (*p == '\n') g_band_n++;
+}
+static void band_clear(void) {
+    free(g_band_text); g_band_text = NULL; g_band_n = 0;
+}
+static void band_draw(sbuf *o, int row) {
+    if (!g_band_rows || !g_band_text) return;
+    int cols = g_fs_cols > 1 ? g_fs_cols - 1 : 1;   /* never the last column */
+    const char *s = g_band_text;
+    for (int i = 0; i < g_band_rows; i++) {
+        sb_printf(o, "\x1b[%d;1H" C_RESET "\x1b[K", row + i);
+        if (!*s) continue;
+        const char *e = strchr(s, '\n');
+        size_t len = e ? (size_t)(e - s) : strlen(s);
+        if (vis_width_n(s, len) > cols) len = vis_offset(s, len, cols);
+        sb_append(o, s, len); sb_puts(o, C_RESET);
+        s = e ? e + 1 : s + strlen(s);
+    }
+}
+
 /* What could the word at the cursor become? */
 static void sug_fill(const char *buf, size_t cur) {
     sug_clear();
@@ -3672,14 +3679,19 @@ static int confirm_impl(const char *question, const char *always_label, const ch
     const char *keys[4] = { "y", "a", project_label ? "p" : "n", "n" };
     int nopt = project_label ? 4 : 3, no_i = nopt - 1;
     int sel = 0, drawn = 0, choice = -1;
+    /* on the full-screen ANSI screen the question is held in rows under the input field (the band); anywhere else it is
+     * printed where the output stands and drawn again over itself */
+    bool band = band_room() >= nopt + 2;   /* the question, the options and the keys */
     view_leave();     /* a question is asked on the live screen */
     sb_pause(true);   /* the menu is transient; only its collapsed final line is conversation content */
     for (;;) {
-        if (layout_sync()) drawn = 0;   /* repainted: the cursor is back where the menu starts */
+        if (layout_sync() && !band) drawn = 0;   /* repainted: the cursor is back where the menu starts */
         int width = term_width();
         sbuf o; sb_init(&o);
-        if (drawn) sb_printf(&o, "\x1b[%dA", drawn);
-        sb_puts(&o, "\r\x1b[J");
+        if (!band) {
+            if (drawn) sb_printf(&o, "\x1b[%dA", drawn);
+            sb_puts(&o, "\r\x1b[J");
+        }
         int lines = 0;
         sb_printf(&o, "  " C_YELLOW C_BOLD "%s" C_RESET "\n", question); lines++;
         for (int i = 0; i < nopt; i++) {
@@ -3700,9 +3712,16 @@ static int confirm_impl(const char *question, const char *always_label, const ch
             sb_puts(&o, width >= 72 ? "↑/↓ or j/k move · enter select · 1-3 / y / a / n · esc = no"
                       : width >= 44 ? "↑/↓ · enter · 1-3 / y / a / n · esc = no" : "↑/↓ enter y/a/n esc");
         sb_puts(&o, C_RESET);
-        drawn = lines;   /* cursor sits on the hint line, `lines` rows below the question */
-        chrome_append(&o);
-        fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o);
+        if (band) {
+            sb_putc(&o, '\n');
+            band_set(o.data);
+            term_status_refresh();   /* sizes the band, re-cuts the region and draws it */
+        } else {
+            drawn = lines;   /* cursor sits on the hint line, `lines` rows below the question */
+            chrome_append(&o);
+            fwrite(o.data, 1, o.len, stdout); fflush(stdout);
+        }
+        sb_free(&o);
 
         int k = read_key();
         if (k == -2) continue;                                   /* resize: redraw */
@@ -3721,8 +3740,11 @@ static int confirm_impl(const char *question, const char *always_label, const ch
         /* anything else: ignore, keep the menu up */
     }
     /* collapse the menu into a single line */
-    if (drawn) printf("\x1b[%dA", drawn);
-    printf("\r\x1b[J");
+    if (band) { band_clear(); term_status_refresh(); }   /* the rows go back to the conversation */
+    else {
+        if (drawn) printf("\x1b[%dA", drawn);
+        printf("\r\x1b[J");
+    }
     sb_pause(false);
     if (!term_confirm_quiet) printf("  " C_YELLOW "%s" C_RESET "  %s\n", question,
            choice == 0 ? C_GREEN "yes" C_RESET : choice == 1 ? C_GREEN "yes, always this session" C_RESET
@@ -3973,42 +3995,29 @@ static int select_impl(const char *title, const char **items, const char **descs
     int top = 0;              /* the first item shown */
     int page = 1;             /* what PgUp/PgDn move by: the items the last paint showed */
     int result = -1;
-    /* on the full-screen ANSI screen the menu is a modal over the conversation (the same box as /usage's overlay),
-     * so it does not depend on counting the lines it drew. Anything else keeps the menu inline. */
-    bool modal = g_fs && g_sb_active && !g_ov_text;
+    /* on the full-screen ANSI screen the menu is held in rows under the input field (the band), so it does not depend on
+     * counting the lines it drew. Anything else (a pipe, a terminal too short for the band) keeps the menu inline. */
+    bool modal = !g_ov_text && band_room() >= 5;
     static const char HINT[] = "type to filter · ↑/↓ move · enter · esc cancel";   /* 44 cells: fits a 60-column window */
-    /* a modal's box keeps one size while the menu changes under the filter: every line is padded to bodyw, and it
-     * has max_show rows whatever the filter leaves. Both are worked out on every pass, so a resize sizes the box too. */
+    /* the band keeps one height while the menu changes under the filter: it has max_show rows whatever the filter leaves.
+     * Its width and rows are worked out on every pass, so a resize sizes it too. */
     int bodyw = 0;
-    bool first = true;   /* the box's first paint goes over the live screen as it is */
     view_leave();     /* a menu is drawn on the live screen */
     sb_pause(true);   /* transient: not conversation content */
     for (;;) {
         int lead = 2 + (mark >= 0 ? 2 : 0);   /* the columns before an item's text: the selection, and the current marker */
         if (modal) {
             layout_sync();
-            int limit = (g_fs_cols > 0 ? g_fs_cols : term_width()) - 8;
-            int lmax = 0, dmax = 0;   /* the widest label and description */
-            for (int i = 0; i < n; i++) {
-                int lw = vis_width(items[i]); if (lw > lmax) lmax = lw;
-                int dw = descs && descs[i] ? vis_width(descs[i]) : 0; if (dw > dmax) dmax = dw;
-            }
-            bodyw = vis_width(title); if (vis_width(HINT) > bodyw) bodyw = vis_width(HINT);
-            if (lead + lmax > bodyw) bodyw = lead + lmax;
-            if (dmax > 0) {
-                int need = block ? lead + MENU_DESC_INDENT + dmax : lead + (lmax < MENU_LABEL_MAX ? lmax : MENU_LABEL_MAX) + 1 + dmax;
-                if (need > bodyw) bodyw = need;
-            }
-            if (bodyw < 40) bodyw = 40;
-            if (bodyw > limit) bodyw = limit;
-            int avail = fs_region() - 7;   /* the title, the filter, the rows, the count, the hint and the box's two */
-            max_show = avail < 3 ? 3 : avail > MENU_MODAL_ROWS ? MENU_MODAL_ROWS : avail;
+            bodyw = (g_fs_cols > 0 ? g_fs_cols : term_width()) - 3;   /* the whole width: nothing is boxed */
+            if (bodyw < 20) bodyw = 20;
+            int avail = band_room() - 4;   /* the rows it may have, less the title, the filter, the count and the hint */
+            max_show = avail < 1 ? 1 : avail > MENU_MODAL_ROWS ? MENU_MODAL_ROWS : avail;
         }
         int w = term_width();
         int room = (modal ? bodyw : w - 2) - lead;   /* the text of a row, after its marker columns */
         if (room < 8) room = 8;
         int namew = menu_label_width(items, n, room);
-        if (modal) {   /* the box is no taller than its items need, whatever the filter leaves */
+        if (modal) {   /* the band is no taller than its items need, whatever the filter leaves */
             int all = 0;
             for (int i = 0; i < n; i++)
                 all += menu_item_rows(items[i], descs ? descs[i] : NULL, room, namew, block, NULL, NULL, 0) + (block && i > 0 && menu_item_sep(descs, i - 1, i));
@@ -4042,7 +4051,7 @@ static int select_impl(const char *title, const char **items, const char **descs
             sb_puts(&o, "\r\x1b[J");
         }
         int lines = 0;
-        int mw = (g_fs_cols > 0 ? g_fs_cols : w) - 8;   /* a modal's lines fit the box the overlay makes of them */
+        int mw = (g_fs_cols > 0 ? g_fs_cols : w) - 3;   /* a menu's lines fit the width it is drawn in */
         /* one row, whatever the width: a title that wraps is still counted as one */
         int tw = vis_width(title);
         if (modal) { sbuf t; sb_init(&t); cells_cut(&t, title, mw); sb_printf(&o, C_BOLD "%s" C_RESET "\n", t.data ? t.data : ""); sb_free(&t); }
@@ -4077,8 +4086,8 @@ static int select_impl(const char *title, const char **items, const char **descs
             if (shown < nvis) sb_printf(&o, C_DIM "  … %d of %d shown" C_RESET "\n", shown, nvis); else sb_puts(&o, "\n");
             sbuf h; sb_init(&h); cells_cut(&h, HINT, mw);
             sb_printf(&o, C_DIM "%s" C_RESET "\n", h.data ? h.data : ""); sb_free(&h);
-            box_pad(&o, bodyw);
-            modal_paint(o.data, first); first = false;
+            band_set(o.data);
+            term_status_refresh();   /* sizes the band, re-cuts the region and draws it */
         } else {
             if (shown < nvis) { sb_printf(&o, C_DIM "  … %d of %d shown" C_RESET "\n", shown, nvis); lines++; }
             drawn = lines;
@@ -4102,7 +4111,7 @@ static int select_impl(const char *title, const char **items, const char **descs
         if (k >= 32 && k < 127 && flen < (int)sizeof filter - 1) { filter[flen++] = (char)k; filter[flen] = 0; continue; }
     }
     /* clear menu */
-    if (modal) term_overlay_close();   /* the conversation under the box is painted back */
+    if (modal) band_clear();   /* the rows go back to the conversation: the refresh below re-cuts the region */
     else { if (drawn) printf("\x1b[%dA", drawn); printf("\r\x1b[J"); }
     term_status_refresh();
     fflush(stdout);
