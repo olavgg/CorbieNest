@@ -1110,7 +1110,25 @@ static void draw_strip(int first, int rows, const char *text) {
     }
 }
 
-static void draw_menu(void) {
+/* The rows a menu box takes under the field: its lines, the title, the hint and the two borders, at most `avail`; 0 when
+ * no menu is open. A menu is drawn like the suggestion list, in rows of its own between the field and the bar. */
+static int menu_height(int avail) {
+    if (!g_menu_on) return 0;
+    int h = g_menu_n + 4;
+    return h > avail ? (avail >= 5 ? avail : 0) : h;
+}
+
+/* The rows a menu box may take: the screen less the field, the bar and two rows of conversation. */
+static int menu_box_room(void) { return g_rows - field_height() - 1 - 2; }
+/* The lines it may have: that less the box's four (title, hint, two borders). */
+static int menu_lines_room(void) {
+    int r = menu_box_room() - 4;
+    return r < 1 ? 1 : r;
+}
+
+/* Draws the box in rows y .. y+h-1 (h from menu_height): the lines that fit, the hint on the row above the border. */
+static void draw_menu(int y, int h) {
+    if (h < 5) return;
     int widest = nc_text_width(g_menu_title) + 2, hint_w = nc_text_width(g_menu_hint);
     if (hint_w > widest) widest = hint_w;
     for (int i = 0; i < g_menu_n; i++) { int w = nc_text_width(g_menu[i].text) + 4; if (w > widest) widest = w; }
@@ -1118,8 +1136,7 @@ static void draw_menu(void) {
     if (w < 40) w = 40;
     if (w > g_cols - 4) w = g_cols - 4;
     if (w < 10) w = 10;
-    int h = g_menu_n + 4;
-    int y = g_field_top - h; if (y < 0) y = 0;
+    int show = h - 4;   /* the lines that fit (all of them unless the screen is small) */
     int x = (g_cols - w) / 2; if (x < 0) x = 0;
     for (int r = 0; r < h; r++) fill_row(y + r, x, x + w, C_MENU, false);
     put_text(y, x, "╭", 1, C_ACCENT, C_MENU, false, NULL);
@@ -1129,7 +1146,7 @@ static void draw_menu(void) {
     for (int i = 1; i < w - 1; i++) { put_text(y, x + i, "─", 1, C_ACCENT, C_MENU, false, NULL); put_text(y + h - 1, x + i, "─", 1, C_ACCENT, C_MENU, false, NULL); }
     for (int r = 1; r < h - 1; r++) { put_text(y + r, x, "│", 1, C_ACCENT, C_MENU, false, NULL); put_text(y + r, x + w - 1, "│", 1, C_ACCENT, C_MENU, false, NULL); }
     put_text(y + 1, x + 2, g_menu_title, w - 4, C_WARN, C_MENU, false, NULL);
-    for (int i = 0; i < g_menu_n; i++) {
+    for (int i = 0; i < g_menu_n && i < show; i++) {
         int ry = y + 2 + i;
         if (g_menu[i].sel) { put_text(ry, x + 2, "❯", 1, C_ACCENT, C_MENU, false, NULL); }
         put_text(ry, x + 4, g_menu[i].text, w - 6, g_menu[i].sel ? C_TEXT : g_menu[i].fg, C_MENU, false, NULL);
@@ -1247,7 +1264,8 @@ void nc_render(void) {
     if (g_rows >= 6 && g_cols >= 10) {
         int fh = field_height();
         int bar = g_rows - 1;   /* the bar is the last row: the folder and branch are in it */
-        int sh = sug_height(g_rows - fh - 1 - 4);   /* the suggestion list under the field; four rows of conversation are kept */
+        /* the suggestion list or a menu box under the field (never both: a menu has the keys); four rows of conversation are kept for the list, two for a menu */
+        int sh = g_menu_on ? menu_height(menu_box_room()) : sug_height(g_rows - fh - 1 - 4);
         int room = g_rows - fh - sh - 1 - 8;   /* the bar, and eight rows of conversation kept for reading */
         int fit = g_rows - fh - sh - 2;
         if (fit < 1) fit = 1;
@@ -1261,12 +1279,11 @@ void nc_render(void) {
         draw_pane(top);
         draw_selection(top);
         draw_field(top);
-        draw_suggest(top + fh, sh);
+        if (g_menu_on) draw_menu(top + fh, sh); else draw_suggest(top + fh, sh);
         draw_strip(bar - srows, srows, strip_text);
         draw_bar(bar);
         if (g_ov_on) draw_overlay();
         if (g_bn_on) draw_banner();
-        if (g_menu_on) draw_menu();
         if (g_pv_on) draw_pasteview();
     }
     /* the hardware cursor sits on the caret, so it blinks where the input is — also while the model
@@ -1781,7 +1798,7 @@ int nc_scroll_modal(const char *title, const char **lines, int n, int start) {
     if (!g_nc || n <= 0 || !lines) return -1;
     int sel = start >= 0 && start < n ? start : 0, top = 0, result = -1;
     for (;;) {
-        int show = g_rows > 8 ? g_rows - 6 : 3;
+        int show = menu_lines_room();
         if (show > n) show = n;
         if (show > 28) show = 28;   /* the menu holds 32 rows; the title and the hint take two */
         if (show < 1) show = 1;
@@ -1827,7 +1844,7 @@ int nc_select(const char *title, const char **items, const char **descs, int n, 
         }
         if (sel >= nvis) sel = nvis > 0 ? nvis - 1 : 0;
         /* a row is the label, and under it the description indented, wrapped to the width the box can have (the box is
-         * the screen less 4, its text the box less 6). The items shown are those around the selected one that fit above
+         * the screen less 4, its text the box less 6). The items shown are those around the selected one that fit under
          * the field, a blank row between two items with descriptions. */
         int tw = g_cols - 10; if (tw < 20) tw = 20;
         int namew = menu_label_width(items, n, tw);
@@ -1835,9 +1852,9 @@ int nc_select(const char *title, const char **items, const char **descs, int n, 
         for (int v = 0; v < nvis; v++)
             ih[v] = menu_item_rows(items[vis[v]], descs ? descs[vis[v]] : NULL, tw, namew, block, NULL, NULL, 0)
                   + (block && v > 0 && menu_item_sep(descs, vis[v - 1], vis[v]));
-        int budget = g_field_top - 4;   /* the box is the rows, the title, the hint and its two borders */
+        int budget = menu_lines_room();   /* the box is under the field: the rows it may have are the screen's, less the field, the bar and four rows of conversation */
         if (budget > MENU_ROWS_MAX - 2) budget = MENU_ROWS_MAX - 2;
-        if (budget < 3) budget = 3;
+        if (budget < 1) budget = 1;
         int lo = sel, hi = sel, used = nvis ? ih[sel] : 0;
         for (bool grew = nvis > 0; grew; ) {
             grew = false;
