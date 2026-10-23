@@ -644,6 +644,7 @@ static bool memory_spawn(int first) {
         for (int fd = 3; fd < maxfd; fd++) if (fd != fds[1]) close(fd);   /* the terminal, the tools' pipes, the servers' */
         fcntl(fds[1], F_SETFD, 0);
         execv(self, av);
+        execv("/proc/self/exe", av);   /* the file was replaced (the link reads "... (deleted)"): the image still runs */
         _exit(127);
     }
     close(fds[1]);
