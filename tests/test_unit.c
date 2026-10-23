@@ -189,7 +189,12 @@ static void write_preview_body(void *ud) {
     sbuf out; sb_init(&out);
     if (!strcmp(which, "unasked")) { g_cfg.mode = MODE_AUTO; g_cfg.interactive = false; }
     else { g_cfg.mode = MODE_MANUAL; g_cfg.interactive = true; }
+    /* the asked write really asks: its answer is read from stdin, which make's own may never give (a terminal waits
+     * for a key, an open pipe or socket for ever), so the question reads /dev/null: end of input, which is a no */
+    int saved_in = dup(STDIN_FILENO), devnull = open("/dev/null", O_RDONLY);
+    if (devnull >= 0) { dup2(devnull, STDIN_FILENO); close(devnull); }
     tools_execute("write_file", a, &out);
+    if (saved_in >= 0) { dup2(saved_in, STDIN_FILENO); close(saved_in); }
     cJSON_Delete(a); sb_free(&out); sb_free(&body);
     CHECK(chdir(old) == 0);
     g_cfg.mode = MODE_AUTO; g_cfg.interactive = false;
