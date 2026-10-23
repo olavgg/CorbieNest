@@ -6881,7 +6881,7 @@ int main(int argc, char **argv) {
         if (rc == 1) break;
         /* Messages queued while the model was busy: after an interrupt they go back to the
          * editor for the user to review; otherwise they are sent one after another. */
-        while (rc != -1 && term_queue_count()) {
+        while (rc == 0 && term_queue_count()) {   /* a quit (1) or an interrupt (-1) ends the drain */
             char *q = term_queue_pop();
             echo_queued(q);
             rc = process_input(q);
