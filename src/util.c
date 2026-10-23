@@ -116,7 +116,9 @@ int write_whole_file_atomic(const char *path, const char *data, size_t len) {
     }
     /* the data has to be on disk before the name points at it, or a crash between the two
      * leaves a file that is present, named right and empty */
-    if (fsync(fd) != 0 || close(fd) != 0 || rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    int bad = fsync(fd) != 0;
+    if (close(fd) != 0) bad = 1;       /* closed whatever fsync said: a failed save must not leak the descriptor */
+    if (bad || rename(tmp, path) != 0) { unlink(tmp); return -1; }
     return 0;
 }
 
