@@ -352,7 +352,9 @@ static char *memory_read(void) {
     size_t n; char *d = read_whole_file(MEMORY_PATH, &n, MEMORY_MAX);
     if (!d) return NULL;
     if (n >= MEMORY_MAX) { char *nl = strrchr(d, '\n'); if (nl) *nl = 0; }
-    return d;
+    char *ok = utf8_fix(d);   /* a Latin-1 file must not make the request body invalid */
+    free(d);
+    return ok;
 }
 
 static void load_memory(void) { free(g_memory); g_memory = memory_read(); }
@@ -1477,9 +1479,13 @@ static void load_project_instructions(void) {
         if (is_file(names[i])) {
             size_t n; char *d = read_whole_file(names[i], &n, 32 * 1024);
             if (d) {
+                /* the byte cap can cut a character in half, and the file may not be UTF-8 at all:
+                 * the system prompt goes into a JSON body that the hosted APIs refuse when it is invalid */
+                char *ok = utf8_fix(d);
                 sbuf b; sb_init(&b);
-                sb_printf(&b, "\n\n# Project instructions (from %s)\n%s", names[i], d);
+                sb_printf(&b, "\n\n# Project instructions (from %s)\n%s", names[i], ok);
                 g_project_instructions = sb_detach(&b);
+                free(ok);
                 free(d);
             }
             break;
