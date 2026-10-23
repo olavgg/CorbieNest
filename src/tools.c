@@ -332,7 +332,7 @@ static void ckpt_save(const char *path) {
     if (g_ckpt_turn < 0 || g_tool_root) return;   /* a candidate's files are not the user's (see tools_enter) */
     for (int i = 0; i < g_ckpt_n; i++) if (g_ckpt[i].turn == g_ckpt_turn && g_ckpt[i].step == g_ckpt_step && !strcmp(g_ckpt[i].path, path)) return;   /* first state in this turn (and step) wins */
     ckpt_t c = { g_ckpt_turn, xstrdup(path), NULL, 0, false, g_ckpt_step };
-    if (is_file(path)) { c.content = read_whole_file(path, &c.len, CKPT_MAX_BYTES); if (!c.content) { free(c.path); return; } c.existed = true; }
+    if (is_file(path)) { c.content = read_whole_file(path, &c.len, CKPT_MAX_BYTES + 1); if (!c.content || c.len > CKPT_MAX_BYTES) { free(c.content); free(c.path); return; } c.existed = true; }   /* too big to keep whole: no checkpoint, so /rewind cannot put back a cut-off file */
     while (g_ckpt_n && g_ckpt_bytes + c.len > CKPT_MAX_BYTES) { ckpt_free(&g_ckpt[0]); memmove(g_ckpt, g_ckpt + 1, sizeof *g_ckpt * (size_t)(g_ckpt_n - 1)); g_ckpt_n--; }
     if (g_ckpt_n == g_ckpt_cap) { g_ckpt_cap = g_ckpt_cap ? g_ckpt_cap * 2 : 32; g_ckpt = xrealloc(g_ckpt, sizeof *g_ckpt * (size_t)g_ckpt_cap); }
     g_ckpt[g_ckpt_n++] = c; g_ckpt_bytes += c.len;
