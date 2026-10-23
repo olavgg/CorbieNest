@@ -4027,7 +4027,9 @@ static void worker_review(orch_run *r, int i) {
     sb_printf(&rb, "\n\n# The task (%d of %d): %s\n", i + 1, r->nt, r->tasks[i].title); sb_put_cut(&rb, r->tasks[i].body, r->budget / 8);
     sb_puts(&rb, "\n\n# The worker's report\n"); sb_put_cut(&rb, w->out.data ? w->out.data : "", r->budget / 6);
     sb_printf(&rb, "\n\n# The files it wrote, as a diff (%d file%s; what a shell command changed is not in it)\n", nfiles, nfiles == 1 ? "" : "s");
-    sb_put_cut(&rb, nfiles ? diff.data : "(it wrote no file)", r->budget / 2);
+    char *dfix = nfiles && diff.data ? utf8_fix(diff.data) : NULL;   /* a diff of a Latin-1 file is not UTF-8, and the request would not be JSON */
+    sb_put_cut(&rb, dfix ? dfix : "(it wrote no file)", r->budget / 2);
+    free(dfix);
     sb_printf(&rb, "\n\n# REVIEW this task (attempt %d of %d)\nIs it done and correct? " ADVISOR_REVIEW_OK " alone if so; otherwise what the worker must do.", w->attempt, ORCH_ATTEMPTS);
     char what[64], spent[96]; snprintf(what, sizeof what, "reviews task %d/%d", i + 1, r->nt);
     chat_stats st; int how;
@@ -4246,7 +4248,9 @@ static void orch_add_fix(orch_run *r, int layer, const char *cmd, const char *ou
     if (from) { while (from < ol && out[from] != '\n') from++; if (from < ol) from++; }   /* the errors are at the end; start on a whole line */
     sb_append(&b, out + from, ol - from);
     sb_puts(&b, "\n\nFind what the errors name and fix it. Change nothing else, and run the build command again to see it pass. Report what you fixed.");
-    *t = (orch_task){ .title = xstrdup("Fix the build"), .body = sb_detach(&b), .layer = layer };
+    char *body = utf8_fix(b.data);   /* the output may quote a Latin-1 line, and the cut above can end inside a character */
+    sb_free(&b);
+    *t = (orch_task){ .title = xstrdup("Fix the build"), .body = body, .layer = layer };
     r->nt++;
 }
 
