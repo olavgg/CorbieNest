@@ -6787,6 +6787,20 @@ int main(int argc, char **argv) {
         }
         return run_benchmark(bench_runs, oneshot, ctx_given, json_out, json_fd);
     }
+    if (json_out && !oneshot) { fprintf(stderr, "corbienest: --output-format json needs -p PROMPT\n"); return 2; }
+    if (stream_in && !stream_out) { fprintf(stderr, "corbienest: --input-format stream-json needs --output-format stream-json\n"); return 2; }
+    if (stream_out && !oneshot && !stream_in) { fprintf(stderr, "corbienest: --output-format stream-json needs -p PROMPT or --input-format stream-json\n"); return 2; }
+    if (stream_out && json_out) { fprintf(stderr, "corbienest: choose one output format\n"); return 2; }
+    /* the JSON goes to the real stdout; what the run prints for people does not. Done before a session is
+     * resumed, whose "resumed session" line would otherwise land ahead of the JSON. */
+    int json_fd = -1, stream_fd = -1;
+    if (json_out || stream_out) {
+        fflush(stdout);
+        int fd = dup(STDOUT_FILENO);
+        if (!freopen("/dev/null", "w", stdout)) { fprintf(stderr, "corbienest: cannot redirect stdout\n"); return 1; }
+        g_cfg.color = false;
+        if (json_out) json_fd = fd; else stream_fd = fd;
+    }
     if (resume_latest) {
         int n; session_info *v = sessions_list(true, &n);
         if (n) session_load(v[0].id); else printf(C_DIM "no earlier session in this directory — starting fresh" C_RESET "\n");
@@ -6798,27 +6812,12 @@ int main(int argc, char **argv) {
         cmd_resume(NULL);
     }
 
-    if (json_out && !oneshot) { fprintf(stderr, "corbienest: --output-format json needs -p PROMPT\n"); return 2; }
-    if (stream_in && !stream_out) { fprintf(stderr, "corbienest: --input-format stream-json needs --output-format stream-json\n"); return 2; }
-    if (stream_out && !oneshot && !stream_in) { fprintf(stderr, "corbienest: --output-format stream-json needs -p PROMPT or --input-format stream-json\n"); return 2; }
-    if (stream_out && json_out) { fprintf(stderr, "corbienest: choose one output format\n"); return 2; }
-    if (stream_out) {   /* the JSON lines go to the real stdout; what the run prints for people does not */
-        fflush(stdout);
-        int sfd = dup(STDOUT_FILENO);
-        if (!freopen("/dev/null", "w", stdout)) { fprintf(stderr, "corbienest: cannot redirect stdout\n"); return 1; }
-        g_cfg.color = false;
-        g_stream_fd = sfd;
+    if (stream_out) {
+        g_stream_fd = stream_fd;
         int rc = stream_run(oneshot, stream_in);
         g_stream_fd = -1;
         term_restore();
         return rc;
-    }
-    int json_fd = -1;
-    if (json_out) {   /* everything the run prints goes to /dev/null; the JSON goes to the real stdout */
-        fflush(stdout);
-        json_fd = dup(STDOUT_FILENO);
-        if (!freopen("/dev/null", "w", stdout)) { fprintf(stderr, "corbienest: cannot redirect stdout\n"); return 1; }
-        g_cfg.color = false;
     }
 
     if (oneshot) {
