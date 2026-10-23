@@ -2134,6 +2134,20 @@ static void test_provider(void) {
     CHECK(!jget(j, "output_config") && !jget(j, "fallbacks"));
     cJSON_Delete(j); free(body);
 
+    /* extended thinking refuses a temperature: it goes out only when no thinking object does */
+    body = provider_turn_body("anthropic:claude-opus-5", &opus, msgs, NULL, 32000, NULL, true, 0.2, false);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "thinking.type"), "adaptive"); CHECK(!jget(j, "temperature"));
+    cJSON_Delete(j); free(body);
+    body = provider_turn_body("anthropic:claude-haiku-4-5", &haiku, msgs, NULL, 64000, NULL, true, 0.2, false);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "thinking.type"), "enabled"); CHECK(!jget(j, "temperature"));
+    cJSON_Delete(j); free(body);
+    body = provider_turn_body("anthropic:claude-haiku-4-5", &haiku, msgs, NULL, 64000, NULL, false, 0.2, false);
+    j = cJSON_Parse(body);
+    CHECK(!jget(j, "thinking") && cJSON_GetNumberValue(jget(j, "temperature")) > 0.19);
+    cJSON_Delete(j); free(body);
+
     /* a call the request is not offering (the advisor, once it was turned off) goes out as text, or the next call is a 400 */
     cJSON *bash_only = cJSON_Parse("[{\"type\":\"function\",\"function\":{\"name\":\"bash\",\"description\":\"run\",\"parameters\":{\"type\":\"object\"}}}]");
     cJSON *dem = cJSON_Parse("[{\"role\":\"user\",\"content\":\"ask\"},"

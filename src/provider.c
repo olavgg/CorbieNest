@@ -495,7 +495,9 @@ char *provider_turn_body(const char *model_name, const model_info *mi, cJSON *me
     cJSON_AddStringToObject(req, "model", model);
     cJSON_AddNumberToObject(req, "max_tokens", max_tokens > 0 ? max_tokens : 32000);
     cJSON_AddBoolToObject(req, "stream", stream);
-    if (temperature >= 0) cJSON_AddNumberToObject(req, "temperature", temperature);
+    /* extended thinking refuses a temperature other than the default: with a thinking object, none goes out */
+    bool think_on = thinking && mi && (mi->think_adaptive || (mi->think_budget && max_tokens > 2048));
+    if (temperature >= 0 && !think_on) cJSON_AddNumberToObject(req, "temperature", temperature);
     bool named = effort && strcmp(effort, "off") && strcmp(effort, "on");
     if (thinking && mi && mi->think_adaptive) {
         cJSON *t = cJSON_AddObjectToObject(req, "thinking"); cJSON_AddStringToObject(t, "type", "adaptive");
