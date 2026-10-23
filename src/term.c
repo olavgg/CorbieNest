@@ -2821,6 +2821,13 @@ static size_t u8_next(const char *s, size_t pos, size_t len) {
     size_t n = pos + (size_t)u8_len((unsigned char)s[pos]);
     return n > len ? len : n;
 }
+/* The byte offset in [ts, te] that is `col` characters into that line (a column kept in
+ * characters, so a move between lines never lands inside a UTF-8 sequence). */
+static size_t u8_col_to(const char *s, size_t ts, size_t te, size_t col) {
+    size_t p = ts;
+    while (col-- > 0 && p < te) p = u8_next(s, p, te);
+    return p;
+}
 static int vis_width(const char *s) {   /* width of prompt ignoring escapes */
     int w = 0;
     for (const char *p = s; *p; ) {
@@ -3490,10 +3497,10 @@ static char *readline_impl(const char *prompt, bool in_field) {
             case K_UP: case 16: {   /* history prev (only if single line or at first line) */
                 if (memchr(e.buf.data, '\n', e.cur)) { /* move up a line */
                     size_t ls = e.cur; while (ls > 0 && e.buf.data[ls-1] != '\n') ls--;
-                    size_t col = e.cur - ls;
+                    size_t col = 0;
+                    for (size_t q = ls; q < e.cur; q = u8_next(e.buf.data, q, e.cur)) col++;
                     size_t pls = ls - 1; while (pls > 0 && e.buf.data[pls-1] != '\n') pls--;
-                    size_t plen = (ls - 1) - pls;
-                    e.cur = pls + (col < plen ? col : plen);
+                    e.cur = u8_col_to(e.buf.data, pls, ls - 1, col);
                     break;
                 }
                 if (e.hist_idx > 0) {
@@ -3506,11 +3513,11 @@ static char *readline_impl(const char *prompt, bool in_field) {
                 const char *nl = memchr(e.buf.data + e.cur, '\n', e.buf.len - e.cur);
                 if (nl) {
                     size_t ls = e.cur; while (ls > 0 && e.buf.data[ls-1] != '\n') ls--;
-                    size_t col = e.cur - ls;
+                    size_t col = 0;
+                    for (size_t q = ls; q < e.cur; q = u8_next(e.buf.data, q, e.cur)) col++;
                     size_t nls = (size_t)(nl - e.buf.data) + 1;
                     size_t nle = nls; while (nle < e.buf.len && e.buf.data[nle] != '\n') nle++;
-                    size_t nlen = nle - nls;
-                    e.cur = nls + (col < nlen ? col : nlen);
+                    e.cur = u8_col_to(e.buf.data, nls, nle, col);
                     break;
                 }
                 if (e.hist_idx < g_hist_n) {
