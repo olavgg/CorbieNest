@@ -901,6 +901,7 @@ static void draw_field(int top) {
     int row = 0, col = 0;
     size_t at = 0;
     for (;;) {
+        while (row + 1 < nrows && at >= starts[row + 1]) { row++; col = 0; }   /* first: the end and a newline are drawn on the row the walker puts them on */
         bool here = at == g_cur;
         int y = top + 1 + row - first, x = 4 + col;
         bool shows = row >= first && row < first + shown;
@@ -913,7 +914,6 @@ static void draw_field(int top) {
             if (here && shows) { nc_style st = { C_BAR_A, C_TEXT, 0 }; paint(g_std, &st, C_BAR_A, C_TEXT); ncplane_putstr_yx(g_std, y, x, " "); }
             at++; continue;   /* the row changes where the walker says: the next row starts after it */
         }
-        while (row + 1 < nrows && at >= starts[row + 1]) { row++; col = 0; y = top + 1 + row - first; x = 4; shows = row >= first && row < first + shown; }
         size_t len = utf8_len(ch);
         if (at + len > g_len) len = g_len - at;
         nc_cell cell; int w = nc_cells(g_ed + at, len, &cell, 1, NULL) ? cell.w : 1;
