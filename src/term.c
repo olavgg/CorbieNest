@@ -2707,8 +2707,8 @@ static int g_hist_n = 0;
 /* A history browse ends (the turn is over, or the queue comes back): the line typed before it returns to the
  * field, so a message being written is not lost in the history. */
 static void ta_end_browse(void) {
-    if (g_ta_hist < 0 || g_ta_hist >= g_hist_n) return;
-    ta_set_text(g_ta_draft ? g_ta_draft : "");
+    if (g_ta_hist < 0) return;
+    if (g_ta_hist < g_hist_n) ta_set_text(g_ta_draft ? g_ta_draft : "");   /* at g_hist_n the field already holds the draft */
     g_ta_hist = -1; free(g_ta_draft); g_ta_draft = NULL;
 }
 static void ta_hist(int k) {
