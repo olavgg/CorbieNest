@@ -3608,6 +3608,7 @@ static bool run_turn_body(void) {
              * have to carry it — an assistant turn the chat template still has to render. */
             if (!aborted && reply_is_empty(reply)) {
                 cJSON_DeleteItemFromArray(g_messages, cJSON_GetArraySize(g_messages) - 1);
+                g_stream_seen = cJSON_GetArraySize(g_messages);   /* the retry's reply lands at this index and must be written */
                 print_stats(&st);
                 if (++empties < 2) {
                     printf(C_YELLOW "⚠ empty reply: %d token%s generated, delivered as neither text nor a tool call — asking again" C_RESET "\n",
@@ -5329,6 +5330,7 @@ static bool compact_conversation(bool resuming, const char *request) {
     if (!resuming) add_message("assistant", "Understood, I have the context from the summary. How should we continue?");
     sb_free(&b); free(ask); cJSON_Delete(reply);
     g_session.last_prompt_tokens = 0;   /* unknown until the next request; also stops auto-compact re-firing */
+    g_stream_seen = cJSON_GetArraySize(g_messages);   /* the array is a new, shorter one: what follows is written, from here */
     printf(C_GREEN "✓ conversation compacted%s" C_RESET "\n", resuming ? " — continuing" : "");
     return true;
 }
