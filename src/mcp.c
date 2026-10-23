@@ -386,12 +386,13 @@ static void connect_one(mcp_server *m) {
     cJSON_Delete(ans);
     notify(m, "notifications/initialized");
     int added = 0;
+    bool failed = false;
     char *cursor = NULL;
     for (int page = 0; page < 20; page++) {
         cJSON *p = cJSON_CreateObject();
         if (cursor) cJSON_AddStringToObject(p, "cursor", cursor);
         ans = request(m, "tools/list", p, MCP_CONNECT_TIMEOUT, &intr);
-        if (!ans) { free(m->status); m->status = xstrdup(m->dead ? "exited while listing its tools" : "did not list its tools"); reap(m); break; }
+        if (!ans) { free(m->status); m->status = xstrdup(m->dead ? "exited while listing its tools" : "did not list its tools"); failed = true; reap(m); break; }
         cJSON *res = cJSON_GetObjectItemCaseSensitive(ans, "result");
         cJSON *tools = res ? cJSON_GetObjectItemCaseSensitive(res, "tools") : NULL, *t;
         cJSON_ArrayForEach(t, tools) {
@@ -417,7 +418,7 @@ static void connect_one(mcp_server *m) {
     }
     free(cursor);
     m->ntools = added;
-    if (m->dead || (m->status && !strncmp(m->status, "exited", 6))) return;
+    if (failed || m->dead || (m->status && !strncmp(m->status, "exited", 6))) return;
     free(m->status);
     char s[80]; snprintf(s, sizeof s, "connected: %d tool%s", added, added == 1 ? "" : "s");
     m->status = xstrdup(s);
