@@ -416,6 +416,18 @@ static void user_add(cJSON **acc, cJSON *block) {
     if (!*acc) *acc = cJSON_CreateArray();
     cJSON_AddItemToArray(*acc, block);
 }
+/* a tool_result must come before any other block of the user message that answers the tool_use blocks */
+static void user_add_result(cJSON **acc, cJSON *block) {
+    if (!*acc) *acc = cJSON_CreateArray();
+    int at = 0;
+    cJSON *b;
+    cJSON_ArrayForEach(b, *acc) {
+        cJSON *ty = cJSON_GetObjectItemCaseSensitive(b, "type");
+        if (!cJSON_IsString(ty) || strcmp(ty->valuestring, "tool_result")) break;
+        at++;
+    }
+    cJSON_InsertItemInArray(*acc, at, block);
+}
 static void user_flush(cJSON *out, cJSON **acc) {
     if (!*acc || cJSON_GetArraySize(*acc) == 0) { cJSON_Delete(*acc); *acc = NULL; return; }
     cJSON *m = cJSON_CreateObject();
@@ -568,7 +580,7 @@ char *provider_turn_body(const char *model_name, const model_info *mi, cJSON *me
                 cJSON_AddStringToObject(b, "type", "tool_result");
                 cJSON_AddStringToObject(b, "tool_use_id", use);
                 cJSON_AddStringToObject(b, "content", jcontent(m));
-                user_add(&acc, b);
+                user_add_result(&acc, b);
             }
         } else {   /* user, and anything else: said by the person */
             if (jcontent(m)[0]) user_add(&acc, text_block(jcontent(m)));

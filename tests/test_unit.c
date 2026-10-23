@@ -2161,6 +2161,19 @@ static void test_provider(void) {
     CHECK(jstr_at(j, "messages.2.content.0.text") && strstr(jstr_at(j, "messages.2.content.0.text"), "[advisor result]\nadvice text"));
     cJSON_Delete(j); free(body); cJSON_Delete(dem);
 
+    /* a demoted result before a real one: the tool_result still comes first in the user message */
+    cJSON *both = cJSON_Parse("[{\"role\":\"user\",\"content\":\"go\"},"
+                              "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call_adv_1\",\"function\":{\"name\":\"advisor\",\"arguments\":{}}},"
+                              "{\"id\":\"toolu_b\",\"function\":{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}}]},"
+                              "{\"role\":\"tool\",\"tool_name\":\"advisor\",\"tool_call_id\":\"call_adv_1\",\"content\":\"advice text\"},"
+                              "{\"role\":\"tool\",\"tool_name\":\"bash\",\"tool_call_id\":\"toolu_b\",\"content\":\"out\"}]");
+    body = provider_turn_body("anthropic:claude-haiku-4-5", &haiku, both, bash_only, 64000, NULL, false, -1, false);
+    j = cJSON_Parse(body);
+    CHECK_STR(jstr_at(j, "messages.2.content.0.type"), "tool_result"); CHECK_STR(jstr_at(j, "messages.2.content.0.tool_use_id"), "toolu_b");
+    CHECK_STR(jstr_at(j, "messages.2.content.1.type"), "text");
+    CHECK(jstr_at(j, "messages.2.content.1.text") && strstr(jstr_at(j, "messages.2.content.1.text"), "[advisor result]"));
+    cJSON_Delete(j); free(body); cJSON_Delete(both);
+
     /* more tool_use blocks than the table holds: the message is rebuilt, so no tool_use is left without its tool_result */
     {
         sbuf big; sb_init(&big);
