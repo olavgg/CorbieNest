@@ -111,9 +111,11 @@ static void load_file(const char *path, const char *origin) {
     if (!d) return;
     cJSON *o = cJSON_Parse(d); free(d);
     cJSON *srv = o ? cJSON_GetObjectItemCaseSensitive(o, "servers") : NULL;
+    if (!cJSON_IsObject(srv)) srv = NULL;
     cJSON *s;
     cJSON_ArrayForEach(s, srv) {
         if (g_nsrv >= MCP_MAX_SERVERS) break;
+        if (!s->string || !cJSON_IsObject(s)) continue;
         bool dup = false; for (int i = 0; i < g_nsrv; i++) if (!strcmp(g_srv[i].name, s->string)) dup = true;
         cJSON *cmd = cJSON_GetObjectItemCaseSensitive(s, "command");
         if (dup || !cJSON_IsString(cmd) || !cmd->valuestring[0] || !s->string[0]) continue;
