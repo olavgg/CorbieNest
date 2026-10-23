@@ -5472,7 +5472,7 @@ static void cmd_ui(const char *arg) {
         na[n++] = g_argv[i];
     }
     na[n++] = "--ui"; na[n++] = (char *)arg;
-    na[n++] = "--resume"; na[n++] = g_session_id;
+    if (g_session_id[0]) { na[n++] = "--resume"; na[n++] = g_session_id; }   /* a session that was never saved has no id: --resume "" opens the picker */
     na[n] = NULL;
     printf(C_DIM "restarting on the %s screen, in this session…" C_RESET "\n", arg);
     fflush(stdout);
@@ -5483,7 +5483,8 @@ static void cmd_ui(const char *arg) {
     /* only reached when the restart failed: the session is saved, and the program is still running. The screen
      * was given back above, so the ANSI one takes the terminal again (a notcurses start on it would fail, and
      * the flag must not say notcurses while there is none). */
-    fprintf(stderr, "corbienest: could not restart (%s); continuing on the ANSI screen — restart with --resume %s\n", strerror(errno), g_session_id);
+    fprintf(stderr, "corbienest: could not restart (%s); continuing on the ANSI screen%s%s\n", strerror(errno),
+            g_session_id[0] ? " — restart with --resume " : "", g_session_id);
     if (g_ui_nc) { g_ui_nc = false; term_fullscreen(true); }
     free(na);
 }
