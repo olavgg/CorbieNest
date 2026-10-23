@@ -3725,7 +3725,7 @@ static int confirm_impl(const char *question, const char *always_label, const ch
 
         int k = read_key();
         if (k == -2) continue;                                   /* resize: redraw */
-        if (k == -1 || k == 3) { choice = 0; break; }             /* EOF / Ctrl-C */
+        if (k == -1 || k == 3) { choice = -1; break; }             /* EOF / Ctrl-C */
         if (k == K_ESC) { choice = no_i; break; }
         if (k == '\r' || k == '\n') { choice = sel; break; }
         if (k == '1' || k == 'y' || k == 'Y') { choice = 0; break; }
