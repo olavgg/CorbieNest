@@ -1924,7 +1924,9 @@ static void print_result_preview(const char *text, int max_lines) {
         int w = term_width() - 6; if (w < 20) w = 20;   /* "  ⎿  " prefix + ellipsis */
         size_t cut = n > (size_t)w ? (size_t)w : n;
         while (cut > 0 && cut < n && ((unsigned char)p[cut] & 0xC0) == 0x80) cut--;   /* don't split UTF-8 */
-        printf("  %s" C_DIM "%.*s%s" C_RESET "\n", first ? "⎿  " : "   ", (int)cut, p, cut < n ? "…" : "");
+        printf("  %s" C_DIM, first ? "⎿  " : "   ");
+        for (size_t i = 0; i < cut; i++) { unsigned char c = (unsigned char)p[i]; if (c == '\t') fputs("    ", stdout); else if (c >= 32 && c != 127) fputc(c, stdout); }   /* no escapes, no carriage returns: they would move the model's cursor */
+        printf("%s" C_RESET "\n", cut < n ? "…" : "");
         first = false; lines++;
         if (!e) break;
         p = e + 1;
