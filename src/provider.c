@@ -432,11 +432,14 @@ typedef struct { char id[40]; bool demote; } turn_call;
 
 static bool blocks_sendable(cJSON *blocks, cJSON *tools) {
     cJSON *b;
+    int uses = 0;
     if (!cJSON_IsArray(blocks) || cJSON_GetArraySize(blocks) == 0) return false;
     cJSON_ArrayForEach(b, blocks) {
         cJSON *ty = cJSON_GetObjectItemCaseSensitive(b, "type");
         cJSON *nm = cJSON_GetObjectItemCaseSensitive(b, "name");
-        if (cJSON_IsString(ty) && !strcmp(ty->valuestring, "tool_use") && !tool_offered(tools, cJSON_IsString(nm) ? nm->valuestring : "")) return false;
+        if (!cJSON_IsString(ty) || strcmp(ty->valuestring, "tool_use")) continue;
+        /* pend[] holds TURN_CALLS: a result with no entry would go out as text and leave its tool_use unanswered */
+        if (++uses > TURN_CALLS || !tool_offered(tools, cJSON_IsString(nm) ? nm->valuestring : "")) return false;
     }
     return true;
 }

@@ -2159,7 +2159,34 @@ static void test_provider(void) {
     CHECK(jstr_at(j, "messages.1.content.0.text") && strstr(jstr_at(j, "messages.1.content.0.text"), "[called advisor]") && !jget(j, "messages.1.content.1"));
     CHECK_STR(jstr_at(j, "messages.2.content.0.type"), "text");
     CHECK(jstr_at(j, "messages.2.content.0.text") && strstr(jstr_at(j, "messages.2.content.0.text"), "[advisor result]\nadvice text"));
-    cJSON_Delete(j); free(body); cJSON_Delete(dem); cJSON_Delete(bash_only);
+    cJSON_Delete(j); free(body); cJSON_Delete(dem);
+
+    /* more tool_use blocks than the table holds: the message is rebuilt, so no tool_use is left without its tool_result */
+    {
+        sbuf big; sb_init(&big);
+        sb_puts(&big, "[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":\"\",\"provider_content\":[");
+        for (int k = 0; k < 66; k++) sb_printf(&big, "%s{\"type\":\"tool_use\",\"id\":\"toolu_%d\",\"name\":\"bash\",\"input\":{}}", k ? "," : "", k);
+        sb_puts(&big, "],\"tool_calls\":[");
+        for (int k = 0; k < 66; k++) sb_printf(&big, "%s{\"id\":\"toolu_%d\",\"function\":{\"name\":\"bash\",\"arguments\":{}}}", k ? "," : "", k);
+        sb_puts(&big, "]}");
+        for (int k = 0; k < 66; k++) sb_printf(&big, ",{\"role\":\"tool\",\"tool_name\":\"bash\",\"tool_call_id\":\"toolu_%d\",\"content\":\"r\"}", k);
+        sb_puts(&big, "]");
+        cJSON *many = cJSON_Parse(big.data); sb_free(&big);
+        body = provider_turn_body("anthropic:claude-haiku-4-5", &haiku, many, bash_only, 64000, NULL, false, -1, false);
+        j = cJSON_Parse(body);
+        int uses = 0, results = 0;
+        cJSON *mm, *bb;
+        cJSON_ArrayForEach(mm, jget(j, "messages")) {
+            cJSON_ArrayForEach(bb, jget(mm, "content")) {
+                const char *ty = jstr_at(bb, "type");
+                if (ty && !strcmp(ty, "tool_use")) uses++;
+                if (ty && !strcmp(ty, "tool_result")) results++;
+            }
+        }
+        CHECK(uses == 64 && results == 64);
+        cJSON_Delete(j); free(body); cJSON_Delete(many);
+    }
+    cJSON_Delete(bash_only);
 
     /* a refusal is the turn's answer. The advisor's parser still reports it as a failure and returns nothing */
     memset(&st, 0, sizeof st);
