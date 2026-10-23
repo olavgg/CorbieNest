@@ -4652,6 +4652,7 @@ static int cmd_goal(const char *arg) {
             free(dirs[k]);
             free(tasks[k].title); free(tasks[k].body);
             if (ws[k].msgs) cJSON_Delete(ws[k].msgs);
+            free(ws[k].plain); free(ws[k].role_model);   /* the request body kept for a plain restart, and a role's model */
             sb_free(&ws[k].out); sb_free(&ws[k].objection);
         }
         free(dirs); free(ws); free(tasks); cJSON_Delete(run.tools);
