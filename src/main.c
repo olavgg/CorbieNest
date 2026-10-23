@@ -2488,9 +2488,19 @@ static int run_subagent(const char *description, const char *prompt, const char 
     if (subagent_resolve(agent_name, &ag, out)) return 1;
     return run_subagent_as(description, prompt, ag, ag ? agent_model_override(ag) : NULL, out);
 }
+static bool tool_offered(cJSON *tools, const char *name) {
+    cJSON *t;
+    cJSON_ArrayForEach(t, tools) {
+        cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
+        cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+        if (cJSON_IsString(nm) && !strcmp(nm->valuestring, name)) return true;
+    }
+    return false;
+}
 /* the tool calls of one sub-agent reply, run on this thread; each result is appended to msgs in the order asked.
+ * offered: the tools this sub-agent was given; a call to any other is answered with an error, not run.
  * quiet: print nothing (a batch of sub-agents runs at once and prints its results when it ends). */
-static void subagent_calls(subagent_rec *rec, cJSON *msgs, cJSON *calls, bool quiet) {
+static void subagent_calls(subagent_rec *rec, cJSON *msgs, cJSON *calls, cJSON *offered, bool quiet) {
     cJSON *call;
     cJSON_ArrayForEach(call, calls) {
         cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
@@ -2509,6 +2519,7 @@ static void subagent_calls(subagent_rec *rec, cJSON *msgs, cJSON *calls, bool qu
         tool_status ts;
         if (!strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "task")) { sb_printf(&o, "error: %s is not available to a sub-agent (read-only)", name); ts = TOOL_ERROR; }
         else if (!strcmp(name, "advisor")) { sb_puts(&o, "error: the advisor is not available to a sub-agent (it would be shown the wrong conversation); report what you found"); ts = TOOL_ERROR; }
+        else if (!tool_offered(offered, name)) { sb_printf(&o, "error: %s is not available to this sub-agent", name); ts = TOOL_ERROR; }
         else ts = tools_execute(name, args, &o);
         (void)ts;
         agent_say_result(rec, o.data);
@@ -2602,7 +2613,7 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
         if (!calls || cJSON_GetArraySize(calls) == 0) { final = cJSON_IsString(content) ? content->valuestring : ""; rc = 0; break; }
         if (iter == SUBAGENT_ITERS) { sb_printf(out, "error: sub-agent stopped after %d tool rounds without a report", SUBAGENT_ITERS); if (cJSON_IsString(content) && content->valuestring[0]) sb_printf(out, "\nIts last message:\n%s", content->valuestring); break; }
         round_first = cJSON_GetArraySize(msgs);
-        subagent_calls(rec, msgs, calls, false);
+        subagent_calls(rec, msgs, calls, tools, false);
         tool_rounds++;
         if (term_poll_interrupt()) { sb_puts(out, "error: sub-agent interrupted by the user"); interrupted = true; break; }
     }
@@ -2744,7 +2755,7 @@ static void sub_run_collect(sub_run *r) {
         return;
     }
     r->round_first = cJSON_GetArraySize(r->msgs);
-    subagent_calls(r->rec, r->msgs, calls, true);
+    subagent_calls(r->rec, r->msgs, calls, r->tools, true);
     r->tool_rounds++; r->iter++;
     r->state = SR_WAITING;
 }
