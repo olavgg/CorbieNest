@@ -3113,8 +3113,8 @@ static int run_advisor(const char *question, sbuf *out) {
  * conversation of that shape is one every chat template renders, and the advice is a tool result
  * like any other advice — where a note from the "user" would be neither. */
 static void advisor_inject(cJSON *reply, const char *label, const char *result) {
-    static int seq;
-    char id[32]; snprintf(id, sizeof id, "call_adv_%d", ++seq);
+    static int seq;   /* restarts at 0 in every process, and a resumed conversation may hold call_adv_1 already */
+    char id[48]; snprintf(id, sizeof id, "call_adv_%d_%d", (int)getpid(), ++seq);
     cJSON *calls = cJSON_GetObjectItemCaseSensitive(reply, "tool_calls");
     if (!calls) calls = cJSON_AddArrayToObject(reply, "tool_calls");
     cJSON *call = cJSON_CreateObject(), *fn = cJSON_AddObjectToObject(call, "function");
