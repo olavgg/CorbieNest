@@ -804,6 +804,7 @@ static tool_status t_edit_file(cJSON *args, sbuf *out) {
     if (!path_in_root(p)) { sb_printf(out, "error: %s is outside this candidate's worktree; edit inside the working directory", path); free(p); return TOOL_ERROR; }
     size_t len; char *d = read_whole_file(p, &len, 0);
     if (!d) { sb_printf(out, "error: cannot read %s: %s", path, strerror(errno)); free(p); return TOOL_ERROR; }
+    if (memchr(d, 0, len)) { sb_printf(out, "error: %s contains NUL bytes (binary); edit_file works on text files", path); free(d); free(p); return TOOL_ERROR; }
     int occ = count_occ(d, olds);
     if (occ == 0) { sb_printf(out, "error: old_string not found in %s. Re-read the file and match the text exactly (whitespace matters).", path); free(d); free(p); return TOOL_ERROR; }
     if (occ > 1 && !all) { sb_printf(out, "error: old_string occurs %d times in %s; include more surrounding context to make it unique, or set replace_all=true.", occ, path); free(d); free(p); return TOOL_ERROR; }
