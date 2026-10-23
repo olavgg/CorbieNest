@@ -1575,7 +1575,7 @@ check("sugsrc/zebra_term.c" in view and "sugsrc/deep/zebra_notes.md" in view, f"
 check("twin.txt" not in view, "and only those")
 s.send("\t"); check("enter take it" in listed(), "Tab starts choosing when they have nothing more in common")
 s.send("\t"); check(s.expect("❯ see @sugsrc/zebra_term.c"), f"and takes the highlighted one: its path replaces what was typed: {since()[-200:]!r}")
-s.send("and @" + sib + "/z"); s.send("e"); check(s.expect(sib + "/zeta_parser.c"), f"a directory in front — also one outside the working directory — is where the search is: {since()[-300:]!r}")
+s.send("and @" + sib + "/z"); s.send("e"); view = listed(); check(sib + "/zeta_parser.c" in view, f"a directory in front — also one outside the working directory — is where the search is: {view!r}")
 s.send("\t"); check(s.expect("@" + sib + "/zeta_parser.c "), "Tab completes it")
 s.send("\r"); check(s.expect("Echo: see @sugsrc/zebra_term.c"), "the message is sent")
 check("(attached sugsrc/zebra_term.c" in since() and "(attached " + sib + "/zeta_parser.c" in since(), f"with both files attached: {since()[-400:]!r}")
