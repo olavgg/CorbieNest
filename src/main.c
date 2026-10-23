@@ -5322,7 +5322,14 @@ static bool compact_conversation(bool resuming, const char *request) {
     account(&st);
     term_status_refresh();
     if (!reply || aborted) { free(ask); if (reply) cJSON_Delete(reply); printf(C_YELLOW "compact cancelled" C_RESET "\n"); return false; }
-    const char *summary = cJSON_GetObjectItemCaseSensitive(reply, "content")->valuestring;
+    cJSON *sc = cJSON_GetObjectItemCaseSensitive(reply, "content");
+    const char *summary = cJSON_IsString(sc) ? sc->valuestring : "";
+    const char *sp = summary; while (*sp == ' ' || *sp == '\n' || *sp == '\t' || *sp == '\r') sp++;
+    if (!*sp) {   /* a reasoning-only or capped reply: the conversation must not be replaced by an empty summary */
+        free(ask); cJSON_Delete(reply);
+        printf(C_YELLOW "compact failed: the model returned no summary — the conversation is unchanged" C_RESET "\n");
+        return false;
+    }
     cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); g_prev_request_first = -1;
     sbuf b; sb_init(&b);
     sb_printf(&b, "This conversation was compacted. Summary of the previous conversation:\n\n%s\n\nContinue from here.", summary);
