@@ -591,6 +591,10 @@ static char *paste_take(void) {
     return t;
 }
 
+/* a loop that does not edit (a menu, the paste view, the scroll modal) takes a paste's key and drops its text,
+ * so the FIFO stays in step with the key queue */
+static void paste_drop(void) { free(paste_take()); }
+
 /* a key out of the stream: Esc closes the overlay or the banner first, else it is queued */
 static void key_out(int k) {
     if (k == NK_SKIP) return;
@@ -987,6 +991,7 @@ static void pv_run(void) {
         nc_render();
         int k = nc_getkey(33);
         if (k == NK_NONE || k == NK_SKIP) continue;
+        if (k == NK_PASTE) { paste_drop(); continue; }
         if (k == NK_RESIZE) break;   /* as the ANSI viewer: a resize closes it */
         long body = (long)pv_body();
         if (k == NK_UP || k == 'k') pv_scroll(-1);
@@ -1771,6 +1776,7 @@ int nc_confirm(const char *question, const char *always_label, const char *proje
         nc_render();
         int k = nc_getkey(33);
         if (k == NK_NONE || k == NK_SKIP) continue;
+        if (k == NK_PASTE) { paste_drop(); continue; }
         if (k == NK_UP || k == 'k') { sel = sel > 0 ? sel - 1 : nopt - 1; continue; }
         if (k == NK_DOWN || k == 'j' || k == 9) { sel = (sel + 1) % nopt; continue; }
         if (k == 13) choice = sel;
@@ -1813,6 +1819,7 @@ int nc_scroll_modal(const char *title, const char **lines, int n, int start) {
         nc_render();
         int k = nc_getkey(1000);
         if (k == NK_NONE || k == NK_SKIP) continue;
+        if (k == NK_PASTE) { paste_drop(); continue; }
         if (k == 27 || k == 3 || k == NK_RESIZE) { result = -1; break; }
         if (k == 13 || k == 10) { result = sel; break; }
         if (k == NK_UP || k == 'k') { if (sel > 0) sel--; }
@@ -1884,6 +1891,7 @@ int nc_select(const char *title, const char **items, const char **descs, int n, 
         nc_render();
         int k = nc_getkey(33);
         if (k == NK_NONE || k == NK_SKIP) continue;
+        if (k == NK_PASTE) { paste_drop(); continue; }
         if (k == 27 || k == 3) { result = -1; break; }
         if (k == 13) { result = nvis ? vis[sel] : -1; break; }
         if (k == NK_UP) { if (sel > 0) sel--; continue; }
