@@ -143,6 +143,7 @@ static void test_gitbranch(void) {
     snprintf(p, sizeof p, "%s", root);
     CHECK(git_branch(p, b, sizeof b) == 0);
     CHECK(git_branch(NULL, b, sizeof b) == 0);
+    CHECK(git_branch("?", b, sizeof b) == 0);   /* what the status bar passes when getcwd failed: no '/' to walk up by */
 }
 
 /* ---------- text tool call recovery ---------- */

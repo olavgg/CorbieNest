@@ -2155,6 +2155,7 @@ int git_branch(const char *dir, char *out, size_t n) {
         }
         if (!strcmp(cur, "/")) return 0;   /* the root: no repository */
         char *slash = strrchr(cur, '/');
+        if (!slash) return 0;   /* a relative name ("?" when getcwd failed) has nothing above it */
         if (slash == cur) strcpy(cur, "/"); else *slash = 0;
     }
     FILE *f = fopen(head, "r");
