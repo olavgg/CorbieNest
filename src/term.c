@@ -3840,6 +3840,7 @@ static void md_flush_star(md_state *m) {
 void md_feed(md_state *m, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         char c = s[i];
+        if (((unsigned char)c < 32 && c != '\n' && c != '\t') || (unsigned char)c == 127) continue;   /* no escapes from model text */
         if (c == '`') { md_flush_star(m); m->pending_ticks++; continue; }
         if (m->pending_ticks) { md_flush_ticks(m); m->at_line_start = false; }
         if (m->in_fence && m->in_info) {   /* the info string: printed as it comes, and kept for the language */
