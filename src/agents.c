@@ -77,7 +77,10 @@ static void read_dir(const char *dir) {
         free(text);
         if (!a.name) a.name = xstrndup(e->d_name, n - 3);
         if (!valid_name(a.name) || have(a.name) || !a.description || !*a.description) { free(a.name); free(a.description); free(a.tools); free(a.model); free(a.body); continue; }
-        if (strlen(a.body) > AGENT_BODY_MAX) a.body[AGENT_BODY_MAX] = 0;
+        /* the body goes into the sub-agent's system prompt, so it must be valid UTF-8 and cut on a character */
+        char *fx = utf8_fix(a.body); free(a.body); a.body = fx;
+        size_t bl = strlen(a.body);
+        if (bl > AGENT_BODY_MAX) a.body[utf8_cut(a.body, bl, AGENT_BODY_MAX)] = 0;
         a.path = xstrdup(path);
         g_agent[g_nagent++] = a;
     }
