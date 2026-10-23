@@ -24,6 +24,14 @@ confirmed before it runs.
   `/goal` races candidates in git worktrees against a metric.
 - **Sessions, memory, skills.** Sessions resume with `--continue` or `/resume`. The project keeps
   a memory file, and skills are reusable `SKILL.md` instructions.
+- **Hooks, permission rules and a sandbox.** `/hooks` runs your shell commands before and after
+  tool calls and at start and stop. `deny` and `ask` rules guard bash, edit and fetch calls, and
+  `sandbox=bwrap` runs the model's shell commands inside bubblewrap. Hooks are guardrails, not a sandbox.
+- **More tools.** MCP servers over stdio (`/mcp`), background bash commands you can read or stop
+  later, a `todo_write` task list the model keeps for a request, and stream-json input and output.
+- **Providers.** Anthropic, xAI, OpenAI, DeepSeek and Kimi, and your own OpenAI-compatible hosts
+  (`/model add`). Request bodies can be gzipped for the providers that accept them (`/gzip`).
+- **Colour themes.** `/ui theme` picks a palette, shared by the terminal screen and the notcurses screen.
 - **Suggested next message.** After each reply the model proposes what you would type next, as a
   muted placeholder in the field: Tab takes it, typing anything clears it (`/suggest off` turns it off).
 - **Full-screen terminal UI.** A rounded input field, a status bar with the model, tokens, context
