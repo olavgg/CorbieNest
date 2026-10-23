@@ -1290,10 +1290,14 @@ static bool is_loop_note(const cJSON *m) {
 static int cmd_rewind(void) {
     int total = cJSON_GetArraySize(g_messages);
     int idx[256]; int n = 0;
-    for (int i = 0; i < total && n < 256; i++) {
+    int first = 0;   /* requests before the last 256 are not offered; the numbering follows from here */
+    for (int i = 0; i < total; i++) {
         cJSON *m = cJSON_GetArrayItem(g_messages, i);
         cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role");
-        if (cJSON_IsString(r) && !strcmp(r->valuestring, "user") && !is_loop_note(m)) idx[n++] = i;
+        if (cJSON_IsString(r) && !strcmp(r->valuestring, "user") && !is_loop_note(m)) {
+            if (n == 256) { memmove(idx, idx + 1, sizeof(int) * 255); n--; first++; }
+            idx[n++] = i;
+        }
     }
     if (!n) { printf(C_DIM "nothing to rewind: the conversation is empty" C_RESET "\n"); return 0; }
     if (!g_cfg.interactive) { printf(C_DIM "/rewind needs an interactive session" C_RESET "\n"); return 0; }
@@ -1303,7 +1307,7 @@ static int cmd_rewind(void) {
         cJSON *c = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(g_messages, idx[i]), "content");
         const char *t = cJSON_IsString(c) ? c->valuestring : ""; while (*t == ' ' || *t == '\n') t++;
         size_t l = strcspn(t, "\n"); if (l > 60) { l = 60; while (l && ((unsigned char)t[l] & 0xC0) == 0x80) l--; }
-        sbuf a; sb_init(&a); sb_printf(&a, "%d. %.*s%s", i + 1, (int)l, t, t[l] ? "…" : ""); bufs[2*i] = sb_detach(&a); items[i] = bufs[2*i];
+        sbuf a; sb_init(&a); sb_printf(&a, "%d. %.*s%s", first + i + 1, (int)l, t, t[l] ? "…" : ""); bufs[2*i] = sb_detach(&a); items[i] = bufs[2*i];
         sbuf names; sb_init(&names); sb_append(&names, "", 0);
         int nf = tools_checkpoint_files(idx[i], &names);
         sbuf b; sb_init(&b);
