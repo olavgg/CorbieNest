@@ -1559,6 +1559,7 @@ static void sug_tab(void) {
         size_t k = 0; while (k < cp && g_sug_items[i].text[k] == g_sug_items[0].text[k]) k++;
         cp = k;
     }
+    while (cp > tl && ((unsigned char)g_sug_items[0].text[cp] & 0xC0) == 0x80) cp--;   /* never inside a UTF-8 character */
     if (cp <= tl) { g_sug_sel = 0; return; }
     char *pre = xstrndup(g_sug_items[0].text, cp);
     ed_delete(g_sug_from, g_cur);
