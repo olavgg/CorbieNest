@@ -1079,7 +1079,7 @@ static void draw_overlay(void) {
     if (left < 0) left = 0;
     for (int r = 0; r < H; r++) fill_row(top + r, left, left + W, C_BAR_A, false);
     nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 };
-    char edge[600] = "";
+    char edge[3 * (size_t)W + 8];   /* "╭" + (W - 2) * "─" + "╮", three bytes each */
     snprintf(edge, sizeof edge, "╭");
     for (int i = 0; i < W - 2; i++) strcat(edge, "─");
     strcat(edge, "╮");
