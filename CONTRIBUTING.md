@@ -7,7 +7,7 @@ small are the most welcome ones.
 
 ```sh
 sudo apt install libcjson-dev libcurl4-openssl-dev     # or: brew install cjson (macOS has libcurl)
-make                              # builds ./corbienest
+make                              # builds ./corbie
 make test                         # C unit tests + pty integration tests
 ```
 
@@ -43,10 +43,10 @@ straight to a PR. Say which model(s) you tried it with — behaviour varies a lo
 
 ## Reporting bugs
 
-Include your OS, `corbienest --version`, the model, and what the status bar / stats line showed.
+Include your OS, `corbie --version`, the model, and what the status bar / stats line showed.
 If the terminal is left in a bad state, the exact terminal emulator matters too. For anything
 that is drawn wrong, a recording says more than a description: run
-`CORBIENEST_TRACE=/tmp/corbie.trace corbienest`, reproduce it and attach the file (it holds the
+`CORBIENEST_TRACE=/tmp/corbie.trace corbie`, reproduce it and attach the file (it holds the
 conversation of that session — see "When something is drawn wrong" in the README).
 
 ## License

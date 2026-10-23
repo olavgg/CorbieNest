@@ -52,7 +52,7 @@ int main(int argc, char **argv) {
     const char *port = argv[1], *out = argv[2], *model = argv[5], *cwd = argv[7];
     int cols = atoi(argv[3]), rows = atoi(argv[4]);
     double secs = atof(argv[6]);
-    const char *bin = argc > 8 ? argv[8] : "./corbienest";
+    const char *bin = argc > 8 ? argv[8] : "./corbie";
 
     char *abs = realpath(bin, NULL);
     if (!abs) { perror(bin); return 1; }

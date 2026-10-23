@@ -57,7 +57,7 @@ brew install cjson libunistring        # libunistring is for the notcurses scree
 ```
 
 ```sh
-make                  # builds ./corbienest
+make                  # builds ./corbie
 make release          # optimized, stripped binary
 sudo make install     # optional: installs to /usr/local/bin
 make test             # the unit tests: no model or network needed
@@ -100,7 +100,7 @@ Homebrew: libncurses (terminfo) and zlib are part of macOS.
 4. Start corbienest on the notcurses screen, for one run or by default:
 
    ```sh
-   ./corbienest --ui notcurses
+   ./corbie --ui notcurses
    ```
 
    `/ui notcurses` switches to it during a session and saves the choice; `ui=notcurses` in the config
@@ -133,7 +133,7 @@ and cJSON are installed.
 
    ```sh
    cd your-project
-   ./corbienest                       # or: ./corbienest --model qwen3-coder:30b
+   ./corbie                       # or: ./corbie --model qwen3-coder:30b
    ```
 
 3. Type a request and press Enter. Approve each file change or command when asked.
@@ -142,7 +142,7 @@ and cJSON are installed.
 
 To use Claude, export `ANTHROPIC_API_KEY`. With no model in the config and none on Ollama, corbienest
 uses `anthropic:claude-opus-5` for that run (it is not saved; `/model` chooses another). To pick a cheaper
-one from the start: `./corbienest --model anthropic:claude-haiku-5-5`.
+one from the start: `./corbie --model anthropic:claude-haiku-5-5`.
 
 ## Documentation
 

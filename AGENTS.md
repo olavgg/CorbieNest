@@ -32,7 +32,7 @@ consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), 
   ANSI bar draws, which `term_nc.c` parses into cell styles).
 - Threads: notcurses starts its own input thread; that is the one exception to "threads exist only
   in `http_job_*`". It is in the library, never calls into corbienest, and this build only.
-- Processes: a memory update runs in a worker *process* (`corbienest --memory-worker SNAPSHOT FD`, `memory_spawn()`:
+- Processes: a memory update runs in a worker *process* (`corbie --memory-worker SNAPSHOT FD`, `memory_spawn()`:
   fork, then setsid, /dev/null on 0-2, the fds closed, exec of the binary itself), so it outlives the program: exit does not
   wait for it, and nothing reaps it but `memory_reap()` (waitpid WNOHANG on its own pid). It has no terminal and must stay
   free of term_* and stdout use; the worker's usage comes back through its pipe and is booked at the prompt.
@@ -82,12 +82,12 @@ consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), 
 ## Build, run, test
 
 ```sh
-make                 # builds ./corbienest  (needs cc, make, libcjson-dev, libcurl4-openssl-dev; links with -pthread; with libunistring-dev, zlib1g-dev and libncurses-dev found, also the notcurses screen, built from vendor/notcurses)
+make                 # builds ./corbie  (needs cc, make, libcjson-dev, libcurl4-openssl-dev; links with -pthread; with libunistring-dev, zlib1g-dev and libncurses-dev found, also the notcurses screen, built from vendor/notcurses)
 make release         # clean, optimized, stripped build (RELEASE_CFLAGS)
 make test            # C unit tests (tests/test_unit.c): what a change has to pass; no model, no network
 make test-unit       # the same, by name (what CI runs)
 make test-integration  # pty (and tmux) integration tests (tests/test_integration.py): on request only, some reach the hosted APIs (costs money)
-./corbienest           # starts with a model from Ollama ($OLLAMA_HOST or 127.0.0.1:11434) or a provider key (ANTHROPIC_API_KEY: anthropic:claude-opus-5 for the run); with neither it starts and says "no model yet" (g_cfg.model is "" then, nothing is sent, /model picks one)
+./corbie           # starts with a model from Ollama ($OLLAMA_HOST or 127.0.0.1:11434) or a provider key (ANTHROPIC_API_KEY: anthropic:claude-opus-5 for the run); with neither it starts and says "no model yet" (g_cfg.model is "" then, nothing is sent, /model picks one)
 ```
 
 `make test` needs no real model: `tests/fake_ollama.py` is a scripted stand-in (`TOOL_TODO` a todo_write list, `TOOL_BG` a background `sleep 317`, `TOOL_MCP` / `TOOL_MCP_FAIL` a call of the echo and shout tools of `tests/fake_mcp.py`, a scripted MCP server for the stdio transport)

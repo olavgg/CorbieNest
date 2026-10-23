@@ -1,5 +1,5 @@
 *.o
-corbienest
+corbie
 tests/test_unit
 __pycache__/
 .corbienest/memory.md

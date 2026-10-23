@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration tests: run the real corbienest binary against tests/fake_ollama.py.
+"""Integration tests: run the real corbie binary against tests/fake_ollama.py.
 
 Covers the non-interactive (-p) agent loop, tool-call recovery, error handling,
 config/env handling, and — via a pseudo-terminal — the interactive editor,
@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # CORBIE_BIN: run the suite on a copy of the binary, so a rebuild of the tree cannot pull it away mid-run
-BIN = os.environ.get("CORBIE_BIN") or os.path.join(HERE, "..", "corbienest")
+BIN = os.environ.get("CORBIE_BIN") or os.path.join(HERE, "..", "corbie")
 sys.path.insert(0, HERE)
 import fake_ollama
 
@@ -229,7 +229,7 @@ class Session:
             for k in ("XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
                 if k not in (env or ENV): os.environ.pop(k, None)
             for k, v in (env or ENV).items(): os.environ[k] = v
-            os.execv(BIN, ["corbienest"] + list(args))
+            os.execv(BIN, ["corbie"] + list(args))
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self.out = b""; self.mark = 0
         self.scr = Screen(cols, rows)

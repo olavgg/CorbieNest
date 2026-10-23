@@ -34,7 +34,7 @@ Do the steps in order. Use the bash tool; run commands from the repository root.
    is not in the frame after step 5).
    ```sh
    .corbienest/skills/screenshot/capture 20601 /tmp/shot-screen.bin 100 34 qwen3-coder:30b 5 \
-     /tmp/demo/projects/myapp "$PWD/corbienest"
+     /tmp/demo/projects/myapp "$PWD/corbie"
    ```
    Then stop the fake server, and only that one: `kill "$(cat /tmp/shot-fake.pid)"`.
 

@@ -5,7 +5,7 @@ This is the full reference. For building and a quick start, see the [README](REA
 ## Usage
 
 ```
-corbienest [options] [-p PROMPT]
+corbie [options] [-p PROMPT]
   -m, --model NAME     model that does the work (default: saved / first tool-capable Ollama model);
                        anthropic:MODEL or claude:MODEL uses the Anthropic API (ANTHROPIC_API_KEY)
   -H, --host URL       ollama host (default $OLLAMA_HOST or http://127.0.0.1:11434)
@@ -38,7 +38,7 @@ corbienest [options] [-p PROMPT]
 ```
 
 ```
-$ corbienest --model qwen3.8 --benchmark 1
+$ corbie --model qwen3.8 --benchmark 1
 benchmark  qwen3.8 · 1 run × 256 tokens per context size · draft 4 (model default, MTP/speculative) · http://127.0.0.1:11434
   ctx    load     placement                 prompt eval    generation              first token
   4k     6.1s     100% GPU (17.3 GB)        441 tok/s     60.2 tok/s               0.36s
@@ -218,7 +218,7 @@ Terminals differ, and a drawing problem that shows in one and not in another can
 from a description. corbienest can record what it draws and what the terminal sends it:
 
 ```sh
-CORBIENEST_TRACE=/tmp/corbie.trace corbienest      # reproduce the problem, then quit
+CORBIENEST_TRACE=/tmp/corbie.trace corbie      # reproduce the problem, then quit
 tools/trace_replay.py /tmp/corbie.trace --info     # sizes, layout changes, keys and mouse reports
 tools/trace_replay.py /tmp/corbie.trace            # play it back, in a terminal of the same size
 tools/trace_replay.py /tmp/corbie.trace --from 40 --step   # from 40 s on, one write per Enter
@@ -378,7 +378,7 @@ across them. Each request ends with its own result line. The `-p` prompt, if giv
 
 ```
 printf '%s\n' '{"type":"user","message":{"role":"user","content":"list the TODOs"}}' \
-  | corbienest --output-format stream-json --input-format stream-json --mode plan
+  | corbie --output-format stream-json --input-format stream-json --mode plan
 ```
 
 Permission prompts cannot be answered in this mode, so a tool that needs one is refused unless
@@ -699,7 +699,7 @@ you made it, so it carries on with the job instead of stopping to ask what to do
 ## Sessions
 
 Every conversation is saved after each request to `~/.config/corbienest/sessions/<id>.json`
-(the latest 100 are kept). `corbienest --continue` picks up the most recent session started in
+(the latest 100 are kept). `corbie --continue` picks up the most recent session started in
 the current directory, `--resume` opens a picker (or `--resume ID`), and `/resume` does the same
 from inside a session. The recap is followed by the conversation as it was: the last 200 messages, what you typed, the replies, and each tool result folded as it is live. The lines you typed go into the ↑ history (the ones already there are not added again). A one-shot run (`-p`) prints none of this and leaves the history alone. A session saved before this change has no record of what was typed, so every user message is shown and nothing goes into the history. `/clear` starts a
 new session; `/status` shows the current id, which is also printed when you quit.
@@ -1171,7 +1171,7 @@ What is shared is `~/.config/corbienest`, and it is written to survive that:
   it gets the whole old file or the whole new one — never a truncated one, and never a mixture.
   It is not merged, though: it is rewritten in full on every setting change, so whichever
   session saved last is what the *next* one starts with. Give the sessions separate settings
-  with `XDG_CONFIG_HOME=~/.config/crow-a corbienest` if that matters.
+  with `XDG_CONFIG_HOME=~/.config/crow-a corbie` if that matters.
 
 The same atomic swap is used for `.corbienest/memory.md`, the permission rules and the
 session files, so a crash or a kill mid-write cannot truncate any of them either.

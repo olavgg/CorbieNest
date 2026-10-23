@@ -87,7 +87,7 @@ NC_VFLAGS := -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -D_DEFAULT_SOURCE -D_DARWIN_C_SOU
 SRC := src/main.c src/util.c src/http.c src/term.c src/term_nc.c src/tools.c src/ollama.c src/provider.c src/skills.c src/theme.c src/mcp.c src/agents.c src/stream.c
 OBJ := $(SRC:.c=.o)
 
-corbienest: $(OBJ) $(NC_OBJ)
+corbie: $(OBJ) $(NC_OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) $(NC_OBJ) $(BREW_LDFLAGS) $(LDLIBS)
 
 # A stamp per setting: switching NOTCURSES rebuilds every object (their flags differ).
@@ -128,8 +128,8 @@ $(NC_DIR)/src/%.o: $(NC_DIR)/src/%.c $(NC_GEN) $(SAN_STAMP)
 RELEASE_CFLAGS ?= -O2 -std=gnu11 -Wall -Wextra -DNDEBUG
 release:
 	$(MAKE) clean
-	$(MAKE) corbienest CFLAGS="$(RELEASE_CFLAGS)" NOTCURSES=$(NOTCURSES) ZLIB=$(ZLIB)
-	strip corbienest
+	$(MAKE) corbie CFLAGS="$(RELEASE_CFLAGS)" NOTCURSES=$(NOTCURSES) ZLIB=$(ZLIB)
+	strip corbie
 
 # The skills that ship with corbienest (skills/, read-only, source "bundled"): make install copies them to
 # $(PREFIX)/share/corbienest/skills, and the build also names the checkout's own skills/, so a run from the
@@ -143,9 +143,9 @@ $(SKILLS_STAMP):
 src/skills.o: SKILL_DEFS := -DBUNDLED_SKILLS_DIR='"$(BUNDLED_SKILLS_DIR)"' -DBUNDLED_SKILLS_SRC='"$(CURDIR)/skills"'
 src/skills.o: $(SKILLS_STAMP)
 
-install: corbienest
+install: corbie
 	install -d $(DESTDIR)$(PREFIX)/bin
-	install -m 755 corbienest $(DESTDIR)$(PREFIX)/bin/corbienest
+	install -m 755 corbie $(DESTDIR)$(PREFIX)/bin/corbie
 	rm -rf $(DESTDIR)$(BUNDLED_SKILLS_DIR)
 	install -d $(DESTDIR)$(BUNDLED_SKILLS_DIR)
 	cp -R skills/. $(DESTDIR)$(BUNDLED_SKILLS_DIR)/
@@ -164,7 +164,7 @@ test: test-unit
 test-unit: tests/test_unit
 	./tests/test_unit
 
-test-integration: corbienest
+test-integration: corbie
 	python3 tests/test_integration.py
 
 # The unit suite under each sanitizer: AddressSanitizer (memory errors; leaks where the platform reports them),
@@ -182,7 +182,7 @@ test-tsan:
 	$(MAKE) SAN=thread test-unit
 
 clean:
-	rm -f $(OBJ) $(NC_SRC:.c=.o) corbienest tests/test_unit .notcurses-* .sanitize-* .zlib-* .skills-*
+	rm -f $(OBJ) $(NC_SRC:.c=.o) corbie tests/test_unit .notcurses-* .sanitize-* .zlib-* .skills-*
 	rm -rf build
 
 .PHONY: install clean test test-unit test-integration test-asan test-ubsan test-tsan release

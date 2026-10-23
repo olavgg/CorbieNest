@@ -4,7 +4,7 @@
 A drawing problem that shows in one terminal and not in another has to be seen
 to be fixed. corbienest records what it draws and what it is sent when asked to:
 
-    CORBIENEST_TRACE=/tmp/corbie.trace corbienest    # reproduce the problem, then quit
+    CORBIENEST_TRACE=/tmp/corbie.trace corbie    # reproduce the problem, then quit
 
 and this plays the recording back, in any terminal resized to the size it was
 made in (the first line of the trace says which):

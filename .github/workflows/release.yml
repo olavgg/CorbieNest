@@ -42,7 +42,7 @@ jobs:
 
       - name: The binary is the version the tag says
         run: |
-          have="v$(./corbienest --version | awk '{print $2}')"
+          have="v$(./corbie --version | awk '{print $2}')"
           echo "binary: $have, tag: $TAG"
           test "$have" = "$TAG" || { echo "::error::the tag is $TAG but the binary says $have (CORBIE_VERSION in src/common.h)"; exit 1; }
 
@@ -53,7 +53,7 @@ jobs:
         run: |
           dir="corbienest-$TAG-${{ matrix.name }}"
           mkdir "$dir"
-          cp corbienest README.md LICENSE "$dir/"
+          cp corbie README.md LICENSE "$dir/"
           tar -czf "$dir.tar.gz" "$dir"
           sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
 
@@ -85,6 +85,6 @@ jobs:
           test -n "$(ls dist/*.tar.gz 2>/dev/null)" || { echo "::error::no platform built"; exit 1; }
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --title "Corbie Nest ${TAG#v}" --generate-notes --notes \
-          "The binaries are built on Ubuntu 22.04 and need cJSON and libcurl at run time: \`sudo apt install libcjson1 libcurl4\` (or your distribution's packages of the same). Unpack, and put \`corbienest\` somewhere on your \`PATH\`."
+          "The binaries are built on Ubuntu 22.04 and need cJSON and libcurl at run time: \`sudo apt install libcjson1 libcurl4\` (or your distribution's packages of the same). Unpack, and put \`corbie\` somewhere on your \`PATH\`."
           fi
           gh release upload "$TAG" dist/* --clobber
