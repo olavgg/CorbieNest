@@ -903,18 +903,23 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
     setpgid(pid, pid);
     g_fg_pgid = pid;
     struct pollfd fds[2] = { { pfd[0], POLLIN, 0 }, { g_cfg.interactive ? term_interrupt_fd() : -1, POLLIN, 0 } };
-    long remaining_ms = (long)timeout_s * 1000;
-    bool timed_out = false;
+    bool timed_out = false, eof = false, reaped = false;
+    int status = 0, eof_idle = 0;
     term_raw(true);
     term_busy(busy);
     struct timeval t0; gettimeofday(&t0, NULL);
     int spin = 0; bool spin_shown = false;
     for (;;) {
-        int r = poll(fds, 2, 100);
+        int r = poll(fds, 2, eof ? 10 : 100);
         if (r < 0) { if (errno == EINTR) continue; break; }
         term_busy_tick();
+        /* the clock, not a count of quiet polls: output every few ms must not push the timeout back */
+        { struct timeval t; gettimeofday(&t, NULL);
+          if ((long)(t.tv_sec - t0.tv_sec) * 1000 + (long)((t.tv_usec - t0.tv_usec) / 1000) >= (long)timeout_s * 1000) { timed_out = true; break; } }
+        /* the pipe is closed but the command may still run (it redirected its own output): wait for it here, where Esc and the timeout are seen */
+        if (eof && waitpid(pid, &status, WNOHANG) == pid) { reaped = true; break; }
         if (r == 0) {
-            remaining_ms -= 100; if (remaining_ms <= 0) { timed_out = true; break; }
+            if (eof && ++eof_idle % 10) continue;
             if (g_cfg.interactive) {   /* inline spinner: nothing else moves while the command runs */
                 struct timeval t; gettimeofday(&t, NULL);
                 double el = (double)(t.tv_sec - t0.tv_sec) + (double)(t.tv_usec - t0.tv_usec) / 1e6;
@@ -931,7 +936,7 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
         if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
             char buf[8192]; ssize_t n = read(pfd[0], buf, sizeof buf);
             if (n > 0) { sb_append(out, buf, (size_t)n); if (out->len > cap * 2) cap_output(out, cap); }
-            else break;   /* EOF */
+            else { eof = true; fds[0].fd = -1; }   /* EOF */
         }
     }
     if (spin_shown) { fputs("\r\x1b[2K", stdout); fflush(stdout); }
@@ -939,8 +944,7 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
     if (timed_out || *interrupted) { kill(-pid, SIGTERM); usleep(200 * 1000); kill(-pid, SIGKILL); }
     /* drain */
     close(pfd[0]);
-    int status = 0;
-    waitpid(pid, &status, 0);
+    if (!reaped) waitpid(pid, &status, 0);
     g_fg_pgid = 0;
     if (timed_out) return 124;
     if (*interrupted) return 130;
