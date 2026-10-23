@@ -662,6 +662,32 @@ static void test_web(void) {
     CHECK(!url_ok("https://"));                           /* no host */
     CHECK(!url_ok("http://169.254.169.254/latest/meta-data/"));   /* cloud metadata */
     CHECK(!url_ok("http://metadata.google.internal/computeMetadata/v1/"));
+    CHECK(!url_ok("http://169.254.169.254./latest/meta-data/"));  /* trailing dot */
+    CHECK(!url_ok("http://2852039166/"));                         /* decimal */
+    CHECK(!url_ok("http://0xa9fea9fe/"));                         /* hex */
+    CHECK(!url_ok("http://0251.0376.0251.0376/"));                /* octal */
+    CHECK(!url_ok("http://169.254.1.1:80/"));                     /* link-local range */
+    CHECK(!url_ok("HTTP://169.254.169.254/"));
+    CHECK(!url_ok("http://[::ffff:169.254.169.254]/"));
+    CHECK(!url_ok("http://[::ffff:a9fe:a9fe]/"));
+    CHECK(!url_ok("http://[64:ff9b::a9fe:a9fe]/"));               /* NAT64 */
+    CHECK(!url_ok("http://[fd00:ec2::254]/"));
+    CHECK(!url_ok("http://[fd00:0ec2::254]/"));                   /* the same address, spelled otherwise */
+    CHECK(!url_ok("http://[fd00:ec2:0:0:0:0:0:254]:80/"));
+    CHECK(!url_ok("http://[FD00:EC2::254]/"));
+    CHECK(!url_ok("http://metadata.google.internal./x"));
+    CHECK(!url_ok("http://METADATA.goog/x"));
+    CHECK(url_ok("http://[2001:db8:a9fe::1]/x"));                 /* a9fe elsewhere in an address is not the range */
+    CHECK(url_ok("http://192.168.1.10:8080/x"));
+    CHECK(url_ok("http://[::1]:8080/x"));
+    CHECK(url_ok("https://user@example.org/x"));
+    CHECK(url_ok("https://169.254.example.org/x"));               /* a name, not an address */
+    {   /* a long userinfo must not hide the host behind it */
+        char big[1200] = "http://";
+        memset(big + 7, 'a', 600);
+        strcpy(big + 607, "@169.254.169.254/x");
+        CHECK(!url_ok(big));
+    }
     CHECK(!url_ok(NULL));
 
     char h[64];

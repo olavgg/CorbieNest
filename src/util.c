@@ -14,6 +14,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pwd.h>
+#include <arpa/inet.h>
 #ifdef WITH_ZLIB
 #include <zlib.h>
 #endif
@@ -1035,6 +1036,36 @@ bool url_cleartext(const char *url) {
     return !url || strncasecmp(url, "https://", 8) != 0;
 }
 
+/* The cloud metadata service, however the host is spelled: the resolver takes 169.254.169.254
+ * as 2852039166, 0xa9fea9fe or 0251.0376.0251.0376 too, and an IPv6 literal has many
+ * spellings, so the address is parsed and its bytes compared. The whole 169.254.0.0/16
+ * link-local range is refused, also inside an IPv4-mapped, -compatible or NAT64 address.
+ * `h` is url_hostname()'s: lowercased, an IPv6 literal still in brackets. A DNS name that
+ * resolves there is out of reach of any check on the text. */
+static bool host_is_metadata(const char *h) {
+    char b[512];
+    size_t n = strlen(h);
+    if (n >= sizeof b) return false;
+    memcpy(b, h, n + 1);
+    while (n && b[n - 1] == '.') b[--n] = 0;   /* "169.254.169.254." resolves the same */
+    if (!strcmp(b, "metadata.google.internal") || !strcmp(b, "metadata.goog")) return true;
+    struct in_addr a4;
+    if (b[0] != '[') return inet_aton(b, &a4) && (ntohl(a4.s_addr) >> 16) == 0xa9fe;
+    char *end = strchr(b, ']');
+    if (!end) return false;
+    *end = 0;
+    char *zone = strchr(b, '%'); if (zone) *zone = 0;
+    unsigned char a6[16];
+    if (inet_pton(AF_INET6, b + 1, a6) != 1) return false;
+    static const unsigned char EC2[16] = { 0xfd, 0, 0x0e, 0xc2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x54 };
+    if (!memcmp(a6, EC2, 16)) return true;
+    static const unsigned char MAPPED[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+    static const unsigned char NAT64[12] = { 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0 };
+    static const unsigned char ZERO[12] = { 0 };
+    bool v4 = !memcmp(a6, MAPPED, 12) || !memcmp(a6, NAT64, 12) || !memcmp(a6, ZERO, 12);
+    return v4 && a6[12] == 169 && a6[13] == 254;
+}
+
 /* Is this a URL we are willing to hand to curl? http(s) only, sane length, no control
  * characters or whitespace (it goes through sh_quote, but a URL with a newline in it is
  * never what the user meant). The cloud metadata addresses are refused outright: the model
@@ -1048,13 +1079,8 @@ bool url_ok(const char *url) {
     for (const char *p = url; *p; p++)
         if ((unsigned char)*p <= 0x20 || (unsigned char)*p == 0x7f) return false;
     char host[512];
-    if (!url_host(url, host, sizeof host)) return false;
-    char *colon = strchr(host, ':');
-    if (colon) *colon = 0;
-    if (!host[0]) return false;
-    if (!strcmp(host, "169.254.169.254") || !strcmp(host, "metadata.google.internal") ||
-        !strcmp(host, "metadata.goog") || !strcmp(host, "[fd00:ec2::254]")) return false;
-    return true;
+    if (!url_hostname(url, host, sizeof host)) return false;
+    return !host_is_metadata(host);
 }
 
 /* ---------- HTML -> text ---------- */
