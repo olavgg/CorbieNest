@@ -2014,10 +2014,11 @@ bool advisor_approves(const char *advice) {
 void advisor_plan_for(const char *advisor, int trained_ctx, advisor_plan *p) {
     memset(p, 0, sizeof *p);
     p->same = model_same(advisor, g_cfg.model);
-    p->api = !p->same && provider_find(advisor, NULL) != NULL;
-    p->cloud = !p->same && (p->api || model_is_cloud(advisor));
-    if (p->same) { p->window = g_cfg.num_ctx > 0 ? g_cfg.num_ctx : ADVISOR_CTX_UNSET; }
-    else if (p->api) { p->window = trained_ctx > 0 ? trained_ctx : ADVISOR_CTX_API; p->send_ctx = -1; p->keep_alive = ""; }
+    /* a hosted API is called through its provider even when it is the main model too: it has no Ollama window or keep_alive to keep */
+    p->api = provider_find(advisor, NULL) != NULL;
+    p->cloud = p->api || (!p->same && model_is_cloud(advisor));
+    if (p->api) { p->window = trained_ctx > 0 ? trained_ctx : ADVISOR_CTX_API; p->send_ctx = -1; p->keep_alive = ""; }
+    else if (p->same) { p->window = g_cfg.num_ctx > 0 ? g_cfg.num_ctx : ADVISOR_CTX_UNSET; }
     else if (p->cloud) {
         p->window = trained_ctx > 0 && trained_ctx < ADVISOR_CTX_CLOUD ? trained_ctx : ADVISOR_CTX_CLOUD;
         p->send_ctx = -1; p->keep_alive = "";

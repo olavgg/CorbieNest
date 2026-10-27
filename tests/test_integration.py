@@ -2473,6 +2473,66 @@ s.send("\x1b"); s.send("\x04"); s.close()
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_MANY"])
 check("fold-line-3" in out and "▸" not in out, "without a screen to click on, the first lines are shown as before")
 
+# ---------- the ANSI screen's mouse selection: what a drag highlights and copies, and a fold's click ----------
+print("test selection: a drag copies what it covers, end included; a fold toggles on the release, not under a drag")
+def osc52(sess, at):
+    """The texts copied (OSC 52) in the output from byte `at` on."""
+    import base64
+    return [base64.b64decode(m).decode("utf-8", "replace") for m in re.findall(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)\x07", sess.out[at:])]
+def drag(sess, r0, c0, r1, c1):
+    """Press at (r0, c0), move to (r1, c1) with the button held, release there; then a key ends the highlight.
+    The texts copied, and the bytes drawn while the button was held (the highlight's paint)."""
+    sess.send(f"\x1b[<0;{c0};{r0}M", 0.05)
+    at = len(sess.out)
+    sess.send(f"\x1b[<32;{c1};{r1}M", 0.15); sess.drain()
+    held = sess.out[at:]
+    sess.send(f"\x1b[<0;{c1};{r1}m", 0.3); sess.drain(0.1, 1)
+    copied = osc52(sess, at)
+    sess.send("x\x7f", 0.2)   # a key ends the highlight (and leaves the field empty)
+    return copied, held
+s = Session(["-m", "fake-coder:latest", "--yolo"]); s.expect("Ctrl-D to quit")
+s.send("!printf 'alpha beta gamma\\nsecond line here\\n'", 0.3); s.send("\r")
+# the output's rows, not the line as typed (the field showed it too): "⎿  alpha…", and the row under it
+rows = screen_when(s, lambda rs: any("⎿  alpha beta gamma" in r for r in rs) and any(r.strip() == "second line here" for r in rs))
+check(rows is not None, "the shell's output is on the screen")
+if rows:
+    ra = next(i for i, r in enumerate(rows, 1) if "⎿  alpha beta gamma" in r); ca = rows[ra - 1].index("alpha") + 1
+    rb = next(i for i, r in enumerate(rows, 1) if r.strip() == "second line here"); cb = rows[rb - 1].index("second") + 1
+    got, _ = drag(s, ra, ca, ra, ca + 4)
+    check(got == ["alpha"], f"the character under the end is in it: {got!r}")
+    got, _ = drag(s, ra, ca + 9, ra, ca + 6)
+    check(got == ["beta"], f"and so it is dragging backwards, the press's character too: {got!r}")
+    got, _ = drag(s, ra, ca, rb, cb + 5)
+    check(got == ["alpha beta gamma\n     second"], f"over two lines: the first one's rest, its newline, the second (its indent too) up to the end: {got!r}")
+    got, _ = drag(s, ra, ca, ra, ca)
+    check(got == [], f"a press and release on one cell copies nothing: {got!r}")
+s.send("TOOL_MANY\r"); check(s.expect("tok/s"), "a folded tool result")
+rows = screen_when(s, lambda rs: any("▸ 6 lines" in r for r in rs))
+check(rows is not None, "its head is on the screen, closed")
+if rows:
+    hr = next(i for i, r in enumerate(rows, 1) if "▸ 6 lines" in r); hc = rows[hr - 1].index("fold-line-1") + 1
+    s.send(f"\x1b[<0;{hc};{hr}M", 0.3)
+    check(screen_when(s, lambda rs: "▾ 6 lines" in rs[hr - 1], 0.6) is None, "a press alone does not toggle the fold: it may be the start of a drag")
+    s.send(f"\x1b[<0;{hc};{hr}m", 0.3)
+    rows = screen_when(s, lambda rs: "▾ 6 lines" in rs[hr - 1])
+    check(rows is not None, "the release that did not move is the click: the fold opens")
+    s.send(f"\x1b[<0;{hc};{hr}M\x1b[<0;{hc};{hr}m", 0.3)
+    rows = screen_when(s, lambda rs: "▸ 6 lines" in rs[hr - 1])
+    check(rows is not None, "and a second click closes it")
+    got, held = drag(s, hr, hc, hr, hc + 10)
+    rows = s.screen()
+    check(got == ["fold-line-1"], f"a drag over the head copies its text: {got!r}")
+    check("▸ 6 lines" in rows[hr - 1], f"and leaves the fold as it was: {rows[hr - 1]!r}")
+    _, held = drag(s, hr, 1, hr, len(rows[hr - 1]))   # the whole head: its colours change inside the highlight
+    lit = held.split(b"\x1b[7m", 1)[1].split(b"\x1b[27m", 1)[0] if b"\x1b[7m" in held else b""
+    sgrs = [m.end() for m in re.finditer(rb"\x1b\[[0-9;]*m", lit)]
+    check(sgrs and all(lit[e:e + 4] == b"\x1b[7m" or lit[e - 4:e] == b"\x1b[7m" for e in sgrs), f"a colour change inside the highlight does not end it: {lit!r}")
+    nxt = next((i for i in range(hr + 1, len(rows) + 1) if rows[i - 1].strip()), None)
+    if nxt:
+        got, _ = drag(s, hr, hc, nxt, 3)
+        check(got and "fold-line-3" not in got[0] and got[0].startswith("fold-line-1"), f"the body of a closed fold is not copied: {got!r}")
+s.send("\x04"); s.close()
+
 print("test location line: the working folder and its git branch, under the status bar")
 br = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=WORK, capture_output=True, text=True).stdout.strip()
 sl = Session(["-m", "fake-coder:latest"]); sl.expect("Ctrl-D to quit")
