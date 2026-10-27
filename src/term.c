@@ -236,6 +236,7 @@ static bool g_sel_on = false;        /* a highlight is on the conversation */
 static bool g_sel_down = false;      /* the button is held: a gesture is in progress */
 static bool g_sel_moved = false;     /* the gesture has moved since the press */
 static ansi_pt g_sel_a, g_sel_b;     /* where the gesture began and where it is now */
+static int g_sel_row = 0;            /* the screen row of the press: a release that did not move is a click there (fold_click) */
 static bool g_view_stale = false;           /* ... and its window has to be painted again (the geometry changed) */
 static char *g_ov_text = NULL;              /* the overlay's text (term_overlay_show): a centred window over the conversation; NULL = none */
 static int g_ov_geo[4] = { -1, -1, -1, -1 };   /* the box last painted: top, left, height, width (-1: none) */
@@ -1427,6 +1428,7 @@ void term_sgr_track(sbuf *st, const char *d, size_t len) {
 /* one row's text, with the part of it that is highlighted in reverse video. `t` is the row's escaped text (the
  * line's bytes from `off`, `len` long): the highlight is the bytes between the two points, in the scrollback's
  * coordinates (a line index and a byte index into the line). */
+static int sel_after(int line, int idx);   /* with the mouse selection, below */
 static void sel_row_paint(sbuf *o, const char *t, int len, int line, int off) {
     int a = 0, b = 0;
     if (g_sel_on) {   /* during a drag too (g_sel_on is set once it has moved): the highlight follows the pointer */
@@ -1434,7 +1436,7 @@ static void sel_row_paint(sbuf *o, const char *t, int len, int line, int off) {
         if (lo.line > hi.line || (lo.line == hi.line && lo.idx > hi.idx)) { ansi_pt q = lo; lo = hi; hi = q; }
         if (line >= lo.line && line <= hi.line) {
             int from = line == lo.line ? lo.idx : 0;
-            int to = line == hi.line ? hi.idx : (int)strlen(term_sb_line(line));
+            int to = line == hi.line ? sel_after(hi.line, hi.idx) : (int)strlen(term_sb_line(line));   /* the character under the end is in it */
             a = from - off; b = to - off;
             if (a < 0) a = 0;
             if (b > len) b = len;
@@ -1442,10 +1444,21 @@ static void sel_row_paint(sbuf *o, const char *t, int len, int line, int off) {
     }
     if (b <= a) { sb_append(o, t, (size_t)len); return; }
     sb_append(o, t, (size_t)a);
-    sb_puts(o, "[7m");          /* reverse video: the highlighted text */
-    sb_append(o, t + a, (size_t)(b - a));
-    sb_puts(o, "[27m");         /* back to normal, the colours the row carried are re-applied by the next SGR */
-    sb_append(o, t + b, (size_t)(len - b));
+    sb_puts(o, "\x1b[7m");          /* reverse video: the highlighted text */
+    int i = a;
+    while (i < b) {   /* an SGR in the span (a reset in coloured text) would end the reverse video: it is set again after each */
+        if (t[i] == 0x1b && i + 1 < len && t[i + 1] == '[') {
+            int j = i + 2;
+            while (j < len && !(t[j] >= '@' && t[j] <= '~')) j++;
+            if (j < len) j++;
+            sb_append(o, t + i, (size_t)(j - i));
+            if (t[j - 1] == 'm') sb_puts(o, "\x1b[7m");
+            i = j; continue;
+        }
+        sb_putc(o, t[i]); i++;
+    }
+    sb_puts(o, "\x1b[27m");         /* back to normal, the colours the row carried are re-applied by the next SGR */
+    sb_append(o, t + i, (size_t)(len - i));
 }
 
 /* a change to the highlight repaints the conversation at once (the view when scrolled back, the live screen otherwise) */
@@ -2421,9 +2434,10 @@ static char *sel_text(ansi_pt a, ansi_pt b) {
     if (a.line > b.line || (a.line == b.line && a.idx > b.idx)) { ansi_pt t = a; a = b; b = t; }
     sbuf out; sb_init(&out);
     for (int i = a.line; i <= b.line && i < term_sb_nlines(); i++) {
+        if (sb_hidden(i)) continue;   /* the body of a closed fold: not on the screen, not copied */
         const char *ln = term_sb_line(i);
         int from = i == a.line ? a.idx : 0;
-        int to = i == b.line ? b.idx : (int)strlen(ln);
+        int to = i == b.line ? sel_after(i, b.idx) : (int)strlen(ln);   /* the character under the end is in it, as in the notcurses pane */
         for (int k = 0; ln[k] && k < to; ) {
             if (ln[k] == 0x1b) {
                 int e = k + 1;
@@ -2437,6 +2451,13 @@ static char *sel_text(ansi_pt a, ansi_pt b) {
         if (i != b.line) sb_putc(&out, '\n');
     }
     return sb_detach(&out);
+}
+
+/* the byte after the character at idx (and the escapes right after it): a highlight's end, which takes that character in */
+static int sel_after(int line, int idx) {
+    const char *t = term_sb_line(line);
+    int n = (int)strlen(t);
+    return idx >= n ? n : idx + vis_to_raw(t + idx, 1);
 }
 
 static void sel_copy(void) {
@@ -2462,12 +2483,25 @@ static void sel_copy(void) {
 
 static void sel_clear(void) { g_sel_on = false; g_sel_down = false; g_sel_moved = false; }
 
+/* the button let go (SGR's 'm', or an X10 report's button 3): a gesture that moved is a selection, copied at once (Cmd+V
+ * pastes it, no key needed); one that did not is a click on the row it was pressed on (a fold's head toggles) */
+static int mouse_release(void) {
+    g_click_row = g_click_frow = 0;
+    if (!g_sel_down) return K_MOUSE;
+    g_sel_down = false;
+    if (g_sel_moved) { g_sel_on = true; sel_copy(); repaint_conv_soon(); }
+    else g_click_row = g_sel_row;
+    return K_MOUSE;
+}
+
 static int mouse_key(int cb, int row, int col) {
+    if ((cb & 0xE3) == 3) return mouse_release();   /* X10's release (SGR says 'm' instead) */
+    bool gesture = false;   /* this press started one: the click, if it stays one, is the release's (a drag from a fold's head must not toggle it) */
     if (g_fs && g_sb_active && !g_ov_text) {   /* the conversation's own gesture: a press, a drag (bit 32) */
         int btn = cb & 0xE3;
         if (btn == 0) {   /* a left press on a conversation row: its point starts the gesture (a click if it does not move) */
             ansi_pt p;
-            if (conv_point(row, col, &p)) { g_sel_a = g_sel_b = p; g_sel_down = true; g_sel_moved = false; g_sel_on = false; }
+            if (conv_point(row, col, &p)) { g_sel_a = g_sel_b = p; g_sel_down = true; g_sel_moved = false; g_sel_on = false; g_sel_row = row; gesture = true; }
             else sel_clear();
         } else if (btn == 32 && g_sel_down) {   /* the drag: the same button held, a new cell */
             ansi_pt p;
@@ -2480,7 +2514,7 @@ static int mouse_key(int cb, int row, int col) {
         }
     }
     if ((cb & 0xE3) == 0 && g_banner_on && row == g_bn_xr && col >= g_bn_xc0 && col <= g_bn_xc1) return K_BANNER_X;   /* the banner's close button */
-    g_click_row = (cb & 0xE3) == 0 && g_fs && row >= 1 && row <= fs_region() ? row : 0;   /* the left button, pressed, not dragged: whoever reads the key may act on it (fold_click) */
+    g_click_row = (cb & 0xE3) == 0 && !gesture && g_fs && row >= 1 && row <= fs_region() ? row : 0;   /* the left button, pressed, not dragged: whoever reads the key may act on it (fold_click) */
     g_click_frow = (cb & 0xE3) == 0 && g_fs && row > fs_region() ? row : 0; g_click_fcol = col;   /* ... or in the field below it (paste_click) */
     if ((cb & 0xC0) != 64 || (cb & 2)) return K_MOUSE;   /* not the vertical wheel */
     if (g_fs && row > fs_region()) return K_MOUSE;
@@ -2492,11 +2526,7 @@ static int csi_key(const char *params, int fin) {
     if (params[0] == '<') {   /* SGR mouse report: <button;column;row, M = pressed, m = released */
         int cb = 0, x = 0, y = 0;
         if ((fin != 'M' && fin != 'm') || sscanf(params + 1, "%d;%d;%d", &cb, &x, &y) != 3) return K_ESC;
-        if (fin == 'm') {
-            if (g_sel_down) { g_sel_down = false; if (g_sel_moved) { g_sel_on = true; sel_copy(); g_click_row = g_click_frow = 0; repaint_conv_soon(); return K_MOUSE; } }   /* the release copies it: Cmd+V pastes, no key needed */
-            g_click_row = g_click_frow = 0;
-            return K_MOUSE;
-        }
+        if (fin == 'm') return mouse_release();
         return mouse_key(cb, y, x);
     }
     switch (fin) {
