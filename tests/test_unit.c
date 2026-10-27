@@ -1284,6 +1284,8 @@ static void test_advisor(void) {
     advisor_plan_for("anthropic:claude-opus-5", 1000000, &p); CHECK(p.api && p.window == 1000000 && p.reply == ADVISOR_REPLY_API);
     advisor_plan_for("openai:gpt-5.2", 0, &p); CHECK(p.api);
     advisor_plan_for("qwen3:32b", 0, &p); CHECK(!p.api && !p.cloud);   /* a tag is not a provider */
+    g_cfg.model = "anthropic:claude-opus-5"; advisor_plan_for("anthropic:claude-opus-5", 0, &p);   /* a hosted main model as its own advisor: still its API, never Ollama */
+    CHECK(p.same && p.api && p.cloud && p.send_ctx < 0 && p.window == ADVISOR_CTX_API && p.reply == ADVISOR_REPLY_API); CHECK_STR(p.keep_alive, "");
     g_cfg.model = old_model; g_cfg.num_ctx = old_ctx; g_cfg.advisor_ctx = old_actx;
 
     cJSON *msgs = cJSON_CreateArray();

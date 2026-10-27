@@ -3262,7 +3262,7 @@ static void advisor_report(void) {
     else if (effort_get(g_cfg.advisor)) printf(C_DIM " · effort %s" C_RESET, effort_get(g_cfg.advisor));
     advisor_plan p; advisor_plan_now(&p);
     printf(C_DIM " · ctx %s%s · guidance %s · %d consultation%s this session · at most %d per request%s%s" C_RESET "\n", p.cloud ? "its own" : fmt_ctx(p.send_ctx > 0 ? p.send_ctx : g_cfg.num_ctx),
-           p.same ? " (the main model's)" : p.api ? " (a hosted API)" : p.cloud ? " (a cloud model)" : g_cfg.advisor_ctx > 0 ? "" : " (auto)", g->name,
+           p.api ? " (a hosted API)" : p.same ? " (the main model's)" : p.cloud ? " (a cloud model)" : g_cfg.advisor_ctx > 0 ? "" : " (auto)", g->name,
            g_session.advisor_calls, g_session.advisor_calls == 1 ? "" : "s", g->uses, g_cfg.advisor_window > 0 ? ", again every " : "", g_cfg.advisor_window > 0 ? fmt_window() : "");
 }
 
