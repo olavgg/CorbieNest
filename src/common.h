@@ -741,6 +741,17 @@ const skill_t *skill_find(const char *name);   /* with or without leading '/' */
 char *skill_expand(const skill_t *s, const char *args);   /* prompt text, malloc'd */
 char *skills_prompt_section(void);       /* system prompt section, malloc'd or NULL */
 int   skill_scaffold(const char *name, char *path_out, size_t n);   /* 0 ok, 1 exists, -1 error */
+/* Moving the skills and agents of .corbienest (a project's) and of the config directory (yours) into .agents (the
+ * folder other tools read; the agents' folder is our own convention). The prompt is main.c's migrate_offer(); these
+ * are the parts that touch files, kept apart so the unit tests reach them. */
+typedef struct { char from[1100], to[1100], key[1100]; const char *kind; int n; } migrate_pair;   /* kind: "skills" or "agents"; n: entries to move; key: what a "never ask" is remembered by */
+typedef struct { int moved, clashed, failed; bool refused; char names[400]; } dir_move_result;     /* names: the ones left behind, comma separated */
+int   dir_entries(const char *dir);                       /* the visible entries of a real folder (a symlink is not one); -1 when it is not there */
+dir_move_result dir_migrate(const char *from, const char *to);   /* renames each entry; never overwrites; refuses a symlinked source or destination */
+int   migrate_pairs(bool user_scope, migrate_pair out[2]);       /* the folders that have something to move and were not declined; the project scope is skipped in $HOME */
+bool  migrate_declined(const char *key);
+void  migrate_decline(const char *key);                   /* remembered in <config>/migrate-declined, one real path per line */
+int   text_mentions(const char *dir, const char *const *needles, int nn, sbuf *out, int max_hits);   /* "file:line" of each line that holds a needle, below dir; returns the hits */
 
 /* ---------- ollama.h ---------- */
 typedef struct {
