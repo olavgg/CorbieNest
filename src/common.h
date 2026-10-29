@@ -402,6 +402,9 @@ void term_size(int *rows, int *cols);
 /* The file CORBIENEST_TRACE names, while everything drawn and typed is being written to it for
  * tools/trace_replay.py (see "trace" in term.c); NULL when it is not. */
 const char *term_trace_path(void);
+/* One record of `kind` in that file (nothing when no trace is written): the notcurses UI notes the input events it
+ * decodes ('N'), since notcurses reads the terminal on its own thread and the 'I' records cannot have them. */
+void term_trace_note(char kind, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void term_clear_screen(void);
 
 /* Full-screen mode: alternate screen with the bottom row reserved for a status

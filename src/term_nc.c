@@ -518,6 +518,10 @@ static bool pane_point(int y, int x, sel_pt *out) {
  * click (a fold's head toggles, as it always did); a press that moved and was released is a selection, copied
  * and kept on the screen until the next key. Scrolling and the banner's close are as before. */
 static void nc_mouse(const ncinput *ni) {
+    if (ni->evtype == NCTYPE_PRESS && ni->id == NCKEY_BUTTON1)   /* where a left press lands against what is up (CORBIENEST_TRACE) */
+        term_trace_note('N', "press y=%d x=%d · banner %d row %d cols %d-%d · close %d row %d cols %d-%d · sel_down %d menu %d pv %d · pane epoch %d/%d",
+                        ni->y, ni->x, g_bn_on, g_bn_xr, g_bn_xc0, g_bn_xc1, g_mx_kind, g_mx_y, g_mx_c0, g_mx_c1,
+                        g_sel_down, g_menu_on, g_pv_on, g_pane_epoch, term_sb_epoch());
     if (ni->evtype == NCTYPE_PRESS && ni->id == NCKEY_BUTTON1 && g_mx_kind && ni->y == g_mx_y && ni->x >= g_mx_c0 && ni->x <= g_mx_c1) {
         if (g_mx_kind == 1 && g_ov_on) { nc_overlay_set(NULL); return; }
         if (g_mx_kind == 2 && (g_menu_on || g_pv_on)) { g_close_req = true; return; }
@@ -689,6 +693,7 @@ static int nc_getkey(int ms) {
         ncinput ni; memset(&ni, 0, sizeof ni);
         uint32_t id = notcurses_get_nblock(g_nc, &ni);
         if (id == 0 || id == (uint32_t)-1) break;
+        term_trace_note('N', "id=%u ev=%d y=%d x=%d mods=0x%x", ni.id, (int)ni.evtype, ni.y, ni.x, ni.modifiers);   /* what notcurses decoded (CORBIENEST_TRACE) */
         if (nckey_mouse_p(ni.id)) { nc_mouse(&ni); if (g_pv_req) return NK_NONE; if (g_close_req) { g_close_req = false; return 27; } continue; }   /* (a click on a modal's close button is its Esc) */   /* a report, not a key (a click for a view ends the read) */
         if (ni.id == NCKEY_TAB && (ni.modifiers & NCKEY_MOD_SHIFT) && ni.evtype != NCTYPE_RELEASE) {   /* Shift+Tab cycles the mode at once, as on the ANSI screen (a key, so it is not queued); a release is not a second press */
             g_cfg.mode = (g_cfg.mode + 1) % MODE_COUNT;

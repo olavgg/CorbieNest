@@ -23,7 +23,8 @@ can cut the replies in two with a pause between the halves.
 
 Settings (environment): SPLIT (0: whole replies), GAP (seconds between the halves),
 ROUND (cut only in that init, 1 = the probe's child), ONLY (cut only that palette
-entry), DA1FIRST (answer DA1 before the palette replies still queued), CLICK, SECS
+entry), DA1FIRST (answer DA1 before the palette replies still queued), CLICK, TRACE
+(a CORBIENEST_TRACE file for the run), SECS
 (how long to run, default 6), ROWS/COLS (40x120). The first argument is the binary
 (default ./corbie); the output is kept in $OUT (default nc_pty_check.out in the temporary
 folder that is HOME for the run), and the path is printed.
@@ -65,6 +66,8 @@ env = dict(os.environ, HOME=home, TERM="xterm-256color", OLLAMA_HOST="127.0.0.1:
 for k in ("ANTHROPIC_API_KEY", "XAI_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY",
           "MOONSHOT_API_KEY", "TMUX", "CORBIENEST_TRACE"):
     env.pop(k, None)
+if os.environ.get("TRACE"):
+    env["CORBIENEST_TRACE"] = os.path.abspath(os.environ["TRACE"])   # the run's trace (N records: what notcurses decoded)
 
 pid, fd = pty.fork()
 if pid == 0:

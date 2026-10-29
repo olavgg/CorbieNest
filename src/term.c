@@ -47,6 +47,8 @@ static void on_winch(int s) { (void)s; g_winch = 1; }
  *   I  bytes read from the terminal: keys, mouse reports
  *   L  the layout changed: the size, the scroll region, the rows of the chrome
  *   V  the scrollback viewer moved or was left          B  the status bar's activity label
+ *   N  an input event as notcurses decoded it (its thread reads the terminal, so that UI has no I records),
+ *      and where a left press landed against the modal that was up (term_trace_note() from term_nc.c)
  * Bytes stand for themselves, except control characters and the backslash: \e \n \r \t \\ \xHH.
  * The file holds the conversation and all that was typed, so it is created readable by its owner
  * alone, and it is theirs to pass on or not. */
@@ -94,6 +96,12 @@ static void trace_open(void) {
     trace_note('#', "corbienest %s trace 1 · TERM=%s · %d rows x %d columns", CORBIE_VERSION, term ? term : "", rows, cols);
 }
 const char *term_trace_path(void) { return g_trace_path; }
+void term_trace_note(char kind, const char *fmt, ...) {
+    if (!g_trace) return;
+    trace_stamp(kind);
+    va_list ap; va_start(ap, fmt); vfprintf(g_trace, fmt, ap); va_end(ap);
+    fputc('\n', g_trace); fflush(g_trace);
+}
 
 /* read() from the terminal: every place that takes input goes through here, so the trace has it */
 static ssize_t in_read(void *buf, size_t n) {
