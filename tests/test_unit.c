@@ -1584,10 +1584,12 @@ static void test_agent_log(void) {
 }
 
 /* the running-tasks strip: how many rows fit, and one row fitted to the width */
-static int u8cols(const char *s) {
+static int u8cols(const char *s) {   /* columns: a character is one, an SGR escape none */
     int w = 0;
-    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++)
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        if (p[0] == 27 && p[1] == '[') { while (*p && *p != 'm') p++; if (!*p) break; continue; }
         if ((*p & 0xC0) != 0x80) w++;
+    }
     return w;
 }
 static int glyph_n(const char *s, const char *g) {
@@ -1635,9 +1637,10 @@ static void test_strip(void) {
     CHECK(ends_with(out, "9s · ↓ 1"));
 
     strip_row(out, sizeof out, 80, STRIP_ROW_TASK, "lean-tracks-economy", 19, NULL, 9, 10, "1s · ↓ 1");
-    CHECK(u8cols(out) == 62 && u8cols(out) < 80);   /* the bar stays with the fraction; the row is not stretched */
+    CHECK(u8cols(out) == 80 && ends_with(out, "1s · ↓ 1"));   /* the time and tokens at the right edge, as on an activity row */
     CHECK(glyph_n(out, "▰") == 18 && glyph_n(out, "▱") == 2);
-    CHECK(strstr(out, "9/10") != NULL);
+    CHECK(strstr(out, "▱  9/10 ") != NULL);                  /* the fraction right after the bar */
+    CHECK(strchr(out, 27) == NULL);                           /* no colour unless asked for */
 
     strip_row(out, sizeof out, 80, STRIP_ROW_TASK, "lean-tracks-economy", 19, NULL, 10, 10, "1s · ↓ 1");
     CHECK(glyph_n(out, "▰") == 20 && glyph_n(out, "▱") == 0);
@@ -1649,6 +1652,20 @@ static void test_strip(void) {
     CHECK(glyph_n(out, "▰") == 8 && glyph_n(out, "▱") == 12 && strstr(out, "4/10") != NULL);
     strip_row(out, sizeof out, 80, STRIP_ROW_MAIN, "main", 4, NULL, 1, 100, NULL);
     CHECK(glyph_n(out, "▰") == 1);   /* a start that would round to an empty bar still fills one cell */
+
+    /* a sub-agent's rounds: the bar and the fraction coloured, ended with 39 (a reset would clear a selected row's band) */
+    strip_row_c(out, sizeof out, 80, STRIP_ROW_TASK, "iso-waiter", 10, NULL, 3, 25, "1m 53s · ↓ 223 tokens", C_CYAN);
+    CHECK(u8cols(out) == 80 && ends_with(out, "1m 53s · ↓ 223 tokens"));
+    CHECK(!strncmp(out, "  ◯ iso-waiter  " C_CYAN "▰▰", strlen("  ◯ iso-waiter  " C_CYAN "▰▰")));
+    CHECK(glyph_n(out, "▰") == 2 && glyph_n(out, "▱") == 18 && strstr(out, "  3/25\x1b[39m ") != NULL);
+    CHECK(strstr(out, "\x1b[0m") == NULL && strstr(out, "\x1b[m") == NULL);
+    strip_row_c(out, sizeof out, 44, STRIP_ROW_TASK, "iso-waiter", 10, NULL, 3, 25, "1m 53s · ↓ 223 tokens", C_CYAN);
+    CHECK(u8cols(out) == 44 && glyph_n(out, "▰") == 0 && strstr(out, "3/25") != NULL && ends_with(out, "223 tokens"));   /* narrow: the bar goes first */
+    strip_row_c(out, sizeof out, 30, STRIP_ROW_TASK, "iso-waiter", 10, NULL, 3, 25, "1m 53s · ↓ 223 tokens", C_CYAN);
+    CHECK(u8cols(out) <= 30 && strstr(out, "3/25") != NULL && strstr(out, "tokens") == NULL);   /* narrower: the time goes, the fraction stays */
+    CHECK(strstr(out, "\x1b[39m") != NULL && utf8_ok(out, strlen(out)));
+    strip_row_c(out, sizeof out, 18, STRIP_ROW_TASK, "iso-waiter", 10, NULL, 3, 25, "1m 53s", C_CYAN);
+    CHECK(u8cols(out) <= 18 && utf8_ok(out, strlen(out)));   /* cut, the escapes counted as no column */
 
     strip_row(out, sizeof out, 12, STRIP_ROW_MAIN, "main", 4, NULL, 4, 10, NULL);
     CHECK(glyph_n(out, "▰") == 0 && glyph_n(out, "▱") == 0);   /* no room for four cells: the bar is dropped */

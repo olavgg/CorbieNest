@@ -2346,9 +2346,9 @@ static const char *agent_state_word(const subagent_rec *r) {
 }
 /* ← on an empty prompt line: the sub-agents of this session, newest first, and the log of the one picked */
 /* ---------- the strip: the running tasks, between the message box and the status bar ----------
- * One row each, newest first, as many as fit: ● main, then each running sub-agent (its name, what
- * it is doing or the main agent's task progress, and how long it has run with the tokens it
- * generated). What does not fit is a "show all" row, which opens the same list in a window that
+ * One row each, newest first, as many as fit: ● main with the main agent's task progress, then each
+ * running sub-agent (its name, the tool rounds it has used as a cyan bar, and how long it has run with
+ * the tokens it generated; what it is doing is in its log and the ← list). What does not fit is a "show all" row, which opens the same list in a window that
  * scrolls. term.c keeps the selection; Enter on a task opens its log, Enter on "show all" the list. */
 static int running_count(void) { int k = 0; for (int i = 0; i < g_agent_n; i++) if (g_agents[i]->state == AG_RUNNING) k++; return k; }
 static const subagent_rec *running_at(int idx) {
@@ -2400,13 +2400,6 @@ static int strip_name_w(bool with_main, int nagents) {
     if (w < 1) w = 1;
     return w;
 }
-/* the task's description while it waits for the model, and the tool it is in otherwise */
-static void agent_mid(const subagent_rec *r, char *dst, size_t n) {
-    const char *src = r && r->desc ? r->desc : "";
-    if (r && r->activity[0] && strcmp(r->activity, "waiting for the model")) src = r->activity;
-    if (!src[0] && r) src = r->activity;
-    one_line(dst, n, src);
-}
 static void agent_right(const subagent_rec *r, int cols, char *dst, size_t n) {
     char el[32], tok[32];
     fmt_run(r->started, el, sizeof el);
@@ -2426,12 +2419,16 @@ static void main_row(char *out, size_t n, int cols, int name_w) {
     todo_counts(&done, &total);   /* the main agent's own task list, when it kept one */
     strip_row(out, n, cols, STRIP_ROW_MAIN, "main", name_w, NULL, done, total, NULL);
 }
+/* a sub-agent's row: its tool rounds used of the SUBAGENT_ITERS it may take, as a cyan bar where its activity was (the
+ * budget it has used, not how far its work is: one that reports at round 4 leaves at 4/25), the time and tokens at the right */
 static void task_row(char *out, size_t n, int cols, int name_w, const subagent_rec *r) {
-    char mid[240], right[80], nm[80];
+    char right[80], nm[80];
     one_line(nm, sizeof nm, r && r->name ? r->name : "general");
-    agent_mid(r, mid, sizeof mid);
-    agent_right(r, cols, right, sizeof right);
-    strip_row(out, n, cols, STRIP_ROW_TASK, nm, name_w, mid, 0, 0, right);
+    int used = r ? r->rounds : 0;
+    if (used < 0) used = 0;
+    if (used > SUBAGENT_ITERS) used = SUBAGENT_ITERS;
+    if (r) agent_right(r, cols, right, sizeof right); else right[0] = 0;
+    strip_row_c(out, n, cols, STRIP_ROW_TASK, nm, name_w, NULL, used, SUBAGENT_ITERS, right, C_CYAN);
 }
 static void show_all_modal(void) {
     int n = running_count();

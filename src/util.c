@@ -1552,19 +1552,34 @@ size_t utf8_cut(const char *s, size_t len, size_t cap) {
 
 /* ---------- the running-tasks strip: one row, and how many rows fit ---------- */
 
+/* the length of the SGR escape (ESC [ … m) at s, 0 when there is none: it takes no column */
+static size_t sr_sgr(const char *s) {
+    if (s[0] != 27 || s[1] != '[') return 0;
+    size_t i = 2;
+    while (s[i] && s[i] != 'm' && i < 32) i++;
+    return s[i] == 'm' ? i + 1 : 0;
+}
 static int sr_cols(const char *s) {
     int w = 0;
     if (!s) return 0;
-    for (; *s; s++) if (((unsigned char)*s & 0xC0) != 0x80) w++;
+    while (*s) {
+        size_t e = sr_sgr(s);
+        if (e) { s += e; continue; }
+        if (((unsigned char)*s & 0xC0) != 0x80) w++;
+        s++;
+    }
     return w;
 }
-/* at most `cols` columns of s. A cut ends with …, which takes one of those columns. */
+/* at most `cols` columns of s. A cut ends with …, which takes one of those columns. The escapes are kept and
+ * take none (a colour started before the cut is ended by whoever draws the row). */
 static void sr_put(sbuf *b, const char *s, int cols, bool ellip) {
     if (cols <= 0 || !s || !*s) return;
     if (sr_cols(s) <= cols) { sb_puts(b, s); return; }
     int keep = ellip && cols >= 1 ? cols - 1 : cols;
     int got = 0;
     for (const char *p = s; *p && got < keep; ) {
+        size_t e = sr_sgr(p);
+        if (e) { sb_append(b, p, e); p += e; continue; }
         const char *nx = p + 1;
         while (((unsigned char)*nx & 0xC0) == 0x80) nx++;
         sb_append(b, p, (size_t)(nx - p));
@@ -1593,6 +1608,10 @@ static void sr_finish(char *out, size_t n, sbuf *b, int cols) {
 
 void strip_row(char *out, size_t n, int cols, int kind, const char *name, int name_w,
                const char *mid, int done, int total, const char *right) {
+    strip_row_c(out, n, cols, kind, name, name_w, mid, done, total, right, NULL);
+}
+void strip_row_c(char *out, size_t n, int cols, int kind, const char *name, int name_w,
+                 const char *mid, int done, int total, const char *right, const char *bar_sgr) {
     if (out && n) out[0] = 0;
     if (!out || n < 2) return;
     if (cols < 1) cols = 1;
@@ -1629,23 +1648,31 @@ void strip_row(char *out, size_t n, int cols, int kind, const char *name, int na
     int left = sr_cols(b.data);
 
     if (prog) {
-        char frac[32], tail[160];
+        char frac[32];
         snprintf(frac, sizeof frac, "%d/%d", done, total);
-        if (rt) snprintf(tail, sizeof tail, "%s · %s", frac, rt);
-        else snprintf(tail, sizeof tail, "%s", frac);
-        int tw = sr_cols(tail), avail = cols - left;
+        const char *on = bar_sgr && *bar_sgr ? bar_sgr : NULL;
+        int fw = sr_cols(frac), avail = cols - left;
         if (avail < 1) { sr_finish(out, n, &b, cols); return; }
-        int room = avail - 2 - tw;   /* two spaces between the bar and the fraction */
-        if (tw > avail || room < 4) sr_put(&b, tail, avail, true);
+        /* the bar and the fraction where an activity's text goes; the time and tokens at the right edge, as on an
+         * activity row (two spaces before them) */
+        int rw = rt ? sr_cols(rt) : 0, rgap = rt ? 2 : 0;
+        if (rt && fw + rgap + rw > avail) { rt = NULL; rw = 0; rgap = 0; }   /* no room for both: the fraction stays */
+        int room = avail - 2 - fw - rgap - rw;   /* two spaces between the bar and the fraction */
+        if (on) sb_puts(&b, on);
+        if (fw > avail) sr_put(&b, frac, avail, true);
         else {
-            int barw = room < 20 ? room : 20;
-            int fill = done <= 0 ? 0 : (done >= total ? barw : (done * barw) / total);
-            if (done > 0 && done < total && fill == 0) fill = 1;
-            if (done >= total) fill = barw;
-            for (int i = 0; i < barw; i++) sb_puts(&b, i < fill ? "▰" : "▱");
-            sb_puts(&b, "  ");
-            sb_puts(&b, tail);
+            if (room >= 4) {
+                int barw = room < 20 ? room : 20;
+                int fill = done <= 0 ? 0 : (done >= total ? barw : (done * barw) / total);
+                if (done > 0 && done < total && fill == 0) fill = 1;
+                if (done >= total) fill = barw;
+                for (int i = 0; i < barw; i++) sb_puts(&b, i < fill ? "▰" : "▱");
+                sb_puts(&b, "  ");
+            }
+            sb_puts(&b, frac);
         }
+        if (on) sb_puts(&b, "\x1b[39m");   /* the default colour back, not a reset: a selected row keeps its band */
+        if (rt) { sr_pad(&b, sr_cols(b.data), cols - rw); sb_puts(&b, rt); }
         sr_finish(out, n, &b, cols);
         return;
     }

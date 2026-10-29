@@ -175,13 +175,16 @@ int    cmd_head(const char *cmd, int width, char *out, size_t n);   /* a shell c
 /* One row of the running-tasks strip, fitted to `cols` columns (a character is a column; `out` is always terminated).
  * STRIP_ROW_MAIN is "● name", STRIP_ROW_TASK is an indented "◯ name", STRIP_ROW_ALL is "  " plus `name`
  * ("show all"). `name_w` is the name column. A `total` above 0 draws a progress bar for done/total
- * instead of `mid`. `right` is the time and tokens: at the right edge of an activity row, after the
- * fraction of a progress row. */
+ * instead of `mid`. `right` is the time and tokens, at the right edge (dropped from a progress row
+ * too narrow for it and the fraction). strip_row_c colours the bar and the fraction with `bar_sgr`
+ * (an SGR escape such as C_CYAN, ended with 39, not a reset; NULL: none); the escapes take no column. */
 #define STRIP_ROW_MAIN 0
 #define STRIP_ROW_TASK 1
 #define STRIP_ROW_ALL  2
 void strip_row(char *out, size_t n, int cols, int kind, const char *name, int name_w,
                const char *mid, int done, int total, const char *right);
+void strip_row_c(char *out, size_t n, int cols, int kind, const char *name, int name_w,
+                 const char *mid, int done, int total, const char *right, const char *bar_sgr);
 /* How `total` running tasks share `room` rows. *with_main: a ● main row. *more: the last row is
  * "show all" because they do not all fit. *shown: how many tasks get a row. *rows: what is drawn. */
 void strip_layout(int room, int total, int *rows, int *shown, bool *with_main, bool *more);
