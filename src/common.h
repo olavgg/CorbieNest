@@ -548,6 +548,13 @@ void        term_banner_hide(void);
 bool        term_banner_open(void);
 #define BANNER_X_FROM_RIGHT 3   /* the close button's centre: this many cells in from the box's right edge (the corner is 1): 2 cells left of the corner */
 #define BANNER_X_W 3            /* the close button is "[×]": its three cells are the click target */
+/* The cells of the close button of a box whose left edge is column `left` and which is `bw` cells wide (any origin: the
+ * ANSI screen counts from 1, notcurses from 0): c0..c1, three cells, as the banner's box has had them. Every modal
+ * (overlay, paste view, menus) puts its "[×]" there, on its first row, and a click on it is an Esc. */
+static inline void close_x_cols(int left, int bw, int *c0, int *c1) {
+    *c0 = left + bw - BANNER_X_FROM_RIGHT - BANNER_X_W / 2;
+    *c1 = *c0 + BANNER_X_W - 1;
+}
 int         term_tick_wait(void);                      /* ms until the next tick (-1: no tick is running) */
 void        term_tick_run(void);                       /* runs the tick if it is due (notcurses' loop calls it) */
 int         term_sb_epoch(void);                      /* changes whenever the lines are renumbered (dropped, cleared): a row map made before is stale */

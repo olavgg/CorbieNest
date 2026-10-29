@@ -208,7 +208,7 @@ enum {
     K_PGUP, K_PGDN, K_ALT_ENTER, K_ESC, K_PASTE_START, K_PASTE_END, K_ALT_B, K_ALT_F, K_ALT_BS,
     K_CTRL_LEFT, K_CTRL_RIGHT, K_SHIFT_TAB,
     K_WHEEL_UP, K_WHEEL_DOWN,   /* the mouse wheel, over the conversation */
-    K_BANNER_X,                 /* the close button of the banner's modal: a click on it */
+    K_CLOSE_X,                  /* the close button "[×]" of a modal (banner, overlay, paste view, menu): a click on it; every modal takes it as its Esc */
     K_MOUSE,                    /* any other mouse report: nothing acts on it */
     K_MOUSE_X10                 /* the old three-byte report: its bytes are still to come */
 };
@@ -244,6 +244,12 @@ static int g_ov_geo[4] = { -1, -1, -1, -1 };   /* the box last painted: top, lef
 static bool g_banner_on = false;
 static sbuf *g_bn = NULL;
 static int g_bn_n = 0, g_bn_bw = 0, g_bn_xr = -1, g_bn_xc0 = -1, g_bn_xc1 = -1;
+/* The close button of the modals that are not the banner: where it was painted (screen row, first and last column, 1-based;
+ * -1 = none). Set by the drawer, reset when the modal closes; close_hit() checks the cell only while its modal is up. */
+enum { MX_OVERLAY, MX_BAND, MX_PASTE, MX_N };
+static int g_mx[MX_N][3] = { { -1, -1, -1 }, { -1, -1, -1 }, { -1, -1, -1 } };
+static bool g_band_x = false;   /* the band's first row carries a close button: a menu is up (band_set), none otherwise */
+static bool g_paste_open = false;   /* the paste view is up */
 static char g_view_hint[200];               /* ... and what the line under that window says meanwhile */
 static bool field_shown(void);              /* the terminal is tall enough for the input field (else only the bar is kept) */
 
@@ -1504,14 +1510,29 @@ static void banner_box(sbuf *o, const bool *only) {
     int region = fs_region(), cols = g_fs_cols > 0 ? g_fs_cols : term_width();
     if (!g_bn_n || region < g_bn_n || cols < g_bn_bw) return;
     int top = (region - g_bn_n) / 2 + 1, left = (cols - g_bn_bw) / 2 + 1; if (left < 1) left = 1;
-    g_bn_xr = top; g_bn_xc0 = left + g_bn_bw - BANNER_X_FROM_RIGHT - BANNER_X_W / 2; g_bn_xc1 = g_bn_xc0 + BANNER_X_W - 1;
+    g_bn_xr = top; close_x_cols(left, g_bn_bw, &g_bn_xc0, &g_bn_xc1);
     for (int i = 0; i < g_bn_n; i++) {
         if (only && !only[i]) continue;   /* a row that did not change is not sent again (over ssh every byte counts) */
         sb_printf(o, "\x1b[%d;%dH" C_RESET "%s" C_RESET, top + i, left, g_bn[i].data ? g_bn[i].data : "");
     }
 }
+/* "[×]" as the banner's box draws it: bold, the × in the brand colour, the brackets in the spark's. The cursor is where
+ * the caller put it; the three cells are close_x_cols()'. */
+static void close_x_put(sbuf *o) {
+    sb_puts(o, "\x1b[1m"); sb_puts(o, th_fg(g_theme->spark_lo)); sb_puts(o, "[");
+    sb_puts(o, "\x1b[1m"); sb_puts(o, th_fg(g_theme->brand)); sb_puts(o, "×");
+    sb_puts(o, "\x1b[1m"); sb_puts(o, th_fg(g_theme->spark_lo)); sb_puts(o, "]" C_RESET);
+}
+/* A left press at (row, col) on a close button whose modal is up. */
+static bool close_hit(int row, int col) {
+    for (int i = 0; i < MX_N; i++) {
+        bool up = i == MX_OVERLAY ? (g_ov_text && !g_banner_on) : i == MX_BAND ? (g_band_text && g_band_x) : g_paste_open;
+        if (up && row == g_mx[i][0] && col >= g_mx[i][1] && col <= g_mx[i][2]) return true;
+    }
+    return false;
+}
 static void overlay_box(sbuf *o) {
-    g_ov_geo[0] = -1;
+    g_ov_geo[0] = -1; g_mx[MX_OVERLAY][0] = -1;
     if (!g_ov_text) return;
     if (g_banner_on) { banner_box(o, NULL); return; }
     int region = fs_region(), cols = g_fs_cols > 0 ? g_fs_cols : term_width();
@@ -1551,6 +1572,11 @@ static void overlay_box(sbuf *o) {
     sb_printf(o, "\x1b[%d;%dH" C_DIM "┌", top, left);
     for (int i = 0; i < bw - 2; i++) sb_puts(o, "─");
     sb_puts(o, "┐" C_RESET);
+    if (bw >= 12) {   /* the close button, in the top border as the banner's box has it */
+        int c0, c1; close_x_cols(left, bw, &c0, &c1);
+        sb_printf(o, "\x1b[%d;%dH", top, c0); close_x_put(o);
+        g_mx[MX_OVERLAY][0] = top; g_mx[MX_OVERLAY][1] = c0; g_mx[MX_OVERLAY][2] = c1;
+    }
     sbuf st; sb_init(&st);   /* the colours in effect at the start of the row being painted */
     for (int row = 0; row < bh - 2; row++) {
         sb_printf(o, "\x1b[%d;%dH" C_DIM "│" C_RESET " " C_RESET, top + 1 + row, left);
@@ -1724,7 +1750,7 @@ bool term_overlay_show(const char *text) {
 void term_overlay_close(void) {
     if (g_ui_nc) { nc_overlay_set(NULL); return; }
     if (!g_ov_text) return;
-    free(g_ov_text); g_ov_text = NULL; g_banner_on = false; g_ov_geo[0] = -1;
+    free(g_ov_text); g_ov_text = NULL; g_banner_on = false; g_ov_geo[0] = -1; g_mx[MX_OVERLAY][0] = -1;
     bool was = g_sb_pause; sb_pause(true);
     if (!layout_sync()) { sbuf o; sb_init(&o); conv_repaint(&o); fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o); }
     sb_pause(was);
@@ -1953,6 +1979,7 @@ static int scroll_modal_impl(const char *title, const char **lines, int n, int s
         term_status_refresh();
         sb_free(&o);
         int k = read_key();
+        if (k == K_CLOSE_X) k = K_ESC;   /* the button is the Esc */
         if (k == -2 || k == -1 || k == K_ESC || k == 3) { result = -1; break; }
         if (k == '\r' || k == '\n') { result = sel; break; }
         if (k == K_UP || k == 'k') { if (sel > 0) sel--; }
@@ -2186,6 +2213,7 @@ static void ta_act(int k) {
         case K_PGUP:       view_scroll(page > 1 ? -page : -1); break;
         case K_PGDN:       view_scroll(page > 1 ? page : 1); break;
         case K_MOUSE:      fold_click(); break;
+        case K_CLOSE_X:    if (g_ov_text) term_overlay_close(); break;   /* an overlay's close button, while the model works */
         default: break;
     }
 }
@@ -2233,7 +2261,7 @@ static void ta_type(unsigned char c) {
         if (st && g_ta_len - st < 24) {
             char par[24]; memcpy(par, g_ta + st, g_ta_len - st); par[g_ta_len - st] = 0;
             int k = csi_key(par, c);
-            if (k == K_SHIFT_TAB || k == K_PGUP || k == K_PGDN || k == K_WHEEL_UP || k == K_WHEEL_DOWN || k == K_MOUSE || k == K_MOUSE_X10) {
+            if (k == K_SHIFT_TAB || k == K_PGUP || k == K_PGDN || k == K_WHEEL_UP || k == K_WHEEL_DOWN || k == K_MOUSE || k == K_MOUSE_X10 || k == K_CLOSE_X) {
                 g_ta_len = st - 2;
                 if (k == K_MOUSE_X10) g_ta_x10 = 3; else ta_act(k);
                 return;
@@ -2513,7 +2541,8 @@ static int mouse_key(int cb, int row, int col) {
             }
         }
     }
-    if ((cb & 0xE3) == 0 && g_banner_on && row == g_bn_xr && col >= g_bn_xc0 && col <= g_bn_xc1) return K_BANNER_X;   /* the banner's close button */
+    if ((cb & 0xE3) == 0 && g_banner_on && row == g_bn_xr && col >= g_bn_xc0 && col <= g_bn_xc1) return K_CLOSE_X;   /* the banner's close button */
+    if ((cb & 0xE3) == 0 && close_hit(row, col)) return K_CLOSE_X;   /* the other modals' */
     g_click_row = (cb & 0xE3) == 0 && !gesture && g_fs && row >= 1 && row <= fs_region() ? row : 0;   /* the left button, pressed, not dragged: whoever reads the key may act on it (fold_click) */
     g_click_frow = (cb & 0xE3) == 0 && g_fs && row > fs_region() ? row : 0; g_click_fcol = col;   /* ... or in the field below it (paste_click) */
     if ((cb & 0xC0) != 64 || (cb & 2)) return K_MOUSE;   /* not the vertical wheel */
@@ -3083,23 +3112,32 @@ static int band_room(void) {   /* the most rows a menu can have here: what is le
 }
 static void band_set(const char *text) {
     free(g_band_text); g_band_text = xstrdup(text ? text : "");
+    g_band_x = true;   /* every menu in the band has a title row, and a close button at the end of it */
     g_band_n = 0;
     for (const char *p = g_band_text; *p; p++) if (*p == '\n') g_band_n++;
 }
 static void band_clear(void) {
-    free(g_band_text); g_band_text = NULL; g_band_n = 0;
+    free(g_band_text); g_band_text = NULL; g_band_n = 0; g_band_x = false; g_mx[MX_BAND][0] = -1;
 }
 static void band_draw(sbuf *o, int row) {
+    g_mx[MX_BAND][0] = -1;
     if (!g_band_rows || !g_band_text) return;
     int cols = g_fs_cols > 1 ? g_fs_cols - 1 : 1;   /* never the last column */
+    int x0 = 0, x1 = 0; bool x = g_band_x && cols >= 20;   /* the close button, on the first row */
+    if (x) close_x_cols(1, cols, &x0, &x1);
     const char *s = g_band_text;
     for (int i = 0; i < g_band_rows; i++) {
         sb_printf(o, "\x1b[%d;1H" C_RESET "\x1b[K", row + i);
         if (!*s) continue;
         const char *e = strchr(s, '\n');
         size_t len = e ? (size_t)(e - s) : strlen(s);
-        if (vis_width_n(s, len) > cols) len = vis_offset(s, len, cols);
+        int room = i == 0 && x ? x0 - 2 : cols;   /* the title stops before the button */
+        if (vis_width_n(s, len) > room) len = vis_offset(s, len, room);
         sb_append(o, s, len); sb_puts(o, C_RESET);
+        if (i == 0 && x) {
+            sb_printf(o, "\x1b[%d;%dH", row, x0); close_x_put(o);
+            g_mx[MX_BAND][0] = row; g_mx[MX_BAND][1] = x0; g_mx[MX_BAND][2] = x1;
+        }
         s = e ? e + 1 : s + strlen(s);
     }
 }
@@ -3315,6 +3353,9 @@ static void paste_modal_impl(int k, const char *text, int lines) {
     char *t = xstrdup(text);
     for (char *p = t; *p; p++) if (*p == '\t') *p = ' ';
     int width = g_fs_cols > 1 ? g_fs_cols : 1, body = region - 2;
+    int x0 = 0, x1 = 0; bool xbtn = width >= 20;   /* the close button, at the right end of the title row */
+    if (xbtn) { close_x_cols(1, width, &x0, &x1); g_mx[MX_PASTE][0] = 1; g_mx[MX_PASTE][1] = x0; g_mx[MX_PASTE][2] = x1; }
+    g_paste_open = true;
     size_t n = 0; size_t (*rw)[2] = paste_rows(t, width, &n);   /* visual rows: (offset, length), as the notcurses view has them */
     size_t top = 0, maxtop = n > (size_t)body ? n - body : 0;
     for (;;) {
@@ -3323,8 +3364,12 @@ static void paste_modal_impl(int k, const char *text, int lines) {
         sb_printf(&o, "\x1b[1;1H\x1b[2K" C_BOLD);
         char title[256];
         snprintf(title, sizeof title, " pasted text #%d · %d lines   ", k, lines);
-        put_clipped(&o, title, width, false);
-        sb_puts(&o, C_RESET " " C_DIM "↑/↓ PgUp/PgDn Home/End scroll · Esc closes" C_RESET);
+        int room = xbtn ? x0 - 2 : width;   /* the text stops before the button */
+        put_clipped(&o, title, room, false);
+        int left = room - vis_width(title) - 1;
+        if (left > 8) { sb_puts(&o, C_RESET " " C_DIM); put_clipped(&o, "↑/↓ PgUp/PgDn Home/End scroll · Esc or × closes", left, false); }
+        sb_puts(&o, C_RESET);
+        if (xbtn) { sb_printf(&o, "\x1b[1;%dH", x0); close_x_put(&o); }
         for (int i = 0; i < body; i++) {
             sb_printf(&o, "\x1b[%d;1H\x1b[2K", i + 2);
             size_t idx = top + (size_t)i;
@@ -3349,6 +3394,7 @@ static void paste_modal_impl(int k, const char *text, int lines) {
         if (top > maxtop) top = maxtop;
     }
     free(rw); free(t);
+    g_paste_open = false; g_mx[MX_PASTE][0] = -1;
     /* back to the conversation: painted again from the model, where the modal stood */
     if (!layout_sync()) { sbuf o; sb_init(&o); conv_repaint(&o); fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o); }
     sb_pause(was);
@@ -3452,7 +3498,8 @@ static char *readline_impl(const char *prompt, bool in_field) {
         idle_armed = false;
         if (k == -1) { result = NULL; break; }
         if (k != 3) ctrlc_count = 0;
-        if ((k == K_ESC || k == K_BANNER_X) && g_ov_text) { term_overlay_close(); continue; }   /* Esc, or the banner's close button, closes the overlay before anything else */
+        if ((k == K_ESC || k == K_CLOSE_X) && g_ov_text) { term_overlay_close(); continue; }   /* Esc, or a modal's close button, closes the overlay before anything else */
+        if (k == K_CLOSE_X) continue;   /* a stale click on a button that is gone: nothing */
         if (k == K_ESC && e.buf.len == 0) {
             if (esc_pending) { result = xstrdup("/rewind"); done = true; break; }
             esc_pending = true;
@@ -3762,6 +3809,7 @@ static int confirm_impl(const char *question, const char *always_label, const ch
         sb_free(&o);
 
         int k = read_key();
+        if (k == K_CLOSE_X) k = K_ESC;   /* the button is the Esc: no */
         if (k == -2) continue;                                   /* resize: redraw */
         if (k == -1 || k == 3) { choice = -1; break; }             /* EOF / Ctrl-C */
         if (k == K_ESC) { choice = no_i; break; }
@@ -4136,6 +4184,7 @@ static int select_impl(const char *title, const char **items, const char **descs
         sb_free(&o);
 
         int k = read_key();
+        if (k == K_CLOSE_X) k = K_ESC;   /* the button is the Esc: cancel */
         if (k == -2) continue;
         if (k == -1 || k == K_ESC || k == 3) { result = -1; break; }
         if (k == '\r') { result = sel; break; }

@@ -262,6 +262,12 @@ static sbuf *g_ov_lines = NULL;       /* the overlay (term_overlay_show): its te
 static int g_ov_n = 0, g_ov_w = 0;
 static bool g_ov_on = false;
 static void nc_banner_close(void);
+/* The close button "[×]" of the overlay, a menu and the paste view (the banner's is g_bn_x*): where draw_* put it this frame
+ * (screen row, first and last column, 0-based). A press on it closes the overlay at once; for a menu or the paste view it
+ * makes nc_getkey return Esc, which each of their loops already takes as "close"; the click is checked only while its
+ * modal is up (g_ov_on / g_menu_on / g_pv_on), whatever the last frame left here. */
+static int g_mx_kind = 0, g_mx_y = -1, g_mx_c0 = -1, g_mx_c1 = -1;   /* kind: 0 none, 1 overlay, 2 menu or paste view */
+static bool g_close_req = false;
 static int g_pane_epoch = -1;          /* term_sb_epoch() when g_pane_line was made; -1: not made (no click acts on it) */
 /* the pane's cells: per row and column, the scrollback line and the character index in it (-1: none), made in
  * draw_pane with the row map. A selection point is one of these, so it is the same text whatever the pane shows. */
@@ -512,6 +518,10 @@ static bool pane_point(int y, int x, sel_pt *out) {
  * click (a fold's head toggles, as it always did); a press that moved and was released is a selection, copied
  * and kept on the screen until the next key. Scrolling and the banner's close are as before. */
 static void nc_mouse(const ncinput *ni) {
+    if (ni->evtype == NCTYPE_PRESS && ni->id == NCKEY_BUTTON1 && g_mx_kind && ni->y == g_mx_y && ni->x >= g_mx_c0 && ni->x <= g_mx_c1) {
+        if (g_mx_kind == 1 && g_ov_on) { nc_overlay_set(NULL); return; }
+        if (g_mx_kind == 2 && (g_menu_on || g_pv_on)) { g_close_req = true; return; }
+    }
     if (g_pv_on) {   /* the paste view: the wheel scrolls it, the rest is not for it */
         if (ni->evtype == NCTYPE_PRESS && ni->id == NCKEY_SCROLL_UP) pv_scroll(-3);
         else if (ni->evtype == NCTYPE_PRESS && ni->id == NCKEY_SCROLL_DOWN) pv_scroll(3);
@@ -679,7 +689,7 @@ static int nc_getkey(int ms) {
         ncinput ni; memset(&ni, 0, sizeof ni);
         uint32_t id = notcurses_get_nblock(g_nc, &ni);
         if (id == 0 || id == (uint32_t)-1) break;
-        if (nckey_mouse_p(ni.id)) { nc_mouse(&ni); if (g_pv_req) return NK_NONE; continue; }   /* a report, not a key (a click for a view ends the read) */
+        if (nckey_mouse_p(ni.id)) { nc_mouse(&ni); if (g_pv_req) return NK_NONE; if (g_close_req) { g_close_req = false; return 27; } continue; }   /* (a click on a modal's close button is its Esc) */   /* a report, not a key (a click for a view ends the read) */
         if (ni.id == NCKEY_TAB && (ni.modifiers & NCKEY_MOD_SHIFT) && ni.evtype != NCTYPE_RELEASE) {   /* Shift+Tab cycles the mode at once, as on the ANSI screen (a key, so it is not queued); a release is not a second press */
             g_cfg.mode = (g_cfg.mode + 1) % MODE_COUNT;
             nc_render_soon();
@@ -757,6 +767,12 @@ static int put_text(int y, int x, const char *s, int maxw, unsigned fg, unsigned
     }
     free(c);
     return col;
+}
+static void draw_close_x(int y, int x0, unsigned bg, int kind) {
+    put_text(y, x0, "[", 1, C_MUTED, bg, false, NULL);
+    put_text(y, x0 + 1, "×", 1, C_ACCENT, bg, false, NULL);
+    put_text(y, x0 + 2, "]", 1, C_MUTED, bg, false, NULL);
+    g_mx_kind = kind; g_mx_y = y; g_mx_c0 = x0; g_mx_c1 = x0 + BANNER_X_W - 1;
 }
 static void fill_row(int y, int x0, int x1, unsigned bg, bool grad) {
     for (int x = x0; x < x1; x++) {
@@ -971,8 +987,12 @@ static void draw_pasteview(void) {
     nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 };
     char title[128];
     snprintf(title, sizeof title, " pasted text #%d · %d lines   ", g_pv_k, g_pv_lines);
-    int used = put_text(0, 0, title, g_cols, C_TEXT, NC_DEFAULT, false, &carry);
-    put_text(0, used, "↑/↓ PgUp/PgDn Home/End scroll · Esc closes", g_cols - used, C_MUTED, NC_DEFAULT, false, &carry);
+    int x0 = 0, x1 = 0; bool xbtn = g_cols >= 20;   /* the close button, at the right end of the title row */
+    if (xbtn) close_x_cols(0, g_cols, &x0, &x1);
+    int room = xbtn ? x0 - 1 : g_cols;   /* the text stops before the button */
+    int used = put_text(0, 0, title, room, C_TEXT, NC_DEFAULT, false, &carry);
+    put_text(0, used, "↑/↓ PgUp/PgDn Home/End scroll · Esc or × closes", room - used, C_MUTED, NC_DEFAULT, false, &carry);
+    if (xbtn) draw_close_x(0, x0, NC_DEFAULT, 2);
     for (size_t i = 0; i < body; i++) {
         size_t idx = g_pv_top + i;
         if (idx >= g_pv_n) break;
@@ -1037,7 +1057,7 @@ static void draw_banner(void) {
     int region = g_field_top, top = (region - g_bn_n) / 2, left = (g_cols - g_bn_bw) / 2;
     if (top < 0) top = 0;
     if (left < 0) left = 0;
-    g_bn_xr = top; g_bn_xc0 = left + g_bn_bw - BANNER_X_FROM_RIGHT - BANNER_X_W / 2; g_bn_xc1 = g_bn_xc0 + BANNER_X_W - 1;
+    g_bn_xr = top; close_x_cols(left, g_bn_bw, &g_bn_xc0, &g_bn_xc1);
     for (int i = 0; i < g_bn_n && top + i < region; i++) {
         fill_row(top + i, left, left + g_bn_bw, C_BAR_A, false);   /* (fill_row takes the end column) */
         nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 };
@@ -1084,6 +1104,7 @@ static void draw_overlay(void) {
     for (int i = 0; i < W - 2; i++) strcat(edge, "─");
     strcat(edge, "╮");
     put_text(top, left, edge, W, C_RULE, C_BAR_A, false, &carry);
+    if (W >= 12) { int c0, c1; close_x_cols(left, W, &c0, &c1); draw_close_x(top, c0, C_BAR_A, 1); }   /* in the top border, as the banner's box has it */
     for (int i = 0; i < g_ov_n; i++) {
         int y = top + 1 + i;
         put_text(y, left, "│ ", 2, C_RULE, C_BAR_A, false, &carry);
@@ -1151,6 +1172,7 @@ static void draw_menu(int y, int h) {
     for (int i = 1; i < w - 1; i++) { put_text(y, x + i, "─", 1, C_ACCENT, C_MENU, false, NULL); put_text(y + h - 1, x + i, "─", 1, C_ACCENT, C_MENU, false, NULL); }
     for (int r = 1; r < h - 1; r++) { put_text(y + r, x, "│", 1, C_ACCENT, C_MENU, false, NULL); put_text(y + r, x + w - 1, "│", 1, C_ACCENT, C_MENU, false, NULL); }
     put_text(y + 1, x + 2, g_menu_title, w - 4, C_WARN, C_MENU, false, NULL);
+    if (w >= 16) { int c0, c1; close_x_cols(x, w, &c0, &c1); draw_close_x(y, c0, C_MENU, 2); }   /* in the top border */
     for (int i = 0; i < g_menu_n && i < show; i++) {
         int ry = y + 2 + i;
         if (g_menu[i].sel) { put_text(ry, x + 2, "❯", 1, C_ACCENT, C_MENU, false, NULL); }
@@ -1264,6 +1286,7 @@ void nc_render(void) {
     ncplane_dim_yx(g_std, &r, &c);
     g_rows = (int)r; g_cols = (int)c;
     g_caret_y = -1;
+    g_mx_kind = 0;   /* the modals below set it again */
     tok_clear();
     ncplane_erase(g_std);
     if (g_rows >= 6 && g_cols >= 10) {

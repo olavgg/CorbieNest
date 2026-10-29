@@ -2391,6 +2391,19 @@ static void test_wellformed(void) {
 }
 
 /* ---------- the notcurses frontend's pure half: SGR, the palette, the cells ---------- */
+/* the close button's cells (every modal's "[×]"): the banner's old arithmetic, from any origin */
+static void test_close_x(void) {
+    int c0, c1;
+    close_x_cols(1, 80, &c0, &c1);   /* ANSI: columns count from 1; the box spans 1..80, its corner is 80 */
+    CHECK(c0 == 77 && c1 == 79);   /* three cells, the last one left of the corner */
+    CHECK(c1 - c0 + 1 == BANNER_X_W);
+    close_x_cols(0, 80, &c0, &c1);   /* notcurses: from 0 */
+    CHECK(c0 == 76 && c1 == 78);
+    close_x_cols(10, 40, &c0, &c1);  /* a box that does not start at the edge */
+    CHECK(c0 == 46 && c1 == 48);
+    close_x_cols(0, 100, &c0, &c1);  /* what main.c's box_lines used: bw - BANNER_X_FROM_RIGHT - BANNER_X_W / 2 */
+    CHECK(c0 == 100 - BANNER_X_FROM_RIGHT - BANNER_X_W / 2);
+}
 static void test_copy_key(void) {
     CHECK(nc_copy_key(false, 'c', true, false));    /* Ctrl+c */
     CHECK(nc_copy_key(false, 'C', true, false));    /* Ctrl+C, notcurses' capital for a letter with Ctrl */
@@ -2611,7 +2624,7 @@ int main(void) {
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "sbuf", test_sbuf }, { "util", test_util }, { "cmd head", test_cmd_head }, { "markdown", test_md }, { "highlight", test_highlight }, { "git branch", test_gitbranch },
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "modes", test_modes },
-        { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
+        { "close button", test_close_x }, { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
         { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme },
     };
