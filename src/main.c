@@ -83,6 +83,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/hooks", "shell commands for this project: before or after a tool call, at start and at the end of a request" },
     { "/mcp", "MCP servers: tools from external programs over stdio (add, remove, reconnect; /mcp alone lists them)" },
     { "/agents", "sub-agent files: roles the main agent starts by name with task (reload; /agents alone lists them)" },
+    { "/config", "display settings: bash show|hide — the model's bash commands in the transcript (alone lists them)" },
     { "/sandbox", "the model's shell commands in bubblewrap: the project writable, the rest read-only (on, off; alone shows it)" },
     { "/permissions", "the project's saved rules: always-allow ones, and deny/ask guards on a tool and a pattern: add, remove, clear" },
     { "/init", "have the model write AGENTS.md for this project" },
@@ -114,6 +115,8 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/memory idle", "off:wait for the next update or the exit instead" },
     { "/hooks", "add:a hook line: pre|post TOOL COMMAND, start|stop COMMAND|remove:remove hook N|clear:remove them all" },
     { "/agents", "reload:read the agent files again" },
+    { "/config", "bash:show or hide the model's bash commands and their output" },
+    { "/config bash", "show:print the commands as now (the default)|hide:print no bash command and no output (a denial or error still shows)" },
     { "/sandbox", "on:run the model's shell commands in bwrap|off:run them without it" },
     { "/mcp", "add:a server: [-g] NAME COMMAND [ARGS…] (-g for every project)|remove:remove a server by name|reconnect:start them again" },
     { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST, or deny|ask TOOL PATTERN|remove:remove rule N|clear:remove them all" },
@@ -1023,15 +1026,18 @@ static void replay_conversation(void) {
                 cJSON *parsed = NULL;
                 if (cJSON_IsString(args)) { parsed = cJSON_Parse(args->valuestring); args = parsed; }
                 char summ[160]; tool_arg_summary(name, args, summ, sizeof summ);
-                printf(C_GREEN "●" C_RESET " " C_BOLD "%s" C_RESET, name);
-                if (summ[0]) printf(C_DIM "(%s)" C_RESET, summ);
-                printf("\n");
+                if (g_cfg.show_bash || strcmp(name, "bash")) {
+                    printf(C_GREEN "●" C_RESET " " C_BOLD "%s" C_RESET, name);
+                    if (summ[0]) printf(C_DIM "(%s)" C_RESET, summ);
+                    printf("\n");
+                }
                 if (parsed) cJSON_Delete(parsed);
             }
         } else if (!strcmp(role, "tool")) {
             cJSON *tn = cJSON_GetObjectItemCaseSensitive(m, "tool_name");
             const char *name = cJSON_IsString(tn) ? tn->valuestring : "";
             if (!strcmp(name, "todo_write")) print_task_lines(text);
+            else if (!strcmp(name, "bash") && !g_cfg.show_bash) {}
             else print_result_folded(text ? text : "", (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8, NULL);
         }
     }
@@ -1350,6 +1356,24 @@ static int cmd_rewind(void) {
 }
 
 /* ---------- /permissions ---------- */
+/* /config [bash [show|hide]]: display settings. Only bash so far: whether the model's bash commands (and their output)
+ * are in the transcript. A command the user is asked about is always shown in the question. */
+static void cmd_config(const char *arg) {
+    if (arg && !strncmp(arg, "bash", 4) && (!arg[4] || arg[4] == ' ')) {
+        const char *v = arg + 4; while (*v == ' ') v++;
+        if (*v) {
+            if (!strcmp(v, "show") || !strcmp(v, "on")) g_cfg.show_bash = true;
+            else if (!strcmp(v, "hide") || !strcmp(v, "off")) g_cfg.show_bash = false;
+            else { printf("usage: /config bash [show|hide]\n"); return; }
+            config_save();
+            printf(C_GREEN "✓ bash commands %s" C_RESET "%s\n", g_cfg.show_bash ? "shown" : "hidden",
+                   g_cfg.show_bash ? "" : C_DIM " — no command line and no output; a command you are asked about is still in the question, a denial or an error still shows" C_RESET);
+            return;
+        }
+    } else if (arg && *arg) { printf("usage: /config [bash [show|hide]]\n"); return; }
+    printf(C_BOLD "bash  " C_RESET "%s" C_DIM "  — /config bash show|hide" C_RESET "\n", g_cfg.show_bash ? "shown" : "hidden");
+}
+
 /* /sandbox: the model's shell commands in bubblewrap (tools.c: what it does) */
 static void cmd_sandbox(const char *arg) {
     if (!arg || !*arg) {
@@ -3668,8 +3692,10 @@ static bool run_turn_body(void) {
             /* a bash call is one line, grey: its header goes with its result (the fold's head), after the approval;
              * short of that the usual header comes first. The summary is kept to half the width, for the output's count. */
             bool bashline = !strcmp(name, "bash");
+            bool bash_hidden = bashline && !g_cfg.show_bash;   /* /config bash hide: no header, no output; a denial or an error still shows */
             char lead[480] = "";
-            if (bashline) {
+            if (bash_hidden) {}
+            else if (bashline) {
                 char head[300];
                 int room = term_width() / 2 - 10; if (room < 20) room = 20;
                 snprintf(head, sizeof head, "%s", summ);
@@ -3696,8 +3722,9 @@ static bool run_turn_body(void) {
             tool_status ts = tools_execute(name, args, &out);
             const char *res = out.data ? out.data : "";
             if (g_advisor_said) {}   /* run_advisor() has said what came of it: the advice is not shown twice */
-            else if (ts == TOOL_DENIED) printf("%s" C_RED "denied" C_RESET "\n", bashline ? lead : "  ⎿  ");
-            else if (ts == TOOL_ERROR) printf("%s" C_RED "%s" C_RESET "\n", bashline ? lead : "  ⎿  ", res);
+            else if (ts == TOOL_DENIED) printf("%s" C_RED "denied" C_RESET "\n", bashline && !bash_hidden ? lead : "  ⎿  ");
+            else if (ts == TOOL_ERROR) printf("%s" C_RED "%s" C_RESET "\n", bashline && !bash_hidden ? lead : "  ⎿  ", res);
+            else if (bash_hidden) {}
             else if (!strcmp(name, "todo_write") && !bashline) print_task_lines(res);
             else print_result_folded(res, (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8, bashline ? lead : NULL);
             if (tool_result_failed(name, res, ts == TOOL_ERROR)) failed = true;
@@ -5528,6 +5555,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/hooks")) cmd_hooks(arg);
     else if (!strcmp(cmd, "/mcp")) cmd_mcp(arg);
     else if (!strcmp(cmd, "/agents")) cmd_agents(arg);
+    else if (!strcmp(cmd, "/config")) cmd_config(arg);
     else if (!strcmp(cmd, "/sandbox")) cmd_sandbox(arg);
     else if (!strcmp(cmd, "/cost")) cmd_cost();
     else if (!strcmp(cmd, "/usage")) cmd_usage(arg);
@@ -6739,7 +6767,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     tools_bg_init();
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.suggest = true; g_cfg.advisor_guidance = GUIDANCE_NORMAL; g_cfg.advisor_window = ADVISOR_WINDOW_DEFAULT;
+    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.suggest = true; g_cfg.show_bash = true; g_cfg.advisor_guidance = GUIDANCE_NORMAL; g_cfg.advisor_window = ADVISOR_WINDOW_DEFAULT;
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();

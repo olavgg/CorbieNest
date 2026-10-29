@@ -438,6 +438,7 @@ void config_load(void) {
         else if (!strcmp(k, "advisor_window")) { double m = atof(v); if (m >= 0 && m <= 24 * 60) g_cfg.advisor_window = (int)(m * 60 + 0.5); }
         else if (!strcmp(k, "advisor_guidance")) { int n = advisor_guidance_parse(v); if (n >= 0) g_cfg.advisor_guidance = n; }
         else if (!strcmp(k, "show_thinking")) g_cfg.show_thinking = atoi(v) != 0;
+        else if (!strcmp(k, "show_bash")) g_cfg.show_bash = atoi(v) != 0;
         else if (!strcmp(k, "ui")) { free(g_cfg.ui); g_cfg.ui = !strcmp(v, "notcurses") ? xstrdup("notcurses") : NULL; }
         else if (!strcmp(k, "theme")) {   /* a name no theme has is said, and the default is used */
             if (theme_set(v)) { free(g_cfg.theme); g_cfg.theme = xstrdup(v); }
@@ -490,6 +491,7 @@ void config_save(void) {
     if (g_cfg.advisor_window != ADVISOR_WINDOW_DEFAULT) sb_printf(&b, "advisor_window=%g\n", g_cfg.advisor_window / 60.0);   /* in minutes, as it is typed */
     if (g_cfg.advisor_guidance != GUIDANCE_NORMAL) sb_printf(&b, "advisor_guidance=%s\n", advisor_guidance()->name);
     sb_printf(&b, "show_thinking=%d\n", g_cfg.show_thinking ? 1 : 0);
+    sb_printf(&b, "show_bash=%d\n", g_cfg.show_bash ? 1 : 0);
     sb_printf(&b, "mode=%s\n", mode_name(g_mode_saved));
     sb_printf(&b, "max_iters=%d\n", g_cfg.max_iters);
     sb_printf(&b, "memory=%d\n", g_cfg.memory ? 1 : 0);

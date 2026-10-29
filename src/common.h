@@ -283,6 +283,7 @@ typedef struct {
     bool  parallel_tasks;/* /effort parallel on: the task calls of one reply run at the same time as sub-agents (default off) */
     char *build;         /* /plan: the command that builds the project after each layer (build=); NULL = detected from the project's build file */
     bool  show_thinking; /* print thinking tokens */
+    bool  show_bash;     /* show the model's bash commands and their output in the transcript (/config bash show|hide; default on) */
     int   mode;          /* permission mode, see MODE_* */
     bool  no_tools;      /* don't send tools at all */
     bool  web;           /* offer the web_fetch/web_search tools (/web, --no-web) */

@@ -970,6 +970,7 @@ static void print_command(const char *cmd, bool will_ask) {
     char first[320];
     int w = term_width() - 6 - 16; if (w < 12) w = 12;   /* "  ▸ $ " and "  (+NNNN lines)" */
     int more = cmd_head(cmd, w, first, sizeof first);
+    if (!g_cfg.show_bash && !will_ask) return;   /* /config bash hide; a command the user is asked about stays visible: they approve what they see */
     if (will_ask && cmd_in_question(cmd)) return;
     if (!will_ask && more == 0) return;   /* not asked, one line: the result's line shows it */
     if (more > 0 && !will_ask) {

@@ -31,6 +31,8 @@ confirmed before it runs.
   later, a `todo_write` task list the model keeps for a request, and stream-json input and output.
 - **Providers.** Anthropic, xAI, OpenAI, DeepSeek and Kimi, and your own OpenAI-compatible hosts
   (`/model add`). Request bodies can be gzipped for the providers that accept them (`/gzip`).
+- **Quiet bash.** `/config bash hide` leaves the model's bash commands and their output out of the transcript
+  (a command you are asked about still shows in the question); `/config bash show` brings them back.
 - **Colour themes.** `/ui theme` picks a palette, shared by the terminal screen and the notcurses screen.
 - **Suggested next message.** After each reply the model proposes what you would type next, as a
   muted placeholder in the field: Tab takes it, typing anything clears it (`/suggest off` turns it off).
