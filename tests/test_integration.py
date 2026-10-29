@@ -513,6 +513,18 @@ out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_BASH please"], e
 check(rc == 0 and "bash(" not in out and "echo hello-from-tool" not in out and "exit code: 0" not in out, f"bash call not shown: {out!r}")
 check("Tool said: hello-from-tool" in out, "the model still got the output")
 
+print("test show_read=0 / show_grep=0 (/config read, /config grep hide): the call lines stay, the results do not; the model still gets them")
+with open(os.path.join(WORK, "look.txt"), "w") as f: f.write("first line\nneedle-in-file here\n")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_LOOK please"])
+check(rc == 0 and "read_file(look.txt)" in out and "needle-in-file here" in out, f"shown by default: {out!r}")
+LCFG = tempfile.mkdtemp(prefix="crowlook_")
+os.makedirs(os.path.join(LCFG, "corbienest")); open(os.path.join(LCFG, "corbienest", "config"), "w").write("show_read=0\nshow_grep=0\n")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_LOOK please"], env=dict(ENV, XDG_CONFIG_HOME=LCFG))
+check(rc == 0 and "read_file(look.txt)" in out and "grep(needle-in-file in look.txt)" in out, f"call lines still shown: {out!r}")
+check("first line" not in out and "needle-in-file here" not in out, f"results hidden: {out!r}")
+tm = [m for m in requests()[-1]["messages"] if m["role"] == "tool"]
+check(len(tm) == 2 and "first line" in tm[0]["content"] and "needle-in-file here" in tm[1]["content"], "the model got both results")
+
 print("test auto-compact in the middle of a turn hands the work back and carries on")
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "HUGE_TOOL please"])
 check("auto-compacting" in out, f"auto-compact fired between the tool result and the next call: {out!r}")

@@ -341,6 +341,13 @@ def script(model, messages, req):
             yield chunk(model, tool_calls=[{"function": {"name": "bash", "arguments": {"command": "echo nope-%d; exit 3" % len(results)}}}])
         yield chunk(model, done=True)
         return
+    if "TOOL_LOOK" in text:   # read_file, then grep, then an answer (the file is look.txt in the working directory)
+        n = len([m for m in messages if m["role"] == "tool"])
+        if n == 0: yield chunk(model, tool_calls=[{"function": {"name": "read_file", "arguments": {"path": "look.txt"}}}])
+        elif n == 1: yield chunk(model, tool_calls=[{"function": {"name": "grep", "arguments": {"pattern": "needle-in-file", "path": "look.txt"}}}])
+        else: yield chunk(model, "Looked.")
+        yield chunk(model, done=True)
+        return
     if "TOOL_READS" in text:
         # a request that only looks: four tool calls, no file written
         results = [m for m in messages if m["role"] == "tool"]

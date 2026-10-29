@@ -83,7 +83,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/hooks", "shell commands for this project: before or after a tool call, at start and at the end of a request" },
     { "/mcp", "MCP servers: tools from external programs over stdio (add, remove, reconnect; /mcp alone lists them)" },
     { "/agents", "sub-agent files: roles the main agent starts by name with task (reload; /agents alone lists them)" },
-    { "/config", "display settings: bash show|hide — the model's bash commands in the transcript (alone lists them)" },
+    { "/config", "display settings: show or hide the model's bash commands, and the results of read_file and grep (alone lists them)" },
     { "/sandbox", "the model's shell commands in bubblewrap: the project writable, the rest read-only (on, off; alone shows it)" },
     { "/permissions", "the project's saved rules: always-allow ones, and deny/ask guards on a tool and a pattern: add, remove, clear" },
     { "/init", "have the model write AGENTS.md for this project" },
@@ -115,8 +115,10 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/memory idle", "off:wait for the next update or the exit instead" },
     { "/hooks", "add:a hook line: pre|post TOOL COMMAND, start|stop COMMAND|remove:remove hook N|clear:remove them all" },
     { "/agents", "reload:read the agent files again" },
-    { "/config", "bash:show or hide the model's bash commands and their output" },
+    { "/config", "bash:show or hide the model's bash commands and their output|read:show or hide the results of read_file|grep:show or hide the results of grep" },
     { "/config bash", "show:print the commands as now (the default)|hide:print no bash command and no output (a denial or error still shows)" },
+    { "/config read", "show:print what read_file returned (the default)|hide:keep the call line, drop the result (an error still shows)" },
+    { "/config grep", "show:print what grep found (the default)|hide:keep the call line, drop the result (an error still shows)" },
     { "/sandbox", "on:run the model's shell commands in bwrap|off:run them without it" },
     { "/mcp", "add:a server: [-g] NAME COMMAND [ARGS…] (-g for every project)|remove:remove a server by name|reconnect:start them again" },
     { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST, or deny|ask TOOL PATTERN|remove:remove rule N|clear:remove them all" },
@@ -839,6 +841,10 @@ static void cmd_memory(const char *arg) {
  * latest SESSIONS_KEEP files are kept. */
 #define SESSIONS_KEEP 100
 static void print_result_preview(const char *text, int lines);
+/* /config: a tool whose result is left out of the transcript (read_file, grep; bash hides its header too, see its own code) */
+static bool tool_output_hidden(const char *name) {
+    return (!strcmp(name, "read_file") && !g_cfg.show_read) || (!strcmp(name, "grep") && !g_cfg.show_grep) || (!strcmp(name, "bash") && !g_cfg.show_bash);
+}
 static void print_result_folded(const char *text, int preview_lines, const char *lead);
 static void stream_flush(void);
 static void print_task_lines(const char *text);
@@ -1037,7 +1043,7 @@ static void replay_conversation(void) {
             cJSON *tn = cJSON_GetObjectItemCaseSensitive(m, "tool_name");
             const char *name = cJSON_IsString(tn) ? tn->valuestring : "";
             if (!strcmp(name, "todo_write")) print_task_lines(text);
-            else if (!strcmp(name, "bash") && !g_cfg.show_bash) {}
+            else if (tool_output_hidden(name)) {}
             else print_result_folded(text ? text : "", (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8, NULL);
         }
     }
@@ -1356,22 +1362,36 @@ static int cmd_rewind(void) {
 }
 
 /* ---------- /permissions ---------- */
-/* /config [bash [show|hide]]: display settings. Only bash so far: whether the model's bash commands (and their output)
- * are in the transcript. A command the user is asked about is always shown in the question. */
+/* /config [bash|read|grep [show|hide]]: display settings: whether the model's bash commands and their output, and the results of
+ * read_file and grep, are in the transcript. (bash hides the command line too; read and grep keep the call line and drop the result.)
+ * A command the user is asked about is always shown in the question; a denial or an error always shows. */
 static void cmd_config(const char *arg) {
-    if (arg && !strncmp(arg, "bash", 4) && (!arg[4] || arg[4] == ' ')) {
-        const char *v = arg + 4; while (*v == ' ') v++;
+    static const struct { const char *name; bool *flag; const char *what, *hidden_note; } ITEMS[] = {
+        { "bash", &g_cfg.show_bash, "bash commands and their output", "no command line and no output; a command you are asked about is still in the question, a denial or an error still shows" },
+        { "read", &g_cfg.show_read, "read_file results", "the read_file call line stays, its result does not; an error still shows" },
+        { "grep", &g_cfg.show_grep, "grep results", "the grep call line stays, its result does not; an error still shows" },
+    };
+    enum { N_ITEMS = sizeof ITEMS / sizeof ITEMS[0] };
+    if (arg && *arg) {
+        int i = 0;
+        size_t l = strcspn(arg, " ");
+        while (i < N_ITEMS && !(strlen(ITEMS[i].name) == l && !strncmp(arg, ITEMS[i].name, l))) i++;
+        if (i == N_ITEMS) { printf("usage: /config [bash|read|grep [show|hide]]\n"); return; }
+        const char *v = arg + l; while (*v == ' ') v++;
         if (*v) {
-            if (!strcmp(v, "show") || !strcmp(v, "on")) g_cfg.show_bash = true;
-            else if (!strcmp(v, "hide") || !strcmp(v, "off")) g_cfg.show_bash = false;
-            else { printf("usage: /config bash [show|hide]\n"); return; }
+            if (!strcmp(v, "show") || !strcmp(v, "on")) *ITEMS[i].flag = true;
+            else if (!strcmp(v, "hide") || !strcmp(v, "off")) *ITEMS[i].flag = false;
+            else { printf("usage: /config %s [show|hide]\n", ITEMS[i].name); return; }
             config_save();
-            printf(C_GREEN "✓ bash commands %s" C_RESET "%s\n", g_cfg.show_bash ? "shown" : "hidden",
-                   g_cfg.show_bash ? "" : C_DIM " — no command line and no output; a command you are asked about is still in the question, a denial or an error still shows" C_RESET);
+            if (*ITEMS[i].flag) printf(C_GREEN "✓ %s shown" C_RESET "\n", ITEMS[i].what);
+            else printf(C_GREEN "✓ %s hidden" C_RESET C_DIM " — %s" C_RESET "\n", ITEMS[i].what, ITEMS[i].hidden_note);
             return;
         }
-    } else if (arg && *arg) { printf("usage: /config [bash [show|hide]]\n"); return; }
-    printf(C_BOLD "bash  " C_RESET "%s" C_DIM "  — /config bash show|hide" C_RESET "\n", g_cfg.show_bash ? "shown" : "hidden");
+        printf(C_BOLD "%-5s " C_RESET "%s" C_DIM "  — /config %s show|hide" C_RESET "\n", ITEMS[i].name, *ITEMS[i].flag ? "shown" : "hidden", ITEMS[i].name);
+        return;
+    }
+    for (int i = 0; i < N_ITEMS; i++)
+        printf(C_BOLD "%-5s " C_RESET "%s" C_DIM "  — %s · /config %s show|hide" C_RESET "\n", ITEMS[i].name, *ITEMS[i].flag ? "shown" : "hidden", ITEMS[i].what, ITEMS[i].name);
 }
 
 /* /sandbox: the model's shell commands in bubblewrap (tools.c: what it does) */
@@ -3724,7 +3744,7 @@ static bool run_turn_body(void) {
             if (g_advisor_said) {}   /* run_advisor() has said what came of it: the advice is not shown twice */
             else if (ts == TOOL_DENIED) printf("%s" C_RED "denied" C_RESET "\n", bashline && !bash_hidden ? lead : "  ⎿  ");
             else if (ts == TOOL_ERROR) printf("%s" C_RED "%s" C_RESET "\n", bashline && !bash_hidden ? lead : "  ⎿  ", res);
-            else if (bash_hidden) {}
+            else if (tool_output_hidden(name)) {}   /* bash: header and result both; read_file, grep: the result only */
             else if (!strcmp(name, "todo_write") && !bashline) print_task_lines(res);
             else print_result_folded(res, (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8, bashline ? lead : NULL);
             if (tool_result_failed(name, res, ts == TOOL_ERROR)) failed = true;
@@ -5294,7 +5314,7 @@ static void cmd_status(void) {
            (g_cfg.no_tools || !g_model_tools) ? "" : (g_cfg.web ? C_DIM " · web on" C_RESET : C_DIM " · web off" C_RESET));
     printf(C_BOLD "mode       " C_RESET "%s%s" C_RESET "\n", g_cfg.mode == MODE_AUTO ? C_RED : g_cfg.mode == MODE_PLAN ? C_CYAN : g_cfg.mode == MODE_ACCEPT_EDITS ? C_ORANGE : "", mode_label(g_cfg.mode));
     printf(C_BOLD "think      " C_RESET "%s, %s\n", g_cfg.think < 0 ? "auto (first call of a request only)" : g_cfg.think ? "on (every call)" : "off", g_cfg.show_thinking ? "shown" : "hidden");
-    printf(C_BOLD "bash       " C_RESET "%s" C_DIM " · /config bash show|hide" C_RESET "\n", g_cfg.show_bash ? "commands shown" : "commands hidden");
+    printf(C_BOLD "shown      " C_RESET "bash %s · read_file %s · grep %s" C_DIM " · /config" C_RESET "\n", g_cfg.show_bash ? "yes" : "no", g_cfg.show_read ? "yes" : "no", g_cfg.show_grep ? "yes" : "no");
     { sbuf c; sb_init(&c); effort_choices(&g_model_info, &c);
       printf(C_BOLD "effort     " C_RESET "%s%s%s" C_RESET "\n", effort_label(g_cfg.model, &g_model_info), c.len ? C_DIM " · /effort: " : "", c.len ? c.data : ""); sb_free(&c); }
     if (g_cfg.advisor) printf(C_BOLD "advisor    " C_RESET "%s" C_DIM " · guidance %s · %d consultation%s this session%s" C_RESET "\n", g_cfg.advisor, advisor_guidance()->name,
@@ -6768,7 +6788,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     tools_bg_init();
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.suggest = true; g_cfg.show_bash = true; g_cfg.advisor_guidance = GUIDANCE_NORMAL; g_cfg.advisor_window = ADVISOR_WINDOW_DEFAULT;
+    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.suggest = true; g_cfg.show_bash = g_cfg.show_read = g_cfg.show_grep = true; g_cfg.advisor_guidance = GUIDANCE_NORMAL; g_cfg.advisor_window = ADVISOR_WINDOW_DEFAULT;
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();
