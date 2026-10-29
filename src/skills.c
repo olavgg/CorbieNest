@@ -2,9 +2,12 @@
  * frontmatter), invoked as /name [args] from the prompt. Looked up in
  *   ./.corbienest/skills/<name>/SKILL.md   ./.corbienest/skills/<name>.md
  *   ./.corbienest/commands/<name>.md       ./.claude/commands/<name>.md   ~/.claude/commands/<name>.md
+ *   ./.agents/skills/<name>/SKILL.md     (the cross-client convention of the Agent Skills standard, agentskills.io)
  *   ./.claude/skills/<name>/SKILL.md     (Claude Code layout, for sharing)
  *   $XDG_CONFIG_HOME/corbienest/skills/<name>/SKILL.md   (and <name>.md)
+ *   ~/.agents/skills/<name>/SKILL.md     (the same convention, for every project)
  *   the bundled skills: $(PREFIX)/share/corbienest/skills (make install) and the checkout's skills/ (the build)
+ *   ~/.claude/skills/<name>/SKILL.md     (Claude Code's own, read last: every other place wins over it)
  * Project skills shadow user skills, and user skills shadow the bundled ones, of the same name. The bundled
  * skills are read only: nothing is copied into the user's configuration, so an upgrade refreshes them. */
 #define _GNU_SOURCE
@@ -122,12 +125,14 @@ int skills_load(void) {
     skills_clear();
     scan_dir(".corbienest/skills", "project");
     scan_dir(".corbienest/commands", "project");   /* Claude-Code-style flat NAME.md custom commands */
+    scan_dir(".agents/skills", "project");          /* the Agent Skills standard's cross-client folder: after our own, before Claude Code's */
     scan_dir(".claude/skills", "project");
     scan_dir(".claude/commands", "project");
     char user[1200]; snprintf(user, sizeof user, "%s/skills", config_dir());
     scan_dir(user, "user");
     snprintf(user, sizeof user, "%s/commands", config_dir());
     scan_dir(user, "user");
+    char *ag = expand_home("~/.agents/skills"); scan_dir(ag, "user"); free(ag);   /* the same convention, for every project */
     char *home = expand_home("~/.claude/commands"); scan_dir(home, "user"); free(home);
 #ifdef BUNDLED_SKILLS_DIR
     scan_dir(BUNDLED_SKILLS_DIR, "bundled");   /* last: a user's or a project's skill of the same name wins */
@@ -135,6 +140,7 @@ int skills_load(void) {
 #ifdef BUNDLED_SKILLS_SRC
     scan_dir(BUNDLED_SKILLS_SRC, "bundled");   /* the checkout's own: the same names as the installed ones are not added twice */
 #endif
+    char *cc = expand_home("~/.claude/skills"); scan_dir(cc, "user"); free(cc);   /* Claude Code's, as they are: last, so a skill of ours of the same name wins (its synced/ folder holds no SKILL.md at this level, so the Claude app's skills do not show) */
     return g_nskills;
 }
 
