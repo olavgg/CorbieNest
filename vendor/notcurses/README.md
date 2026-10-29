@@ -45,6 +45,8 @@ and FFI bindings, the demos, tests and tools, and the man pages.
   The wait is a `pthread_cond_wait` on `icond` in a cleanup-pushed loop (so a cancel still works); a drain or EOF
   is not waited for, and the reader broadcasts `icond` when it frees a slot in `internal_get()` (marked
   `corbienest:` in that file). Reapply it with the others.
+  Not during init (`initdata` set): `notcurses_init()` reads no keys until the input thread has handed the
+  replies over, so a wait there never ended; during init a full queue drops the key, as upstream does.
 
 Nothing else is changed. `make` compiles these files with the flags in the top-level Makefile
 (`NC_VFLAGS`): they are not held to our `-Werror`, and the two warnings upstream's own code has

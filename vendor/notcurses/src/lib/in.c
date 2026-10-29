@@ -523,8 +523,10 @@ load_ncinput(inputctx* ictx, ncinput *tni){
   }
   pthread_mutex_lock(&ictx->ilock);
   // corbienest: a full queue makes this thread wait for the reader; it does not drop the key. A paste is thousands
-  // of keys, and a dropped one loses text or the paste's end marker. A drain or EOF is not waited for.
-  if(ictx->ivalid == ictx->isize && !ictx->drain && !ictx->stdineof){
+  // of keys, and a dropped one loses text or the paste's end marker. A drain or EOF is not waited for, and neither is
+  // init (initdata set): notcurses_init reads no keys until this thread has handed the replies over, so a wait there
+  // would never end; during init a full queue drops, as upstream does.
+  if(ictx->initdata == NULL && ictx->ivalid == ictx->isize && !ictx->drain && !ictx->stdineof){
     pthread_cleanup_push(cleanup_mutex, &ictx->ilock);
     while(ictx->ivalid == ictx->isize && !ictx->drain && !ictx->stdineof){
       pthread_cond_wait(&ictx->icond, &ictx->ilock);
