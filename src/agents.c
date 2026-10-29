@@ -5,6 +5,7 @@
  *   .corbienest/agents/NAME.md     this project
  *   .claude/agents/NAME.md         this project (Claude Code's folder)
  *   <config>/agents/NAME.md        yours, for every project
+ *   ~/.claude/agents/NAME.md       Claude Code's own, for every project (read last)
  * The frontmatter keys: name (the file name by default), description, tools (a comma list of sub-agent tools; the
  * default is all of them), model (a model for this agent; the default is the sub-agents' model). An agent can use only
  * the tools a sub-agent has (read_file, list_dir, grep, bash, web_fetch, web_search): it cannot be given more, and it
@@ -97,6 +98,7 @@ int agents_load(void) {
         snprintf(p, sizeof p, "%s/.claude/agents", cwd); read_dir(p);
     }
     snprintf(p, sizeof p, "%s/agents", config_dir()); read_dir(p);
+    char *cc = expand_home("~/.claude/agents"); read_dir(cc); free(cc);   /* Claude Code's, as they are: last, so any file of ours of the same name wins */
     return g_nagent;
 }
 int agents_count(void) { return g_nagent; }

@@ -439,8 +439,9 @@ You review code. For each bug give the file, the line and the fix, and nothing e
 ```
 
 - **Where they are read.** `.corbienest/agents/NAME.md` and `.claude/agents/NAME.md` in the project,
-  then `agents/NAME.md` in your config directory (for every project). The first file of a name is the
-  one used. Claude Code's folder works as it is.
+  then `agents/NAME.md` in your config directory (for every project), then `~/.claude/agents/NAME.md`
+  (Claude Code's own, last). The first file of a name is the one used. Claude Code's folders work as
+  they are.
 - **The frontmatter.** `name` (the file name, if left out), `description` (required: the main agent
   reads it to choose), `tools` (a comma list; left out, the agent has every sub-agent tool), and
   `model` (left out, or `inherit`, the sub-agents' model from `/subagent`). The body is the role,
@@ -663,8 +664,14 @@ Report findings as a list.
 
 An optional `model:` line names the model the skill runs on when it is a role of a plan (see [Orchestrating](#orchestrating)); without it the role runs on the model in use.
 
-Put project skills in `.corbienest/skills/NAME/SKILL.md` (or `NAME.md`; `.claude/skills/` is
-read too), personal ones in `~/.config/corbienest/skills/`. Claude Code's flat custom
+Put project skills in `.corbienest/skills/NAME/SKILL.md` (or `NAME.md`), personal ones in
+`~/.config/corbienest/skills/`. The folders of other tools are read too, after ours, so a skill of the
+same name in ours wins: `.agents/skills/` and `~/.agents/skills/` (the cross-client convention of the
+[Agent Skills standard](https://agentskills.io): a folder with a `SKILL.md`), then `.claude/skills/`,
+and last `~/.claude/skills/`. Order, first one found is used: `.corbienest`, `.agents`, `.claude` in the
+project, then your config directory, `~/.agents`, the bundled skills, `~/.claude/skills`. A skill from
+another tool is used as it is: it may name tools Corbie Nest does not have (the Claude app's skills in
+`~/.claude/skills/synced/` are not found: they sit one folder deeper). Claude Code's flat custom
 commands are picked up as well: `.corbienest/commands/NAME.md`, `.claude/commands/NAME.md`,
 `~/.claude/commands/NAME.md` (frontmatter optional — the file body is the prompt). Run one with `/NAME args` —
 `$ARGUMENTS` is replaced by the arguments — or from the shell with `-p "/NAME args"`.

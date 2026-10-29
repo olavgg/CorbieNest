@@ -926,6 +926,7 @@ static int skills_load_unbundled(void) {
     return n;
 }
 
+#define P(rel) (snprintf(pb, sizeof pb, "%s/" rel, hm), pb)   /* a path under the test's fake HOME (needs hm and pb) */
 static void test_skills(void) {
     char dir[] = "/tmp/crowtest_s_XXXXXX"; CHECK(mkdtemp(dir) != NULL);
     char old[4096]; CHECK(getcwd(old, sizeof old) != NULL); CHECK(chdir(dir) == 0);
@@ -962,6 +963,54 @@ static void test_skills(void) {
     CHECK(skill_scaffold("bad name!", path, sizeof path) == -1);
     CHECK(skills_load_unbundled() == 4);   /* rev, plain, tester and the scaffolded one */
     char *sec = skills_prompt_section(); CHECK(sec && strstr(sec, "/new-one") && strstr(sec, "written in C")); free(sec);
+    /* Claude Code's own ~/.claude/skills and ~/.claude/agents are read, last (the Claude app's skills in synced/ add nothing): ours of the same name win, and the Claude
+     * app's synced/ folder (skills one level further down) adds nothing */
+    {
+        char *oh = getenv("HOME") ? xstrdup(getenv("HOME")) : NULL;
+        char hm[600], pb[700]; snprintf(hm, sizeof hm, "%s/home", dir);   /* not the project: ./.claude is read as the project's */
+        setenv("HOME", hm, 1);
+        CHECK(mkdir_p(P(".claude/skills/ccskill")) == 0 && mkdir_p(P(".claude/skills/rev")) == 0 && mkdir_p(P(".claude/skills/synced/u1/appskill")) == 0);
+        const char *cc = "---\nname: ccskill\ndescription: From Claude Code\n---\nCC body.\n";
+        CHECK(write_whole_file(P(".claude/skills/ccskill/SKILL.md"), cc, strlen(cc)) == 0);
+        const char *shadow = "---\nname: rev\ndescription: Claude's rev\n---\nNot this one.\n";
+        CHECK(write_whole_file(P(".claude/skills/rev/SKILL.md"), shadow, strlen(shadow)) == 0);
+        const char *app = "---\nname: appskill\ndescription: A Claude app skill\n---\nx\n";
+        CHECK(write_whole_file(P(".claude/skills/synced/u1/appskill/SKILL.md"), app, strlen(app)) == 0);
+        /* the Agent Skills standard's cross-client folders: ./.agents/skills and ~/.agents/skills, between our own and Claude Code's */
+        CHECK(mkdir_p(".agents/skills/proj-agents") == 0 && mkdir_p(".agents/skills/rev") == 0 && mkdir_p(P(".agents/skills/home-agents")) == 0 && mkdir_p(P(".agents/skills/ccskill")) == 0);
+        const char *pa = "---\nname: proj-agents\ndescription: From ./.agents/skills\n---\nP.\n";
+        const char *ra = "---\nname: rev\ndescription: The .agents rev\n---\nNot this one either.\n";
+        const char *ha = "---\nname: home-agents\ndescription: From ~/.agents/skills\n---\nH.\n";
+        const char *ca = "---\nname: ccskill\ndescription: The ~/.agents ccskill\n---\nBefore Claude Code's.\n";
+        CHECK(write_whole_file(".agents/skills/proj-agents/SKILL.md", pa, strlen(pa)) == 0);
+        CHECK(write_whole_file(".agents/skills/rev/SKILL.md", ra, strlen(ra)) == 0);
+        CHECK(write_whole_file(P(".agents/skills/home-agents/SKILL.md"), ha, strlen(ha)) == 0);
+        CHECK(write_whole_file(P(".agents/skills/ccskill/SKILL.md"), ca, strlen(ca)) == 0);
+        CHECK(skills_load_unbundled() == 7);   /* the four, ccskill, proj-agents and home-agents */
+        s = skill_find("proj-agents"); CHECK(s != NULL);
+        if (s) CHECK_STR(s->desc, "From ./.agents/skills");
+        s = skill_find("home-agents"); CHECK(s != NULL);
+        if (s) CHECK_STR(s->desc, "From ~/.agents/skills");
+        s = skill_find("ccskill"); CHECK(s != NULL);
+        if (s) CHECK_STR(s->desc, "The ~/.agents ccskill");   /* ~/.agents/skills is read before ~/.claude/skills */
+        s = skill_find("rev"); CHECK(s != NULL);
+        if (s) CHECK_STR(s->desc, "Review things");   /* .corbienest's: before ./.agents' and both .claude ones */
+        CHECK(skill_find("appskill") == NULL);
+        CHECK(mkdir_p(P(".claude/agents")) == 0 && mkdir_p(".corbienest/agents") == 0);
+        const char *a1 = "---\nname: cc-only-agent\ndescription: From ~/.claude/agents\ntools: Read\n---\nRole.\n";
+        const char *a2 = "---\nname: cc-shared-agent\ndescription: Claude's copy\n---\nOld.\n";
+        const char *a3 = "---\nname: cc-shared-agent\ndescription: Ours\n---\nNew.\n";
+        CHECK(write_whole_file(P(".claude/agents/cc-only-agent.md"), a1, strlen(a1)) == 0);
+        CHECK(write_whole_file(P(".claude/agents/cc-shared-agent.md"), a2, strlen(a2)) == 0);
+        CHECK(write_whole_file(".corbienest/agents/cc-shared-agent.md", a3, strlen(a3)) == 0);
+        agents_load();
+        const agent_t *ag = agent_find("cc-only-agent"); CHECK(ag != NULL);
+        if (ag) CHECK_STR(ag->description, "From ~/.claude/agents");
+        ag = agent_find("cc-shared-agent"); CHECK(ag != NULL);
+        if (ag) CHECK_STR(ag->description, "Ours");   /* the project's own file wins over both .claude ones */
+        if (oh) { setenv("HOME", oh, 1); free(oh); } else unsetenv("HOME");
+        agents_load();
+    }
     CHECK(chdir(old) == 0);
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
 }
