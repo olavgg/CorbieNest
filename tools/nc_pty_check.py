@@ -12,6 +12,9 @@ can cut the replies in two with a pause between the halves.
 
     tools/nc_pty_check.py                          # whole replies
     SPLIT=12 GAP=0.002 tools/nc_pty_check.py       # every reply cut after 12 bytes, 2 ms apart
+    ROUND=2 ONLY=191 SPLIT=1 GAP=0.01 DA1FIRST=1 tools/nc_pty_check.py
+                                                   # one reply cut right after its ESC (iTerm2 on macOS: a
+                                                   # 1 KB read cuts the replies anywhere)
     ROUND=2 ONLY=194 SPLIT=12 GAP=0.01 DA1FIRST=1 tools/nc_pty_check.py
                                                    # only palette entry 194 of the second init (the
                                                    # first is nc_probe's child) cut, DA1 answered first
@@ -193,7 +196,11 @@ if pyte and status == 0:
     screen = pyte.Screen(COLS, ROWS)
     pyte.ByteStream(screen).feed(data)
     up = any("[×]" in row for row in screen.display)
-    print("banner up at the end: %s" % up)
+    shown = "\n".join(screen.display)
+    on_screen = "rgb:" in shown or "]4;" in shown      # notcurses draws cell by cell: the bytes alone can miss a reply's text
+    print("banner up at the end: %s · reply text on the screen: %s" % (up, on_screen))
+    if on_screen:
+        status = 1
     if CLICK:
         if up:
             status = 2

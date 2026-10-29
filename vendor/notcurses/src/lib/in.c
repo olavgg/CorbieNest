@@ -2434,12 +2434,11 @@ process_melange(inputctx* ictx, const unsigned char* buf, int* bufused){
       consumed = process_escape(ictx, buf + offset, *bufused);
       if(consumed < 0){
         if(ictx->midescape){
-          // corbienest: a partial escape that fills the buffer (or one of one or two bytes: Esc, Alt+key) is given up
-          // at once; a longer one at the start of the buffer is a terminal reply cut between two writes (iTerm2's
-          // palette replies), so block_on_input waits for the rest and it is given up only when nothing came
+          // corbienest: a partial escape at the start of the buffer may be a terminal reply cut between two reads (a
+          // 1 KB read cuts iTerm2's 7 KB of palette replies anywhere, after the ESC too), so block_on_input waits for
+          // the rest, and it is given up only when nothing came (a lone Esc key) or it fills the buffer
           if(*bufused != -consumed ||
-             (*bufused == origlen && (ictx->amata.used <= 2 || ictx->midtimeout ||
-                                      origlen >= (int)sizeof(ictx->ibuf)))){
+             (*bufused == origlen && (ictx->midtimeout || origlen >= (int)sizeof(ictx->ibuf)))){
             // not at the end; treat it as input. no need to move between
             // buffers; simply ensure we process it as input, and don't mark
             // anything as consumed.
@@ -2525,10 +2524,11 @@ block_on_input(inputctx* ictx, unsigned* rtfd, unsigned* rifd){
   logtrace("blocking on input availability");
   *rtfd = *rifd = 0;
   unsigned nonblock = ictx->midescape;
-  // corbienest: the rest of a partial escape longer than Esc or Alt+key is waited for (a terminal can write a reply
-  // in pieces); MIDESCAPE_WAIT_MS bounds it, and midtimeout says it ran out
-  enum { MIDESCAPE_WAIT_MS = 100 };
-  int midwait = nonblock && ictx->amata.used > 2 ? MIDESCAPE_WAIT_MS : 0;
+  // corbienest: the rest of a partial escape is waited for (a read can cut a terminal's reply anywhere) and midtimeout
+  // says it ran out. MIDESCAPE_WAIT_MS for a longer part, and for any during init, when replies are expected; a lone
+  // ESC or ESC plus one byte after init is most likely the Esc key (or Alt+key), so it waits ESC_WAIT_MS only
+  enum { MIDESCAPE_WAIT_MS = 100, ESC_WAIT_MS = 25 };
+  int midwait = !nonblock ? 0 : (ictx->initdata || ictx->amata.used > 2) ? MIDESCAPE_WAIT_MS : ESC_WAIT_MS;
   ictx->midtimeout = 0;
   if(nonblock){
     loginfo("nonblocking read to check for completion");
