@@ -1372,7 +1372,7 @@ static void cmd_sandbox(const char *arg) {
 static void cmd_agents(const char *arg) {
     if (arg && !strcmp(arg, "reload")) { printf(C_GREEN "✓ %d sub-agent%s" C_RESET "\n", agents_load(), agents_count() == 1 ? "" : "s"); return; }
     if (arg && *arg) { printf("usage: /agents [reload]\n"); return; }
-    if (!agents_count()) { printf(C_DIM "  no sub-agent files. Add NAME.md to .corbienest/agents/ (this project) or %s/agents/ (yours): frontmatter name, description, tools, model; the body is its role" C_RESET "\n", config_dir()); return; }
+    if (!agents_count()) { printf(C_DIM "  no sub-agent files. Add NAME.md to .agents/agents/ (this project) or %s/agents/ (yours): frontmatter name, description, tools, model; the body is its role" C_RESET "\n", config_dir()); return; }
     for (int i = 0; i < agents_count(); i++) {
         const agent_t *a = agent_get(i);
         printf("  %2d. " C_BOLD "%s" C_RESET " — %s\n", i + 1, a->name, a->description);
@@ -4804,7 +4804,7 @@ static void cmd_skills(const char *arg) {
     int n = skills_count();
     if (!n) {
         printf(C_DIM "no skills found." C_RESET "\n"
-               "  put a SKILL.md in .corbienest/skills/NAME/ (project) or %s/skills/NAME/ (user), or run " C_BOLD "/skills new NAME" C_RESET "\n", config_dir());
+               "  put a SKILL.md in .agents/skills/NAME/ (project) or %s/skills/NAME/ (user), or run " C_BOLD "/skills new NAME" C_RESET "\n", config_dir());
         return;
     }
     int w = term_width();
@@ -6683,6 +6683,56 @@ static bool hosted_fallback(bool quiet) {
     return false;
 }
 
+/* The skills and agents of .corbienest (this project) and of the config directory (yours) can move into .agents, the folder
+ * other tools read (agents: our own convention, no standard names one). Asked once per scope, at the screen, before the
+ * first prompt; a "no" is remembered per folder (<config>/migrate-declined). Only skills/ and agents/ move: memory.md,
+ * commands/, hooks and the config stay. Never with -p, a pipe or a resumed session; CORBIENEST_NO_MIGRATE=1 skips it. */
+static void migrate_offer(void) {
+    bool changed = false;
+    for (int scope = 0; scope < 2; scope++) {
+        bool user = scope == 1;
+        migrate_pair pr[2]; int np = migrate_pairs(user, pr);
+        if (!np) continue;
+        int ns = 0, na = 0;
+        for (int i = 0; i < np; i++) { if (!strcmp(pr[i].kind, "skills")) ns = pr[i].n; else na = pr[i].n; }
+        char what[120] = "";
+        if (ns) snprintf(what, sizeof what, "%d skill%s", ns, ns == 1 ? "" : "s");
+        if (na) snprintf(what + strlen(what), sizeof what - strlen(what), "%s%d agent%s", ns ? " and " : "", na, na == 1 ? "" : "s");
+        char title[300], d0[600], d2[300];
+        snprintf(title, sizeof title, "Move %s from %s to %s?", what, user ? "your config folder" : ".corbienest/", user ? "~/.agents/" : ".agents/");
+        snprintf(d0, sizeof d0, "Skills go to %s/skills, which other tools read too; agents to %s/agents, which only Corbie Nest reads. Nothing is overwritten. Memory, commands and permissions stay%s",
+                 user ? "~/.agents" : ".agents", user ? "~/.agents" : ".agents",
+                 user ? "." : ". If they are tracked in git, the move shows up as changes to commit.");
+        snprintf(d2, sizeof d2, "Remembered in %s/migrate-declined", config_dir());
+        const char *items[3] = { "Move them", "Not now", "No, never ask about these folders" };
+        const char *descs[3] = { d0, "Ask again the next time Corbie Nest starts here", d2 };
+        int pick = term_select_block(title, items, descs, 3, 0);   /* blocks: the description under its title (the labels are not short) */
+        if (pick == 2) { for (int i = 0; i < np; i++) migrate_decline(pr[i].key); continue; }
+        if (pick != 0) continue;   /* Esc, or not now */
+        int moved = 0;
+        sbuf left; sb_init(&left);
+        for (int i = 0; i < np; i++) {
+            dir_move_result r = dir_migrate(pr[i].from, pr[i].to);
+            if (r.refused) { printf(C_YELLOW "  %s was not moved: it, or its destination, is a symlink or cannot be written" C_RESET "\n", pr[i].from); continue; }
+            moved += r.moved;
+            if (r.names[0]) sb_printf(&left, "%s%s", left.len ? ", " : "", r.names);
+        }
+        if (!user) rmdir(".corbienest");   /* only when nothing else is in it */
+        printf(C_GREEN "✓ moved %d item%s into %s" C_RESET "\n", moved, moved == 1 ? "" : "s", user ? "~/.agents" : ".agents");
+        if (left.len) printf(C_YELLOW "  left where they were (the name is already there, or the move failed): %s" C_RESET "\n", left.data);
+        sb_free(&left);
+        /* a skill that names its old folder (run .corbienest/skills/x/run.sh) is broken by the move: say where */
+        static const char *const old[2] = { "corbienest/skills/", "corbienest/agents/" };
+        sbuf hits; sb_init(&hits);
+        int nh = 0;
+        for (int i = 0; i < np; i++) nh += text_mentions(pr[i].to, old, 2, &hits, 8 - nh > 0 ? 8 - nh : 0);
+        if (nh) printf(C_YELLOW "  these still name the old folder, and need their paths updated:" C_RESET "\n" C_DIM "%s" C_RESET, hits.data);
+        sb_free(&hits);
+        changed = changed || moved > 0;
+    }
+    if (changed) { skills_load(); agents_load(); }
+}
+
 int main(int argc, char **argv) {
     g_argc = argc; g_argv = argv;
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
@@ -6869,6 +6919,7 @@ int main(int argc, char **argv) {
         return aborted ? 130 : g_turn_failed ? 1 : 0;   /* -p: an error (the model did not answer) is a failed run */
     }
 
+    if (g_cfg.interactive && !resume_id && !resume_latest && !getenv("CORBIENEST_NO_MIGRATE")) migrate_offer();
     banner();
     if (term_trace_path())   /* it holds the conversation: nobody should be recording one without seeing so */
         printf(C_YELLOW "trace:" C_RESET C_DIM " everything drawn and typed in this session is written to %s" C_RESET "\n\n", term_trace_path());

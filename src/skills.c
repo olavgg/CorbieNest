@@ -180,16 +180,16 @@ char *skills_prompt_section(void) {
                 "if a task clearly matches a skill's description you may also read its SKILL.md with read_file and follow it. Available:\n");
     for (int i = 0; i < g_nskills; i++)
         sb_printf(&b, "- /%s — %s (%s)\n", g_skills[i].name, *g_skills[i].desc ? g_skills[i].desc : "no description", g_skills[i].path);
-    sb_puts(&b, "When asked to create or extend a skill: put it in .corbienest/skills/<name>/SKILL.md (frontmatter with name + description, then the instructions; "
+    sb_puts(&b, "When asked to create or extend a skill: put it in .agents/skills/<name>/SKILL.md (frontmatter with name + description, then the instructions; "
                 "$ARGUMENTS is replaced by the user's arguments). Helper programs that a skill needs must be written in C (compiled with cc/make); "
                 "use Rust only when third-party libraries are genuinely required; Python is a last resort only.\n");
     return sb_detach(&b);
 }
 
-/* Scaffold .corbienest/skills/<name>/SKILL.md; returns 0 ok, -1 error (errno) , 1 exists */
+/* Scaffold .agents/skills/<name>/SKILL.md; returns 0 ok, -1 error (errno) , 1 exists */
 int skill_scaffold(const char *name, char *path_out, size_t n) {
     if (!valid_name(name)) { errno = EINVAL; return -1; }
-    char dir[1024]; snprintf(dir, sizeof dir, ".corbienest/skills/%s", name);
+    char dir[1024]; snprintf(dir, sizeof dir, ".agents/skills/%s", name);
     snprintf(path_out, n, "%s/SKILL.md", dir);
     if (is_file(path_out)) return 1;
     if (mkdir_p(dir) != 0) return -1;
@@ -214,4 +214,160 @@ int skill_scaffold(const char *name, char *path_out, size_t n) {
     int rc = write_whole_file(path_out, b.data, b.len);
     sb_free(&b);
     return rc == 0 ? 0 : -1;
+}
+
+/* ---------- moving the skills and agents of .corbienest into .agents ----------
+ * Only the skills/ and agents/ folders move: memory.md (rewritten by the program itself), commands/, hooks and the
+ * rest of the config directory stay where they are, so .corbienest is removed only when nothing is left in it.
+ * Nothing is overwritten, nothing is copied, nothing is removed that is not empty. */
+#include <limits.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+static bool is_real_dir(const char *path) {   /* a folder that is not a symlink */
+    struct stat st;
+    return lstat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+static bool is_symlink(const char *path) {
+    struct stat st;
+    return lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+}
+int dir_entries(const char *dir) {
+    if (!is_real_dir(dir)) return -1;
+    DIR *dp = opendir(dir);
+    if (!dp) return -1;
+    int n = 0;
+    struct dirent *de;
+    while ((de = readdir(dp))) if (de->d_name[0] != '.') n++;   /* as scan_dir: hidden entries are not skills */
+    closedir(dp);
+    return n;
+}
+
+dir_move_result dir_migrate(const char *from, const char *to) {
+    dir_move_result r; memset(&r, 0, sizeof r);
+    if (!is_real_dir(from)) { r.refused = true; return r; }   /* a symlinked source may be shared: moving out of it would take files from elsewhere */
+    char parent[1100]; snprintf(parent, sizeof parent, "%s", to);
+    char *sl = strrchr(parent, '/'); if (sl) *sl = 0;
+    if ((sl && is_symlink(parent)) || is_symlink(to)) { r.refused = true; return r; }   /* ... and so could a symlinked destination carry them out of the project */
+    if (mkdir_p(to) != 0) { r.refused = true; return r; }
+    DIR *dp = opendir(from);
+    if (!dp) { r.refused = true; return r; }
+    char **names = NULL; int n = 0, cap = 0;
+    struct dirent *de;
+    while ((de = readdir(dp))) {
+        if (de->d_name[0] == '.') continue;
+        if (n == cap) { cap = cap ? cap * 2 : 16; names = xrealloc(names, sizeof(char*) * (size_t)cap); }
+        names[n++] = xstrdup(de->d_name);
+    }
+    closedir(dp);
+    qsort(names, (size_t)n, sizeof(char*), cmp_name);
+    size_t nl = 0;
+    for (int i = 0; i < n; i++) {
+        char src[2300], dst[2300]; struct stat st;
+        snprintf(src, sizeof src, "%s/%s", from, names[i]); snprintf(dst, sizeof dst, "%s/%s", to, names[i]);
+        bool left = false;
+        if (lstat(dst, &st) == 0 || errno != ENOENT) { r.clashed++; left = true; }   /* rename(2) would replace it, silently: look first */
+        else if (rename(src, dst) == 0) r.moved++;
+        else if (errno == ENOENT) { /* another session moved it first */ }
+        else { r.failed++; left = true; }   /* another filesystem (EXDEV) and the like: left where it is */
+        if (left && nl + strlen(names[i]) + 3 < sizeof r.names) nl += (size_t)snprintf(r.names + nl, sizeof r.names - nl, "%s%s", nl ? ", " : "", names[i]);
+        free(names[i]);
+    }
+    free(names);
+    rmdir(from);   /* only when it ended empty */
+    return r;
+}
+
+static char *declined_path(void) {
+    char p[1200]; snprintf(p, sizeof p, "%s/migrate-declined", config_dir());
+    return xstrdup(p);
+}
+bool migrate_declined(const char *key) {
+    char *p = declined_path(); size_t n; char *d = read_whole_file(p, &n, 64 * 1024); free(p);
+    if (!d) return false;
+    bool hit = false;
+    char *save = NULL;
+    for (char *l = strtok_r(d, "\n", &save); l && !hit; l = strtok_r(NULL, "\n", &save)) hit = !strcmp(l, key);
+    free(d);
+    return hit;
+}
+void migrate_decline(const char *key) {
+    if (migrate_declined(key)) return;
+    char *p = declined_path(); size_t n = 0; char *d = read_whole_file(p, &n, 64 * 1024);
+    sbuf b; sb_init(&b);
+    if (d) { sb_append(&b, d, n); if (n && d[n-1] != '\n') sb_putc(&b, '\n'); }
+    sb_printf(&b, "%s\n", key);
+    write_whole_file_atomic(p, b.data, b.len);
+    sb_free(&b); free(d); free(p);
+}
+
+int migrate_pairs(bool user_scope, migrate_pair out[2]) {
+    static const char *kinds[2] = { "skills", "agents" };
+    char *home = expand_home("~");
+    if (!user_scope) {   /* in $HOME the project's .agents IS ~/.agents: the user scope covers it */
+        char cwdp[PATH_MAX], homep[PATH_MAX];   /* realpath(3) may write PATH_MAX bytes */
+        if (!realpath(".", cwdp) || (home && realpath(home, homep) && !strcmp(cwdp, homep))) { free(home); return 0; }
+    }
+    int n = 0;
+    for (int k = 0; k < 2; k++) {
+        migrate_pair *p = &out[n];
+        memset(p, 0, sizeof *p);
+        if (user_scope) {
+            snprintf(p->from, sizeof p->from, "%s/%s", config_dir(), kinds[k]);
+            snprintf(p->to, sizeof p->to, "%s/.agents/%s", home ? home : "", kinds[k]);
+        } else {
+            snprintf(p->from, sizeof p->from, ".corbienest/%s", kinds[k]);
+            snprintf(p->to, sizeof p->to, ".agents/%s", kinds[k]);
+        }
+        p->kind = kinds[k];
+        p->n = dir_entries(p->from);
+        if (p->n <= 0) continue;
+        char rt[PATH_MAX], rf[PATH_MAX];
+        if (!realpath(p->from, rf)) continue;
+        size_t kl = strlen(rf);
+        if (kl >= sizeof p->key) continue;   /* a path that long is not one we keep a decline for */
+        memcpy(p->key, rf, kl + 1);
+        if (realpath(p->to, rt) && !strcmp(rf, rt)) continue;   /* the same folder (a config dir that is ~/.agents) */
+        if (migrate_declined(p->key)) continue;
+        n++;
+    }
+    free(home);
+    return n;
+}
+
+/* Files below dir that still name an old path: a skill that says "run .corbienest/skills/x/run.sh" is broken by the move. */
+static void mentions_walk(const char *dir, int depth, const char *const *needles, int nn, sbuf *out, int *hits, int max_hits, int *files) {
+    DIR *dp = opendir(dir);
+    if (!dp) return;
+    struct dirent *de;
+    while ((de = readdir(dp)) && *hits < max_hits && *files < 400) {
+        if (de->d_name[0] == '.') continue;
+        char path[2300]; snprintf(path, sizeof path, "%s/%s", dir, de->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) { if (depth < 4) mentions_walk(path, depth + 1, needles, nn, out, hits, max_hits, files); continue; }
+        if (!S_ISREG(st.st_mode) || st.st_size > 256 * 1024) continue;
+        (*files)++;
+        size_t len; char *d = read_whole_file(path, &len, 256 * 1024);
+        if (!d) continue;
+        if (memchr(d, 0, len)) { free(d); continue; }   /* a binary */
+        int line = 1;
+        for (char *p = d; p && *p && *hits < max_hits; line++) {
+            char *e = strchr(p, '\n');
+            size_t ll = e ? (size_t)(e - p) : strlen(p);
+            for (int i = 0; i < nn; i++) {
+                size_t nl = strlen(needles[i]);
+                for (const char *q = p; q + nl <= p + ll; q++) if (!memcmp(q, needles[i], nl)) { sb_printf(out, "%s:%d\n", path, line); (*hits)++; goto next_line; }
+            }
+            next_line:
+            p = e ? e + 1 : NULL;
+        }
+        free(d);
+    }
+    closedir(dp);
+}
+int text_mentions(const char *dir, const char *const *needles, int nn, sbuf *out, int max_hits) {
+    int hits = 0, files = 0;
+    mentions_walk(dir, 0, needles, nn, out, &hits, max_hits, &files);
+    return hits;
 }

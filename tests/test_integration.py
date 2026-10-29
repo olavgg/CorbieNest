@@ -90,6 +90,7 @@ WORK = os.path.realpath(tempfile.mkdtemp(prefix="crowtest_"))   # realpath: the 
 CFG = tempfile.mkdtemp(prefix="crowcfg_")
 ENV = dict(os.environ, XDG_CONFIG_HOME=CFG, OLLAMA_HOST=HOST, TERM="xterm-256color", HOME=WORK)
 ENV.pop("CORBIENEST_MODEL", None)
+ENV["CORBIENEST_NO_MIGRATE"] = "1"   # the start-up offer to move .corbienest's skills and agents into .agents would wait for an answer in every session below that has such a folder; its own test lifts this
 # A hosted key in the shell is the user's, not the test's: the tests that need one set it themselves (KEYS, TENV),
 # and the rest must not reach a hosted API (that costs money) because the shell happens to export one.
 for _k in ("XAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"): ENV.pop(_k, None)
@@ -901,8 +902,8 @@ s.send("/skills reload\r"); check(s.expect("/fix-issue"), "Claude-Code-style .cl
 s.send("/fix-issue 42\r"); check(s.expect("skill fix-issue"), "custom command runs"); s.expect("tok/s")
 check("Fix issue 42 following" in requests()[-1]["messages"][-1]["content"], "$ARGUMENTS substituted in a command file")
 shutil.rmtree(os.path.join(WORK, ".claude"))
-s.send("/skills new deploy\r"); check(s.expect("created .corbienest/skills/deploy/SKILL.md"), "/skills new")
-check(os.path.exists(os.path.join(WORK, ".corbienest", "skills", "deploy", "SKILL.md")), "scaffold written")
+s.send("/skills new deploy\r"); check(s.expect("created .agents/skills/deploy/SKILL.md"), "/skills new")
+check(os.path.exists(os.path.join(WORK, ".agents", "skills", "deploy", "SKILL.md")), "scaffold written")
 
 print("test interactive: bundled skills: read-only, listed as bundled; a user's skill of the same name wins")
 BWORK = tempfile.mkdtemp(prefix="crowbund_")   # no .corbienest here: only the bundled skills can show
@@ -918,6 +919,54 @@ open(os.path.join(BCFG, "corbienest", "skills", "long-tests", "SKILL.md"), "w").
 sb = Session(["-m", "fake-coder:latest", "--yolo"], env=ENVB, cwd=BWORK); sb.expect("Ctrl-D to quit")
 sb.send("/skills\r"); check(sb.expect("USER OVERRIDE") and sb.expect("[user]"), "a user's skill of the same name shadows the bundled one")
 sb.close()
+
+print("test interactive: the offer to move .corbienest's skills and agents into .agents")
+MW = os.path.realpath(tempfile.mkdtemp(prefix="crowmig_")); MH = tempfile.mkdtemp(prefix="crowmigh_"); MC = tempfile.mkdtemp(prefix="crowmigc_")
+def mig_files():
+    os.makedirs(os.path.join(MW, ".corbienest", "skills", "movedskill"), exist_ok=True)
+    open(os.path.join(MW, ".corbienest", "skills", "movedskill", "SKILL.md"), "w").write("---\nname: movedskill\ndescription: Moved by the offer\n---\nRun .corbienest/skills/movedskill/run.sh now.\n")
+    os.makedirs(os.path.join(MW, ".corbienest", "agents"), exist_ok=True)
+    open(os.path.join(MW, ".corbienest", "agents", "moveda.md"), "w").write("---\nname: moveda\ndescription: An agent that moved\n---\nRole.\n")
+mig_files()
+open(os.path.join(MW, ".corbienest", "memory.md"), "w").write("# Project memory\n- a fact\n")
+ENVM = dict(ENV, XDG_CONFIG_HOME=MC, HOME=MH); del ENVM["CORBIENEST_NO_MIGRATE"]
+def mig_session(): return Session(["-m", "fake-coder:latest"], env=ENVM, cwd=MW, banner=True)
+m = mig_session()
+check(m.expect("Move 1 skill and 1 agent from .corbienest/ to .agents/"), "the offer names what would move")
+check("Move them" in m.text() and "Not now" in m.text() and "never ask about these folders" in m.text(), "...and the three answers")
+m.send("\r")   # the first row: Move them
+check(m.expect("moved 2 items into .agents"), "answering the first row moves them")
+check(m.expect("still name the old folder") and "movedskill/SKILL.md:5" in m.text(), "a file that still names the old folder is pointed out")
+m.close_banner()
+check(os.path.isfile(os.path.join(MW, ".agents", "skills", "movedskill", "SKILL.md")) and os.path.isfile(os.path.join(MW, ".agents", "agents", "moveda.md")), "the skill and the agent are in .agents")
+check(not os.path.exists(os.path.join(MW, ".corbienest", "skills")) and not os.path.exists(os.path.join(MW, ".corbienest", "agents")), "the emptied folders are gone")
+check(os.path.isfile(os.path.join(MW, ".corbienest", "memory.md")), "memory.md stays where it is")
+m.send("/skills\r"); check(m.expect("/movedskill"), "the moved skill is listed without a restart")
+m.send("/agents\r"); check(m.expect("moveda"), "the moved agent is listed too")
+m.send("\x04"); m.close()
+m = mig_session(); m.close_banner(); check("Move " not in m.text(), "nothing left to move: no offer"); m.send("\x04"); m.close()
+mig_files()
+m = mig_session(); check(m.expect("Move 1 skill and 1 agent"), "new files in the old folders: the offer is back")
+m.send("\x1b", wait=0.3)   # Esc: not now
+m.close_banner(); check(os.path.isfile(os.path.join(MW, ".corbienest", "skills", "movedskill", "SKILL.md")), "Esc moves nothing")
+m.send("\x04"); m.close()
+m = mig_session(); check(m.expect("Move 1 skill and 1 agent"), "not now: asked again at the next start")
+m.send("\x1b[B\x1b[B\r", wait=0.4)   # the third row: never ask about these folders
+m.close_banner()
+check(os.path.isfile(os.path.join(MW, ".corbienest", "skills", "movedskill", "SKILL.md")), "never: nothing moved")
+declined = open(os.path.join(MC, "corbienest", "migrate-declined")).read().split()
+check(declined == [os.path.join(MW, ".corbienest", "skills"), os.path.join(MW, ".corbienest", "agents")], f"never: both folders are remembered ({declined})")
+m.send("\x04"); m.close()
+m = mig_session(); m.close_banner(); check("Move " not in m.text(), "a declined folder is not offered again"); m.send("\x04"); m.close()
+# the user scope: the config directory's skills and agents go to ~/.agents
+os.makedirs(os.path.join(MC, "corbienest", "skills", "userskill"), exist_ok=True)
+open(os.path.join(MC, "corbienest", "skills", "userskill", "SKILL.md"), "w").write("---\nname: userskill\ndescription: Yours\n---\nx\n")
+m = mig_session(); check(m.expect("Move 1 skill from your config folder to ~/.agents/"), "the config directory's skills are offered too")
+m.send("\r"); check(m.expect("moved 1 item into ~/.agents"), "...and move")
+m.close_banner()
+check(os.path.isfile(os.path.join(MH, ".agents", "skills", "userskill", "SKILL.md")) and not os.path.exists(os.path.join(MC, "corbienest", "skills")), "the skill is in ~/.agents, not in the config directory")
+check(os.path.isfile(os.path.join(MC, "corbienest", "migrate-declined")), "the config directory's other files stay")
+m.send("\x04"); m.close()
 
 print("test interactive: ctrl-c interrupts generation; type-ahead")
 s.send("SLOW\r"); check(s.expect("two"), "streaming started")

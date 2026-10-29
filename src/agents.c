@@ -3,8 +3,11 @@
  * An agent is a Markdown file, the frontmatter for its settings and the body for its role (added to the sub-agent's
  * prompt). Where they are read, in this order (the first file of a name is the one used):
  *   .corbienest/agents/NAME.md     this project
+ *   .agents/agents/NAME.md         this project (Corbie Nest's own convention, next to the standard .agents/skills: no
+ *                                  standard names a folder for sub-agents, so other tools do not read it)
  *   .claude/agents/NAME.md         this project (Claude Code's folder)
  *   <config>/agents/NAME.md        yours, for every project
+ *   ~/.agents/agents/NAME.md       yours too (the same convention)
  *   ~/.claude/agents/NAME.md       Claude Code's own, for every project (read last)
  * The frontmatter keys: name (the file name by default), description, tools (a comma list of sub-agent tools; the
  * default is all of them), model (a model for this agent; the default is the sub-agents' model). An agent can use only
@@ -95,9 +98,11 @@ int agents_load(void) {
     char cwd[1024], p[1200];
     if (getcwd(cwd, sizeof cwd)) {
         snprintf(p, sizeof p, "%s/.corbienest/agents", cwd); read_dir(p);
+        snprintf(p, sizeof p, "%s/.agents/agents", cwd); read_dir(p);
         snprintf(p, sizeof p, "%s/.claude/agents", cwd); read_dir(p);
     }
     snprintf(p, sizeof p, "%s/agents", config_dir()); read_dir(p);
+    char *ag = expand_home("~/.agents/agents"); read_dir(ag); free(ag);
     char *cc = expand_home("~/.claude/agents"); read_dir(cc); free(cc);   /* Claude Code's, as they are: last, so any file of ours of the same name wins */
     return g_nagent;
 }

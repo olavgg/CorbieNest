@@ -1008,8 +1008,79 @@ static void test_skills(void) {
         if (ag) CHECK_STR(ag->description, "From ~/.claude/agents");
         ag = agent_find("cc-shared-agent"); CHECK(ag != NULL);
         if (ag) CHECK_STR(ag->description, "Ours");   /* the project's own file wins over both .claude ones */
+        /* .agents/agents (project) and ~/.agents/agents (user): after .corbienest, before .claude; the user's before ~/.claude */
+        CHECK(mkdir_p(".agents/agents") == 0 && mkdir_p(P(".agents/agents")) == 0);
+        const char *b1 = "---\nname: dot-agents-proj\ndescription: From ./.agents/agents\n---\nR.\n";
+        const char *b2 = "---\nname: cc-shared-agent\ndescription: The .agents copy\n---\nNot this.\n";
+        const char *b3 = "---\nname: cc-only-agent\ndescription: From ~/.agents/agents\n---\nR.\n";
+        CHECK(write_whole_file(".agents/agents/dot-agents-proj.md", b1, strlen(b1)) == 0);
+        CHECK(write_whole_file(".agents/agents/cc-shared-agent.md", b2, strlen(b2)) == 0);
+        CHECK(write_whole_file(P(".agents/agents/cc-only-agent.md"), b3, strlen(b3)) == 0);
+        agents_load();
+        ag = agent_find("dot-agents-proj"); CHECK(ag != NULL);
+        if (ag) CHECK_STR(ag->description, "From ./.agents/agents");
+        ag = agent_find("cc-shared-agent"); CHECK(ag != NULL);
+        if (ag) CHECK_STR(ag->description, "Ours");   /* .corbienest's file before .agents' */
+        ag = agent_find("cc-only-agent"); CHECK(ag != NULL);
+        if (ag) CHECK_STR(ag->description, "From ~/.agents/agents");   /* ~/.agents/agents before ~/.claude/agents */
         if (oh) { setenv("HOME", oh, 1); free(oh); } else unsetenv("HOME");
         agents_load();
+    }
+    /* moving a folder's entries into another (the .corbienest -> .agents offer): nothing is overwritten, a symlink is never
+     * followed, an emptied source goes, one with something left stays */
+    {
+        CHECK(mkdir_p("mv/src/a-skill") == 0 && mkdir_p("mv/src/b-skill") == 0 && mkdir_p("mv/dst") == 0);
+        CHECK(write_whole_file("mv/src/a-skill/SKILL.md", "A\n", 2) == 0 && write_whole_file("mv/src/b-skill/SKILL.md", "B-new\n", 6) == 0);
+        CHECK(write_whole_file("mv/src/flat.md", "flat\n", 5) == 0 && write_whole_file("mv/src/.hidden", "h", 1) == 0);
+        CHECK(mkdir_p("mv/dst/b-skill") == 0 && write_whole_file("mv/dst/b-skill/SKILL.md", "B-old\n", 6) == 0);   /* a name that is taken there */
+        CHECK(dir_entries("mv/src") == 3 && dir_entries("mv/missing") == -1);   /* the hidden one is not counted */
+        dir_move_result r = dir_migrate("mv/src", "mv/dst");
+        CHECK(!r.refused && r.moved == 2 && r.clashed == 1 && r.failed == 0);
+        CHECK_STR(r.names, "b-skill");
+        CHECK(is_file("mv/dst/a-skill/SKILL.md") && is_file("mv/dst/flat.md") && !is_file("mv/src/a-skill/SKILL.md"));
+        size_t bl; char *bd = read_whole_file("mv/dst/b-skill/SKILL.md", &bl, 100);
+        CHECK(bd && !strcmp(bd, "B-old\n")); free(bd);   /* not replaced */
+        CHECK(is_file("mv/src/b-skill/SKILL.md") && is_dir("mv/src"));   /* what could not move, and so the folder, stays */
+        /* now the clash is gone: a second run moves it, and the emptied source folder is removed (its hidden file keeps it) */
+        CHECK(system("rm -rf mv/dst/b-skill") == 0);
+        r = dir_migrate("mv/src", "mv/dst");
+        CHECK(r.moved == 1 && r.clashed == 0 && is_file("mv/dst/b-skill/SKILL.md") && is_dir("mv/src"));   /* .hidden is still in it */
+        CHECK(unlink("mv/src/.hidden") == 0 && dir_migrate("mv/src", "mv/dst").moved == 0 && !is_dir("mv/src"));   /* nothing left to move, and the folder is empty now: gone */
+    }
+    {   /* a symlinked source or destination is refused: the entries could be taken from, or carried to, somewhere else */
+        CHECK(mkdir_p("sl/real") == 0 && mkdir_p("sl/src/x") == 0 && mkdir_p("sl/target") == 0);
+        CHECK(symlink("target", "sl/dstlink") == 0 && symlink("src", "sl/srclink") == 0);
+        dir_move_result r = dir_migrate("sl/src", "sl/dstlink");
+        CHECK(r.refused && r.moved == 0 && is_dir("sl/src/x"));
+        r = dir_migrate("sl/srclink", "sl/real");
+        CHECK(r.refused && r.moved == 0 && is_dir("sl/src/x") && dir_entries("sl/srclink") == -1);
+        CHECK(mkdir_p("sl/parent-real") == 0 && symlink("target", "sl/parent-real/agents") == 0);   /* the destination folder itself a symlink */
+        r = dir_migrate("sl/src", "sl/parent-real/agents");
+        CHECK(r.refused && is_dir("sl/src/x") && !is_dir("sl/target/x"));
+    }
+    {   /* the pairs the offer asks about: a folder with entries, once; a declined one never again */
+        char *oh = getenv("HOME") ? xstrdup(getenv("HOME")) : NULL;
+        char hm[600]; snprintf(hm, sizeof hm, "%s/home", dir);
+        setenv("HOME", hm, 1);
+        CHECK(system("rm -rf .corbienest .agents") == 0 && mkdir_p(".corbienest/skills/p1") == 0 && mkdir_p(".corbienest/agents") == 0);
+        CHECK(write_whole_file(".corbienest/agents/ag.md", "x", 1) == 0);
+        migrate_pair pr[2]; int np = migrate_pairs(false, pr);
+        CHECK(np == 2 && !strcmp(pr[0].kind, "skills") && pr[0].n == 1 && !strcmp(pr[1].kind, "agents") && !strcmp(pr[1].to, ".agents/agents"));
+        if (!strncmp(config_dir(), dir, strlen(dir))) {   /* only with the test's own config folder: the decline is written there */
+            CHECK(!migrate_declined(pr[0].key));
+            migrate_decline(pr[0].key); migrate_decline(pr[0].key);
+            CHECK(migrate_declined(pr[0].key) && !migrate_declined(pr[1].key));
+            np = migrate_pairs(false, pr);
+            CHECK(np == 1 && !strcmp(pr[0].kind, "agents"));
+        }
+        sbuf hits; sb_init(&hits);
+        { const char *mt = "see .corbienest/skills/x/run.sh\nno\n"; CHECK(write_whole_file(".corbienest/agents/ag.md", mt, strlen(mt)) == 0); }
+        const char *const needles[] = { "corbienest/skills/", "corbienest/agents/" };
+        CHECK(text_mentions(".corbienest/agents", needles, 2, &hits, 5) == 1 && strstr(hits.data, "ag.md:1"));
+        sb_free(&hits);
+        CHECK(setenv("HOME", dir, 1) == 0);   /* in $HOME the project scope is skipped: its .agents is ~/.agents */
+        CHECK(migrate_pairs(false, pr) == 0);
+        if (oh) { setenv("HOME", oh, 1); free(oh); } else unsetenv("HOME");
     }
     CHECK(chdir(old) == 0);
     char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir); if (system(cmd)) {}
