@@ -5903,7 +5903,7 @@ static int box_lines(int frame, int spark) {
         sbuf *o = &g_box_out[row]; sb_clear(o);
         int last = -1;   /* the colour the terminal has, along this row */
         if (row == 0 || row == H - 1) {
-            int bx = bw - BANNER_X_FROM_RIGHT - BANNER_X_W / 2;   /* the close button's first cell */
+            int bx, bx1; close_x_cols(0, bw, &bx, &bx1);   /* the close button's first cell */
             for (int x = 0; x < bw; x++) {
                 if (row == 0 && x >= bx && x < bx + BANNER_X_W) {   /* "[×]": bold, the × brightest: the close button */
                     if (x == bx + 1) sb_printf(o, "\x1b[1m%s×", th_fg(g_theme->brand));

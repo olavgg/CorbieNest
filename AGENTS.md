@@ -63,6 +63,12 @@ consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), 
   `OD`). Two changes in the vendored input make the paste match the ANSI reader: a CRLF is one break (an Enter keeps
   its byte), and a byte that is not UTF-8 is U+FFFD, one per byte, and a full input queue makes the input thread wait
   instead of dropping a key (`load_ncinput()`; a paste is thousands of keys, see its README).
+- Close buttons: every modal has a clickable `[×]` that is its Esc: the banner (top border), the `/usage` overlay (top border), the
+  paste view (right end of the title row) and the menus (`term_confirm`, `term_select`, the task list: top border in notcurses, the right end
+  of the first band row on the ANSI screen). `close_x_cols()` (common.h) is the one place that says which three cells; the drawer records them
+  (`g_mx[]` in term.c, `g_mx_*` in term_nc.c), the click is checked only while its modal is up, and the ANSI key is `K_CLOSE_X`, which each modal
+  loop turns into `K_ESC` (so a confirm answers "no", as Esc does); notcurses' `nc_getkey()` returns Esc for it, and the overlay is closed at
+  once. A new modal gets one the same way. The inline (no band) ANSI menus have none: they are not boxes.
 - Start-up in the notcurses UI: `nc_start()` runs `notcurses_init` in a child process first (`nc_probe()`, 2 s): a child that does not come back is killed, the terminal is restored and the ANSI UI runs. The vendored core has the DA1 fix for tmux 3.4+ (`\e[?1;2;4c`, upstream #2736, PR #2926), so under tmux the probe passes; the probe stays as the safety net for a terminal that still hangs.
 - History in the notcurses field: `g_browse` says a browse is on; `nc_unbrowse()` is the one reset. The position alone is not enough (it is set before a sent line is added to the history). The list yields ↑/↓ while browsing.
 - The notcurses field prints nothing it sent: `nc_echo_line()` (term.c) puts the line returned by `term_readline`/`term_ask_line` into the conversation, through `term_user_band()`, as the ANSI editor does.
