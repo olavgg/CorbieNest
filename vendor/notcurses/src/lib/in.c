@@ -93,6 +93,7 @@ typedef struct inputctx {
 
   unsigned midescape; // we're in the middle of a potential escape. we need
                       //  to do a nonblocking read and try to complete it.
+  unsigned midtimeout; // corbienest: the wait for the rest of a partial escape ended with nothing new (block_on_input)
   unsigned stdineof;  // have we seen an EOF on stdin?
 
   unsigned linesigs;  // are line discipline signals active?
@@ -2017,6 +2018,7 @@ create_inputctx(tinfo* ti, FILE* infp, int lmargin, int tmargin, int rmargin,
                             i->linesigs = linesigs_enabled;
                             i->tbufvalid = 0;
                             i->midescape = 0;
+                            i->midtimeout = 0;
                             i->lmargin = lmargin;
                             i->tmargin = tmargin;
                             i->rmargin = rmargin;
@@ -2432,12 +2434,23 @@ process_melange(inputctx* ictx, const unsigned char* buf, int* bufused){
       consumed = process_escape(ictx, buf + offset, *bufused);
       if(consumed < 0){
         if(ictx->midescape){
-          if(*bufused != -consumed || *bufused == origlen){
+          // corbienest: a partial escape that fills the buffer (or one of one or two bytes: Esc, Alt+key) is given up
+          // at once; a longer one at the start of the buffer is a terminal reply cut between two writes (iTerm2's
+          // palette replies), so block_on_input waits for the rest and it is given up only when nothing came
+          if(*bufused != -consumed ||
+             (*bufused == origlen && (ictx->amata.used <= 2 || ictx->midtimeout ||
+                                      origlen >= (int)sizeof(ictx->ibuf)))){
             // not at the end; treat it as input. no need to move between
             // buffers; simply ensure we process it as input, and don't mark
             // anything as consumed.
             ictx->midescape = 0;
+            // corbienest: and leave no state behind, or every later escape is walked from a stale position
+            ictx->amata.used = 0;
+            ictx->amata.state = 0;
+            ictx->amata.instring = 0;
+            ictx->amata.matchstart = NULL;
           }
+          ictx->midtimeout = 0;
         }
       }
     }
@@ -2512,12 +2525,17 @@ block_on_input(inputctx* ictx, unsigned* rtfd, unsigned* rifd){
   logtrace("blocking on input availability");
   *rtfd = *rifd = 0;
   unsigned nonblock = ictx->midescape;
+  // corbienest: the rest of a partial escape longer than Esc or Alt+key is waited for (a terminal can write a reply
+  // in pieces); MIDESCAPE_WAIT_MS bounds it, and midtimeout says it ran out
+  enum { MIDESCAPE_WAIT_MS = 100 };
+  int midwait = nonblock && ictx->amata.used > 2 ? MIDESCAPE_WAIT_MS : 0;
+  ictx->midtimeout = 0;
   if(nonblock){
     loginfo("nonblocking read to check for completion");
     ictx->midescape = 0;
   }
 #ifdef __MINGW32__
-  int timeoutms = nonblock ? 0 : -1;
+  int timeoutms = nonblock ? midwait : -1;   // corbienest: midwait, not 0
   DWORD ncount = 0;
   HANDLE handles[2];
   if(!ictx->stdineof){
@@ -2576,10 +2594,10 @@ block_on_input(inputctx* ictx, unsigned* rtfd, unsigned* rifd){
 #endif
   int events;
 #if defined(__APPLE__) || defined(__MINGW32__)
-  int timeoutms = nonblock ? 0 : -1;
+  int timeoutms = nonblock ? midwait : -1;   // corbienest: midwait, not 0
   while((events = poll(pfds, pfdcount, timeoutms)) < 0){ // FIXME smask?
 #else
-  struct timespec ts = { .tv_sec = 0, .tv_nsec = 0, };
+  struct timespec ts = { .tv_sec = 0, .tv_nsec = midwait * 1000000L, };   // corbienest: midwait, not 0
   struct timespec* pts = nonblock ? &ts : NULL;
   while((events = ppoll(pfds, pfdcount, pts, &smask)) < 0){
 #endif
@@ -2592,6 +2610,9 @@ block_on_input(inputctx* ictx, unsigned* rtfd, unsigned* rifd){
     }
   }
   loginfo("poll returned %d", events);
+  if(nonblock && midwait && events == 0){
+    ictx->midtimeout = 1;   // corbienest: the rest of the partial escape did not come
+  }
   pfdcount = 0;
   while(events){
     if(pfds[pfdcount].revents){

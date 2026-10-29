@@ -230,6 +230,12 @@ build must be warning-free with `-Wall -Wextra`.
   terminal only is found by replaying its trace, not by guessing: ask for one. The file holds
   the conversation, so it is created 0600 and the banner says when one is being written; keep
   it a recording — nothing may behave differently because it is on.
+- `tools/nc_pty_check.py` starts `corbie --ui notcurses` on a pty that plays the terminal: it
+  answers notcurses' start-up queries and can cut the replies in two (`SPLIT`, `GAP`, `ROUND`,
+  `ONLY`, `DA1FIRST`; `CLICK=y,x` or `CLICK=esc` after 4 s), and fails when a reply shows as text,
+  the ANSI fallback runs, or (with pyte) the banner closes by itself or stays up after the click.
+  A manual check of the vendored input layer (see its README), timing-dependent, not in `make test`.
+  Notcurses reads stdin on its own thread, so `CORBIENEST_TRACE` has no `I` records in that UI.
 - Enter while busy on a slash command first goes to `term_run_while_busy` (main.c's
   `run_slash_while_busy` / `slash_runs_while_busy`), which runs it there and then when it only
   reports state or flips a setting. Such a command runs *inside* the poll of a live request:

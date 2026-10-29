@@ -47,6 +47,17 @@ and FFI bindings, the demos, tests and tools, and the man pages.
   `corbienest:` in that file). Reapply it with the others.
   Not during init (`initdata` set): `notcurses_init()` reads no keys until the input thread has handed the
   replies over, so a wait there never ended; during init a full queue drops the key, as upstream does.
+- `src/lib/in.c`, `process_melange()` and `block_on_input()`: a terminal reply cut between two reads. Upstream
+  takes an unfinished escape at the start of the buffer as typed keys at once (so that a lone Esc is not held), and
+  leaves the escape automaton where it stopped. A reply that arrives in pieces (iTerm2's OSC 4 palette replies; on
+  macOS `BUFSIZ` is 1024, so the 7 KB burst of 256 replies is cut every 1024 bytes anyway) then came out as text,
+  `]4;194;rgb:d7d7/ffff/d7d7` in the input field, and every later escape was walked from the stale position: mouse
+  reports were misread (the banner's `[×]` did nothing), the DA1 reply was missed (an init that waited for ever), or
+  the `assert` in `process_escape()` aborted. Now an unfinished escape of more than two bytes (not Esc, not
+  Alt+key) is waited for: `block_on_input()` polls up to `MIDESCAPE_WAIT_MS` (100 ms) instead of 0 and sets
+  `midtimeout` when nothing came, and only then, or when the escape fills the buffer, is it given up as keys; a
+  give-up resets the automaton (`used`, `state`, `instring`, `matchstart`). Marked `corbienest:`; reapply it with
+  the others. `tools/nc_pty_check.py` plays such a terminal.
 
 Nothing else is changed. `make` compiles these files with the flags in the top-level Makefile
 (`NC_VFLAGS`): they are not held to our `-Werror`, and the two warnings upstream's own code has
@@ -65,4 +76,7 @@ Copy the same paths from a newer upstream tarball, reapply the change above wher
 not taken it, and check the upstream file list in `CMakeLists.txt` (`NCCORESRCS`, `COMPATSRC`,
 and the `src/media` files `USE_MULTIMEDIA=none` compiles). Then `make clean && make` and
 `make test`, and the tmux start-up check: `./corbienest --ui notcurses` in tmux must show
-`ui: notcurses` in the banner.
+`ui: notcurses` in the banner. Then the split-reply check, with pyte installed:
+`tools/nc_pty_check.py`, `SPLIT=12 GAP=0.002 tools/nc_pty_check.py` and
+`ROUND=2 ONLY=194 SPLIT=12 GAP=0.01 DA1FIRST=1 tools/nc_pty_check.py` must exit 0, and with
+`CLICK=10,100` (the banner's `[×]` at 40x120) too.
