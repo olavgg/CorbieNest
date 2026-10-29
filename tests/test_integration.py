@@ -506,6 +506,13 @@ msgs = requests()[-1]["messages"]
 check(msgs[-1]["role"] == "tool" and msgs[-1]["tool_name"] == "bash", "tool result message sent back")
 check("tool_calls" in msgs[-2], "assistant tool_calls kept in history")
 
+print("test show_bash=0 (/config bash hide): no bash header, command or output in the transcript; the model still gets the result")
+QCFG = tempfile.mkdtemp(prefix="crowquiet_")
+os.makedirs(os.path.join(QCFG, "corbienest")); open(os.path.join(QCFG, "corbienest", "config"), "w").write("show_bash=0\n")
+out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_BASH please"], env=dict(ENV, XDG_CONFIG_HOME=QCFG))
+check(rc == 0 and "bash(" not in out and "echo hello-from-tool" not in out and "exit code: 0" not in out, f"bash call not shown: {out!r}")
+check("Tool said: hello-from-tool" in out, "the model still got the output")
+
 print("test auto-compact in the middle of a turn hands the work back and carries on")
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "HUGE_TOOL please"])
 check("auto-compacting" in out, f"auto-compact fired between the tool result and the next call: {out!r}")
