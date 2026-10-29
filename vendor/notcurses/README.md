@@ -75,7 +75,7 @@ when all three are found (`NOTCURSES=auto`) and leaves it out otherwise.
 Copy the same paths from a newer upstream tarball, reapply the change above where upstream has
 not taken it, and check the upstream file list in `CMakeLists.txt` (`NCCORESRCS`, `COMPATSRC`,
 and the `src/media` files `USE_MULTIMEDIA=none` compiles). Then `make clean && make` and
-`make test`, and the tmux start-up check: `./corbienest --ui notcurses` in tmux must show
+`make test`, and the tmux start-up check: `./corbie --ui notcurses` in tmux must show
 `ui: notcurses` in the banner. Then the split-reply check, with pyte installed:
 `tools/nc_pty_check.py`, `SPLIT=12 GAP=0.002 tools/nc_pty_check.py` and
 `ROUND=2 ONLY=194 SPLIT=12 GAP=0.01 DA1FIRST=1 tools/nc_pty_check.py` must exit 0, and with
