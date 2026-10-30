@@ -19,7 +19,8 @@ made in (the first line of the trace says which):
 The trace is text, one record per line: "<ms> <kind> <payload>", the kinds being
 O (written to the terminal), H (output held back while scrolled back), I (read
 from the terminal), L (layout), V (scrollback viewer), B (activity label), N (an
-input event notcurses decoded: the notcurses UI has no I records). See
+input event notcurses decoded: the notcurses UI has no I records), S (scrollback
+lines spilled to the file or loaded back). See
 "trace" in src/term.c. It holds the conversation and everything typed.
 """
 import argparse
@@ -96,7 +97,7 @@ def info(path):
         if kind == "I":
             typed, typed_at, typed_end = payload, t, t
         else:
-            name = {"#": "trace", "L": "layout", "V": "viewer", "B": "busy", "N": "nc-in"}.get(kind, kind)
+            name = {"#": "trace", "L": "layout", "V": "viewer", "B": "busy", "N": "nc-in", "S": "spill"}.get(kind, kind)
             print("%9.3f  %-7s %s" % (t, name, payload.decode("utf-8", "replace")))
     flush()
     print("%9.3f  end     %d bytes written to the terminal, %d held back while scrolled back" % (last, written, held))

@@ -49,6 +49,14 @@ consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), 
   Enter on a row, Esc closes), shared by both loops. Not yet: the `@file` list is the same code path
   but is not tested in this UI, and the `/model` picker (`cmd_model_picker`, through `term_select` → `nc_select`) lists the Ollama
   models and the Anthropic ones (`anthropic:ID`), as the ANSI picker does; xAI and OpenAI are advisors only and are not in it.
+- The scrollback keeps every line: past `SB_MAX_LINES` (8000) the oldest go to an unlinked file in TMPDIR
+  (`sb_spill`, util.c: a stack of lines with their fold state, unit-tested), down to 6000, and come back when a view
+  reads above memory (`term_sb_load_older()`: the ANSI viewer's `view_scroll()`, Home/`g` loads them all; the notcurses
+  `draw_pane()` walk). Not while scrolled back (`g_view_top`, `nc_scrolled_back()`): then the cap is 100000, so reading
+  back does not thrash. Line numbers stay relative to memory (`term_sb_first()` lines are before line 0); a spill or
+  load bumps the epoch and moves the holders (the cursor line, the viewer's top); notcurses' `/clear` point is counted
+  from the first line ever. `ESC[2J` empties the file. Ctrl+O reaches spilled folds through their kept state
+  (`meta_at()`); a head's mark is fixed when it comes back.
 - Ctrl+O and the folds, both UIs: every fold head carries a dim `(ctrl+o to expand)` (`fold_hint_put()`, util.c, written
   by `term_fold_begin()`), which `term_fold_toggle()` turns to `(ctrl+o to collapse)` with the mark (`fold_head_turn()`,
   pure, unit-tested). Ctrl+O (a paste token at the caret first) is `term_fold_all()`: every fold opens when one is shut,

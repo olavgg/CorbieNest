@@ -185,6 +185,20 @@ void strip_row(char *out, size_t n, int cols, int kind, const char *name, int na
                const char *mid, int done, int total, const char *right);
 void strip_row_c(char *out, size_t n, int cols, int kind, const char *name, int name_w,
                  const char *mid, int done, int total, const char *right, const char *bar_sgr);
+
+/* The scrollback's spill file (util.c): the lines the in-memory model gave up, oldest first, in an unlinked file
+ * in TMPDIR (opened on the first append, close-on-exec). A stack: term.c appends the oldest lines it lets go and
+ * pops the newest ones back when the view reads above what memory holds, so a line is in one place or the other.
+ * Each line keeps its fold state (sb_meta, which the store does not read). The file is not limited beyond
+ * SB_SPILL_MAX lines; an append past that, or one that cannot be written, returns false. */
+typedef struct { int fold; unsigned char kind; bool hidden; } sb_meta;
+typedef struct { int fd; long long *off; sb_meta *meta; int n, cap; long long end; } sb_spill;
+#define SB_SPILL_MAX 4000000
+bool  sb_spill_append(sb_spill *s, const char *line, size_t len, sb_meta m);
+char *sb_spill_read(const sb_spill *s, int i, sb_meta *m);   /* line i (0 = the oldest), malloc'd; NULL on a read error */
+void  sb_spill_pop(sb_spill *s, int k);                      /* the newest k lines leave the file (they are back in memory) */
+void  sb_spill_reset(sb_spill *s);                           /* empty, the file kept for the next lines */
+void  sb_spill_close(sb_spill *s);                           /* empty, the file closed */
 /* How `total` running tasks share `room` rows. *with_main: a ● main row. *more: the last row is
  * "show all" because they do not all fit. *shown: how many tasks get a row. *rows: what is drawn. */
 void strip_layout(int room, int total, int *rows, int *shown, bool *with_main, bool *more);
@@ -579,6 +593,16 @@ void        term_tick_run(void);                       /* runs the tick if it is
 int         term_sb_epoch(void);                      /* changes whenever the lines are renumbered (dropped, cleared): a row map made before is stale */
 const char *term_sb_line(int i);
 bool        term_sb_hidden(int i);                    /* a closed fold's body */
+/* Lines before the model's first one are in the spill file (sb_spill): term_sb_first() is how many (so line i is the
+ * conversation's line term_sb_first() + i), and term_sb_load_older(k) brings up to k of them back in front of line 0,
+ * renumbering the lines (the epoch changes); it returns how many came. */
+int         term_sb_first(void);
+int         term_sb_load_older(int k);
+#define     SB_LOAD_LINES 2000                        /* what a view that reads above the model asks for at a time */
+/* tests only: the model without a screen (on: recording, everything cleared; off: back to nothing) */
+void        term_sb_test(bool on);
+void        term_sb_test_feed(const char *s);
+void        term_sb_test_fold(const char *head, const char *body);   /* a closed fold, as term_fold_begin…end make it */
 void        term_sgr_track(sbuf *st, const char *d, size_t len);   /* the colours in effect after d: what a wrapped row continues in */
 int         term_sb_col(void);                        /* column the output is at (0 = a fresh line) */
 
@@ -612,6 +636,7 @@ void   nc_render(void);                               /* draws the pane, field, 
 void   nc_render_soon(void);                          /* the same, at most every few tens of ms */
 void   nc_output(void);                               /* a write reached the conversation */
 void   nc_clear(void);                                /* the conversation starts over at the top */
+bool   nc_scrolled_back(void);                        /* the pane shows older lines than the newest (the model keeps them) */
 void   nc_prefill(const char *text);                  /* text for the field at the next prompt */
 void   nc_leave_browse(void);                         /* a history browse ends: the line typed before it is back in the field */
 char  *nc_readline(const char *prompt, bool in_field);

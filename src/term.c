@@ -47,6 +47,7 @@ static void on_winch(int s) { (void)s; g_winch = 1; }
  *   I  bytes read from the terminal: keys, mouse reports
  *   L  the layout changed: the size, the scroll region, the rows of the chrome
  *   V  the scrollback viewer moved or was left          B  the status bar's activity label
+ *   S  scrollback lines spilled to the file or loaded back from it (sb_spill_oldest, term_sb_load_older)
  *   N  an input event as notcurses decoded it (its thread reads the terminal, so that UI has no I records),
  *      and where a left press landed against the modal that was up (term_trace_note() from term_nc.c)
  * Bytes stand for themselves, except control characters and the backslash: \e \n \r \t \\ \xHH.
@@ -1002,7 +1003,13 @@ void term_clear_screen(void) {
  * its submitted line as ordinary output, the inline one notes it (sb_note). It is also what
  * tells the field editor where the transcript ended (conv_pos). PgUp at the prompt opens the viewer
  * (scroll_view): the region shows a window into the buffer, PgDn/End/Esc go back. */
-#define SB_MAX_LINES 8000
+/* Lines past SB_MAX_LINES go to the spill file (sb_spill, util.c), down to SB_KEEP_LINES, and come back when the view
+ * reads above them (term_sb_load_older). Not while the view is scrolled back: then SB_HARD_LINES, so reading back
+ * through a long session does not write and read the same lines again with each line of output. */
+#define SB_MAX_LINES  8000
+#define SB_KEEP_LINES 6000
+#define SB_HARD_LINES 100000
+static sb_spill g_spill;              /* the lines before g_sb[0], oldest first */
 static sbuf *g_sb = NULL;             /* logical lines */
 static int   g_sb_n = 0, g_sb_cap = 0;
 static int   g_sb_epoch = 0;      /* bumped whenever line numbers stop meaning what they did (lines dropped, cleared) */
@@ -1011,8 +1018,7 @@ static int   g_sb_epoch = 0;      /* bumped whenever line numbers stop meaning w
  * it out, so the region, the viewer and conv_pos() all see the transcript without it, and the
  * cursor movements step over it. */
 enum { SB_PLAIN, SB_FOLD_HEAD, SB_FOLD_BODY };
-typedef struct { int fold; unsigned char kind; bool hidden; } sb_meta;
-static sb_meta *g_sb_meta = NULL;     /* one per line of g_sb */
+static sb_meta *g_sb_meta = NULL;     /* one per line of g_sb (sb_meta: common.h, the spill file keeps it too) */
 static int   g_fold_seq = 0;          /* the last fold's number */
 static int   g_fold_rec = 0;          /* the fold whose body is being written (term_fold_begin…end): recorded, not painted */
 static int   g_click_frow = 0, g_click_fcol = 0;   /* a left click in the field below the conversation: its row and column (paste_click) */
@@ -1055,6 +1061,7 @@ static int vis_width_n(const char *s, size_t len) {
     }
     return w;
 }
+static void sb_spill_oldest(int drop);
 static void sb_ensure_line(void) {
     if (g_sb_n == 0) { g_sb_line = 0; g_sb_col = 0; }
     while (g_sb_line >= g_sb_n) {
@@ -1065,14 +1072,96 @@ static void sb_ensure_line(void) {
         g_sb_meta[g_sb_n] = (sb_meta){ g_fold_rec, g_fold_rec ? SB_FOLD_BODY : SB_PLAIN, g_fold_rec != 0 };
         sb_init(&g_sb[g_sb_n]); sb_append(&g_sb[g_sb_n], "", 0); g_sb_n++;
     }
-    if (g_sb_n > SB_MAX_LINES) {   /* drop the oldest quarter */
-        int drop = SB_MAX_LINES / 4;
-        for (int i = 0; i < drop; i++) sb_free(&g_sb[i]);
-        memmove(g_sb, g_sb + drop, sizeof *g_sb * (size_t)(g_sb_n - drop));
-        memmove(g_sb_meta, g_sb_meta + drop, sizeof *g_sb_meta * (size_t)(g_sb_n - drop));
-        g_sb_n -= drop; g_sb_line -= drop; if (g_sb_line < 0) g_sb_line = 0;
-        g_sb_epoch++;   /* the line numbers moved: a row map made before is not to be read */
+    bool held = g_view_top >= 0 || (g_ui_nc && nc_scrolled_back());   /* scrolled back: older lines are being read */
+    if (g_sb_n > (held ? SB_HARD_LINES : SB_MAX_LINES)) sb_spill_oldest(g_sb_n - (held ? SB_HARD_LINES * 3 / 4 : SB_KEEP_LINES));
+}
+
+/* The oldest `drop` lines go to the spill file, in order, with their fold state; the rest are renumbered from 0. A
+ * line that cannot be written takes the file's lines with it (they would no longer join up with memory): the old
+ * behaviour, the oldest lines lost. A viewer scrolled back keeps its place (its top row moves up with the lines). */
+static void sb_spill_oldest(int drop) {
+    if (drop > g_sb_line) drop = g_sb_line;   /* never the line output is on */
+    if (drop <= 0) return;
+    if (g_view_top >= 0) {
+        int width = g_fs_cols > 0 ? g_fs_cols : 1, rows = 0;
+        for (int i = 0; i < drop; i++) {
+            if (g_sb_meta[i].hidden) continue;
+            size_t len = g_sb[i].len, off = 0;
+            do { off = vis_offset(g_sb[i].data + off, len - off, width) + off; rows++; } while (off < len);
+        }
+        g_view_top = g_view_top > rows ? g_view_top - rows : 0;
     }
+    bool kept = true;
+    for (int i = 0; i < drop; i++) {
+        if (kept && !sb_spill_append(&g_spill, g_sb[i].data ? g_sb[i].data : "", g_sb[i].len, g_sb_meta[i])) { kept = false; sb_spill_reset(&g_spill); }
+        sb_free(&g_sb[i]);
+    }
+    if (!kept) sb_spill_reset(&g_spill);
+    memmove(g_sb, g_sb + drop, sizeof *g_sb * (size_t)(g_sb_n - drop));
+    memmove(g_sb_meta, g_sb_meta + drop, sizeof *g_sb_meta * (size_t)(g_sb_n - drop));
+    g_sb_n -= drop; g_sb_line -= drop;
+    g_sb_epoch++;   /* the line numbers moved: a row map made before is not to be read */
+    g_sel_on = g_sel_down = false;
+    trace_note('S', "spilled %d lines%s (%d in the file, %d in memory)", drop, kept ? "" : " (the file failed: lost)", g_spill.n, g_sb_n);
+}
+
+/* Up to k lines from the spill file back in front of line 0 (the newest of the file's first). A fold head among them
+ * gets its mark from its body's state, which Ctrl+O may have changed while it was in the file. */
+int term_sb_load_older(int k) {
+    if (k > g_spill.n) k = g_spill.n;
+    if (k <= 0) return 0;
+    if (g_sb_n + k > g_sb_cap) {
+        while (g_sb_n + k > g_sb_cap) g_sb_cap = g_sb_cap ? g_sb_cap * 2 : 256;
+        g_sb = xrealloc(g_sb, sizeof *g_sb * (size_t)g_sb_cap); g_sb_meta = xrealloc(g_sb_meta, sizeof *g_sb_meta * (size_t)g_sb_cap);
+    }
+    memmove(g_sb + k, g_sb, sizeof *g_sb * (size_t)g_sb_n);
+    memmove(g_sb_meta + k, g_sb_meta, sizeof *g_sb_meta * (size_t)g_sb_n);
+    int from = g_spill.n - k;
+    for (int j = 0; j < k; j++) {
+        sb_meta m = { 0, SB_PLAIN, false };
+        char *t = sb_spill_read(&g_spill, from + j, &m);
+        sb_init(&g_sb[j]); sb_puts(&g_sb[j], t ? t : ""); free(t);
+        if (!g_sb[j].data) sb_append(&g_sb[j], "", 0);
+        g_sb_meta[j] = m;
+    }
+    sb_spill_pop(&g_spill, k);
+    g_sb_n += k; g_sb_line += k;
+    for (int j = 0; j < k; j++)
+        if (g_sb_meta[j].kind == SB_FOLD_HEAD && j + 1 < g_sb_n && g_sb_meta[j + 1].kind == SB_FOLD_BODY && g_sb_meta[j + 1].fold == g_sb_meta[j].fold) {
+            char *turned = fold_head_turn(g_sb[j].data, !g_sb_meta[j + 1].hidden);
+            sb_clear(&g_sb[j]); sb_puts(&g_sb[j], turned); free(turned);
+        }
+    g_sb_epoch++;
+    g_sel_on = g_sel_down = false;
+    trace_note('S', "loaded %d lines back (%d in the file, %d in memory)", k, g_spill.n, g_sb_n);
+    return k;
+}
+int term_sb_first(void) { return g_spill.n; }
+
+static void sb_feed(const char *p, size_t n);
+/* tests only (test_unit.c): the model fed directly, without a screen or the stdout hook */
+static void sb_clear_all(void) {
+    for (int i = 0; i < g_sb_n; i++) sb_free(&g_sb[i]);
+    g_sb_n = 0; g_sb_line = 0; g_sb_col = 0; g_sb_epoch++;
+    g_sb_seqn = -1; g_sb_cr = false; g_sb_sgrn = 0; g_sb_decsc = 0;
+    sb_spill_close(&g_spill);
+}
+void term_sb_test(bool on) { sb_clear_all(); g_sb_active = on; g_view_top = -1; }
+void term_sb_test_feed(const char *s) { if (g_sb_active) sb_feed(s, strlen(s)); }
+/* a closed fold as term_fold_begin()…term_fold_end() make it, written into the model instead of through stdout */
+void term_sb_test_fold(const char *head, const char *body) {
+    if (!g_sb_active || g_fold_rec) return;
+    if (g_sb_col > 0) sb_feed("\n", 1);
+    sbuf h; sb_init(&h); sb_puts(&h, head); fold_hint_put(&h, false);
+    sb_feed(h.data, h.len); sb_free(&h);
+    sb_ensure_line();
+    g_sb_meta[g_sb_line] = (sb_meta){ ++g_fold_seq, SB_FOLD_HEAD, false };
+    sb_feed("\n", 1);
+    g_fold_rec = g_fold_seq;
+    sb_ensure_line();
+    g_sb_meta[g_sb_line] = (sb_meta){ g_fold_rec, SB_FOLD_BODY, true };
+    sb_feed(body, strlen(body));
+    term_fold_end();
 }
 /* the cursor is about to write: cut the line at the cursor column (a redraw overwrites the rest) */
 static void sb_cut_at_cursor(void) {
@@ -1142,7 +1231,7 @@ static void sb_escape_done(void) {
         case 'D': g_sb_col -= a ? a : 1; if (g_sb_col < 0) g_sb_col = 0; break;
         case 'K': if (a == 2) { int width = sb_width(); if (width < 1) width = 1; g_sb_col = ((g_sb_col == 0 ? 0 : (g_sb_col - 1) / width)) * width; }
                   sb_cut_at_cursor(); break;
-        case 'J': if (a == 2) { for (int i = 0; i < g_sb_n; i++) sb_free(&g_sb[i]); g_sb_n = 0; g_sb_line = 0; g_sb_col = 0; g_sb_epoch++; }
+        case 'J': if (a == 2) { for (int i = 0; i < g_sb_n; i++) sb_free(&g_sb[i]); g_sb_n = 0; g_sb_line = 0; g_sb_col = 0; g_sb_epoch++; sb_spill_reset(&g_spill); }
                   else { sb_cut_at_cursor(); sb_drop_after(g_sb_line); }
                   break;
         default: break;                                       /* H, r, n … : absolute moves and queries, not tracked */
@@ -1772,6 +1861,11 @@ static void view_scroll(int delta) {
     int live = view_rows() + field_shown(), nrows; free(sb_rows(g_fs_cols, &nrows));   /* the region when not scrolled back */
     int maxtop = nrows > live ? nrows - live : 0;
     long top = (long)(g_view_top >= 0 ? g_view_top : maxtop) + delta;
+    while (top < 0 && term_sb_load_older(SB_LOAD_LINES) > 0) {   /* above the model: the spill file's lines come back in front */
+        int was = nrows;
+        free(sb_rows(g_fs_cols, &nrows));
+        top += nrows - was; maxtop += nrows - was;
+    }
     if (top < 0) top = 0;
     if (top >= maxtop) { view_leave(); return; }   /* the live screen starts there or above: back to it */
     g_view_top = (int)top;
@@ -1859,17 +1953,23 @@ int term_fold_toggle(int line) {
 
 /* Ctrl+O: every fold opens when one of them is shut, and they all close when none is. The heads are found from the
  * model's marks (a head's first body line says whether it is shut). Returns the folds turned. */
+/* the fold state of the conversation's line `a`, counted from the first line ever: in the spill file or in memory */
+static sb_meta *meta_at(int a) { return a < g_spill.n ? &g_spill.meta[a] : &g_sb_meta[a - g_spill.n]; }
+static bool fold_head_at(int a, int total) {
+    return a + 1 < total && meta_at(a)->kind == SB_FOLD_HEAD && meta_at(a + 1)->kind == SB_FOLD_BODY && meta_at(a + 1)->fold == meta_at(a)->fold;
+}
 int term_fold_all(void) {
     if (g_fold_rec || !g_sb_active) return 0;
+    int total = g_spill.n + g_sb_n;   /* the spill file's folds too: their heads are turned when they come back (term_sb_load_older) */
     bool any_shut = false;
-    for (int i = 0; i + 1 < g_sb_n && !any_shut; i++)
-        if (g_sb_meta[i].kind == SB_FOLD_HEAD && g_sb_meta[i + 1].kind == SB_FOLD_BODY && g_sb_meta[i + 1].fold == g_sb_meta[i].fold
-            && g_sb_meta[i + 1].hidden) any_shut = true;
+    for (int a = 0; a < total && !any_shut; a++) if (fold_head_at(a, total) && meta_at(a + 1)->hidden) any_shut = true;
     int turned = 0;
-    for (int i = 0; i + 1 < g_sb_n; i++) {
-        if (g_sb_meta[i].kind != SB_FOLD_HEAD || g_sb_meta[i + 1].kind != SB_FOLD_BODY || g_sb_meta[i + 1].fold != g_sb_meta[i].fold) continue;
-        if (g_sb_meta[i + 1].hidden != any_shut) continue;   /* already as wanted */
-        if (term_fold_toggle(i) >= 0) turned++;
+    for (int a = 0; a < total; a++) {
+        if (!fold_head_at(a, total) || meta_at(a + 1)->hidden != any_shut) continue;   /* (already as wanted) */
+        if (a >= g_spill.n) { if (term_fold_toggle(a - g_spill.n) >= 0) turned++; continue; }
+        int id = meta_at(a)->fold;
+        for (int b = a + 1; b < total && meta_at(b)->fold == id && meta_at(b)->kind == SB_FOLD_BODY; b++) meta_at(b)->hidden = !any_shut;
+        turned++;
     }
     trace_note('F', "ctrl+o: %d folds %s", turned, any_shut ? "opened" : "closed");
     return turned;

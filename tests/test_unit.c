@@ -212,6 +212,95 @@ static void test_write_preview(void) {
     CHECK(strstr(q, "line 0 of the file") != NULL);
     free(q);
 }
+static void test_sb_spill(void) {
+    sb_spill sp; memset(&sp, 0, sizeof sp);
+    char line[64];
+    bool all = true;
+    for (int i = 0; i < 20000; i++) {   /* lines of different lengths, the empty one too, each with its fold state */
+        int n = i % 7 == 0 ? 0 : snprintf(line, sizeof line, "\x1b[2mline %d\x1b[0m", i);
+        all = sb_spill_append(&sp, line, (size_t)n, (sb_meta){ i, (unsigned char)(i % 3), i % 2 == 1 }) && all;
+    }
+    CHECK(all && sp.n == 20000 && sp.fd > 0);
+    CHECK((fcntl(sp.fd, F_GETFD) & FD_CLOEXEC) != 0);   /* not handed to the commands the tools run */
+    sb_meta m;
+    char *t = sb_spill_read(&sp, 12345, &m);
+    CHECK(t && !strcmp(t, "\x1b[2mline 12345\x1b[0m") && m.fold == 12345 && m.kind == (unsigned char)(12345 % 3) && m.hidden);
+    free(t);
+    t = sb_spill_read(&sp, 14, &m);    /* (14 % 7 == 0: the empty line) */
+    CHECK(t && !*t && m.fold == 14 && !m.hidden);
+    free(t);
+    CHECK(sb_spill_read(&sp, 20000, &m) == NULL && sb_spill_read(&sp, -1, &m) == NULL);
+    /* a stack: the newest lines leave, and what is appended next takes their place */
+    sb_spill_pop(&sp, 5000);
+    CHECK(sp.n == 15000);
+    CHECK(sb_spill_append(&sp, "after the pop", 13, (sb_meta){ 7, 1, false }));
+    t = sb_spill_read(&sp, 15000, &m);
+    CHECK(t && !strcmp(t, "after the pop") && m.fold == 7);
+    free(t);
+    t = sb_spill_read(&sp, 14999, &m);
+    CHECK(t && !strcmp(t, "\x1b[2mline 14999\x1b[0m"));   /* the line under it is as it was */
+    free(t);
+    sb_spill_reset(&sp);
+    CHECK(sp.n == 0 && sb_spill_read(&sp, 0, &m) == NULL);
+    CHECK(sb_spill_append(&sp, "fresh", 5, (sb_meta){ 0, 0, false }));
+    t = sb_spill_read(&sp, 0, NULL);
+    CHECK(t && !strcmp(t, "fresh"));
+    free(t);
+    sb_spill_close(&sp);
+    CHECK(sp.fd == 0 && sp.n == 0 && sp.off == NULL);
+
+    /* the model: past SB_MAX_LINES the oldest lines go to the file, and all of them come back, in order */
+    term_sb_test(true);
+    char buf[64];
+    for (int i = 0; i < 25000; i++) { snprintf(buf, sizeof buf, "row %d\n", i); term_sb_test_feed(buf); }
+    int first = term_sb_first(), n = term_sb_nlines();
+    CHECK(first > 0 && n <= 8001);                        /* memory stays bounded */
+    CHECK(first + n == 25001);                            /* nothing lost: the file and memory join up (the last line is the empty one output goes on) */
+    snprintf(buf, sizeof buf, "row %d", first);
+    CHECK(!strcmp(term_sb_line(0), buf));                 /* memory starts where the file ends */
+    int epoch = term_sb_epoch();
+    CHECK(term_sb_load_older(SB_LOAD_LINES) == SB_LOAD_LINES && term_sb_first() == first - SB_LOAD_LINES && term_sb_epoch() != epoch);
+    snprintf(buf, sizeof buf, "row %d", first - SB_LOAD_LINES);
+    CHECK(!strcmp(term_sb_line(0), buf));                 /* the lines just before, in front */
+    while (term_sb_load_older(SB_LOAD_LINES) > 0) {}
+    CHECK(term_sb_first() == 0 && term_sb_nlines() == 25001);
+    CHECK(!strcmp(term_sb_line(0), "row 0") && !strcmp(term_sb_line(24999), "row 24999"));
+    bool order = true;
+    for (int i = 0; i < 25000 && order; i++) { snprintf(buf, sizeof buf, "row %d", i); order = !strcmp(term_sb_line(i), buf); }
+    CHECK(order);
+    term_sb_test_feed("one more\n");                     /* output again, nobody scrolled back: memory is cut down again */
+    CHECK(term_sb_nlines() <= 8001 && term_sb_first() + term_sb_nlines() == 25002);
+    term_sb_test_feed("\x1b[2J");                        /* a clear empties the file too */
+    CHECK(term_sb_first() == 0);
+    term_sb_test(false);
+
+    /* Ctrl+O reaches folds in the file: a fold at the start, then enough lines to spill it */
+    const char *body = "b1\nb2\nb3\nb4\nb5\nb6\n";
+    term_sb_test(true);
+    term_sb_test_fold("  " TERM_FOLD_CLOSED " first fold", body);
+    for (int i = 0; i < 20000; i++) { snprintf(buf, sizeof buf, "row %d\n", i); term_sb_test_feed(buf); }
+    CHECK(term_sb_first() > 8);                           /* the head and its body are in the file */
+    CHECK(term_fold_all() == 1);                          /* opened there */
+    while (term_sb_load_older(SB_LOAD_LINES) > 0) {}
+    CHECK(strstr(term_sb_line(0), TERM_FOLD_OPEN " first fold") && strstr(term_sb_line(0), TERM_FOLD_HINT_COLLAPSE));   /* its mark turned on the way back */
+    CHECK(!term_sb_hidden(1) && !term_sb_hidden(6) && !strcmp(term_sb_line(6), "b6"));
+    CHECK(term_fold_all() == 1);                          /* in memory now: closed again */
+    CHECK(strstr(term_sb_line(0), TERM_FOLD_CLOSED " first fold") && strstr(term_sb_line(0), TERM_FOLD_HINT_EXPAND) && term_sb_hidden(1));
+    term_sb_test(false);
+
+    /* the file's last line is a head, its body in memory: the first spill cuts 8001 lines down to 6000, so lines
+     * 0-2000 go and line 2000 is the head */
+    term_sb_test(true);
+    for (int i = 0; i < 2000; i++) { snprintf(buf, sizeof buf, "pre %d\n", i); term_sb_test_feed(buf); }
+    term_sb_test_fold("  " TERM_FOLD_CLOSED " split fold", body);
+    for (int i = 0; i < 7000; i++) { snprintf(buf, sizeof buf, "row %d\n", i); term_sb_test_feed(buf); }
+    CHECK(term_sb_first() == 2001 && !strcmp(term_sb_line(0), "b1") && term_sb_hidden(0));   /* the head in the file, the body here */
+    CHECK(term_fold_all() == 1 && !term_sb_hidden(0) && !term_sb_hidden(5));                  /* the body opens */
+    CHECK(term_sb_load_older(1) == 1);
+    CHECK(strstr(term_sb_line(0), TERM_FOLD_OPEN " split fold") && strstr(term_sb_line(0), TERM_FOLD_HINT_COLLAPSE));   /* and its head comes back open */
+    CHECK(term_fold_all() == 1 && strstr(term_sb_line(0), TERM_FOLD_CLOSED) && term_sb_hidden(1));
+    term_sb_test(false);
+}
 static void test_fold_head(void) {
     /* the head as written: "(ctrl+o to expand)" after it, dim, two spaces before it */
     sbuf h; sb_init(&h); sb_puts(&h, "  " TERM_FOLD_CLOSED " $ ls  (+40 lines)"); fold_hint_put(&h, false);
@@ -2787,7 +2876,7 @@ int main(void) {
     g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 10; g_cfg.interactive = false;
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "sbuf", test_sbuf }, { "util", test_util }, { "cmd head", test_cmd_head }, { "markdown", test_md }, { "highlight", test_highlight }, { "git branch", test_gitbranch },
-        { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "fold head", test_fold_head }, { "modes", test_modes },
+        { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "fold head", test_fold_head }, { "scrollback spill", test_sb_spill }, { "modes", test_modes },
         { "close button", test_close_x }, { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
         { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme },

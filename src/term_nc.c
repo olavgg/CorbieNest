@@ -198,6 +198,7 @@ void   nc_overlay_set(const char *text) { (void)text; }
 bool   nc_overlay_open(void) { return false; }
 void   nc_output(void) {}
 void   nc_clear(void) {}
+bool   nc_scrolled_back(void) { return false; }
 void   nc_prefill(const char *text) { (void)text; }
 void   nc_leave_browse(void) {}
 char  *nc_readline(const char *prompt, bool in_field) { (void)prompt; (void)in_field; return NULL; }
@@ -295,7 +296,8 @@ static bool g_sel_down = false;       /* a button is held: the gesture is in pro
 static bool g_sel_moved = false;      /* the gesture has moved since the press */
 static sel_pt g_sel_a, g_sel_b;       /* where the gesture began and where it is now */
 static int g_sel_epoch = -1;          /* term_sb_epoch() when the selection was made */
-static int g_clear_at = 0;             /* lines before this one are not shown (/clear) */
+static int g_clear_at = 0;             /* the conversation's lines before this one are not shown (/clear): counted from the
+                                          * first line ever, spilled ones too (term_sb_first() + the model's index) */
 static bool g_pending = false;         /* output arrived that is not drawn yet */
 static double g_last_draw = 0;
 
@@ -796,14 +798,26 @@ static void draw_pane(int view) {
     for (int y = 0; y < view; y++) g_pane_line[y] = -1;
     if (view * g_cols > g_pane_cells_n) { g_pane_cells = xrealloc(g_pane_cells, sizeof *g_pane_cells * (size_t)(view * g_cols)); g_pane_cells_n = view * g_cols; }
     for (int k = 0; k < view * g_cols; k++) g_pane_cells[k] = (pane_cell){ -1, -1, { NC_DEFAULT, NC_DEFAULT, 0 }, "" };
-    int total = term_sb_nlines();
-    int start = g_clear_at < total ? g_clear_at : total;
     typedef struct { nc_cell *c; int n; int rows; int idx; } lline;
     lline *ls = NULL;
     int nls = 0, cap = 0, acc = 0;
     int need = view + g_top;
-    /* the lines are read from the newest back, until they fill the pane (and the scroll-back) */
-    for (int i = total - 1; i >= start && acc < need; i--) {
+    int total = term_sb_nlines();
+    int start = g_clear_at - term_sb_first();
+    if (start < 0) start = 0;
+    if (start > total) start = total;
+    /* the lines are read from the newest back, until they fill the pane (and the scroll-back); lines in the spill file
+     * come back when the walk runs out of the model's (the lines are renumbered then: the walk starts over) */
+    for (int i = total - 1; acc < need; i--) {
+        if (i < start) {
+            if (start > 0 || term_sb_first() <= g_clear_at || term_sb_load_older(SB_LOAD_LINES) <= 0) break;
+            for (int k = 0; k < nls; k++) free(ls[k].c);
+            nls = 0; acc = 0;
+            total = term_sb_nlines();
+            start = g_clear_at - term_sb_first(); if (start < 0) start = 0;
+            i = total;
+            continue;
+        }
         if (term_sb_hidden(i)) continue;
         const char *s = term_sb_line(i);
         size_t len = strlen(s);
@@ -1499,8 +1513,9 @@ bool nc_size(int *rows, int *cols) {
     return true;
 }
 
+bool nc_scrolled_back(void) { return g_nc && g_top > 0; }
 void nc_clear(void) {
-    g_clear_at = term_sb_nlines();
+    g_clear_at = term_sb_first() + term_sb_nlines();
     g_top = 0;
     nc_render();
 }

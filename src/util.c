@@ -1550,6 +1550,72 @@ size_t utf8_cut(const char *s, size_t len, size_t cap) {
     return n;
 }
 
+/* ---------- the scrollback's spill file ---------- */
+
+static bool spill_open(sb_spill *s) {
+    if (s->fd > 0) return true;
+    const char *dir = getenv("TMPDIR");
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s/corbie-scrollback-XXXXXX", dir && *dir ? dir : "/tmp");
+    int fd = mkstemp(path);
+    if (fd < 0) return false;
+    unlink(path);   /* nothing to clean up: the file goes when the program does */
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (fd == 0) { int nfd = dup(fd); close(fd); if (nfd < 0) return false; fd = nfd; }   /* (0 means "not open" here) */
+    s->fd = fd;
+    return true;
+}
+bool sb_spill_append(sb_spill *s, const char *line, size_t len, sb_meta m) {
+    if (s->n >= SB_SPILL_MAX || !spill_open(s)) return false;
+    if (s->n == s->cap) {
+        int cap = s->cap ? s->cap * 2 : 4096;
+        s->off = xrealloc(s->off, sizeof *s->off * (size_t)cap);
+        s->meta = xrealloc(s->meta, sizeof *s->meta * (size_t)cap);
+        s->cap = cap;
+    }
+    for (size_t done = 0; done < len; ) {
+        ssize_t w = pwrite(s->fd, line + done, len - done, (off_t)(s->end + (long long)done));
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return false;
+        done += (size_t)w;
+    }
+    s->off[s->n] = s->end;
+    s->meta[s->n] = m;
+    s->n++;
+    s->end += (long long)len;
+    return true;
+}
+char *sb_spill_read(const sb_spill *s, int i, sb_meta *m) {
+    if (i < 0 || i >= s->n || s->fd <= 0) return NULL;
+    long long a = s->off[i], b = i + 1 < s->n ? s->off[i + 1] : s->end;
+    size_t len = (size_t)(b - a);
+    char *buf = xmalloc(len + 1);
+    for (size_t got = 0; got < len; ) {
+        ssize_t r = pread(s->fd, buf + got, len - got, (off_t)(a + (long long)got));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { free(buf); return NULL; }
+        got += (size_t)r;
+    }
+    buf[len] = 0;
+    if (m) *m = s->meta[i];
+    return buf;
+}
+void sb_spill_pop(sb_spill *s, int k) {
+    if (k <= 0) return;
+    if (k >= s->n) { sb_spill_reset(s); return; }
+    s->n -= k;
+    s->end = s->off[s->n];   /* the next append writes over what left */
+}
+void sb_spill_reset(sb_spill *s) {
+    s->n = 0; s->end = 0;
+    if (s->fd > 0) (void)ftruncate(s->fd, 0);
+}
+void sb_spill_close(sb_spill *s) {
+    if (s->fd > 0) close(s->fd);
+    free(s->off); free(s->meta);
+    memset(s, 0, sizeof *s);
+}
+
 /* ---------- fold heads: the mark and the Ctrl+O hint ---------- */
 
 void fold_hint_put(sbuf *b, bool open) {
