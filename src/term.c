@@ -216,6 +216,7 @@ enum {
     K_NONE = 0, K_UP = 1000, K_DOWN, K_LEFT, K_RIGHT, K_HOME, K_END, K_DEL,
     K_PGUP, K_PGDN, K_ALT_ENTER, K_ESC, K_PASTE_START, K_PASTE_END, K_ALT_B, K_ALT_F, K_ALT_BS,
     K_CTRL_LEFT, K_CTRL_RIGHT, K_SHIFT_TAB,
+    K_CTRL_END,                 /* Ctrl+End (CSI 1;5F): back to the newest line when scrolled back; at the end of a line elsewhere, as End */
     K_WHEEL_UP, K_WHEEL_DOWN,   /* the mouse wheel, over the conversation */
     K_CLOSE_X,                  /* the close button "[×]" of a modal (banner, overlay, paste view, menu): a click on it; every modal takes it as its Esc */
     K_MOUSE,                    /* any other mouse report: nothing acts on it */
@@ -1764,7 +1765,7 @@ static void view_paint(void) {
     overlay_box(&o);
     sb_puts(&o, "\x1b[?7h");
     snprintf(g_view_hint, sizeof g_view_hint, g_field_focus ? "↑ scrollback · rows %d-%d of %d · wheel/PgUp/PgDn ↑/↓ scroll · End/Esc/Enter back"
-                                                           : "↑ scrollback · rows %d-%d of %d · Esc or scrolling down: back to the output",
+                                                           : "↑ scrollback · rows %d-%d of %d · Esc, Ctrl+End or scrolling down: back to the output",
              nrows ? g_view_top + 1 : 0, g_view_top + rows < nrows ? g_view_top + rows : nrows, nrows);
     chrome_append(&o);
     fwrite(o.data, 1, o.len, stdout); fflush(stdout); sb_free(&o); free(r);
@@ -2140,7 +2141,7 @@ static int scroll_modal_impl(const char *title, const char **lines, int n, int s
         else if (k == K_WHEEL_UP) { sel -= 3; if (sel < 0) sel = 0; }
         else if (k == K_WHEEL_DOWN) { sel += 3; if (sel >= n) sel = n - 1; }
         else if (k == K_HOME || k == 'g') sel = 0;
-        else if (k == K_END || k == 'G') sel = n - 1;
+        else if (k == K_END || k == K_CTRL_END || k == 'G') sel = n - 1;
     }
     band_clear();
     term_status_refresh();
@@ -2364,6 +2365,7 @@ static void ta_act(int k) {
         case K_WHEEL_DOWN: view_scroll(WHEEL_ROWS); break;
         case K_PGUP:       view_scroll(page > 1 ? -page : -1); break;
         case K_PGDN:       view_scroll(page > 1 ? page : 1); break;
+        case K_CTRL_END:   view_leave(); break;   /* Ctrl+End: back to the newest line */
         case K_MOUSE:      fold_click(); break;
         case K_CLOSE_X:    if (g_ov_text) term_overlay_close(); break;   /* an overlay's close button, while the model works */
         case 15:           fold_all_key(); break;                            /* Ctrl+O: every fold opens or closes */
@@ -2414,7 +2416,7 @@ static void ta_type(unsigned char c) {
         if (st && g_ta_len - st < 24) {
             char par[24]; memcpy(par, g_ta + st, g_ta_len - st); par[g_ta_len - st] = 0;
             int k = csi_key(par, c);
-            if (k == K_SHIFT_TAB || k == K_PGUP || k == K_PGDN || k == K_WHEEL_UP || k == K_WHEEL_DOWN || k == K_MOUSE || k == K_MOUSE_X10 || k == K_CLOSE_X) {
+            if (k == K_SHIFT_TAB || k == K_PGUP || k == K_PGDN || k == K_CTRL_END || k == K_WHEEL_UP || k == K_WHEEL_DOWN || k == K_MOUSE || k == K_MOUSE_X10 || k == K_CLOSE_X) {
                 g_ta_len = st - 2;
                 if (k == K_MOUSE_X10) g_ta_x10 = 3; else ta_act(k);
                 return;
@@ -2718,9 +2720,10 @@ static int csi_key(const char *params, int fin) {
         case 'A': return K_UP; case 'B': return K_DOWN;
         case 'C': return !strcmp(params, "1;5") ? K_CTRL_RIGHT : K_RIGHT;
         case 'D': return !strcmp(params, "1;5") ? K_CTRL_LEFT : K_LEFT;
-        case 'H': return K_HOME; case 'F': return K_END;
+        case 'H': return K_HOME; case 'F': return !strcmp(params, "1;5") ? K_CTRL_END : K_END;
         case '~':
             if (!strcmp(params, "1") || !strcmp(params, "7")) return K_HOME;
+            if (!strcmp(params, "4;5") || !strcmp(params, "8;5")) return K_CTRL_END;
             if (!strcmp(params, "4") || !strcmp(params, "8")) return K_END;
             if (!strcmp(params, "3")) return K_DEL;
             if (!strcmp(params, "5")) return K_PGUP;
@@ -3408,7 +3411,7 @@ static void ed_hist_search(editor *e) {
         int k = read_key();
         if (k == -2) continue;
         if (k == -1 || k == 3 || k == 7 || k == K_ESC) { ed_set(e, orig); break; }          /* cancel */
-        if (k == '\r' || k == '\n' || k == K_RIGHT || k == K_LEFT || k == K_END || k == K_HOME || k == '\t') { keep = true; break; }
+        if (k == '\r' || k == '\n' || k == K_RIGHT || k == K_LEFT || k == K_END || k == K_CTRL_END || k == K_HOME || k == '\t') { keep = true; break; }
         if (k == 18) {                                                                    /* next older */
             int i = (idx < g_hist_n ? idx : g_hist_n) - 1;
             while (i >= 0 && !ci_contains(g_hist[i], query)) i--;
@@ -3544,7 +3547,7 @@ static void paste_modal_impl(int k, const char *text, int lines) {
         else if (key == K_WHEEL_UP) { top = top > 3 ? top - 3 : 0; }
         else if (key == K_WHEEL_DOWN) { top += 3; }
         else if (key == K_HOME || key == 'g') top = 0;
-        else if (key == K_END || key == 'G') top = maxtop;
+        else if (key == K_END || key == K_CTRL_END || key == 'G') top = maxtop;
         else break;
         if (top > maxtop) top = maxtop;
     }
@@ -3614,7 +3617,7 @@ static char *readline_impl(const char *prompt, bool in_field) {
         if (g_bn_key && k != K_IDLE && k != K_BG && k != K_MOUSE && k != K_MOUSE_X10 && k != K_WHEEL_UP && k != K_WHEEL_DOWN && k != K_CLOSE_X
             && k != K_ESC && k != K_PGUP && k != K_PGDN && k != -1 && k != -2) { term_banner_key(); ed_refresh(&e); }
         if (term_hint && k != K_IDLE && k != K_MOUSE && k != K_WHEEL_UP && k != K_WHEEL_DOWN && k != -2 && k != -1 && k != '\t'
-            && k != K_LEFT && k != K_RIGHT && k != K_HOME && k != K_END) {
+            && k != K_LEFT && k != K_RIGHT && k != K_HOME && k != K_END && k != K_CTRL_END) {
             /* the placeholder goes with the first key that is not a way of looking at the prompt; Esc takes it
              * away and is not the rewind's Esc (that one counts only with nothing shown) */
             term_hint_clear();
@@ -3719,7 +3722,7 @@ static char *readline_impl(const char *prompt, bool in_field) {
             case K_HOME: case 1: {
                 size_t p = e.cur; while (p > 0 && e.buf.data[p-1] != '\n') p--; e.cur = p; break; }
             case 15: if (!paste_unfold(&e)) fold_all_key(); break;   /* Ctrl-O: the paste token at the caret, else every fold */
-            case K_END: case 5: {
+            case K_END: case K_CTRL_END: case 5: {
                 size_t p = e.cur; while (p < e.buf.len && e.buf.data[p] != '\n') p++; e.cur = p; break; }
             case K_ALT_B: case K_CTRL_LEFT: e.cur = word_left(&e); break;
             case K_ALT_F: case K_CTRL_RIGHT: e.cur = word_right(&e); break;
@@ -3979,7 +3982,7 @@ static int confirm_impl(const char *question, const char *always_label, const ch
         if (k == K_DOWN || k == 'j' || k == 14) { if (sel < nopt - 1) sel++; continue; }
         if (k == '\t') { sel = (sel + 1) % nopt; continue; }
         if (k == K_HOME) { sel = 0; continue; }
-        if (k == K_END) { sel = no_i; continue; }
+        if (k == K_END || k == K_CTRL_END) { sel = no_i; continue; }
         /* anything else: ignore, keep the menu up */
     }
     /* collapse the menu into a single line */
@@ -4350,7 +4353,7 @@ static int select_impl(const char *title, const char **items, const char **descs
         if (k == K_PGUP) { selpos -= page; if (selpos < 0) selpos = 0; if (nvis) sel = vis[selpos]; continue; }
         if (k == K_PGDN) { selpos += page; if (selpos >= nvis) selpos = nvis - 1; if (nvis) sel = vis[selpos]; continue; }
         if (k == K_HOME) { if (nvis) sel = vis[0]; continue; }
-        if (k == K_END) { if (nvis) sel = vis[nvis - 1]; continue; }
+        if (k == K_END || k == K_CTRL_END) { if (nvis) sel = vis[nvis - 1]; continue; }
         if (k == 127 || k == 8) { if (flen) filter[--flen] = 0; continue; }
         if (k == 21) { flen = 0; filter[0] = 0; continue; }
         if (k >= 32 && k < 127 && flen < (int)sizeof filter - 1) { filter[flen++] = (char)k; filter[flen] = 0; continue; }

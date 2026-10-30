@@ -248,6 +248,7 @@ bool nc_compiled(void) { return true; }
 #define NK_PGDN  (-18)
 #define NK_RESIZE (-19)
 #define NK_PASTE (-20)         /* a bracketed paste, its text taken from the paste FIFO (edit_key inserts it) */
+#define NK_CTRL_END (-21)      /* Ctrl+End: the pane back to the newest line (the pill says so while it is scrolled back) */
 
 static struct notcurses *g_nc = NULL;
 static FILE *g_nc_out = NULL;          /* notcurses' own stream: a dup of fd 1, never the captured stdout */
@@ -267,6 +268,7 @@ static void nc_banner_close(void);
  * (screen row, first and last column, 0-based). A press on it closes the overlay at once; for a menu or the paste view it
  * makes nc_getkey return Esc, which each of their loops already takes as "close"; the click is checked only while its
  * modal is up (g_ov_on / g_menu_on / g_pv_on), whatever the last frame left here. */
+static int g_pill_y = -1, g_pill_x0 = 0, g_pill_x1 = 0;   /* the "Jump to bottom" pill, while the pane is scrolled back: its row and columns [x0, x1); y -1 = none */
 static int g_mx_kind = 0, g_mx_y = -1, g_mx_c0 = -1, g_mx_c1 = -1;   /* kind: 0 none, 1 overlay, 2 menu or paste view */
 static bool g_close_req = false;
 static int g_pane_epoch = -1;          /* term_sb_epoch() when g_pane_line was made; -1: not made (no click acts on it) */
@@ -379,7 +381,7 @@ static int nc_key_code(const ncinput *ni) {
         case NCKEY_LEFT:      return NK_LEFT;
         case NCKEY_RIGHT:     return NK_RIGHT;
         case NCKEY_HOME:      return NK_HOME;
-        case NCKEY_END:       return NK_END;
+        case NCKEY_END:       return (ni->modifiers & NCKEY_MOD_CTRL) ? NK_CTRL_END : NK_END;
         case NCKEY_DEL:       return NK_DEL;
         case NCKEY_PGUP:      return NK_PGUP;
         case NCKEY_PGDOWN:    return NK_PGDN;
@@ -569,6 +571,10 @@ static void nc_mouse(const ncinput *ni) {
     if (ni->evtype != NCTYPE_PRESS) return;
     if (g_bn_on && ni->id == NCKEY_BUTTON1 && ni->y == g_bn_xr && ni->x >= g_bn_xc0 && ni->x <= g_bn_xc1) { nc_banner_close(); return; }
     if (g_menu_on) return;
+    if (ni->id == NCKEY_BUTTON1 && g_pill_y >= 0 && g_top > 0 && ni->y == g_pill_y && ni->x >= g_pill_x0 && ni->x < g_pill_x1) {   /* the pill: the same as Ctrl+End */
+        sel_clear(); g_top = 0; nc_render_soon();
+        return;
+    }
     if (ni->id == NCKEY_SCROLL_UP) { pane_scroll(3); return; }
     if (ni->id == NCKEY_SCROLL_DOWN) { pane_scroll(-3); return; }
     if (ni->id != NCKEY_BUTTON1) return;
@@ -631,6 +637,7 @@ static void pm_text(int k) {
             case NK_LEFT: t = "[D"; break;
             case NK_HOME: t = "[H"; break;
             case NK_END:  t = "[F"; break;
+            case NK_CTRL_END: t = "[1;5F"; break;
             case NK_DEL:  t = "[3~"; break;
             case NK_PGUP: t = "[5~"; break;
             case NK_PGDN: t = "[6~"; break;
@@ -788,6 +795,23 @@ static void fill_row(int y, int x0, int x1, unsigned bg, bool grad) {
         paint(g_std, &st, NC_DEFAULT, b);
         ncplane_putstr_yx(g_std, y, x, " ");
     }
+}
+
+/* While the pane is scrolled back (g_top > 0), a pill in the middle of its last row, just above the field, says how to get
+ * back to the newest line; a click on it does the same as Ctrl+End. Its cells are kept for nc_mouse. */
+static void draw_pill(int y) {
+    static const char *label = " ↓ Jump to bottom (ctrl+end) ";
+    g_pill_y = -1;
+    if (g_top <= 0 || y < 0) return;
+    int w = 0;
+    nc_cell *c = xmalloc(sizeof *c * 64);
+    int n = nc_cells(label, strlen(label), c, 64, NULL);
+    for (int j = 0; j < n; j++) w += c[j].w;
+    free(c);
+    if (w > g_cols) return;
+    int x0 = (g_cols - w) / 2;
+    put_text(y, x0, label, w, C_TEXT, C_BAR_A, false, NULL);
+    g_pill_y = y; g_pill_x0 = x0; g_pill_x1 = x0 + w;
 }
 
 /* the conversation pane: the scrollback model's lines, `view` rows high; top-aligned while they fit, the newest at the bottom once they fill it */
@@ -1038,7 +1062,7 @@ static void pv_run(void) {
         else if (k == NK_PGUP) pv_scroll(-(body - 1));
         else if (k == NK_PGDN || k == ' ') pv_scroll(body - 1);
         else if (k == NK_HOME || k == 'g') g_pv_top = 0;
-        else if (k == NK_END || k == 'G') g_pv_top = pv_maxtop();
+        else if (k == NK_END || k == NK_CTRL_END || k == 'G') g_pv_top = pv_maxtop();
         else break;
     }
     g_pv_on = false;
@@ -1306,6 +1330,7 @@ void nc_render(void) {
     g_rows = (int)r; g_cols = (int)c;
     g_caret_y = -1;
     g_mx_kind = 0;   /* the modals below set it again */
+    g_pill_y = -1;
     tok_clear();
     ncplane_erase(g_std);
     if (g_rows >= 6 && g_cols >= 10) {
@@ -1326,6 +1351,7 @@ void nc_render(void) {
         draw_pane(top);
         draw_selection(top);
         draw_field(top);
+        if (!g_menu_on && !g_pv_on) draw_pill(top - 1);
         if (g_menu_on) draw_menu(top + fh, sh); else draw_suggest(top + fh, sh);
         draw_strip(bar - srows, srows, strip_text);
         draw_bar(bar);
@@ -1588,6 +1614,7 @@ static void edit_key(int k) {
                 free(t);
             }
             break; }
+        case NK_CTRL_END: g_top = 0; g_sel_on = false; nc_render(); break;   /* Ctrl+End: back to the newest line (the pill's key) */
         case NK_PGUP:  g_top += pane_rows() / 2; nc_render(); break;
         case NK_PGDN:  g_top -= pane_rows() / 2; if (g_top < 0) g_top = 0; nc_render(); break;
         default:
@@ -1889,7 +1916,7 @@ int nc_scroll_modal(const char *title, const char **lines, int n, int start) {
         else if (k == NK_PGUP) { sel -= show; if (sel < 0) sel = 0; }
         else if (k == NK_PGDN || k == ' ') { sel += show; if (sel >= n) sel = n - 1; }
         else if (k == NK_HOME || k == 'g') sel = 0;
-        else if (k == NK_END || k == 'G') sel = n - 1;
+        else if (k == NK_END || k == NK_CTRL_END || k == 'G') sel = n - 1;
     }
     menu_close();
     return result;

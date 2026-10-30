@@ -57,6 +57,7 @@ consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), 
   load bumps the epoch and moves the holders (the cursor line, the viewer's top); notcurses' `/clear` point is counted
   from the first line ever. `ESC[2J` empties the file. Ctrl+O reaches spilled folds through their kept state
   (`meta_at()`); a head's mark is fixed when it comes back.
+- Scrolled back (`g_top > 0`) in the notcurses UI, `draw_pill()` puts a "↓ Jump to bottom (ctrl+end)" pill in the middle of the pane's last row, above the field; a left click on it (`g_pill_*`, checked in `nc_mouse()`) or Ctrl+End (`NK_CTRL_END`, `edit_key()`) sets `g_top = 0`. The ANSI screen has its reserved note row (`view_note()`); Ctrl+End (`K_CTRL_END`, CSI `1;5F`/`4;5~`/`8;5~`) leaves the viewer there too, also while the model works, and is End everywhere else.
 - Ctrl+O and the folds, both UIs: every fold head carries a dim `(ctrl+o to expand)` (`fold_hint_put()`, util.c, written
   by `term_fold_begin()`), which `term_fold_toggle()` turns to `(ctrl+o to collapse)` with the mark (`fold_head_turn()`,
   pure, unit-tested). Ctrl+O (a paste token at the caret first) is `term_fold_all()`: every fold opens when one is shut,
