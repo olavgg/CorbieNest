@@ -1524,17 +1524,28 @@ static bool tok_del(bool before) {
 
 /* Ctrl-O: the paste token the caret is on (or just after) is replaced by its text, which can then be read and
  * edited; as on the ANSI screen, the paste is still sent as it stands if the token is not in the line any more */
-static void tok_unfold(void) {
+static bool tok_unfold(void) {
     size_t sp[PASTE_MAX][2]; int ks[PASTE_MAX];
     size_t n = paste_tokens(g_ed ? g_ed : "", g_len, sp, ks, NULL, PASTE_MAX);
     for (size_t i = 0; i < n; i++) {
         if (g_cur < sp[i][0] || g_cur > sp[i][1]) continue;
         const char *t = term_paste_text(ks[i], NULL);
-        if (!t) return;
+        if (!t) return false;
         ed_delete(sp[i][0], sp[i][1]);   /* the caret goes to where the token was */
         ed_insert(t, strlen(t));
-        return;
+        return true;
     }
+    return false;
+}
+
+/* Ctrl+O without a paste token at the caret: every fold opens, or all close when none is shut (term_fold_all), and the
+ * pane goes to the bottom */
+static void fold_all_key(void) {
+    fflush(stdout);
+    if (term_fold_all() <= 0) return;
+    g_top = 0;
+    g_sel_on = false;
+    nc_render_soon();
 }
 
 /* the keys that edit the line; the scroll keys move the pane (the wheel's are PgUp/PgDn here) */
@@ -1672,6 +1683,7 @@ int nc_poll_interrupt(void) {
         if (sug_key(k)) continue;                        /* the list's keys: Tab, ↓/↑, Enter on a row, Esc closes it */
         if (k == NK_UP || k == NK_DOWN) { nc_hist(k, true); continue; }   /* the queue first, then the history */
         if (k == 3 || k == 27) return 1;                 /* Ctrl-C and Esc stop the work, as in the ANSI UI */
+        if (k == 15) { fold_all_key(); continue; }       /* Ctrl-O: every fold opens or closes, while the model works too */
         if (k == 13) {                                   /* Enter while busy: the line is queued for the model */
             if (g_len) {
                 /* a slash command main.c can run right there (/status, /mode, …) runs now, as in the ANSI UI */
@@ -1742,7 +1754,7 @@ static char *readline_loop(void) {
             continue;
         }
         ctrl_c = 0;
-        if (k == 15 && g_main_field) { tok_unfold(); continue; }   /* Ctrl-O: unfold the paste token at the caret */
+        if (k == 15) { if (!g_main_field || !tok_unfold()) fold_all_key(); continue; }   /* Ctrl-O: the paste token at the caret, else every fold */
         if (k == 27) { ed_set(""); nc_unbrowse(); if (g_main_field) term_paste_reset(); continue; }
         if (k == NK_UP || k == NK_DOWN) { nc_hist(k, false); continue; }
         edit_key(k);

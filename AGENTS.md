@@ -49,6 +49,12 @@ consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), 
   Enter on a row, Esc closes), shared by both loops. Not yet: the `@file` list is the same code path
   but is not tested in this UI, and the `/model` picker (`cmd_model_picker`, through `term_select` → `nc_select`) lists the Ollama
   models and the Anthropic ones (`anthropic:ID`), as the ANSI picker does; xAI and OpenAI are advisors only and are not in it.
+- Ctrl+O and the folds, both UIs: every fold head carries a dim `(ctrl+o to expand)` (`fold_hint_put()`, util.c, written
+  by `term_fold_begin()`), which `term_fold_toggle()` turns to `(ctrl+o to collapse)` with the mark (`fold_head_turn()`,
+  pure, unit-tested). Ctrl+O (a paste token at the caret first) is `term_fold_all()`: every fold opens when one is shut,
+  all close otherwise, and the view goes to the bottom; at the prompt, in the viewer and while the model works
+  (`fold_all_key()` in term.c and in term_nc.c). The notcurses screen turns `IEXTEN` off after init (`nc_start()`):
+  notcurses leaves it on, and the tty driver then eats Ctrl+O (VDISCARD on macOS) and Ctrl+V (VLNEXT).
 - Folds and mouse in the notcurses UI (long tool results, multi-line bash commands and the advisor's advice all fold there now, through the same `term_fold_begin()`): `notcurses_mice_enable(BUTTON_EVENT)` in `nc_start()`; `nc_getkey()`
   takes mouse reports out of the key stream (`nc_mouse()`): a left click on a fold's head calls
   `term_fold_toggle()` (the same toggle as the ANSI screen), the wheel scrolls the pane. A click finds its
@@ -57,7 +63,7 @@ consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), 
   rows are not in the map. Selecting text with the mouse needs Shift in most terminals, as in the ANSI UI.
 - Not in the notcurses UI yet (say so when touched): the viewer (PgUp scrolls the pane), the `←` agents menu,
   images. Paste tokens: a click on one opens the paste view (`draw_pasteview()`, `pv_run()`, the same keys as the
-  ANSI viewer), Ctrl-O unfolds one (`tok_unfold()`), and a token is drawn as the caret is (`draw_field()`). The
+  ANSI viewer), Ctrl-O unfolds one (`tok_unfold()`; with no token at the caret Ctrl-O is the folds' key, below), and a token is drawn as the caret is (`draw_field()`). The
   notcurses input layer (vendor/notcurses) hides one thing from the paste reader, so it differs from the ANSI
   reader: an arrow or editing key inside a paste gives its CSI text (`[D` for Left: a SS3 `ESC O D` gives `[D`, not
   `OD`). Two changes in the vendored input make the paste match the ANSI reader: a CRLF is one break (an Enter keeps

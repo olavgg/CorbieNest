@@ -212,6 +212,33 @@ static void test_write_preview(void) {
     CHECK(strstr(q, "line 0 of the file") != NULL);
     free(q);
 }
+static void test_fold_head(void) {
+    /* the head as written: "(ctrl+o to expand)" after it, dim, two spaces before it */
+    sbuf h; sb_init(&h); sb_puts(&h, "  " TERM_FOLD_CLOSED " $ ls  (+40 lines)"); fold_hint_put(&h, false);
+    CHECK(!strcmp(h.data, "  " TERM_FOLD_CLOSED " $ ls  (+40 lines)  " C_DIM TERM_FOLD_HINT_EXPAND C_RESET));
+    /* opened: the mark and the hint turn together, the rest as it was */
+    char *o = fold_head_turn(h.data, true);
+    CHECK(!strcmp(o, "  " TERM_FOLD_OPEN " $ ls  (+40 lines)  " C_DIM TERM_FOLD_HINT_COLLAPSE C_RESET));
+    char *c = fold_head_turn(o, false);   /* and back: the text it started as */
+    CHECK(!strcmp(c, h.data));
+    free(o); free(c);
+    /* turning a head to the state it is in changes nothing */
+    char *same = fold_head_turn(h.data, false);
+    CHECK(!strcmp(same, h.data));
+    free(same);
+    /* a head without the hint (written before it existed, or a sub-agent log's): only the mark */
+    char *m = fold_head_turn(TERM_FOLD_CLOSED " 12 lines", true);
+    CHECK(!strcmp(m, TERM_FOLD_OPEN " 12 lines"));
+    free(m);
+    /* only the first mark turns: a ▸ in the command's own text stays */
+    char *f = fold_head_turn(TERM_FOLD_CLOSED " $ echo " TERM_FOLD_CLOSED, true);
+    CHECK(!strcmp(f, TERM_FOLD_OPEN " $ echo " TERM_FOLD_CLOSED));
+    free(f);
+    char *e = fold_head_turn(NULL, true);
+    CHECK(e && !*e);
+    free(e);
+    sb_free(&h);
+}
 static void test_tools_body(void *ud) {
     (void)ud;
     char dir[] = "/tmp/crowtest_dir_XXXXXX";
@@ -2760,7 +2787,7 @@ int main(void) {
     g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 10; g_cfg.interactive = false;
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "sbuf", test_sbuf }, { "util", test_util }, { "cmd head", test_cmd_head }, { "markdown", test_md }, { "highlight", test_highlight }, { "git branch", test_gitbranch },
-        { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "modes", test_modes },
+        { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "fold head", test_fold_head }, { "modes", test_modes },
         { "close button", test_close_x }, { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
         { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme },

@@ -1790,7 +1790,8 @@ bool term_fold_begin(const char *head) {
     if ((!g_fs && !g_ui_nc) || !g_sb_active || g_fold_rec) return false;   /* no folds without a screen to click (ANSI full-screen or notcurses); none inside one */
     fflush(stdout);
     if (g_sb_col > 0) fputs("\n", stdout);
-    fputs(head, stdout); fflush(stdout);
+    sbuf h; sb_init(&h); sb_puts(&h, head); fold_hint_put(&h, false);   /* "(ctrl+o to expand)" after it */
+    fputs(h.data, stdout); fflush(stdout); sb_free(&h);
     sb_ensure_line();
     g_sb_meta[g_sb_line] = (sb_meta){ ++g_fold_seq, SB_FOLD_HEAD, false };
     fputs("\n", stdout); fflush(stdout);
@@ -1822,7 +1823,9 @@ static void show_block_impl(const char *head, const char *body) {
     sb_ensure_line();
     g_fold_rec = id;
     g_sb_meta[g_sb_line] = (sb_meta){ id, SB_FOLD_HEAD, false };
-    sb_feed(head, strlen(head)); sb_feed("\n", 1);
+    sb_feed(head, strlen(head));
+    if (strstr(head, TERM_FOLD_OPEN)) { sbuf h; sb_init(&h); fold_hint_put(&h, true); sb_feed(h.data, h.len); sb_free(&h); }   /* open: "(ctrl+o to collapse)" */
+    sb_feed("\n", 1);
     sb_feed(body, blen);
     if (blen && body[blen - 1] != '\n') sb_feed("\n", 1);
     g_fold_rec = 0;
@@ -1848,12 +1851,31 @@ int term_fold_toggle(int line) {
     fflush(stdout);
     int id = g_sb_meta[line].fold, nb = 0; bool open = false;
     for (int i = line + 1; i < g_sb_n && g_sb_meta[i].fold == id && g_sb_meta[i].kind == SB_FOLD_BODY; i++) { g_sb_meta[i].hidden = !g_sb_meta[i].hidden; open = !g_sb_meta[i].hidden; nb++; }
-    char *mark = strstr(g_sb[line].data, open ? TERM_FOLD_CLOSED : TERM_FOLD_OPEN);   /* the two marks are as long as each other */
-    if (mark) memcpy(mark, open ? TERM_FOLD_OPEN : TERM_FOLD_CLOSED, strlen(TERM_FOLD_OPEN));
+    char *turned = fold_head_turn(g_sb[line].data, open);   /* the mark, and the hint: expand ↔ collapse */
+    sb_clear(&g_sb[line]); sb_puts(&g_sb[line], turned); free(turned);
     trace_note('F', "fold %d %s (line %d)", id, open ? "opened" : "closed", line);
     return nb;
 }
 
+/* Ctrl+O: every fold opens when one of them is shut, and they all close when none is. The heads are found from the
+ * model's marks (a head's first body line says whether it is shut). Returns the folds turned. */
+int term_fold_all(void) {
+    if (g_fold_rec || !g_sb_active) return 0;
+    bool any_shut = false;
+    for (int i = 0; i + 1 < g_sb_n && !any_shut; i++)
+        if (g_sb_meta[i].kind == SB_FOLD_HEAD && g_sb_meta[i + 1].kind == SB_FOLD_BODY && g_sb_meta[i + 1].fold == g_sb_meta[i].fold
+            && g_sb_meta[i + 1].hidden) any_shut = true;
+    int turned = 0;
+    for (int i = 0; i + 1 < g_sb_n; i++) {
+        if (g_sb_meta[i].kind != SB_FOLD_HEAD || g_sb_meta[i + 1].kind != SB_FOLD_BODY || g_sb_meta[i + 1].fold != g_sb_meta[i].fold) continue;
+        if (g_sb_meta[i + 1].hidden != any_shut) continue;   /* already as wanted */
+        if (term_fold_toggle(i) >= 0) turned++;
+    }
+    trace_note('F', "ctrl+o: %d folds %s", turned, any_shut ? "opened" : "closed");
+    return turned;
+}
+
+static void fold_repaint(void);
 static void fold_click(void) {
     int row = g_click_row; g_click_row = 0;
     if (!row || !g_fs || !g_sb_active || g_fold_rec || row > fs_region()) return;
@@ -1863,6 +1885,10 @@ static void fold_click(void) {
     int idx = first + row - 1, line = idx >= 0 && idx < n ? r[idx].line : -1;
     free(r);
     if (term_fold_toggle(line) < 0) return;
+    fold_repaint();
+}
+/* the region painted again from the model after folds turned: the viewer's window, or the live conversation */
+static void fold_repaint(void) {
     if (g_view_top >= 0) view_paint();
     else {
         bool was = g_sb_pause; sb_pause(true);
@@ -1871,6 +1897,14 @@ static void fold_click(void) {
         sb_pause(was);
     }
     term_status_refresh();   /* the chrome, and the editor's cursor back in the field */
+}
+/* Ctrl+O on the full-screen ANSI screen: every fold opens or closes (term_fold_all), and the view goes to the bottom */
+static void fold_all_key(void) {
+    if (!g_fs || !g_sb_active || g_fold_rec) return;
+    fflush(stdout);
+    if (term_fold_all() <= 0) return;
+    view_leave();
+    fold_repaint();
 }
 
 /* Type-ahead: bytes typed while the model was generating are kept here so
@@ -2212,6 +2246,7 @@ static void ta_submit(void) {
 static int csi_key(const char *params, int fin);
 static int mouse_key(int cb, int row, int col);
 static void fold_click(void);
+static void fold_all_key(void);
 static void ta_act(int k) {
     int page = view_rows() - 1;
     switch (k) {
@@ -2222,6 +2257,7 @@ static void ta_act(int k) {
         case K_PGDN:       view_scroll(page > 1 ? page : 1); break;
         case K_MOUSE:      fold_click(); break;
         case K_CLOSE_X:    if (g_ov_text) term_overlay_close(); break;   /* an overlay's close button, while the model works */
+        case 15:           fold_all_key(); break;                            /* Ctrl+O: every fold opens or closes */
         default: break;
     }
 }
@@ -2285,6 +2321,7 @@ static void ta_type(unsigned char c) {
     if (!g_ta_paste && (c == 14 || c == 16) && ta_sug_key(c == 14 ? K_DOWN : K_UP)) return;
     if (!g_ta_paste && (c == 14 || c == 16)) { ta_hist(c == 14 ? K_DOWN : K_UP); return; }   /* Ctrl-N / Ctrl-P: as ↓ / ↑ */
     if (!g_ta_paste && c == '\t' && g_fs) { ta_sug_key(c); return; }   /* Tab completes, or does nothing: it is not text */
+    if (!g_ta_paste && c == 15 && g_fs) { ta_act(15); return; }          /* Ctrl+O: the folds, at once (a token in the pending text unfolds at the prompt) */
     ta_put(c);
     /* show it in the field — unless it is a byte of a key sequence still arriving (a wheel
      * report is a dozen of them), which is not text and changes nothing there */
@@ -2739,6 +2776,7 @@ static void scroll_view_impl(int delta) {
         int k = read_key();
         if (k == -2) { view_paint(); continue; }
         if (k == K_MOUSE) { fold_click(); continue; }
+        if (k == 15) { fold_all_key(); continue; }   /* Ctrl+O: every fold, and the view goes to the bottom (out of the viewer) */
         int page = view_rows() - 1; if (page < 1) page = 1;
         if (k == K_PGUP) view_scroll(-page);
         else if (k == K_PGDN || k == ' ') view_scroll(page);
@@ -3569,7 +3607,7 @@ static char *readline_impl(const char *prompt, bool in_field) {
             case K_RIGHT: case 6: e.cur = u8_next(e.buf.data, e.cur, e.buf.len); break;
             case K_HOME: case 1: {
                 size_t p = e.cur; while (p > 0 && e.buf.data[p-1] != '\n') p--; e.cur = p; break; }
-            case 15: paste_unfold(&e); break;   /* Ctrl-O: unfold the paste token at the caret */
+            case 15: if (!paste_unfold(&e)) fold_all_key(); break;   /* Ctrl-O: the paste token at the caret, else every fold */
             case K_END: case 5: {
                 size_t p = e.cur; while (p < e.buf.len && e.buf.data[p] != '\n') p++; e.cur = p; break; }
             case K_ALT_B: case K_CTRL_LEFT: e.cur = word_left(&e); break;

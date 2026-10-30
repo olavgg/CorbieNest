@@ -1550,6 +1550,34 @@ size_t utf8_cut(const char *s, size_t len, size_t cap) {
     return n;
 }
 
+/* ---------- fold heads: the mark and the Ctrl+O hint ---------- */
+
+void fold_hint_put(sbuf *b, bool open) {
+    sb_puts(b, "  " C_DIM);
+    sb_puts(b, open ? TERM_FOLD_HINT_COLLAPSE : TERM_FOLD_HINT_EXPAND);
+    sb_puts(b, C_RESET);
+}
+
+/* the first `from` in s becomes `to` (into b, with the rest); false when it is not there */
+static bool fold_swap(sbuf *b, const char *s, const char *from, const char *to) {
+    const char *at = strstr(s, from);
+    if (!at) return false;
+    sb_append(b, s, (size_t)(at - s));
+    sb_puts(b, to);
+    sb_puts(b, at + strlen(from));
+    return true;
+}
+char *fold_head_turn(const char *line, bool open) {
+    sbuf a, b; sb_init(&a); sb_init(&b);
+    const char *s = line ? line : "";
+    if (!fold_swap(&a, s, open ? TERM_FOLD_CLOSED : TERM_FOLD_OPEN, open ? TERM_FOLD_OPEN : TERM_FOLD_CLOSED)) sb_puts(&a, s);
+    const char *t = a.data ? a.data : "";
+    if (!fold_swap(&b, t, open ? TERM_FOLD_HINT_EXPAND : TERM_FOLD_HINT_COLLAPSE,
+                   open ? TERM_FOLD_HINT_COLLAPSE : TERM_FOLD_HINT_EXPAND)) sb_puts(&b, t);
+    sb_free(&a);
+    return sb_detach(&b);
+}
+
 /* ---------- the running-tasks strip: one row, and how many rows fit ---------- */
 
 /* the length of the SGR escape (ESC [ … m) at s, 0 when there is none: it takes no column */

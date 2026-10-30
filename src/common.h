@@ -500,7 +500,18 @@ extern int (*term_run_while_busy)(const char *line);
  * False = no folding here (not in full-screen mode): print a preview instead. */
 #define TERM_FOLD_CLOSED "▸"
 #define TERM_FOLD_OPEN   "▾"
+/* the hint after a fold's head (dim, two spaces before it), which Ctrl+O acts on: every fold opens, or closes when
+ * none is shut (term_fold_all) */
+#define TERM_FOLD_HINT_EXPAND   "(ctrl+o to expand)"
+#define TERM_FOLD_HINT_COLLAPSE "(ctrl+o to collapse)"
 bool        term_fold_begin(const char *head);
+/* Ctrl+O: opens every fold when one is shut, closes them all otherwise; returns the folds turned (0: none there).
+ * Only the model changes; the UI repaints and goes to the bottom. */
+int         term_fold_all(void);
+/* util.c, pure: the hint as written after a head; and a head's text turned open or shut (the mark ▸/▾ and the hint
+ * expand/collapse), malloc'd; the text as it was when neither is in it */
+void        fold_hint_put(sbuf *b, bool open);
+char       *fold_head_turn(const char *line, bool open);
 /* rate limits: the anthropic-ratelimit-* headers of a response (util.c); per model, the last seen */
 void        ratelimit_header(ratelimit_info *rl, const char *line, size_t n);
 void        ratelimit_set(const char *model, const ratelimit_info *rl);
