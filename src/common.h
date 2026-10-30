@@ -579,6 +579,8 @@ bool        term_banner_show(const char **lines, int n, int bw);   /* the banner
 void        term_banner_draw(const char **lines, int n, int bw);   /* the modal's lines again (a tick) */
 void        term_banner_hide(void);
 bool        term_banner_open(void);
+void        term_banner_key(void);   /* a key typed in the field: the start-up box goes away with it */
+void        term_banner_dismiss_on_key(void);   /* the banner that is up goes away with the first key typed in the field (the start-up box; /banner stays until its X or Esc) */
 #define BANNER_X_FROM_RIGHT 3   /* the close button's centre: this many cells in from the box's right edge (the corner is 1): 2 cells left of the corner */
 #define BANNER_X_W 3            /* the close button is "[×]": its three cells are the click target */
 /* The cells of the close button of a box whose left edge is column `left` and which is `bw` cells wide (any origin: the
