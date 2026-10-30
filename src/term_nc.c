@@ -1465,6 +1465,11 @@ bool nc_start(void) {
         return false;
     }
     g_std = notcurses_stdplane(g_nc);
+    /* notcurses clears ECHO and ICANON only, so IEXTEN stays on, and with it the tty driver takes Ctrl+O (VDISCARD on
+     * macOS and the BSDs) and Ctrl+V (VLNEXT) before they are read: Ctrl+O never reached the folds. The ANSI screen's
+     * raw mode turns it off too; notcurses_stop() puts the terminal's own settings back. */
+    struct termios tios;
+    if (tcgetattr(STDIN_FILENO, &tios) == 0) { tios.c_lflag &= ~(tcflag_t)IEXTEN; (void)tcsetattr(STDIN_FILENO, TCSANOW, &tios); }
     fputs("\x1b[?2004h", g_nc_out); fflush(g_nc_out);   /* bracketed paste on for the session: a paste comes as one marked block (see the paste section) */
     (void)notcurses_mice_enable(g_nc, NCMICE_BUTTON_EVENT | NCMICE_DRAG_EVENT);   /* drags too: a selection needs the moves while the button is held (press alone reports one cell) */   /* clicks (folds) and the wheel (the pane); without it the terminal keeps its own */
     g_top = 0; g_clear_at = 0; g_pending = false; g_kq_n = 0;
