@@ -222,7 +222,7 @@ static void test_sb_spill(void) {
     }
     CHECK(all && sp.n == 20000 && sp.fd > 0);
     CHECK((fcntl(sp.fd, F_GETFD) & FD_CLOEXEC) != 0);   /* not handed to the commands the tools run */
-    sb_meta m;
+    sb_meta m = { 0, 0, false };   /* (set only by a read that succeeds: GCC -O2 would call it maybe-uninitialized) */
     char *t = sb_spill_read(&sp, 12345, &m);
     CHECK(t && !strcmp(t, "\x1b[2mline 12345\x1b[0m") && m.fold == 12345 && m.kind == (unsigned char)(12345 % 3) && m.hidden);
     free(t);

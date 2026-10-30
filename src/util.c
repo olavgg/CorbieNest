@@ -1608,7 +1608,9 @@ void sb_spill_pop(sb_spill *s, int k) {
 }
 void sb_spill_reset(sb_spill *s) {
     s->n = 0; s->end = 0;
-    if (s->fd > 0) (void)ftruncate(s->fd, 0);
+    /* the old lines' bytes go; a file that cannot be cut is closed instead, and the next spill opens a new one (glibc
+     * marks ftruncate warn_unused_result, which a (void) cast does not silence under GCC) */
+    if (s->fd > 0 && ftruncate(s->fd, 0) != 0) { close(s->fd); s->fd = 0; }
 }
 void sb_spill_close(sb_spill *s) {
     if (s->fd > 0) close(s->fd);
