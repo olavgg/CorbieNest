@@ -49,6 +49,20 @@ consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), 
   Enter on a row, Esc closes), shared by both loops. Not yet: the `@file` list is the same code path
   but is not tested in this UI, and the `/model` picker (`cmd_model_picker`, through `term_select` → `nc_select`) lists the Ollama
   models and the Anthropic ones (`anthropic:ID`), as the ANSI picker does; xAI and OpenAI are advisors only and are not in it.
+- The scrollback keeps every line: past `SB_MAX_LINES` (8000) the oldest go to an unlinked file in TMPDIR
+  (`sb_spill`, util.c: a stack of lines with their fold state, unit-tested), down to 6000, and come back when a view
+  reads above memory (`term_sb_load_older()`: the ANSI viewer's `view_scroll()`, Home/`g` loads them all; the notcurses
+  `draw_pane()` walk). Not while scrolled back (`g_view_top`, `nc_scrolled_back()`): then the cap is 100000, so reading
+  back does not thrash. Line numbers stay relative to memory (`term_sb_first()` lines are before line 0); a spill or
+  load bumps the epoch and moves the holders (the cursor line, the viewer's top); notcurses' `/clear` point is counted
+  from the first line ever. `ESC[2J` empties the file. Ctrl+O reaches spilled folds through their kept state
+  (`meta_at()`); a head's mark is fixed when it comes back.
+- Ctrl+O and the folds, both UIs: every fold head carries a dim `(ctrl+o to expand)` (`fold_hint_put()`, util.c, written
+  by `term_fold_begin()`), which `term_fold_toggle()` turns to `(ctrl+o to collapse)` with the mark (`fold_head_turn()`,
+  pure, unit-tested). Ctrl+O (a paste token at the caret first) is `term_fold_all()`: every fold opens when one is shut,
+  all close otherwise, and the view goes to the bottom; at the prompt, in the viewer and while the model works
+  (`fold_all_key()` in term.c and in term_nc.c). The notcurses screen turns `IEXTEN` off after init (`nc_start()`):
+  notcurses leaves it on, and the tty driver then eats Ctrl+O (VDISCARD on macOS) and Ctrl+V (VLNEXT).
 - Folds and mouse in the notcurses UI (long tool results, multi-line bash commands and the advisor's advice all fold there now, through the same `term_fold_begin()`): `notcurses_mice_enable(BUTTON_EVENT)` in `nc_start()`; `nc_getkey()`
   takes mouse reports out of the key stream (`nc_mouse()`): a left click on a fold's head calls
   `term_fold_toggle()` (the same toggle as the ANSI screen), the wheel scrolls the pane. A click finds its
@@ -57,7 +71,7 @@ consult) is libcurl behind `src/http.c`; the UI is ANSI escapes (`src/term.c`), 
   rows are not in the map. Selecting text with the mouse needs Shift in most terminals, as in the ANSI UI.
 - Not in the notcurses UI yet (say so when touched): the viewer (PgUp scrolls the pane), the `←` agents menu,
   images. Paste tokens: a click on one opens the paste view (`draw_pasteview()`, `pv_run()`, the same keys as the
-  ANSI viewer), Ctrl-O unfolds one (`tok_unfold()`), and a token is drawn as the caret is (`draw_field()`). The
+  ANSI viewer), Ctrl-O unfolds one (`tok_unfold()`; with no token at the caret Ctrl-O is the folds' key, below), and a token is drawn as the caret is (`draw_field()`). The
   notcurses input layer (vendor/notcurses) hides one thing from the paste reader, so it differs from the ANSI
   reader: an arrow or editing key inside a paste gives its CSI text (`[D` for Left: a SS3 `ESC O D` gives `[D`, not
   `OD`). Two changes in the vendored input make the paste match the ANSI reader: a CRLF is one break (an Enter keeps
@@ -230,6 +244,15 @@ build must be warning-free with `-Wall -Wextra`.
   terminal only is found by replaying its trace, not by guessing: ask for one. The file holds
   the conversation, so it is created 0600 and the banner says when one is being written; keep
   it a recording — nothing may behave differently because it is on.
+- `tools/nc_pty_check.py` starts `corbie --ui notcurses` on a pty that plays the terminal: it
+  answers notcurses' start-up queries and can cut the replies in two (`SPLIT`, `GAP`, `ROUND`,
+  `ONLY`, `DA1FIRST`; `CLICK=y,x` or `CLICK=esc` after 4 s; `FOLDS=1`: Ctrl+O on two folds, against
+  `tests/fake_ollama.py`, which the integration suite cannot do on that screen), and fails when a reply shows as text,
+  the ANSI fallback runs, or (with pyte) the banner closes by itself or stays up after the click.
+  A manual check of the vendored input layer (see its README), timing-dependent, not in `make test`.
+  Notcurses reads stdin on its own thread, so `CORBIENEST_TRACE` has no `I` records in that UI: it has
+  `N` records instead (`term_trace_note()`: each event notcurses decoded, and where a left press landed
+  against the banner's and the modals' close buttons). `TRACE=FILE` passes a trace through the script.
 - Enter while busy on a slash command first goes to `term_run_while_busy` (main.c's
   `run_slash_while_busy` / `slash_runs_while_busy`), which runs it there and then when it only
   reports state or flips a setting. Such a command runs *inside* the poll of a live request:

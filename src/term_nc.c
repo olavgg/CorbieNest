@@ -198,6 +198,7 @@ void   nc_overlay_set(const char *text) { (void)text; }
 bool   nc_overlay_open(void) { return false; }
 void   nc_output(void) {}
 void   nc_clear(void) {}
+bool   nc_scrolled_back(void) { return false; }
 void   nc_prefill(const char *text) { (void)text; }
 void   nc_leave_browse(void) {}
 char  *nc_readline(const char *prompt, bool in_field) { (void)prompt; (void)in_field; return NULL; }
@@ -295,7 +296,8 @@ static bool g_sel_down = false;       /* a button is held: the gesture is in pro
 static bool g_sel_moved = false;      /* the gesture has moved since the press */
 static sel_pt g_sel_a, g_sel_b;       /* where the gesture began and where it is now */
 static int g_sel_epoch = -1;          /* term_sb_epoch() when the selection was made */
-static int g_clear_at = 0;             /* lines before this one are not shown (/clear) */
+static int g_clear_at = 0;             /* the conversation's lines before this one are not shown (/clear): counted from the
+                                          * first line ever, spilled ones too (term_sb_first() + the model's index) */
 static bool g_pending = false;         /* output arrived that is not drawn yet */
 static double g_last_draw = 0;
 
@@ -518,6 +520,10 @@ static bool pane_point(int y, int x, sel_pt *out) {
  * click (a fold's head toggles, as it always did); a press that moved and was released is a selection, copied
  * and kept on the screen until the next key. Scrolling and the banner's close are as before. */
 static void nc_mouse(const ncinput *ni) {
+    if (ni->evtype == NCTYPE_PRESS && ni->id == NCKEY_BUTTON1)   /* where a left press lands against what is up (CORBIENEST_TRACE) */
+        term_trace_note('N', "press y=%d x=%d · banner %d row %d cols %d-%d · close %d row %d cols %d-%d · sel_down %d menu %d pv %d · pane epoch %d/%d",
+                        ni->y, ni->x, g_bn_on, g_bn_xr, g_bn_xc0, g_bn_xc1, g_mx_kind, g_mx_y, g_mx_c0, g_mx_c1,
+                        g_sel_down, g_menu_on, g_pv_on, g_pane_epoch, term_sb_epoch());
     if (ni->evtype == NCTYPE_PRESS && ni->id == NCKEY_BUTTON1 && g_mx_kind && ni->y == g_mx_y && ni->x >= g_mx_c0 && ni->x <= g_mx_c1) {
         if (g_mx_kind == 1 && g_ov_on) { nc_overlay_set(NULL); return; }
         if (g_mx_kind == 2 && (g_menu_on || g_pv_on)) { g_close_req = true; return; }
@@ -689,6 +695,7 @@ static int nc_getkey(int ms) {
         ncinput ni; memset(&ni, 0, sizeof ni);
         uint32_t id = notcurses_get_nblock(g_nc, &ni);
         if (id == 0 || id == (uint32_t)-1) break;
+        term_trace_note('N', "id=%u ev=%d y=%d x=%d mods=0x%x", ni.id, (int)ni.evtype, ni.y, ni.x, ni.modifiers);   /* what notcurses decoded (CORBIENEST_TRACE) */
         if (nckey_mouse_p(ni.id)) { nc_mouse(&ni); if (g_pv_req) return NK_NONE; if (g_close_req) { g_close_req = false; return 27; } continue; }   /* (a click on a modal's close button is its Esc) */   /* a report, not a key (a click for a view ends the read) */
         if (ni.id == NCKEY_TAB && (ni.modifiers & NCKEY_MOD_SHIFT) && ni.evtype != NCTYPE_RELEASE) {   /* Shift+Tab cycles the mode at once, as on the ANSI screen (a key, so it is not queued); a release is not a second press */
             g_cfg.mode = (g_cfg.mode + 1) % MODE_COUNT;
@@ -791,14 +798,26 @@ static void draw_pane(int view) {
     for (int y = 0; y < view; y++) g_pane_line[y] = -1;
     if (view * g_cols > g_pane_cells_n) { g_pane_cells = xrealloc(g_pane_cells, sizeof *g_pane_cells * (size_t)(view * g_cols)); g_pane_cells_n = view * g_cols; }
     for (int k = 0; k < view * g_cols; k++) g_pane_cells[k] = (pane_cell){ -1, -1, { NC_DEFAULT, NC_DEFAULT, 0 }, "" };
-    int total = term_sb_nlines();
-    int start = g_clear_at < total ? g_clear_at : total;
     typedef struct { nc_cell *c; int n; int rows; int idx; } lline;
     lline *ls = NULL;
     int nls = 0, cap = 0, acc = 0;
     int need = view + g_top;
-    /* the lines are read from the newest back, until they fill the pane (and the scroll-back) */
-    for (int i = total - 1; i >= start && acc < need; i--) {
+    int total = term_sb_nlines();
+    int start = g_clear_at - term_sb_first();
+    if (start < 0) start = 0;
+    if (start > total) start = total;
+    /* the lines are read from the newest back, until they fill the pane (and the scroll-back); lines in the spill file
+     * come back when the walk runs out of the model's (the lines are renumbered then: the walk starts over) */
+    for (int i = total - 1; acc < need; i--) {
+        if (i < start) {
+            if (start > 0 || term_sb_first() <= g_clear_at || term_sb_load_older(SB_LOAD_LINES) <= 0) break;
+            for (int k = 0; k < nls; k++) free(ls[k].c);
+            nls = 0; acc = 0;
+            total = term_sb_nlines();
+            start = g_clear_at - term_sb_first(); if (start < 0) start = 0;
+            i = total;
+            continue;
+        }
         if (term_sb_hidden(i)) continue;
         const char *s = term_sb_line(i);
         size_t len = strlen(s);
@@ -1460,6 +1479,11 @@ bool nc_start(void) {
         return false;
     }
     g_std = notcurses_stdplane(g_nc);
+    /* notcurses clears ECHO and ICANON only, so IEXTEN stays on, and with it the tty driver takes Ctrl+O (VDISCARD on
+     * macOS and the BSDs) and Ctrl+V (VLNEXT) before they are read: Ctrl+O never reached the folds. The ANSI screen's
+     * raw mode turns it off too; notcurses_stop() puts the terminal's own settings back. */
+    struct termios tios;
+    if (tcgetattr(STDIN_FILENO, &tios) == 0) { tios.c_lflag &= ~(tcflag_t)IEXTEN; (void)tcsetattr(STDIN_FILENO, TCSANOW, &tios); }
     fputs("\x1b[?2004h", g_nc_out); fflush(g_nc_out);   /* bracketed paste on for the session: a paste comes as one marked block (see the paste section) */
     (void)notcurses_mice_enable(g_nc, NCMICE_BUTTON_EVENT | NCMICE_DRAG_EVENT);   /* drags too: a selection needs the moves while the button is held (press alone reports one cell) */   /* clicks (folds) and the wheel (the pane); without it the terminal keeps its own */
     g_top = 0; g_clear_at = 0; g_pending = false; g_kq_n = 0;
@@ -1489,8 +1513,9 @@ bool nc_size(int *rows, int *cols) {
     return true;
 }
 
+bool nc_scrolled_back(void) { return g_nc && g_top > 0; }
 void nc_clear(void) {
-    g_clear_at = term_sb_nlines();
+    g_clear_at = term_sb_first() + term_sb_nlines();
     g_top = 0;
     nc_render();
 }
@@ -1514,17 +1539,28 @@ static bool tok_del(bool before) {
 
 /* Ctrl-O: the paste token the caret is on (or just after) is replaced by its text, which can then be read and
  * edited; as on the ANSI screen, the paste is still sent as it stands if the token is not in the line any more */
-static void tok_unfold(void) {
+static bool tok_unfold(void) {
     size_t sp[PASTE_MAX][2]; int ks[PASTE_MAX];
     size_t n = paste_tokens(g_ed ? g_ed : "", g_len, sp, ks, NULL, PASTE_MAX);
     for (size_t i = 0; i < n; i++) {
         if (g_cur < sp[i][0] || g_cur > sp[i][1]) continue;
         const char *t = term_paste_text(ks[i], NULL);
-        if (!t) return;
+        if (!t) return false;
         ed_delete(sp[i][0], sp[i][1]);   /* the caret goes to where the token was */
         ed_insert(t, strlen(t));
-        return;
+        return true;
     }
+    return false;
+}
+
+/* Ctrl+O without a paste token at the caret: every fold opens, or all close when none is shut (term_fold_all), and the
+ * pane goes to the bottom */
+static void fold_all_key(void) {
+    fflush(stdout);
+    if (term_fold_all() <= 0) return;
+    g_top = 0;
+    g_sel_on = false;
+    nc_render_soon();
 }
 
 /* the keys that edit the line; the scroll keys move the pane (the wheel's are PgUp/PgDn here) */
@@ -1662,6 +1698,7 @@ int nc_poll_interrupt(void) {
         if (sug_key(k)) continue;                        /* the list's keys: Tab, ↓/↑, Enter on a row, Esc closes it */
         if (k == NK_UP || k == NK_DOWN) { nc_hist(k, true); continue; }   /* the queue first, then the history */
         if (k == 3 || k == 27) return 1;                 /* Ctrl-C and Esc stop the work, as in the ANSI UI */
+        if (k == 15) { fold_all_key(); continue; }       /* Ctrl-O: every fold opens or closes, while the model works too */
         if (k == 13) {                                   /* Enter while busy: the line is queued for the model */
             if (g_len) {
                 /* a slash command main.c can run right there (/status, /mode, …) runs now, as in the ANSI UI */
@@ -1732,7 +1769,7 @@ static char *readline_loop(void) {
             continue;
         }
         ctrl_c = 0;
-        if (k == 15 && g_main_field) { tok_unfold(); continue; }   /* Ctrl-O: unfold the paste token at the caret */
+        if (k == 15) { if (!g_main_field || !tok_unfold()) fold_all_key(); continue; }   /* Ctrl-O: the paste token at the caret, else every fold */
         if (k == 27) { ed_set(""); nc_unbrowse(); if (g_main_field) term_paste_reset(); continue; }
         if (k == NK_UP || k == NK_DOWN) { nc_hist(k, false); continue; }
         edit_key(k);

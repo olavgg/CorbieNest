@@ -1537,6 +1537,36 @@ check(not scrolled(s), "PgDn at the bottom leaves the viewer")
 s.send("typed\r"); check(s.expect("Echo: typed"), "prompt usable again")
 s.send("\x04"); s.close()
 
+print("test interactive: PgUp page by page from the bottom past the top of a session longer than memory keeps")
+# 220 `!seq` outputs of 39 lines (a `!` output of 40 or more is cut to a preview) print 1..8580, each once: over 9,000
+# lines, so the oldest went to the spill file. PgUp a page at a time must show every number on the way up (none skipped
+# where the file's lines are loaded back), the top only moving up, the viewer open throughout, and stop at the top.
+s = new_session(["-m", "fake-coder:latest"])
+s.send("!echo FIRST-MARK\r", 0.5); s.drain(0.1, 1)
+for k in range(220):
+    s.send(f"!seq {k * 39 + 1} {k * 39 + 39}\r", 0.1); s.drain(0.08, 0.6)
+s.send("!echo LAST-MARK\r", 0.5)
+check(screen_when(s, lambda rs: any("LAST-MARK" in r for r in rs), 15) is not None, "all of it printed")
+_num = re.compile(r"^\s*(?:⎿\s+)?(\d+)\s*$")
+_nums = lambda rs: [int(m.group(1)) for m in (_num.match(r) for r in rs) if m]
+seen = set(_nums(s.screen())); prev = None; down = []; closed = None; at_top = 0; steps = 0
+while steps < 1500 and at_top <= 3:
+    s.send("\x1b[5~", 0.03); s.drain(0.06, 0.5); steps += 1
+    rows = s.screen(); ns = _nums(rows); seen.update(ns)
+    if _note_row(rows) is None: closed = steps; break
+    if ns and prev is not None and ns[0] > prev: down.append((steps, prev, ns[0]))
+    if ns: prev = ns[0]
+    if any("FIRST-MARK" in r for r in rows): at_top += 1
+missing = [n for n in range(1, 8581) if n not in seen]
+check(not missing, f"every number was on the screen on the way up: {len(missing)} missing, from {missing[:5]}")
+check(closed is None, f"the viewer stayed open (it closed at step {closed})")
+check(not down, f"the top only moved up: {down[:3]}")
+check(at_top > 3, f"the first line is reached, and PgUp past it stays there ({steps} steps)")
+s.send("\x1b[F", 0.5)
+rows = screen_when(s, lambda rs: _note_row(rs) is None and any("LAST-MARK" in r for r in rs))
+check(rows is not None, "End: back to the live screen and its last line")
+s.send("\x04"); s.close()
+
 print("test interactive: the mouse wheel scrolls the conversation; the arrows stay the input field's")
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
 raw = s.out.decode("utf-8", "replace")
@@ -2540,6 +2570,25 @@ check("fold-line-3" in view, "scrolled back it works the same")
 s.send("\x1b"); s.send("\x04"); s.close()
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_MANY"])
 check("fold-line-3" in out and "▸" not in out, "without a screen to click on, the first lines are shown as before")
+
+# ---------- Ctrl+O: every fold at once, and the hint on each head ----------
+print("test interactive: ctrl+o opens every fold, and closes them all again; each head says so")
+s = new_session(["-m", "fake-coder:latest", "--yolo"])
+s.send("TOOL_MANY one\r"); s.expect("tok/s")
+s.send("TOOL_MANY two\r"); s.expect("tok/s")
+heads = lambda rs: [r for r in rs if "6 lines · fold-line-1" in r]
+rows = screen_when(s, lambda rs: len(heads(rs)) == 2)
+check(rows is not None and all("▸" in h and "(ctrl+o to expand)" in h for h in heads(rows)), f"two closed folds, each with the hint: {rows and heads(rows)!r}")
+s.send("\x0f")
+rows = screen_when(s, lambda rs: len(heads(rs)) == 2 and all("▾" in h for h in heads(rs)))
+check(rows is not None and all("(ctrl+o to collapse)" in h for h in heads(rows)), f"ctrl+o opens both, and the hint turns: {rows and heads(rows)!r}")
+check(rows is not None and sum(1 for r in rows if r.strip() == "fold-line-5") == 2, "the bodies are on the screen")
+s.send("\x0f")
+rows = screen_when(s, lambda rs: len(heads(rs)) == 2 and all("▸" in h for h in heads(rs)))
+check(rows is not None and all("(ctrl+o to expand)" in h for h in heads(rows)) and not any(r.strip() == "fold-line-5" for r in rows), "ctrl+o again closes them all")
+s.send("SLOW talk\r", 0.8); s.send("\x0f")
+check(screen_when(s, lambda rs: len(heads(rs)) == 2 and all("▾" in h for h in heads(rs))) is not None, "while the model works too")
+s.expect("tok/s"); s.send("\x04"); s.close()
 
 # ---------- the ANSI screen's mouse selection: what a drag highlights and copies, and a fold's click ----------
 print("test selection: a drag copies what it covers, end included; a fold toggles on the release, not under a drag")

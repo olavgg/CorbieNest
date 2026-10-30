@@ -212,6 +212,122 @@ static void test_write_preview(void) {
     CHECK(strstr(q, "line 0 of the file") != NULL);
     free(q);
 }
+static void test_sb_spill(void) {
+    sb_spill sp; memset(&sp, 0, sizeof sp);
+    char line[64];
+    bool all = true;
+    for (int i = 0; i < 20000; i++) {   /* lines of different lengths, the empty one too, each with its fold state */
+        int n = i % 7 == 0 ? 0 : snprintf(line, sizeof line, "\x1b[2mline %d\x1b[0m", i);
+        all = sb_spill_append(&sp, line, (size_t)n, (sb_meta){ i, (unsigned char)(i % 3), i % 2 == 1 }) && all;
+    }
+    CHECK(all && sp.n == 20000 && sp.fd > 0);
+    CHECK((fcntl(sp.fd, F_GETFD) & FD_CLOEXEC) != 0);   /* not handed to the commands the tools run */
+    sb_meta m = { 0, 0, false };   /* (set only by a read that succeeds: GCC -O2 would call it maybe-uninitialized) */
+    char *t = sb_spill_read(&sp, 12345, &m);
+    CHECK(t && !strcmp(t, "\x1b[2mline 12345\x1b[0m") && m.fold == 12345 && m.kind == (unsigned char)(12345 % 3) && m.hidden);
+    free(t);
+    t = sb_spill_read(&sp, 14, &m);    /* (14 % 7 == 0: the empty line) */
+    CHECK(t && !*t && m.fold == 14 && !m.hidden);
+    free(t);
+    CHECK(sb_spill_read(&sp, 20000, &m) == NULL && sb_spill_read(&sp, -1, &m) == NULL);
+    /* a stack: the newest lines leave, and what is appended next takes their place */
+    sb_spill_pop(&sp, 5000);
+    CHECK(sp.n == 15000);
+    CHECK(sb_spill_append(&sp, "after the pop", 13, (sb_meta){ 7, 1, false }));
+    t = sb_spill_read(&sp, 15000, &m);
+    CHECK(t && !strcmp(t, "after the pop") && m.fold == 7);
+    free(t);
+    t = sb_spill_read(&sp, 14999, &m);
+    CHECK(t && !strcmp(t, "\x1b[2mline 14999\x1b[0m"));   /* the line under it is as it was */
+    free(t);
+    sb_spill_reset(&sp);
+    CHECK(sp.n == 0 && sb_spill_read(&sp, 0, &m) == NULL);
+    CHECK(sb_spill_append(&sp, "fresh", 5, (sb_meta){ 0, 0, false }));
+    t = sb_spill_read(&sp, 0, NULL);
+    CHECK(t && !strcmp(t, "fresh"));
+    free(t);
+    sb_spill_close(&sp);
+    CHECK(sp.fd == 0 && sp.n == 0 && sp.off == NULL);
+
+    /* the model: past SB_MAX_LINES the oldest lines go to the file, and all of them come back, in order */
+    term_sb_test(true);
+    char buf[64];
+    for (int i = 0; i < 25000; i++) { snprintf(buf, sizeof buf, "row %d\n", i); term_sb_test_feed(buf); }
+    int first = term_sb_first(), n = term_sb_nlines();
+    CHECK(first > 0 && n <= 8001);                        /* memory stays bounded */
+    CHECK(first + n == 25001);                            /* nothing lost: the file and memory join up (the last line is the empty one output goes on) */
+    snprintf(buf, sizeof buf, "row %d", first);
+    CHECK(!strcmp(term_sb_line(0), buf));                 /* memory starts where the file ends */
+    int epoch = term_sb_epoch();
+    CHECK(term_sb_load_older(SB_LOAD_LINES) == SB_LOAD_LINES && term_sb_first() == first - SB_LOAD_LINES && term_sb_epoch() != epoch);
+    snprintf(buf, sizeof buf, "row %d", first - SB_LOAD_LINES);
+    CHECK(!strcmp(term_sb_line(0), buf));                 /* the lines just before, in front */
+    while (term_sb_load_older(SB_LOAD_LINES) > 0) {}
+    CHECK(term_sb_first() == 0 && term_sb_nlines() == 25001);
+    CHECK(!strcmp(term_sb_line(0), "row 0") && !strcmp(term_sb_line(24999), "row 24999"));
+    bool order = true;
+    for (int i = 0; i < 25000 && order; i++) { snprintf(buf, sizeof buf, "row %d", i); order = !strcmp(term_sb_line(i), buf); }
+    CHECK(order);
+    term_sb_test_feed("one more\n");                     /* output again, nobody scrolled back: memory is cut down again */
+    CHECK(term_sb_nlines() <= 8001 && term_sb_first() + term_sb_nlines() == 25002);
+    term_sb_test_feed("\x1b[2J");                        /* a clear empties the file too */
+    CHECK(term_sb_first() == 0);
+    term_sb_test(false);
+
+    /* Ctrl+O reaches folds in the file: a fold at the start, then enough lines to spill it */
+    const char *body = "b1\nb2\nb3\nb4\nb5\nb6\n";
+    term_sb_test(true);
+    term_sb_test_fold("  " TERM_FOLD_CLOSED " first fold", body);
+    for (int i = 0; i < 20000; i++) { snprintf(buf, sizeof buf, "row %d\n", i); term_sb_test_feed(buf); }
+    CHECK(term_sb_first() > 8);                           /* the head and its body are in the file */
+    CHECK(term_fold_all() == 1);                          /* opened there */
+    while (term_sb_load_older(SB_LOAD_LINES) > 0) {}
+    CHECK(strstr(term_sb_line(0), TERM_FOLD_OPEN " first fold") && strstr(term_sb_line(0), TERM_FOLD_HINT_COLLAPSE));   /* its mark turned on the way back */
+    CHECK(!term_sb_hidden(1) && !term_sb_hidden(6) && !strcmp(term_sb_line(6), "b6"));
+    CHECK(term_fold_all() == 1);                          /* in memory now: closed again */
+    CHECK(strstr(term_sb_line(0), TERM_FOLD_CLOSED " first fold") && strstr(term_sb_line(0), TERM_FOLD_HINT_EXPAND) && term_sb_hidden(1));
+    term_sb_test(false);
+
+    /* the file's last line is a head, its body in memory: the first spill cuts 8001 lines down to 6000, so lines
+     * 0-2000 go and line 2000 is the head */
+    term_sb_test(true);
+    for (int i = 0; i < 2000; i++) { snprintf(buf, sizeof buf, "pre %d\n", i); term_sb_test_feed(buf); }
+    term_sb_test_fold("  " TERM_FOLD_CLOSED " split fold", body);
+    for (int i = 0; i < 7000; i++) { snprintf(buf, sizeof buf, "row %d\n", i); term_sb_test_feed(buf); }
+    CHECK(term_sb_first() == 2001 && !strcmp(term_sb_line(0), "b1") && term_sb_hidden(0));   /* the head in the file, the body here */
+    CHECK(term_fold_all() == 1 && !term_sb_hidden(0) && !term_sb_hidden(5));                  /* the body opens */
+    CHECK(term_sb_load_older(1) == 1);
+    CHECK(strstr(term_sb_line(0), TERM_FOLD_OPEN " split fold") && strstr(term_sb_line(0), TERM_FOLD_HINT_COLLAPSE));   /* and its head comes back open */
+    CHECK(term_fold_all() == 1 && strstr(term_sb_line(0), TERM_FOLD_CLOSED) && term_sb_hidden(1));
+    term_sb_test(false);
+}
+static void test_fold_head(void) {
+    /* the head as written: "(ctrl+o to expand)" after it, dim, two spaces before it */
+    sbuf h; sb_init(&h); sb_puts(&h, "  " TERM_FOLD_CLOSED " $ ls  (+40 lines)"); fold_hint_put(&h, false);
+    CHECK(!strcmp(h.data, "  " TERM_FOLD_CLOSED " $ ls  (+40 lines)  " C_DIM TERM_FOLD_HINT_EXPAND C_RESET));
+    /* opened: the mark and the hint turn together, the rest as it was */
+    char *o = fold_head_turn(h.data, true);
+    CHECK(!strcmp(o, "  " TERM_FOLD_OPEN " $ ls  (+40 lines)  " C_DIM TERM_FOLD_HINT_COLLAPSE C_RESET));
+    char *c = fold_head_turn(o, false);   /* and back: the text it started as */
+    CHECK(!strcmp(c, h.data));
+    free(o); free(c);
+    /* turning a head to the state it is in changes nothing */
+    char *same = fold_head_turn(h.data, false);
+    CHECK(!strcmp(same, h.data));
+    free(same);
+    /* a head without the hint (written before it existed, or a sub-agent log's): only the mark */
+    char *m = fold_head_turn(TERM_FOLD_CLOSED " 12 lines", true);
+    CHECK(!strcmp(m, TERM_FOLD_OPEN " 12 lines"));
+    free(m);
+    /* only the first mark turns: a ▸ in the command's own text stays */
+    char *f = fold_head_turn(TERM_FOLD_CLOSED " $ echo " TERM_FOLD_CLOSED, true);
+    CHECK(!strcmp(f, TERM_FOLD_OPEN " $ echo " TERM_FOLD_CLOSED));
+    free(f);
+    char *e = fold_head_turn(NULL, true);
+    CHECK(e && !*e);
+    free(e);
+    sb_free(&h);
+}
 static void test_tools_body(void *ud) {
     (void)ud;
     char dir[] = "/tmp/crowtest_dir_XXXXXX";
@@ -1584,10 +1700,12 @@ static void test_agent_log(void) {
 }
 
 /* the running-tasks strip: how many rows fit, and one row fitted to the width */
-static int u8cols(const char *s) {
+static int u8cols(const char *s) {   /* columns: a character is one, an SGR escape none */
     int w = 0;
-    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++)
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        if (p[0] == 27 && p[1] == '[') { while (*p && *p != 'm') p++; if (!*p) break; continue; }
         if ((*p & 0xC0) != 0x80) w++;
+    }
     return w;
 }
 static int glyph_n(const char *s, const char *g) {
@@ -1635,9 +1753,10 @@ static void test_strip(void) {
     CHECK(ends_with(out, "9s · ↓ 1"));
 
     strip_row(out, sizeof out, 80, STRIP_ROW_TASK, "lean-tracks-economy", 19, NULL, 9, 10, "1s · ↓ 1");
-    CHECK(u8cols(out) == 62 && u8cols(out) < 80);   /* the bar stays with the fraction; the row is not stretched */
+    CHECK(u8cols(out) == 80 && ends_with(out, "1s · ↓ 1"));   /* the time and tokens at the right edge, as on an activity row */
     CHECK(glyph_n(out, "▰") == 18 && glyph_n(out, "▱") == 2);
-    CHECK(strstr(out, "9/10") != NULL);
+    CHECK(strstr(out, "▱  9/10 ") != NULL);                  /* the fraction right after the bar */
+    CHECK(strchr(out, 27) == NULL);                           /* no colour unless asked for */
 
     strip_row(out, sizeof out, 80, STRIP_ROW_TASK, "lean-tracks-economy", 19, NULL, 10, 10, "1s · ↓ 1");
     CHECK(glyph_n(out, "▰") == 20 && glyph_n(out, "▱") == 0);
@@ -1649,6 +1768,20 @@ static void test_strip(void) {
     CHECK(glyph_n(out, "▰") == 8 && glyph_n(out, "▱") == 12 && strstr(out, "4/10") != NULL);
     strip_row(out, sizeof out, 80, STRIP_ROW_MAIN, "main", 4, NULL, 1, 100, NULL);
     CHECK(glyph_n(out, "▰") == 1);   /* a start that would round to an empty bar still fills one cell */
+
+    /* a sub-agent's rounds: the bar and the fraction coloured, ended with 39 (a reset would clear a selected row's band) */
+    strip_row_c(out, sizeof out, 80, STRIP_ROW_TASK, "iso-waiter", 10, NULL, 3, 25, "1m 53s · ↓ 223 tokens", C_CYAN);
+    CHECK(u8cols(out) == 80 && ends_with(out, "1m 53s · ↓ 223 tokens"));
+    CHECK(!strncmp(out, "  ◯ iso-waiter  " C_CYAN "▰▰", strlen("  ◯ iso-waiter  " C_CYAN "▰▰")));
+    CHECK(glyph_n(out, "▰") == 2 && glyph_n(out, "▱") == 18 && strstr(out, "  3/25\x1b[39m ") != NULL);
+    CHECK(strstr(out, "\x1b[0m") == NULL && strstr(out, "\x1b[m") == NULL);
+    strip_row_c(out, sizeof out, 44, STRIP_ROW_TASK, "iso-waiter", 10, NULL, 3, 25, "1m 53s · ↓ 223 tokens", C_CYAN);
+    CHECK(u8cols(out) == 44 && glyph_n(out, "▰") == 0 && strstr(out, "3/25") != NULL && ends_with(out, "223 tokens"));   /* narrow: the bar goes first */
+    strip_row_c(out, sizeof out, 30, STRIP_ROW_TASK, "iso-waiter", 10, NULL, 3, 25, "1m 53s · ↓ 223 tokens", C_CYAN);
+    CHECK(u8cols(out) <= 30 && strstr(out, "3/25") != NULL && strstr(out, "tokens") == NULL);   /* narrower: the time goes, the fraction stays */
+    CHECK(strstr(out, "\x1b[39m") != NULL && utf8_ok(out, strlen(out)));
+    strip_row_c(out, sizeof out, 18, STRIP_ROW_TASK, "iso-waiter", 10, NULL, 3, 25, "1m 53s", C_CYAN);
+    CHECK(u8cols(out) <= 18 && utf8_ok(out, strlen(out)));   /* cut, the escapes counted as no column */
 
     strip_row(out, sizeof out, 12, STRIP_ROW_MAIN, "main", 4, NULL, 4, 10, NULL);
     CHECK(glyph_n(out, "▰") == 0 && glyph_n(out, "▱") == 0);   /* no room for four cells: the bar is dropped */
@@ -2743,7 +2876,7 @@ int main(void) {
     g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 10; g_cfg.interactive = false;
     struct { const char *name; void (*fn)(void); } tests[] = {
         { "sbuf", test_sbuf }, { "util", test_util }, { "cmd head", test_cmd_head }, { "markdown", test_md }, { "highlight", test_highlight }, { "git branch", test_gitbranch },
-        { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "modes", test_modes },
+        { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "fold head", test_fold_head }, { "scrollback spill", test_sb_spill }, { "modes", test_modes },
         { "close button", test_close_x }, { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
         { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme },

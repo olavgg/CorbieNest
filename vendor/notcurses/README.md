@@ -45,6 +45,22 @@ and FFI bindings, the demos, tests and tools, and the man pages.
   The wait is a `pthread_cond_wait` on `icond` in a cleanup-pushed loop (so a cancel still works); a drain or EOF
   is not waited for, and the reader broadcasts `icond` when it frees a slot in `internal_get()` (marked
   `corbienest:` in that file). Reapply it with the others.
+  Not during init (`initdata` set): `notcurses_init()` reads no keys until the input thread has handed the
+  replies over, so a wait there never ended; during init a full queue drops the key, as upstream does.
+- `src/lib/in.c`, `process_melange()` and `block_on_input()`: a terminal reply cut between two reads. Upstream
+  takes an unfinished escape at the start of the buffer as typed keys at once (so that a lone Esc is not held), and
+  leaves the escape automaton where it stopped. A reply that arrives in pieces (iTerm2's OSC 4 palette replies; on
+  macOS `BUFSIZ` is 1024, so the 7 KB burst of 256 replies is cut every 1024 bytes anyway) then came out as text,
+  `]4;194;rgb:d7d7/ffff/d7d7` in the input field, and every later escape was walked from the stale position: mouse
+  reports were misread (the banner's `[×]` did nothing), the DA1 reply was missed (an init that waited for ever), or
+  the `assert` in `process_escape()` aborted. Now an unfinished escape is waited for: `block_on_input()` polls up to
+  `MIDESCAPE_WAIT_MS` (100 ms) instead of 0 for a part longer than two bytes and for any part during init (replies
+  are expected then), `ESC_WAIT_MS` (25 ms) for a lone ESC or ESC plus one byte after init (most likely the Esc key
+  or Alt+key, so a lone Esc costs 25 ms), and sets `midtimeout` when nothing came; only then, or when the escape fills
+  the buffer, is it given up as keys. A give-up resets the automaton (`used`, `state`, `instring`, `matchstart`).
+  The cut after the ESC is the common one on macOS: iTerm2 3.7.6 writes each reply whole, but a 1 KB read cuts the
+  burst anywhere (measured: reads of 1022 bytes ending mid-reply). Marked `corbienest:`; reapply it with the others.
+  `tools/nc_pty_check.py` plays such a terminal.
 
 Nothing else is changed. `make` compiles these files with the flags in the top-level Makefile
 (`NC_VFLAGS`): they are not held to our `-Werror`, and the two warnings upstream's own code has
@@ -62,5 +78,9 @@ when all three are found (`NOTCURSES=auto`) and leaves it out otherwise.
 Copy the same paths from a newer upstream tarball, reapply the change above where upstream has
 not taken it, and check the upstream file list in `CMakeLists.txt` (`NCCORESRCS`, `COMPATSRC`,
 and the `src/media` files `USE_MULTIMEDIA=none` compiles). Then `make clean && make` and
-`make test`, and the tmux start-up check: `./corbienest --ui notcurses` in tmux must show
-`ui: notcurses` in the banner.
+`make test`, and the tmux start-up check: `./corbie --ui notcurses` in tmux must show
+`ui: notcurses` in the banner. Then the split-reply check, with pyte installed:
+`tools/nc_pty_check.py`, `SPLIT=12 GAP=0.002 tools/nc_pty_check.py` and
+`ROUND=2 ONLY=194 SPLIT=12 GAP=0.01 DA1FIRST=1 tools/nc_pty_check.py`, the same with `SPLIT=1` and `SPLIT=2`
+(a cut right after the ESC) and `SPLIT=1 GAP=0.002` must exit 0, and with
+`CLICK=10,100` (the banner's `[×]` at 40x120) too.

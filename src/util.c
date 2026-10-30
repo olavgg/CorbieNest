@@ -1550,21 +1550,132 @@ size_t utf8_cut(const char *s, size_t len, size_t cap) {
     return n;
 }
 
+/* ---------- the scrollback's spill file ---------- */
+
+static bool spill_open(sb_spill *s) {
+    if (s->fd > 0) return true;
+    const char *dir = getenv("TMPDIR");
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s/corbie-scrollback-XXXXXX", dir && *dir ? dir : "/tmp");
+    int fd = mkstemp(path);
+    if (fd < 0) return false;
+    unlink(path);   /* nothing to clean up: the file goes when the program does */
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (fd == 0) { int nfd = dup(fd); close(fd); if (nfd < 0) return false; fd = nfd; }   /* (0 means "not open" here) */
+    s->fd = fd;
+    return true;
+}
+bool sb_spill_append(sb_spill *s, const char *line, size_t len, sb_meta m) {
+    if (s->n >= SB_SPILL_MAX || !spill_open(s)) return false;
+    if (s->n == s->cap) {
+        int cap = s->cap ? s->cap * 2 : 4096;
+        s->off = xrealloc(s->off, sizeof *s->off * (size_t)cap);
+        s->meta = xrealloc(s->meta, sizeof *s->meta * (size_t)cap);
+        s->cap = cap;
+    }
+    for (size_t done = 0; done < len; ) {
+        ssize_t w = pwrite(s->fd, line + done, len - done, (off_t)(s->end + (long long)done));
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return false;
+        done += (size_t)w;
+    }
+    s->off[s->n] = s->end;
+    s->meta[s->n] = m;
+    s->n++;
+    s->end += (long long)len;
+    return true;
+}
+char *sb_spill_read(const sb_spill *s, int i, sb_meta *m) {
+    if (i < 0 || i >= s->n || s->fd <= 0) return NULL;
+    long long a = s->off[i], b = i + 1 < s->n ? s->off[i + 1] : s->end;
+    size_t len = (size_t)(b - a);
+    char *buf = xmalloc(len + 1);
+    for (size_t got = 0; got < len; ) {
+        ssize_t r = pread(s->fd, buf + got, len - got, (off_t)(a + (long long)got));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) { free(buf); return NULL; }
+        got += (size_t)r;
+    }
+    buf[len] = 0;
+    if (m) *m = s->meta[i];
+    return buf;
+}
+void sb_spill_pop(sb_spill *s, int k) {
+    if (k <= 0) return;
+    if (k >= s->n) { sb_spill_reset(s); return; }
+    s->n -= k;
+    s->end = s->off[s->n];   /* the next append writes over what left */
+}
+void sb_spill_reset(sb_spill *s) {
+    s->n = 0; s->end = 0;
+    /* the old lines' bytes go; a file that cannot be cut is closed instead, and the next spill opens a new one (glibc
+     * marks ftruncate warn_unused_result, which a (void) cast does not silence under GCC) */
+    if (s->fd > 0 && ftruncate(s->fd, 0) != 0) { close(s->fd); s->fd = 0; }
+}
+void sb_spill_close(sb_spill *s) {
+    if (s->fd > 0) close(s->fd);
+    free(s->off); free(s->meta);
+    memset(s, 0, sizeof *s);
+}
+
+/* ---------- fold heads: the mark and the Ctrl+O hint ---------- */
+
+void fold_hint_put(sbuf *b, bool open) {
+    sb_puts(b, "  " C_DIM);
+    sb_puts(b, open ? TERM_FOLD_HINT_COLLAPSE : TERM_FOLD_HINT_EXPAND);
+    sb_puts(b, C_RESET);
+}
+
+/* the first `from` in s becomes `to` (into b, with the rest); false when it is not there */
+static bool fold_swap(sbuf *b, const char *s, const char *from, const char *to) {
+    const char *at = strstr(s, from);
+    if (!at) return false;
+    sb_append(b, s, (size_t)(at - s));
+    sb_puts(b, to);
+    sb_puts(b, at + strlen(from));
+    return true;
+}
+char *fold_head_turn(const char *line, bool open) {
+    sbuf a, b; sb_init(&a); sb_init(&b);
+    const char *s = line ? line : "";
+    if (!fold_swap(&a, s, open ? TERM_FOLD_CLOSED : TERM_FOLD_OPEN, open ? TERM_FOLD_OPEN : TERM_FOLD_CLOSED)) sb_puts(&a, s);
+    const char *t = a.data ? a.data : "";
+    if (!fold_swap(&b, t, open ? TERM_FOLD_HINT_EXPAND : TERM_FOLD_HINT_COLLAPSE,
+                   open ? TERM_FOLD_HINT_COLLAPSE : TERM_FOLD_HINT_EXPAND)) sb_puts(&b, t);
+    sb_free(&a);
+    return sb_detach(&b);
+}
+
 /* ---------- the running-tasks strip: one row, and how many rows fit ---------- */
 
+/* the length of the SGR escape (ESC [ … m) at s, 0 when there is none: it takes no column */
+static size_t sr_sgr(const char *s) {
+    if (s[0] != 27 || s[1] != '[') return 0;
+    size_t i = 2;
+    while (s[i] && s[i] != 'm' && i < 32) i++;
+    return s[i] == 'm' ? i + 1 : 0;
+}
 static int sr_cols(const char *s) {
     int w = 0;
     if (!s) return 0;
-    for (; *s; s++) if (((unsigned char)*s & 0xC0) != 0x80) w++;
+    while (*s) {
+        size_t e = sr_sgr(s);
+        if (e) { s += e; continue; }
+        if (((unsigned char)*s & 0xC0) != 0x80) w++;
+        s++;
+    }
     return w;
 }
-/* at most `cols` columns of s. A cut ends with …, which takes one of those columns. */
+/* at most `cols` columns of s. A cut ends with …, which takes one of those columns. The escapes are kept and
+ * take none (a colour started before the cut is ended by whoever draws the row). */
 static void sr_put(sbuf *b, const char *s, int cols, bool ellip) {
     if (cols <= 0 || !s || !*s) return;
     if (sr_cols(s) <= cols) { sb_puts(b, s); return; }
     int keep = ellip && cols >= 1 ? cols - 1 : cols;
     int got = 0;
     for (const char *p = s; *p && got < keep; ) {
+        size_t e = sr_sgr(p);
+        if (e) { sb_append(b, p, e); p += e; continue; }
         const char *nx = p + 1;
         while (((unsigned char)*nx & 0xC0) == 0x80) nx++;
         sb_append(b, p, (size_t)(nx - p));
@@ -1593,6 +1704,10 @@ static void sr_finish(char *out, size_t n, sbuf *b, int cols) {
 
 void strip_row(char *out, size_t n, int cols, int kind, const char *name, int name_w,
                const char *mid, int done, int total, const char *right) {
+    strip_row_c(out, n, cols, kind, name, name_w, mid, done, total, right, NULL);
+}
+void strip_row_c(char *out, size_t n, int cols, int kind, const char *name, int name_w,
+                 const char *mid, int done, int total, const char *right, const char *bar_sgr) {
     if (out && n) out[0] = 0;
     if (!out || n < 2) return;
     if (cols < 1) cols = 1;
@@ -1629,23 +1744,31 @@ void strip_row(char *out, size_t n, int cols, int kind, const char *name, int na
     int left = sr_cols(b.data);
 
     if (prog) {
-        char frac[32], tail[160];
+        char frac[32];
         snprintf(frac, sizeof frac, "%d/%d", done, total);
-        if (rt) snprintf(tail, sizeof tail, "%s · %s", frac, rt);
-        else snprintf(tail, sizeof tail, "%s", frac);
-        int tw = sr_cols(tail), avail = cols - left;
+        const char *on = bar_sgr && *bar_sgr ? bar_sgr : NULL;
+        int fw = sr_cols(frac), avail = cols - left;
         if (avail < 1) { sr_finish(out, n, &b, cols); return; }
-        int room = avail - 2 - tw;   /* two spaces between the bar and the fraction */
-        if (tw > avail || room < 4) sr_put(&b, tail, avail, true);
+        /* the bar and the fraction where an activity's text goes; the time and tokens at the right edge, as on an
+         * activity row (two spaces before them) */
+        int rw = rt ? sr_cols(rt) : 0, rgap = rt ? 2 : 0;
+        if (rt && fw + rgap + rw > avail) { rt = NULL; rw = 0; rgap = 0; }   /* no room for both: the fraction stays */
+        int room = avail - 2 - fw - rgap - rw;   /* two spaces between the bar and the fraction */
+        if (on) sb_puts(&b, on);
+        if (fw > avail) sr_put(&b, frac, avail, true);
         else {
-            int barw = room < 20 ? room : 20;
-            int fill = done <= 0 ? 0 : (done >= total ? barw : (done * barw) / total);
-            if (done > 0 && done < total && fill == 0) fill = 1;
-            if (done >= total) fill = barw;
-            for (int i = 0; i < barw; i++) sb_puts(&b, i < fill ? "▰" : "▱");
-            sb_puts(&b, "  ");
-            sb_puts(&b, tail);
+            if (room >= 4) {
+                int barw = room < 20 ? room : 20;
+                int fill = done <= 0 ? 0 : (done >= total ? barw : (done * barw) / total);
+                if (done > 0 && done < total && fill == 0) fill = 1;
+                if (done >= total) fill = barw;
+                for (int i = 0; i < barw; i++) sb_puts(&b, i < fill ? "▰" : "▱");
+                sb_puts(&b, "  ");
+            }
+            sb_puts(&b, frac);
         }
+        if (on) sb_puts(&b, "\x1b[39m");   /* the default colour back, not a reset: a selected row keeps its band */
+        if (rt) { sr_pad(&b, sr_cols(b.data), cols - rw); sb_puts(&b, rt); }
         sr_finish(out, n, &b, cols);
         return;
     }

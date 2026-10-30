@@ -175,13 +175,30 @@ int    cmd_head(const char *cmd, int width, char *out, size_t n);   /* a shell c
 /* One row of the running-tasks strip, fitted to `cols` columns (a character is a column; `out` is always terminated).
  * STRIP_ROW_MAIN is "● name", STRIP_ROW_TASK is an indented "◯ name", STRIP_ROW_ALL is "  " plus `name`
  * ("show all"). `name_w` is the name column. A `total` above 0 draws a progress bar for done/total
- * instead of `mid`. `right` is the time and tokens: at the right edge of an activity row, after the
- * fraction of a progress row. */
+ * instead of `mid`. `right` is the time and tokens, at the right edge (dropped from a progress row
+ * too narrow for it and the fraction). strip_row_c colours the bar and the fraction with `bar_sgr`
+ * (an SGR escape such as C_CYAN, ended with 39, not a reset; NULL: none); the escapes take no column. */
 #define STRIP_ROW_MAIN 0
 #define STRIP_ROW_TASK 1
 #define STRIP_ROW_ALL  2
 void strip_row(char *out, size_t n, int cols, int kind, const char *name, int name_w,
                const char *mid, int done, int total, const char *right);
+void strip_row_c(char *out, size_t n, int cols, int kind, const char *name, int name_w,
+                 const char *mid, int done, int total, const char *right, const char *bar_sgr);
+
+/* The scrollback's spill file (util.c): the lines the in-memory model gave up, oldest first, in an unlinked file
+ * in TMPDIR (opened on the first append, close-on-exec). A stack: term.c appends the oldest lines it lets go and
+ * pops the newest ones back when the view reads above what memory holds, so a line is in one place or the other.
+ * Each line keeps its fold state (sb_meta, which the store does not read). The file is not limited beyond
+ * SB_SPILL_MAX lines; an append past that, or one that cannot be written, returns false. */
+typedef struct { int fold; unsigned char kind; bool hidden; } sb_meta;
+typedef struct { int fd; long long *off; sb_meta *meta; int n, cap; long long end; } sb_spill;
+#define SB_SPILL_MAX 4000000
+bool  sb_spill_append(sb_spill *s, const char *line, size_t len, sb_meta m);
+char *sb_spill_read(const sb_spill *s, int i, sb_meta *m);   /* line i (0 = the oldest), malloc'd; NULL on a read error */
+void  sb_spill_pop(sb_spill *s, int k);                      /* the newest k lines leave the file (they are back in memory) */
+void  sb_spill_reset(sb_spill *s);                           /* empty, the file kept for the next lines */
+void  sb_spill_close(sb_spill *s);                           /* empty, the file closed */
 /* How `total` running tasks share `room` rows. *with_main: a ● main row. *more: the last row is
  * "show all" because they do not all fit. *shown: how many tasks get a row. *rows: what is drawn. */
 void strip_layout(int room, int total, int *rows, int *shown, bool *with_main, bool *more);
@@ -399,6 +416,9 @@ void term_size(int *rows, int *cols);
 /* The file CORBIENEST_TRACE names, while everything drawn and typed is being written to it for
  * tools/trace_replay.py (see "trace" in term.c); NULL when it is not. */
 const char *term_trace_path(void);
+/* One record of `kind` in that file (nothing when no trace is written): the notcurses UI notes the input events it
+ * decodes ('N'), since notcurses reads the terminal on its own thread and the 'I' records cannot have them. */
+void term_trace_note(char kind, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void term_clear_screen(void);
 
 /* Full-screen mode: alternate screen with the bottom row reserved for a status
@@ -494,7 +514,18 @@ extern int (*term_run_while_busy)(const char *line);
  * False = no folding here (not in full-screen mode): print a preview instead. */
 #define TERM_FOLD_CLOSED "▸"
 #define TERM_FOLD_OPEN   "▾"
+/* the hint after a fold's head (dim, two spaces before it), which Ctrl+O acts on: every fold opens, or closes when
+ * none is shut (term_fold_all) */
+#define TERM_FOLD_HINT_EXPAND   "(ctrl+o to expand)"
+#define TERM_FOLD_HINT_COLLAPSE "(ctrl+o to collapse)"
 bool        term_fold_begin(const char *head);
+/* Ctrl+O: opens every fold when one is shut, closes them all otherwise; returns the folds turned (0: none there).
+ * Only the model changes; the UI repaints and goes to the bottom. */
+int         term_fold_all(void);
+/* util.c, pure: the hint as written after a head; and a head's text turned open or shut (the mark ▸/▾ and the hint
+ * expand/collapse), malloc'd; the text as it was when neither is in it */
+void        fold_hint_put(sbuf *b, bool open);
+char       *fold_head_turn(const char *line, bool open);
 /* rate limits: the anthropic-ratelimit-* headers of a response (util.c); per model, the last seen */
 void        ratelimit_header(ratelimit_info *rl, const char *line, size_t n);
 void        ratelimit_set(const char *model, const ratelimit_info *rl);
@@ -562,6 +593,16 @@ void        term_tick_run(void);                       /* runs the tick if it is
 int         term_sb_epoch(void);                      /* changes whenever the lines are renumbered (dropped, cleared): a row map made before is stale */
 const char *term_sb_line(int i);
 bool        term_sb_hidden(int i);                    /* a closed fold's body */
+/* Lines before the model's first one are in the spill file (sb_spill): term_sb_first() is how many (so line i is the
+ * conversation's line term_sb_first() + i), and term_sb_load_older(k) brings up to k of them back in front of line 0,
+ * renumbering the lines (the epoch changes); it returns how many came. */
+int         term_sb_first(void);
+int         term_sb_load_older(int k);
+#define     SB_LOAD_LINES 2000                        /* what a view that reads above the model asks for at a time */
+/* tests only: the model without a screen (on: recording, everything cleared; off: back to nothing) */
+void        term_sb_test(bool on);
+void        term_sb_test_feed(const char *s);
+void        term_sb_test_fold(const char *head, const char *body);   /* a closed fold, as term_fold_begin…end make it */
 void        term_sgr_track(sbuf *st, const char *d, size_t len);   /* the colours in effect after d: what a wrapped row continues in */
 int         term_sb_col(void);                        /* column the output is at (0 = a fresh line) */
 
@@ -595,6 +636,7 @@ void   nc_render(void);                               /* draws the pane, field, 
 void   nc_render_soon(void);                          /* the same, at most every few tens of ms */
 void   nc_output(void);                               /* a write reached the conversation */
 void   nc_clear(void);                                /* the conversation starts over at the top */
+bool   nc_scrolled_back(void);                        /* the pane shows older lines than the newest (the model keeps them) */
 void   nc_prefill(const char *text);                  /* text for the field at the next prompt */
 void   nc_leave_browse(void);                         /* a history browse ends: the line typed before it is back in the field */
 char  *nc_readline(const char *prompt, bool in_field);
