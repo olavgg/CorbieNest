@@ -6123,6 +6123,7 @@ static void banner(void) {
     }
     bool animate = g_cfg.interactive && (g_ui_nc || term_is_fullscreen());
     banner_modal(animate);
+    if (animate) term_banner_dismiss_on_key();
     printf(C_DIM "/help for commands · @file to attach · !cmd for shell · shift+tab to switch mode · Ctrl-D to quit" C_RESET "\n\n");
 }
 

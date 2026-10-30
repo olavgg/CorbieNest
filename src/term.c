@@ -251,6 +251,7 @@ static char *g_ov_text = NULL;              /* the overlay's text (term_overlay_
 static int g_ov_geo[4] = { -1, -1, -1, -1 };   /* the box last painted: top, left, height, width (-1: none) */
 /* the banner's modal (term_banner_show): the box's lines, drawn as they are, with the close button at (g_bn_xr, g_bn_xc) */
 static bool g_banner_on = false;
+static bool g_bn_key = false;   /* the banner now up goes away with the first key typed (set for the start-up box only) */
 static sbuf *g_bn = NULL;
 static int g_bn_n = 0, g_bn_bw = 0, g_bn_xr = -1, g_bn_xc0 = -1, g_bn_xc1 = -1;
 /* The close button of the modals that are not the banner: where it was painted (screen row, first and last column, 1-based;
@@ -1804,6 +1805,7 @@ static void banner_store(const char **lines, int n, int bw) {
     for (int i = 0; i < n; i++) { sb_init(&g_bn[i]); sb_puts(&g_bn[i], lines[i]); }
 }
 bool term_banner_show(const char **lines, int n, int bw) {
+    g_bn_key = false;   /* a box shown again (/banner) stays until its X or Esc; the start-up one sets the flag after */
     if (g_ui_nc) { nc_banner_set(lines, n, bw, true); return true; }
     if (!g_fs || !g_sb_active || n <= 0) return false;
     banner_store(lines, n, bw);
@@ -1835,6 +1837,13 @@ void term_banner_hide(void) {
     if (g_banner_on) term_overlay_close();
 }
 bool term_banner_open(void) { return g_ui_nc ? nc_banner_open() : g_banner_on; }
+void term_banner_dismiss_on_key(void) { g_bn_key = true; }
+/* a key typed at the prompt: the start-up box makes way for it (term_banner_show clears the flag, so /banner's box stays) */
+void term_banner_key(void) {
+    if (!g_bn_key) return;
+    g_bn_key = false;
+    if (term_banner_open()) term_banner_hide();
+}
 
 bool term_overlay_show(const char *text) {
     if (g_ui_nc) { if (!text) return false; nc_overlay_set(text); return true; }   /* the notcurses UI draws it as a modal too */
@@ -3602,6 +3611,8 @@ static char *readline_impl(const char *prompt, bool in_field) {
             if (term_bg_ready && term_bg_ready()) ed_hook_run(&e, term_bg_run);
             continue;
         }
+        if (g_bn_key && k != K_IDLE && k != K_BG && k != K_MOUSE && k != K_MOUSE_X10 && k != K_WHEEL_UP && k != K_WHEEL_DOWN && k != K_CLOSE_X
+            && k != K_ESC && k != K_PGUP && k != K_PGDN && k != -1 && k != -2) { term_banner_key(); ed_refresh(&e); }
         if (term_hint && k != K_IDLE && k != K_MOUSE && k != K_WHEEL_UP && k != K_WHEEL_DOWN && k != -2 && k != -1 && k != '\t'
             && k != K_LEFT && k != K_RIGHT && k != K_HOME && k != K_END) {
             /* the placeholder goes with the first key that is not a way of looking at the prompt; Esc takes it

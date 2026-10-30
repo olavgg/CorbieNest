@@ -1751,6 +1751,7 @@ static char *readline_loop(void) {
         term_tick_run();
         if (k == NK_NONE || k == NK_SKIP) continue;
         idle_at = -1;                                  /* typing cancels the idle work for this prompt */
+        if (k != 27 && k != NK_RESIZE && k != NK_PGUP && k != NK_PGDN) term_banner_key();
         if (term_hint && k != 9 && k != NK_LEFT && k != NK_RIGHT && k != NK_HOME && k != NK_END && k != 27) term_hint_clear();   /* the placeholder goes with the first key that changes or leaves the field (as the ANSI one does) */
         if (term_hint && k == 27) { term_hint_clear(); continue; }   /* Esc takes the placeholder away; it is not the clear-the-line Esc */
         if (term_hint && g_len == 0 && k == 9) { ed_set(term_hint); term_hint_clear(); continue; }   /* Tab takes it: the text now, to send or to change */
