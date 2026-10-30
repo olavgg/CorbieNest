@@ -2541,6 +2541,25 @@ s.send("\x1b"); s.send("\x04"); s.close()
 out, rc = run(["-m", "fake-coder:latest", "--yolo", "-p", "TOOL_MANY"])
 check("fold-line-3" in out and "▸" not in out, "without a screen to click on, the first lines are shown as before")
 
+# ---------- Ctrl+O: every fold at once, and the hint on each head ----------
+print("test interactive: ctrl+o opens every fold, and closes them all again; each head says so")
+s = new_session(["-m", "fake-coder:latest", "--yolo"])
+s.send("TOOL_MANY one\r"); s.expect("tok/s")
+s.send("TOOL_MANY two\r"); s.expect("tok/s")
+heads = lambda rs: [r for r in rs if "6 lines · fold-line-1" in r]
+rows = screen_when(s, lambda rs: len(heads(rs)) == 2)
+check(rows is not None and all("▸" in h and "(ctrl+o to expand)" in h for h in heads(rows)), f"two closed folds, each with the hint: {rows and heads(rows)!r}")
+s.send("\x0f")
+rows = screen_when(s, lambda rs: len(heads(rs)) == 2 and all("▾" in h for h in heads(rs)))
+check(rows is not None and all("(ctrl+o to collapse)" in h for h in heads(rows)), f"ctrl+o opens both, and the hint turns: {rows and heads(rows)!r}")
+check(rows is not None and sum(1 for r in rows if r.strip() == "fold-line-5") == 2, "the bodies are on the screen")
+s.send("\x0f")
+rows = screen_when(s, lambda rs: len(heads(rs)) == 2 and all("▸" in h for h in heads(rs)))
+check(rows is not None and all("(ctrl+o to expand)" in h for h in heads(rows)) and not any(r.strip() == "fold-line-5" for r in rows), "ctrl+o again closes them all")
+s.send("SLOW talk\r", 0.8); s.send("\x0f")
+check(screen_when(s, lambda rs: len(heads(rs)) == 2 and all("▾" in h for h in heads(rs))) is not None, "while the model works too")
+s.expect("tok/s"); s.send("\x04"); s.close()
+
 # ---------- the ANSI screen's mouse selection: what a drag highlights and copies, and a fold's click ----------
 print("test selection: a drag copies what it covers, end included; a fold toggles on the release, not under a drag")
 def osc52(sess, at):

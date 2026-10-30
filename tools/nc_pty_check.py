@@ -20,6 +20,8 @@ can cut the replies in two with a pause between the halves.
                                                    # first is nc_probe's child) cut, DA1 answered first
     CLICK=10,100 tools/nc_pty_check.py             # click row 10, column 100 (1-based) after 4 s
     CLICK=esc tools/nc_pty_check.py                # press Esc after 4 s
+    FOLDS=1 tools/nc_pty_check.py                  # Ctrl+O on two folds (a fake model, tests/fake_ollama.py):
+                                                   # the hint, all open, all closed (needs pyte)
 
 Settings (environment): SPLIT (0: whole replies), GAP (seconds between the halves),
 ROUND (cut only in that init, 1 = the probe's child), ONLY (cut only that palette
@@ -28,6 +30,11 @@ entry), DA1FIRST (answer DA1 before the palette replies still queued), CLICK, TR
 (how long to run, default 6), ROWS/COLS (40x120). The first argument is the binary
 (default ./corbie); the output is kept in $OUT (default nc_pty_check.out in the temporary
 folder that is HOME for the run), and the path is printed.
+
+With FOLDS=1 the run talks to tests/fake_ollama.py (started on a free port): two TOOL_MANY replies leave two
+folds, then Ctrl+O is pressed twice; it fails (1) unless both heads show "(ctrl+o to expand)", the first Ctrl+O
+opens both ("(ctrl+o to collapse)") and the second closes them. Ctrl+O reaches the program only with IEXTEN off
+(the tty driver eats it otherwise, VDISCARD), so this also guards nc_start()'s termios.
 
 Exit status: 1 if a reply's text reached the screen or notcurses did not start (the
 ANSI fallback, or no notcurses banner), or (with pyte installed, which plays the
@@ -60,9 +67,24 @@ ROWS, COLS = int(os.environ.get("ROWS", "40")), int(os.environ.get("COLS", "120"
 binary = sys.argv[1] if len(sys.argv) > 1 else "./corbie"
 binary = os.path.abspath(binary)
 
+FOLDS = bool(os.environ.get("FOLDS"))
 home = tempfile.mkdtemp(prefix="ncpty")
 env = dict(os.environ, HOME=home, TERM="xterm-256color", OLLAMA_HOST="127.0.0.1:9",
            XDG_CONFIG_HOME=os.path.join(home, ".config"))
+fake = None
+if FOLDS:   # a scripted model (tests/fake_ollama.py) on a free port, and a config that skips the side calls
+    import socket
+    import subprocess
+    sk = socket.socket(); sk.bind(("127.0.0.1", 0)); port = sk.getsockname()[1]; sk.close()
+    here = os.path.dirname(os.path.abspath(__file__))
+    fake = subprocess.Popen([sys.executable, os.path.join(here, "..", "tests", "fake_ollama.py"), str(port)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.8)
+    os.makedirs(os.path.join(home, ".config", "corbienest"))
+    with open(os.path.join(home, ".config", "corbienest", "config"), "w") as f:
+        f.write("model=fake-coder:latest\nmode=auto\nmemory=0\nsuggest=0\n")
+    env["OLLAMA_HOST"] = "127.0.0.1:%d" % port
+    SECS = max(SECS, 13)
 for k in ("ANTHROPIC_API_KEY", "XAI_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY",
           "MOONSHOT_API_KEY", "TMUX", "CORBIENEST_TRACE"):
     env.pop(k, None)
@@ -77,6 +99,7 @@ fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
 
 REPLY_TEXT = b"rgb:d7d7/ffff/d7d7"
+TERM_EXPAND, TERM_COLLAPSE = "(ctrl+o to expand)", "(ctrl+o to collapse)"   # common.h TERM_FOLD_HINT_*
 QUERY = re.compile(rb"\x1b\]4;\d+;\?|\x1b\]1[01];\?|\x1b\[6n|\x1b\[c|\x1b\[>0q")
 
 
@@ -133,6 +156,11 @@ out = bytearray()
 scan = 0
 t0 = time.time()
 clicked = False
+# FOLDS: the banner away, two folded results, then a look before and after each Ctrl+O
+FOLD_KEYS = [(3.5, b"\x1b"), (4.0, b"TOOL_MANY one\r"), (6.5, b"TOOL_MANY two\r"), (9.5, "SNAP"),
+             (9.6, b"\x0f"), (10.8, "SNAP"), (10.9, b"\x0f"), (12.1, "SNAP")]
+fold_done = set()
+fold_snaps = []
 while time.time() - t0 < SECS:
     r, _, _ = select.select([fd], [], [], 0.01)
     if r:
@@ -157,6 +185,15 @@ while time.time() - t0 < SECS:
                 else:
                     queue.append((rounds[0], reply_for(q)))
         scan = max(last.end() if last else scan, len(out) - 16)   # a query cut by this read is found next time
+    if FOLDS:
+        el = time.time() - t0
+        for i, (at, keys) in enumerate(FOLD_KEYS):
+            if el >= at and i not in fold_done:
+                fold_done.add(i)
+                if keys == "SNAP":
+                    fold_snaps.append(bytes(out))
+                else:
+                    write_all(keys)
     if CLICK and not clicked and time.time() - t0 > 4:
         if CLICK == "esc":
             write_all(b"\x1b")
@@ -170,6 +207,8 @@ try:
     os.kill(pid, 9)
 except ProcessLookupError:
     pass
+if fake:
+    fake.kill()
 
 data = bytes(out)
 out_path = os.environ.get("OUT") or os.path.join(home, "nc_pty_check.out")
@@ -207,6 +246,21 @@ if pyte and status == 0:
     if CLICK:
         if up:
             status = 2
-    elif not up:
-        status = 1        # nothing was pressed, so something read as a key closed it
+    elif not up and not FOLDS:
+        status = 1        # nothing was pressed, so something read as a key closed it (FOLDS presses Esc itself)
+if FOLDS and pyte:
+    def heads_of(snap):
+        sc = pyte.Screen(COLS, ROWS)
+        pyte.ByteStream(sc).feed(snap)
+        return [r.strip() for r in sc.display if "6 lines · fold-line-1" in r]
+    states = [heads_of(sn) for sn in fold_snaps]
+    want = [("▸", TERM_EXPAND), ("▾", TERM_COLLAPSE), ("▸", TERM_EXPAND)]
+    ok = len(states) == 3 and all(len(h) == 2 and all(m in x and t in x for x in h) for h, (m, t) in zip(states, want))
+    for tag, h in zip(("folded", "after ctrl+o", "ctrl+o again"), states):
+        print("%-13s %r" % (tag, h))
+    print("ctrl+o on the folds: %s" % ("ok" if ok else "FAILED"))
+    if not ok:
+        status = 1
+elif FOLDS:
+    status = 1
 sys.exit(status)

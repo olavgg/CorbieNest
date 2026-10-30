@@ -238,7 +238,8 @@ build must be warning-free with `-Wall -Wextra`.
   it a recording — nothing may behave differently because it is on.
 - `tools/nc_pty_check.py` starts `corbie --ui notcurses` on a pty that plays the terminal: it
   answers notcurses' start-up queries and can cut the replies in two (`SPLIT`, `GAP`, `ROUND`,
-  `ONLY`, `DA1FIRST`; `CLICK=y,x` or `CLICK=esc` after 4 s), and fails when a reply shows as text,
+  `ONLY`, `DA1FIRST`; `CLICK=y,x` or `CLICK=esc` after 4 s; `FOLDS=1`: Ctrl+O on two folds, against
+  `tests/fake_ollama.py`, which the integration suite cannot do on that screen), and fails when a reply shows as text,
   the ANSI fallback runs, or (with pyte) the banner closes by itself or stays up after the click.
   A manual check of the vendored input layer (see its README), timing-dependent, not in `make test`.
   Notcurses reads stdin on its own thread, so `CORBIENEST_TRACE` has no `I` records in that UI: it has
