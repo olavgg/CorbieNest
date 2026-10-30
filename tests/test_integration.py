@@ -1537,6 +1537,36 @@ check(not scrolled(s), "PgDn at the bottom leaves the viewer")
 s.send("typed\r"); check(s.expect("Echo: typed"), "prompt usable again")
 s.send("\x04"); s.close()
 
+print("test interactive: PgUp page by page from the bottom past the top of a session longer than memory keeps")
+# 220 `!seq` outputs of 39 lines (a `!` output of 40 or more is cut to a preview) print 1..8580, each once: over 9,000
+# lines, so the oldest went to the spill file. PgUp a page at a time must show every number on the way up (none skipped
+# where the file's lines are loaded back), the top only moving up, the viewer open throughout, and stop at the top.
+s = new_session(["-m", "fake-coder:latest"])
+s.send("!echo FIRST-MARK\r", 0.5); s.drain(0.1, 1)
+for k in range(220):
+    s.send(f"!seq {k * 39 + 1} {k * 39 + 39}\r", 0.1); s.drain(0.08, 0.6)
+s.send("!echo LAST-MARK\r", 0.5)
+check(screen_when(s, lambda rs: any("LAST-MARK" in r for r in rs), 15) is not None, "all of it printed")
+_num = re.compile(r"^\s*(?:⎿\s+)?(\d+)\s*$")
+_nums = lambda rs: [int(m.group(1)) for m in (_num.match(r) for r in rs) if m]
+seen = set(_nums(s.screen())); prev = None; down = []; closed = None; at_top = 0; steps = 0
+while steps < 1500 and at_top <= 3:
+    s.send("\x1b[5~", 0.03); s.drain(0.06, 0.5); steps += 1
+    rows = s.screen(); ns = _nums(rows); seen.update(ns)
+    if _note_row(rows) is None: closed = steps; break
+    if ns and prev is not None and ns[0] > prev: down.append((steps, prev, ns[0]))
+    if ns: prev = ns[0]
+    if any("FIRST-MARK" in r for r in rows): at_top += 1
+missing = [n for n in range(1, 8581) if n not in seen]
+check(not missing, f"every number was on the screen on the way up: {len(missing)} missing, from {missing[:5]}")
+check(closed is None, f"the viewer stayed open (it closed at step {closed})")
+check(not down, f"the top only moved up: {down[:3]}")
+check(at_top > 3, f"the first line is reached, and PgUp past it stays there ({steps} steps)")
+s.send("\x1b[F", 0.5)
+rows = screen_when(s, lambda rs: _note_row(rs) is None and any("LAST-MARK" in r for r in rs))
+check(rows is not None, "End: back to the live screen and its last line")
+s.send("\x04"); s.close()
+
 print("test interactive: the mouse wheel scrolls the conversation; the arrows stay the input field's")
 s = Session(["-m", "fake-coder:latest"]); s.expect("Ctrl-D to quit")
 raw = s.out.decode("utf-8", "replace")
