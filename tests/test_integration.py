@@ -1549,15 +1549,15 @@ s.send("!echo LAST-MARK\r", 0.5)
 check(screen_when(s, lambda rs: any("LAST-MARK" in r for r in rs), 15) is not None, "all of it printed")
 _num = re.compile(r"^\s*(?:⎿\s+)?(\d+)\s*$")
 _nums = lambda rs: [int(m.group(1)) for m in (_num.match(r) for r in rs) if m]
-seen = set(_nums(s.screen())); prev = None; down = []; closed = None; at_top = 0; steps = 0
+shown = set(_nums(s.screen())); prev = None; down = []; closed = None; at_top = 0; steps = 0
 while steps < 1500 and at_top <= 3:
     s.send("\x1b[5~", 0.03); s.drain(0.06, 0.5); steps += 1
-    rows = s.screen(); ns = _nums(rows); seen.update(ns)
+    rows = s.screen(); ns = _nums(rows); shown.update(ns)
     if _note_row(rows) is None: closed = steps; break
     if ns and prev is not None and ns[0] > prev: down.append((steps, prev, ns[0]))
     if ns: prev = ns[0]
     if any("FIRST-MARK" in r for r in rows): at_top += 1
-missing = [n for n in range(1, 8581) if n not in seen]
+missing = [n for n in range(1, 8581) if n not in shown]
 check(not missing, f"every number was on the screen on the way up: {len(missing)} missing, from {missing[:5]}")
 check(closed is None, f"the viewer stayed open (it closed at step {closed})")
 check(not down, f"the top only moved up: {down[:3]}")
