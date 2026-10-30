@@ -12,7 +12,7 @@ Argument (optional): a different model name for the status line. The default is 
 Do the steps in order. Use the bash tool; run commands from the repository root.
 
 1. Build corbienest with notcurses and the helpers.
-   `make` (must not warn), then `make -C .corbienest/skills/screenshot`.
+   `make` (must not warn), then `make -C .agents/skills/screenshot`.
    `make` builds the notcurses screen when libnotcurses is installed; the picture needs it.
 
 2. Make the demo project the status line shows: a git repository on `main`, so the location line
@@ -33,14 +33,14 @@ Do the steps in order. Use the bash tool; run commands from the repository root.
 4. Capture the screen for five seconds (the banner is drawn at startup; seven seconds if the title
    is not in the frame after step 5).
    ```sh
-   .corbienest/skills/screenshot/capture 20601 /tmp/shot-screen.bin 100 34 qwen3-coder:30b 5 \
+   .agents/skills/screenshot/capture 20601 /tmp/shot-screen.bin 100 34 qwen3-coder:30b 5 \
      /tmp/demo/projects/myapp "$PWD/corbie"
    ```
    Then stop the fake server, and only that one: `kill "$(cat /tmp/shot-fake.pid)"`.
 
 5. Draw the frame into a transcript, and check the picture's text before converting it.
    ```sh
-   .corbienest/skills/screenshot/screen /tmp/shot-screen.bin 100 34 docs/demo.ansi
+   .agents/skills/screenshot/screen /tmp/shot-screen.bin 100 34 docs/demo.ansi
    sed 's/\x1b\[[0-9;]*m//g' docs/demo.ansi | sed -n 5,26p
    ```
    It must show the box's top edge, the three block-letter title rows (`▄▀▀ ▄▀▀▄`), the version
