@@ -2874,7 +2874,7 @@ static bool tasks_batch(cJSON *calls, bool *failed) {
         }
         bool stepped = false;
         for (i = 0; i < n; i++)
-            if (rs[i].state == SR_RUNNING && http_job_done(rs[i].job)) { sub_run_collect(&rs[i]); stepped = true; }
+            if (rs[i].state == SR_RUNNING && http_job_done(rs[i].job)) { sub_run_collect(&rs[i]); stepped = true; label[0] = 0; }   /* (a sub-agent's bash or web call took the bar, term_busy(NULL): say it again, or the spinner, the strip's clocks and the typed text stop being drawn) */
         if (stepped) continue;
         if (term_poll_interrupt()) { aborted = true; break; }
         term_busy_tick();
