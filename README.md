@@ -32,8 +32,9 @@ confirmed before it runs.
 - **Providers.** Anthropic, xAI, OpenAI, DeepSeek and Kimi, and your own OpenAI-compatible hosts
   (`/model add`). Request bodies can be gzipped for the providers that accept them (`/gzip`).
 - **Quiet transcript.** `/config bash hide` leaves the model's bash commands and their output out of the transcript
-  (a command you are asked about still shows in the question); `/config read hide` and `/config grep hide` drop the
-  results of `read_file` and `grep` and keep their call lines. `show` brings each back; `/config` lists them.
+  (a command you are asked about still shows in the question); `/config read|grep|list|fetch|search hide` drop the
+  results of `read_file`, `grep`, `list_dir`, `web_fetch` and `web_search` and keep their call lines. `show` brings each
+  back; `/config` lists them.
 - **Colour themes.** `/ui theme` picks a palette, shared by the terminal screen and the notcurses screen.
 - **Suggested next message.** After each reply the model proposes what you would type next, as a
   muted placeholder in the field: Tab takes it, typing anything clears it (`/suggest off` turns it off).
