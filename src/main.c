@@ -3701,6 +3701,7 @@ static bool run_turn_body(void) {
         if (tasks_batchable(calls)) {   /* /effort parallel on: the sub-agents of this reply run at the same time */
             bool stopped = tasks_batch(calls, &failed);
             g_fail_rounds = failed ? g_fail_rounds + 1 : 0;
+            session_save();   /* every call of the round is answered: the conversation up to here can be resumed if the program dies */
             if (advisor_step_in_due()) advisor_step_in(reply);
             printf("\n");
             if (stopped) return true;
@@ -3760,6 +3761,7 @@ static bool run_turn_body(void) {
             if (parsed) cJSON_Delete(parsed);
         }
         g_fail_rounds = failed ? g_fail_rounds + 1 : 0;
+        session_save();   /* a checkpoint: a crash or a closed terminal later in the request no longer loses the rounds so far (/resume) */
         if (advisor_step_in_due()) advisor_step_in(reply);
         printf("\n");
         if (guard_note) { add_loop_note(total_rounds); guard_note = false; }
