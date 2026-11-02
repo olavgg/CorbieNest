@@ -1567,6 +1567,10 @@ static char *build_system_prompt(void) {
             "\n# Tools\nYou have these tools: %s. Use them proactively "
             "instead of asking the user to paste files or run commands for you.\n", tools_summary_line());
         sb_puts(&b,
+            "- Say before you act: when a message needs tool calls, open with one or two sentences in text — the answer if you already know it, "
+            "or what you are about to look at or do and why — and only then call the tools. A question is answered in words first; "
+            "investigate afterwards only if the answer needs it. Do not go silent between tool calls: a short note when you change direction "
+            "or learn something that matters. Skip the opener for a trivial one-step request where the tool call says it all.\n"
             "- Explore first: use list_dir / grep / read_file to understand relevant code before changing it.\n"
             "- Batch independent calls: when you need several reads, searches or fetches that do not depend on each other's results, request them all in one reply rather than one per turn.\n"
             "- Always read a file before editing it. Use edit_file for targeted changes (old_string must match exactly); "
