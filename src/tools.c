@@ -820,10 +820,12 @@ static tool_status t_edit_file(cJSON *args, sbuf *out) {
         s = m + ol;
         if (!all) { sb_puts(&nb, s); break; }
     }
-    printf("  " C_DIM "edit %s (%d replacement%s)" C_RESET "\n", path, occ, occ == 1 ? "" : "s");
+    /* /config edit hide: no diff in the transcript, unless the user is about to be asked (they approve what they see) */
+    bool show_diff = g_cfg.show_edit || confirm_will_ask(CONF_EDIT, &g_always_edit, path);
+    if (show_diff) printf("  " C_DIM "edit %s (%d replacement%s)" C_RESET "\n", path, occ, occ == 1 ? "" : "s");
     /* diff-ish preview */
-    { sbuf t; sb_init(&t); const char *q = olds; while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "- %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_RED, NULL); sb_free(&t); }
-    { sbuf t; sb_init(&t); const char *q = news; if (!*q) sb_puts(&t, "+ (deleted)\n"); while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "+ %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_GREEN, NULL); sb_free(&t); }
+    if (show_diff) { sbuf t; sb_init(&t); const char *q = olds; while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "- %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_RED, NULL); sb_free(&t); }
+    if (show_diff) { sbuf t; sb_init(&t); const char *q = news; if (!*q) sb_puts(&t, "+ (deleted)\n"); while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "+ %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_GREEN, NULL); sb_free(&t); }
     char *reason = NULL;
     if (!confirm("Apply this edit?", CONF_EDIT, &g_always_edit, path, &reason)) {
         sb_printf(out, "User denied editing %s.%s%s", path, reason ? " Reason: " : "", reason ? reason : "");

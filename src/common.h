@@ -283,7 +283,7 @@ typedef struct {
     bool  parallel_tasks;/* /effort parallel on: the task calls of one reply run at the same time as sub-agents (default off) */
     char *build;         /* /plan: the command that builds the project after each layer (build=); NULL = detected from the project's build file */
     bool  show_thinking; /* print thinking tokens */
-    bool  show_read, show_grep, show_list, show_fetch, show_search;   /* show the result of read_file / grep / list_dir / web_fetch / web_search in the transcript (/config read|grep|list|fetch|search show|hide; default on; the call line stays) */
+    bool  show_read, show_grep, show_list, show_fetch, show_search, show_edit;   /* show the result of read_file / grep / list_dir / web_fetch / web_search in the transcript (/config read|grep|list|fetch|search show|hide; default on; the call line stays); show_edit: the edit_file diff preview and its result line (/config edit show|hide; an edit the user is asked about shows its diff in the question) */
     bool  show_bash;     /* show the model's bash commands and their output in the transcript (/config bash show|hide; default on) */
     int   mode;          /* permission mode, see MODE_* */
     bool  no_tools;      /* don't send tools at all */
