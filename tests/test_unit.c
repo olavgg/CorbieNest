@@ -1286,6 +1286,27 @@ static void test_suggest(void) {
     free(t);
 }
 
+static void test_config_merge(void) {
+    const char *base = "# h\nmode=manual\nthink=-1\neffort.a=b:c=low\nshow_bash=1\n";
+    /* another session turned parallel on and changed an effort; this one changed the mode only */
+    const char *theirs = "# h\nmode=manual\nthink=-1\neffort.a=b:c=high\nshow_bash=1\nparallel=on\n";
+    const char *ours = "# h\nmode=auto\nthink=-1\neffort.a=b:c=low\nshow_bash=1\n";
+    char *m = config_merge(base, ours, theirs);
+    CHECK(strstr(m, "mode=auto\n") && strstr(m, "parallel=on\n") && strstr(m, "effort.a=b:c=high\n") && !strstr(m, "=low"));
+    free(m);
+    /* this session deleted a key it had: it stays deleted; the other one deleted one this one did not touch: gone */
+    m = config_merge("a=1\nb=2\nc=3\n", "a=1\nc=3\n", "a=1\nb=2\n");
+    CHECK(strstr(m, "a=1\n") && !strstr(m, "b=") && !strstr(m, "c="));
+    free(m);
+    /* a key changed here beats the file's; a key added here is kept; no base (nothing was loaded): ours is all there is */
+    m = config_merge("a=1\n", "a=2\nn=1\n", "a=3\n");
+    CHECK(strstr(m, "a=2\n") && strstr(m, "n=1\n") && !strstr(m, "a=3"));
+    free(m);
+    m = config_merge(NULL, "a=2\n", "a=3\nz=1\n");
+    CHECK(strstr(m, "a=2\n") && !strstr(m, "a=3") && strstr(m, "z=1\n"));
+    free(m);
+}
+
 static void test_effort(void) {
     model_info none  = mi_of("{\"capabilities\":[\"completion\",\"tools\"]}");
     model_info onoff = mi_of("{\"details\":{\"family\":\"qwen3\"},\"capabilities\":[\"completion\",\"thinking\"]}");
@@ -2746,7 +2767,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "modes", test_modes },
         { "close button", test_close_x }, { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme },
+        { "config merge", test_config_merge }, { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

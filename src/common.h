@@ -336,6 +336,7 @@ int         mode_parse(const char *s);    /* -1 if unknown */
 const char *config_dir(void);        /* ~/.config/corbienest (created) */
 void config_load(void);
 void config_save(void);
+char *config_merge(const char *base, const char *ours, const char *theirs);   /* config_save's three-way merge per key; malloc'd text */
 void config_set_mode(int mode);   /* the mode for this run and for the config file (/mode); --yolo, Shift+Tab and /yolo set g_cfg.mode only */
 
 /* ---------- http.h ---------- */

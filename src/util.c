@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -399,11 +400,14 @@ static void trim(char *s) {
     while (n && (s[n-1] == '\n' || s[n-1] == '\r' || s[n-1] == ' ' || s[n-1] == '\t')) s[--n] = 0;
 }
 
+static void config_text(sbuf *bp);
+static char *g_cfg_base;
+
 void config_load(void) {
     char path[1200];
     snprintf(path, sizeof path, "%s/config", config_dir());
     FILE *f = fopen(path, "r");
-    if (!f) return;
+    if (!f) { sbuf t; sb_init(&t); config_text(&t); free(g_cfg_base); g_cfg_base = sb_detach(&t); return; }
     char line[4096];
     char *legacy_level = NULL;   /* think_level=: one level for every model, from before levels were kept per model */
     while (fgets(line, sizeof line, f)) {
@@ -465,18 +469,21 @@ void config_load(void) {
     /* the old global level belonged to whatever model was in use when it was set */
     if (legacy_level && effort_name_ok(legacy_level) && g_cfg.model && !effort_get(g_cfg.model)) effort_set(g_cfg.model, legacy_level);
     free(legacy_level);
+    sbuf t; sb_init(&t); config_text(&t); free(g_cfg_base); g_cfg_base = sb_detach(&t);   /* what this session starts from, see config_save */
 }
 
 /* The whole file is rewritten on every setting change, and another session may be reading it
- * (or writing it) at that moment — so it is built in memory and swapped in in one step. This
- * makes a torn or truncated config impossible; it does not merge two sessions' settings, and
- * is not meant to: whoever saved last is what the next session starts with. */
+ * (or writing it) at that moment — so it is built in memory and swapped in in one step: a torn or
+ * truncated config is impossible. Two sessions open at once must not undo each other's settings
+ * either (a session started before /effort parallel on was typed in another one would write the old
+ * value back with its next save), so a save is a three-way merge, per key, of g_cfg_base (what this
+ * process last wrote, or read), the text of this process's settings now, and the file as it is: a key
+ * this session did not change is taken from the file, one it changed is its own. The lock file keeps
+ * two saves from interleaving their read and write. */
 void config_set_mode(int mode) { g_cfg.mode = mode; g_mode_saved = mode; }
 
-void config_save(void) {
-    char path[1200];
-    snprintf(path, sizeof path, "%s/config", config_dir());
-    sbuf b; sb_init(&b);
+static void config_text(sbuf *bp) {
+    sbuf b = *bp;
     sb_puts(&b, "# corbienest config (auto-written)\n");
     if (g_cfg.model && *g_cfg.model) sb_printf(&b, "model=%s\n", g_cfg.model);
     if (g_cfg.host) sb_printf(&b, "host=%s\n", g_cfg.host);
@@ -514,8 +521,69 @@ void config_save(void) {
     sb_printf(&b, "keep_alive=%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "");
     if (g_cfg.ui) sb_printf(&b, "ui=%s\n", g_cfg.ui);
     if (g_cfg.theme) sb_printf(&b, "theme=%s\n", g_cfg.theme);
-    write_whole_file_atomic(path, b.data, b.len);
-    sb_free(&b);
+    *bp = b;
+}
+
+/* the key of a config line: split at the first '=', except effort.<model> and price.<model>, at the last (as config_load) */
+static size_t config_key_len(const char *line, size_t len) {
+    bool last = !strncmp(line, "effort.", 7) || !strncmp(line, "price.", 6);
+    size_t k = len;
+    for (size_t i = 0; i < len; i++) if (line[i] == '=') { k = i; if (!last) break; }
+    return k;
+}
+
+/* the line of text for key (length kl) in a config text, or NULL; *ll is its length */
+static const char *config_find(const char *text, const char *key, size_t kl, size_t *ll) {
+    for (const char *p = text; p && *p; ) {
+        const char *e = strchr(p, '\n'); size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n && p[0] != '#' && config_key_len(p, n) == kl && !strncmp(p, key, kl) && p[kl] == '=') { *ll = n; return p; }
+        p = e ? e + 1 : NULL;
+    }
+    return NULL;
+}
+
+char *config_merge(const char *base, const char *ours, const char *theirs) {
+    if (!base) base = "";
+    if (!theirs) theirs = "";
+    sbuf out; sb_init(&out);
+    sb_puts(&out, "# corbienest config (auto-written)\n");
+    for (const char *p = ours; p && *p; ) {
+        const char *e = strchr(p, '\n'); size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n && p[0] != '#') {
+            size_t kl = config_key_len(p, n), bl = 0, tl = 0;
+            const char *b = config_find(base, p, kl, &bl), *t = config_find(theirs, p, kl, &tl);
+            if (b && bl == n && !strncmp(b, p, n)) {   /* not changed here: the file has the say (a key deleted there stays deleted) */
+                if (t) { sb_append(&out, t, tl); sb_puts(&out, "\n"); }
+            } else { sb_append(&out, p, n); sb_puts(&out, "\n"); }
+        }
+        p = e ? e + 1 : NULL;
+    }
+    for (const char *p = theirs; p && *p; ) {   /* what only the file has: written there since, unless this session deleted it */
+        const char *e = strchr(p, '\n'); size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n && p[0] != '#') {
+            size_t kl = config_key_len(p, n), l = 0;
+            if (!config_find(ours, p, kl, &l) && !config_find(base, p, kl, &l)) { sb_append(&out, p, n); sb_puts(&out, "\n"); }
+        }
+        p = e ? e + 1 : NULL;
+    }
+    return sb_detach(&out);
+}
+
+void config_save(void) {
+    char path[1200], lockp[1200];
+    snprintf(path, sizeof path, "%s/config", config_dir());
+    snprintf(lockp, sizeof lockp, "%s/config.lock", config_dir());
+    sbuf b; sb_init(&b);
+    config_text(&b);
+    char *ours = sb_detach(&b);
+    int lk = open(lockp, O_CREAT | O_RDWR, 0600);
+    if (lk >= 0) flock(lk, LOCK_EX);
+    size_t sz; char *theirs = read_whole_file(path, &sz, 1024 * 1024);
+    char *merged = theirs ? config_merge(g_cfg_base, ours, theirs) : xstrdup(ours);
+    write_whole_file_atomic(path, merged, strlen(merged));
+    if (lk >= 0) { flock(lk, LOCK_UN); close(lk); }
+    free(merged); free(theirs);
+    free(g_cfg_base); g_cfg_base = ours;   /* ours, not the merge: a key not changed here keeps following the file */
 }
 
 /* ---------- effort: how hard each model thinks ---------- */
