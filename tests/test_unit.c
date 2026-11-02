@@ -187,7 +187,8 @@ static void write_preview_body(void *ud) {
     cJSON_AddStringToObject(a, "path", "long.txt");
     cJSON_AddStringToObject(a, "content", body.data);
     sbuf out; sb_init(&out);
-    if (!strcmp(which, "unasked")) { g_cfg.mode = MODE_AUTO; g_cfg.interactive = false; }
+    g_cfg.show_write = !strcmp(which, "hidden") ? false : true;
+    if (!strcmp(which, "unasked") || !strcmp(which, "hidden")) { g_cfg.mode = MODE_AUTO; g_cfg.interactive = false; }
     else { g_cfg.mode = MODE_MANUAL; g_cfg.interactive = true; }
     /* the asked write really asks: its answer is read from stdin, which make's own may never give (a terminal waits
      * for a key, an open pipe or socket for ever), so the question reads /dev/null: end of input, which is a no */
@@ -211,6 +212,10 @@ static void test_write_preview(void) {
     CHECK(strstr(q, TERM_FOLD_CLOSED) == NULL);                 /* asked: never folded */
     CHECK(strstr(q, "line 0 of the file") != NULL);
     free(q);
+    char *h = capture(write_preview_body, (void *)"hidden");   /* /config write hide: an unasked write prints no header and no preview */
+    CHECK(strstr(h, "line 0 of the file") == NULL && strstr(h, "create ") == NULL);
+    free(h);
+    g_cfg.show_write = true;
 }
 static void test_tools_body(void *ud) {
     (void)ud;

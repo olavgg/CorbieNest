@@ -115,7 +115,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/memory idle", "off:wait for the next update or the exit instead" },
     { "/hooks", "add:a hook line: pre|post TOOL COMMAND, start|stop COMMAND|remove:remove hook N|clear:remove them all" },
     { "/agents", "reload:read the agent files again" },
-    { "/config", "bash:show or hide the model's bash commands and their output|read:show or hide the results of read_file|grep:show or hide the results of grep|list:show or hide the results of list_dir|fetch:show or hide the results of web_fetch|search:show or hide the results of web_search|edit:show or hide the diff of edit_file" },
+    { "/config", "bash:show or hide the model's bash commands and their output|read:show or hide the results of read_file|grep:show or hide the results of grep|list:show or hide the results of list_dir|fetch:show or hide the results of web_fetch|search:show or hide the results of web_search|edit:show or hide the diff of edit_file|write:show or hide the preview of write_file" },
     { "/config bash", "show:print the commands as now (the default)|hide:print no bash command and no output (a denial or error still shows)" },
     { "/config read", "show:print what read_file returned (the default)|hide:keep the call line, drop the result (an error still shows)" },
     { "/config grep", "show:print what grep found (the default)|hide:keep the call line, drop the result (an error still shows)" },
@@ -847,7 +847,7 @@ static void print_result_preview(const char *text, int lines);
 /* /config: a tool whose result is left out of the transcript (read_file, grep, list_dir, web_fetch, web_search; bash hides its header too, see its own code) */
 static bool tool_output_hidden(const char *name) {
     return (!strcmp(name, "read_file") && !g_cfg.show_read) || (!strcmp(name, "grep") && !g_cfg.show_grep) || (!strcmp(name, "bash") && !g_cfg.show_bash) ||
-           (!strcmp(name, "list_dir") && !g_cfg.show_list) || (!strcmp(name, "web_fetch") && !g_cfg.show_fetch) || (!strcmp(name, "web_search") && !g_cfg.show_search) || (!strcmp(name, "edit_file") && !g_cfg.show_edit);
+           (!strcmp(name, "list_dir") && !g_cfg.show_list) || (!strcmp(name, "web_fetch") && !g_cfg.show_fetch) || (!strcmp(name, "web_search") && !g_cfg.show_search) || (!strcmp(name, "edit_file") && !g_cfg.show_edit) || (!strcmp(name, "write_file") && !g_cfg.show_write);
 }
 static void print_result_folded(const char *text, int preview_lines, const char *lead);
 static void stream_flush(void);
@@ -1366,8 +1366,8 @@ static int cmd_rewind(void) {
 }
 
 /* ---------- /permissions ---------- */
-/* /config [bash|read|grep|list|fetch|search|edit [show|hide]]: display settings: whether the model's bash commands and their output, and the
- * results of read_file, grep, list_dir, web_fetch and web_search, and the diff of edit_file, are in the transcript. (bash hides the command line too; the others keep the call line and drop the result.)
+/* /config [bash|read|grep|list|fetch|search|edit|write [show|hide]]: display settings: whether the model's bash commands and their output, and the
+ * results of read_file, grep, list_dir, web_fetch and web_search, the diff of edit_file and the preview of write_file, are in the transcript. (bash hides the command line too; the others keep the call line and drop the result.)
  * A command the user is asked about is always shown in the question; a denial or an error always shows. */
 static void cmd_config(const char *arg) {
     static const struct { const char *name; bool *flag; const char *what, *hidden_note; } ITEMS[] = {
@@ -1378,13 +1378,14 @@ static void cmd_config(const char *arg) {
         { "fetch", &g_cfg.show_fetch, "web_fetch results", "the web_fetch call line stays, its result does not; an error still shows" },
         { "search", &g_cfg.show_search, "web_search results", "the web_search call line stays, its result does not; an error still shows" },
         { "edit", &g_cfg.show_edit, "edit_file diffs", "the edit_file call line stays, its diff and its result do not; an edit you are asked about still shows its diff in the question, a denial or an error still shows" },
+        { "write", &g_cfg.show_write, "write_file previews", "the write_file call line stays, its preview and its result do not; a write you are asked about still shows its preview in the question, a denial or an error still shows" },
     };
     enum { N_ITEMS = sizeof ITEMS / sizeof ITEMS[0] };
     if (arg && *arg) {
         int i = 0;
         size_t l = strcspn(arg, " ");
         while (i < N_ITEMS && !(strlen(ITEMS[i].name) == l && !strncmp(arg, ITEMS[i].name, l))) i++;
-        if (i == N_ITEMS) { printf("usage: /config [bash|read|grep|list|fetch|search|edit [show|hide]]\n"); return; }
+        if (i == N_ITEMS) { printf("usage: /config [bash|read|grep|list|fetch|search|edit|write [show|hide]]\n"); return; }
         const char *v = arg + l; while (*v == ' ') v++;
         if (*v) {
             if (!strcmp(v, "show") || !strcmp(v, "on")) *ITEMS[i].flag = true;
@@ -5324,8 +5325,8 @@ static void cmd_status(void) {
            (g_cfg.no_tools || !g_model_tools) ? "" : (g_cfg.web ? C_DIM " · web on" C_RESET : C_DIM " · web off" C_RESET));
     printf(C_BOLD "mode       " C_RESET "%s%s" C_RESET "\n", g_cfg.mode == MODE_AUTO ? C_RED : g_cfg.mode == MODE_PLAN ? C_CYAN : g_cfg.mode == MODE_ACCEPT_EDITS ? C_ORANGE : "", mode_label(g_cfg.mode));
     printf(C_BOLD "think      " C_RESET "%s, %s\n", g_cfg.think < 0 ? "auto (first call of a request only)" : g_cfg.think ? "on (every call)" : "off", g_cfg.show_thinking ? "shown" : "hidden");
-    printf(C_BOLD "shown      " C_RESET "bash %s · read_file %s · grep %s · list_dir %s · web_fetch %s · web_search %s · edit_file %s" C_DIM " · /config" C_RESET "\n",
-           g_cfg.show_bash ? "yes" : "no", g_cfg.show_read ? "yes" : "no", g_cfg.show_grep ? "yes" : "no", g_cfg.show_list ? "yes" : "no", g_cfg.show_fetch ? "yes" : "no", g_cfg.show_search ? "yes" : "no", g_cfg.show_edit ? "yes" : "no");
+    printf(C_BOLD "shown      " C_RESET "bash %s · read_file %s · grep %s · list_dir %s · web_fetch %s · web_search %s · edit_file %s · write_file %s" C_DIM " · /config" C_RESET "\n",
+           g_cfg.show_bash ? "yes" : "no", g_cfg.show_read ? "yes" : "no", g_cfg.show_grep ? "yes" : "no", g_cfg.show_list ? "yes" : "no", g_cfg.show_fetch ? "yes" : "no", g_cfg.show_search ? "yes" : "no", g_cfg.show_edit ? "yes" : "no", g_cfg.show_write ? "yes" : "no");
     { sbuf c; sb_init(&c); effort_choices(&g_model_info, &c);
       printf(C_BOLD "effort     " C_RESET "%s%s%s" C_RESET "\n", effort_label(g_cfg.model, &g_model_info), c.len ? C_DIM " · /effort: " : "", c.len ? c.data : ""); sb_free(&c); }
     if (g_cfg.advisor) printf(C_BOLD "advisor    " C_RESET "%s" C_DIM " · guidance %s · %d consultation%s this session%s" C_RESET "\n", g_cfg.advisor, advisor_guidance()->name,
@@ -6799,7 +6800,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     tools_bg_init();
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.suggest = true; g_cfg.show_bash = g_cfg.show_read = g_cfg.show_grep = g_cfg.show_list = g_cfg.show_fetch = g_cfg.show_search = g_cfg.show_edit = true; g_cfg.advisor_guidance = GUIDANCE_NORMAL; g_cfg.advisor_window = ADVISOR_WINDOW_DEFAULT;
+    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.suggest = true; g_cfg.show_bash = g_cfg.show_read = g_cfg.show_grep = g_cfg.show_list = g_cfg.show_fetch = g_cfg.show_search = g_cfg.show_edit = g_cfg.show_write = true; g_cfg.advisor_guidance = GUIDANCE_NORMAL; g_cfg.advisor_window = ADVISOR_WINDOW_DEFAULT;
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();

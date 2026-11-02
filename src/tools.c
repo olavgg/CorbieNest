@@ -762,12 +762,16 @@ static tool_status t_write_file(cJSON *args, sbuf *out) {
     char *p = expand_home(path);
     if (!path_in_root(p)) { sb_printf(out, "error: %s is outside this candidate's worktree; write inside the working directory", path); free(p); return TOOL_ERROR; }
     bool exists = is_file(p);
-    printf("  " C_DIM "%s %s (%zu bytes)" C_RESET "\n", exists ? "overwrite" : "create", path, strlen(content));
+    /* /config write hide: no header and no preview, unless the user is about to be asked (they approve what they see) */
+    bool asked = confirm_will_ask(CONF_EDIT, &g_always_write, path);
+    bool show_prev = g_cfg.show_write || asked;
+    if (show_prev) printf("  " C_DIM "%s %s (%zu bytes)" C_RESET "\n", exists ? "overwrite" : "create", path, strlen(content));
     const char *dot = strrchr(path, '.'), *slash = strrchr(path, '/');
     const char *lang = dot && (!slash || dot > slash) ? dot + 1 : NULL;
     /* A write the user is asked about shows its first lines as before: they approve what they see. A write that
      * goes through without a question is folded like a command that runs unasked (the head says how much). */
-    if (!confirm_will_ask(CONF_EDIT, &g_always_write, path)) preview_folded(content, lang);
+    if (!show_prev) {}
+    else if (!asked) preview_folded(content, lang);
     else preview_lines(content, 12, C_GREEN, lang);
     char *reason = NULL;
     if (!confirm(exists ? "Overwrite this file?" : "Create this file?", CONF_EDIT, &g_always_write, path, &reason)) {
