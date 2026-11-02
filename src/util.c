@@ -448,6 +448,8 @@ void config_load(void) {
         else if (!strcmp(k, "show_list")) g_cfg.show_list = atoi(v) != 0;
         else if (!strcmp(k, "show_fetch")) g_cfg.show_fetch = atoi(v) != 0;
         else if (!strcmp(k, "show_search")) g_cfg.show_search = atoi(v) != 0;
+        else if (!strcmp(k, "show_edit")) g_cfg.show_edit = atoi(v) != 0;
+        else if (!strcmp(k, "show_write")) g_cfg.show_write = atoi(v) != 0;
         else if (!strcmp(k, "ui")) { free(g_cfg.ui); g_cfg.ui = !strcmp(v, "notcurses") ? xstrdup("notcurses") : NULL; }
         else if (!strcmp(k, "theme")) {   /* a name no theme has is said, and the default is used */
             if (theme_set(v)) { free(g_cfg.theme); g_cfg.theme = xstrdup(v); }
@@ -509,6 +511,8 @@ static void config_text(sbuf *bp) {
     sb_printf(&b, "show_list=%d\n", g_cfg.show_list ? 1 : 0);
     sb_printf(&b, "show_fetch=%d\n", g_cfg.show_fetch ? 1 : 0);
     sb_printf(&b, "show_search=%d\n", g_cfg.show_search ? 1 : 0);
+    sb_printf(&b, "show_edit=%d\n", g_cfg.show_edit ? 1 : 0);
+    sb_printf(&b, "show_write=%d\n", g_cfg.show_write ? 1 : 0);
     sb_printf(&b, "mode=%s\n", mode_name(g_mode_saved));
     sb_printf(&b, "max_iters=%d\n", g_cfg.max_iters);
     sb_printf(&b, "memory=%d\n", g_cfg.memory ? 1 : 0);

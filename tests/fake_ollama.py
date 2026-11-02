@@ -349,6 +349,11 @@ def script(model, messages, req):
         else: yield chunk(model, "Looked.")
         yield chunk(model, done=True)
         return
+    if "TOOL_EDIT" in text:   # edit_file on look.txt (see the show_edit test), then an answer
+        if last["role"] == "tool": yield chunk(model, "Edited.")
+        else: yield chunk(model, tool_calls=[{"function": {"name": "edit_file", "arguments": {"path": "look.txt", "old_string": "first line", "new_string": "second-marker line"}}}])
+        yield chunk(model, done=True)
+        return
     if "TOOL_READS" in text:
         # a request that only looks: four tool calls, no file written
         results = [m for m in messages if m["role"] == "tool"]

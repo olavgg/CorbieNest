@@ -762,12 +762,16 @@ static tool_status t_write_file(cJSON *args, sbuf *out) {
     char *p = expand_home(path);
     if (!path_in_root(p)) { sb_printf(out, "error: %s is outside this candidate's worktree; write inside the working directory", path); free(p); return TOOL_ERROR; }
     bool exists = is_file(p);
-    printf("  " C_DIM "%s %s (%zu bytes)" C_RESET "\n", exists ? "overwrite" : "create", path, strlen(content));
+    /* /config write hide: no header and no preview, unless the user is about to be asked (they approve what they see) */
+    bool asked = confirm_will_ask(CONF_EDIT, &g_always_write, path);
+    bool show_prev = g_cfg.show_write || asked;
+    if (show_prev) printf("  " C_DIM "%s %s (%zu bytes)" C_RESET "\n", exists ? "overwrite" : "create", path, strlen(content));
     const char *dot = strrchr(path, '.'), *slash = strrchr(path, '/');
     const char *lang = dot && (!slash || dot > slash) ? dot + 1 : NULL;
     /* A write the user is asked about shows its first lines as before: they approve what they see. A write that
      * goes through without a question is folded like a command that runs unasked (the head says how much). */
-    if (!confirm_will_ask(CONF_EDIT, &g_always_write, path)) preview_folded(content, lang);
+    if (!show_prev) {}
+    else if (!asked) preview_folded(content, lang);
     else preview_lines(content, 12, C_GREEN, lang);
     char *reason = NULL;
     if (!confirm(exists ? "Overwrite this file?" : "Create this file?", CONF_EDIT, &g_always_write, path, &reason)) {
@@ -820,10 +824,12 @@ static tool_status t_edit_file(cJSON *args, sbuf *out) {
         s = m + ol;
         if (!all) { sb_puts(&nb, s); break; }
     }
-    printf("  " C_DIM "edit %s (%d replacement%s)" C_RESET "\n", path, occ, occ == 1 ? "" : "s");
+    /* /config edit hide: no diff in the transcript, unless the user is about to be asked (they approve what they see) */
+    bool show_diff = g_cfg.show_edit || confirm_will_ask(CONF_EDIT, &g_always_edit, path);
+    if (show_diff) printf("  " C_DIM "edit %s (%d replacement%s)" C_RESET "\n", path, occ, occ == 1 ? "" : "s");
     /* diff-ish preview */
-    { sbuf t; sb_init(&t); const char *q = olds; while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "- %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_RED, NULL); sb_free(&t); }
-    { sbuf t; sb_init(&t); const char *q = news; if (!*q) sb_puts(&t, "+ (deleted)\n"); while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "+ %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_GREEN, NULL); sb_free(&t); }
+    if (show_diff) { sbuf t; sb_init(&t); const char *q = olds; while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "- %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_RED, NULL); sb_free(&t); }
+    if (show_diff) { sbuf t; sb_init(&t); const char *q = news; if (!*q) sb_puts(&t, "+ (deleted)\n"); while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "+ %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_GREEN, NULL); sb_free(&t); }
     char *reason = NULL;
     if (!confirm("Apply this edit?", CONF_EDIT, &g_always_edit, path, &reason)) {
         sb_printf(out, "User denied editing %s.%s%s", path, reason ? " Reason: " : "", reason ? reason : "");
