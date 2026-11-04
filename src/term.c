@@ -1317,8 +1317,10 @@ void term_title_bytes(int state, bool iterm, const char *dir, sbuf *out) {
 static void title_dir(char *dir, size_t n) {   /* the working folder's name (the last part of its path) */
     char cwd[PATH_MAX];
     if (!getcwd(cwd, sizeof cwd)) { snprintf(dir, n, "?"); return; }
-    const char *b = strrchr(cwd, '/');
-    snprintf(dir, n, "%s", b && b[1] ? b + 1 : cwd);
+    const char *b = strrchr(cwd, '/'), *name = b && b[1] ? b + 1 : cwd;
+    size_t l = strlen(name);
+    if (l >= n) { l = n - 1; while (l && ((unsigned char)name[l] & 0xC0) == 0x80) l--; }   /* cut between characters */
+    memcpy(dir, name, l); dir[l] = 0;   /* (not snprintf: a path is up to PATH_MAX, and gcc -Werror=format-truncation says so) */
 }
 void term_title_set(int state) {
     static char shown[256];   /* the folder the title last named: a /cd changes it while the state stays */
