@@ -2818,25 +2818,34 @@ static char *map_all(const char *in) {
 /* the window title and iTerm2's status: the bytes for each state, and for leaving */
 static void test_title(void) {
     sbuf o; sb_init(&o);
-    term_title_bytes(1, false, &o);
-    CHECK_STR(o.data, "\x1b]0;\xF0\x9F\x9F\xA2 corbie \xC2\xB7 ready\x07");   /* 🟢 in the title, nothing else outside iTerm2 */
+    term_title_bytes(1, false, "myapp", &o);
+    CHECK_STR(o.data, "\x1b]0;\xF0\x9F\x9F\xA2 Corbie | myapp\x07");   /* 🟢 and the folder: the marker is all a plain terminal has */
     o.len = 0; if (o.data) o.data[0] = 0;
-    term_title_bytes(2, true, &o);
-    CHECK_STR(o.data, "\x1b]0;\xF0\x9F\x9F\xA0 corbie \xC2\xB7 working\x07\x1b]21337;status=Working;indicator=#ffa500\x07");   /* 🟠, and iTerm2's subtitle and orange dot */
+    term_title_bytes(2, true, "myapp", &o);
+    CHECK_STR(o.data, "\x1b]0;Corbie | myapp\x07\x1b]21337;status=Working;indicator=#ffa500\x07");   /* iTerm2: no marker (its dot and subtitle say it), orange */
     o.len = 0; if (o.data) o.data[0] = 0;
-    term_title_bytes(1, true, &o);
-    CHECK(strstr(o.data, "status=Idle;indicator=#5fd75f") != NULL);   /* the green dot */
+    term_title_bytes(1, true, "myapp", &o);
+    CHECK(strstr(o.data, "status=Idle;indicator=#5fd75f") != NULL && !strstr(o.data, "\xF0\x9F"));   /* the green dot */
     o.len = 0; if (o.data) o.data[0] = 0;
-    term_title_bytes(3, true, &o);
-    CHECK(strstr(o.data, "status=Waiting;indicator=#f1c40f") != NULL && strstr(o.data, "\xF0\x9F\x9F\xA1") != NULL);
+    term_title_bytes(3, false, "myapp", &o);
+    CHECK(strstr(o.data, "\xF0\x9F\x9F\xA1 Corbie | myapp") != NULL && !strstr(o.data, "21337"));
     o.len = 0; if (o.data) o.data[0] = 0;
-    term_title_bytes(0, false, &o);
+    term_title_bytes(3, true, "myapp", &o);
+    CHECK(strstr(o.data, "status=Waiting;indicator=#f1c40f") != NULL);
+    o.len = 0; if (o.data) o.data[0] = 0;
+    term_title_bytes(1, false, "a\x07" "b\x1b]0;x", &o);
+    CHECK_STR(o.data, "\x1b]0;\xF0\x9F\x9F\xA2 Corbie | ab]0;x\x07");   /* a control byte in a folder name cannot end the title early */
+    o.len = 0; if (o.data) o.data[0] = 0;
+    term_title_bytes(2, true, NULL, &o);
+    CHECK(strstr(o.data, "Corbie | ?\x07") != NULL);   /* no folder known */
+    o.len = 0; if (o.data) o.data[0] = 0;
+    term_title_bytes(0, false, "myapp", &o);
     CHECK_STR(o.data, "\x1b[23;0t");   /* leaving: the title as it was */
     o.len = 0; if (o.data) o.data[0] = 0;
-    term_title_bytes(0, true, &o);
+    term_title_bytes(0, true, "myapp", &o);
     CHECK_STR(o.data, "\x1b[23;0t\x1b]21337;status=;indicator=;status-color=\x07");   /* and iTerm2's status cleared */
     o.len = 0; if (o.data) o.data[0] = 0;
-    term_title_bytes(9, true, &o);
+    term_title_bytes(9, true, "myapp", &o);
     CHECK(o.len == 0);   /* a state there is none of writes nothing */
     sb_free(&o);
     g_cfg.title = true; g_cfg.interactive = false;

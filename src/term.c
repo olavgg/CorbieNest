@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1281,22 +1282,23 @@ static void fd1_write(const char *b, size_t n) {   /* a cursor move to fd 1 itse
     while (off < n) { ssize_t w = write(STDOUT_FILENO, b + off, n - off); if (w < 0) { if (errno == EINTR) continue; return; } off += (size_t)w; }
 }
 /* ---------- the terminal window's title and status ----------
- * The title says what the program is doing, so a tab in the background shows it: a 🟢 while the prompt waits, a 🟠 while
- * a turn runs, a 🟡 while a question waits for the user. Every terminal that takes OSC 0 shows the marker (a title has no
- * colour of its own). iTerm2 also has a status of its own, OSC 21337: the line under the tab's title and the dot on the tab
- * (https://iterm2.com/documentation-session-status.html); it is sent only there (TERM_PROGRAM, or LC_TERMINAL, which an
- * ssh session keeps), and cleared on the way out. The title as the program found it is pushed (CSI 22;0 t) at the first
+ * The title is "Corbie | folder". It says what the program is doing, so a tab in the background shows it: a 🟢 while the
+ * prompt waits, a 🟠 while a turn runs, a 🟡 while a question waits for the user. A plain terminal gets the marker in front
+ * of the title (a title has no colour of its own). iTerm2 has a status of its own, OSC 21337: the line under the tab's
+ * title and the dot on the tab (https://iterm2.com/documentation-session-status.html); it says the state there, once,
+ * so iTerm2's title has no marker. It is sent only there (TERM_PROGRAM, or LC_TERMINAL, which an ssh session keeps),
+ * and cleared on the way out. The title as the program found it is pushed (CSI 22;0 t) at the first
  * change and popped (CSI 23;0 t) when the terminal is given back. */
 static bool title_iterm(void) {
     const char *tp = getenv("TERM_PROGRAM"), *lc = getenv("LC_TERMINAL");
     return (tp && !strcmp(tp, "iTerm.app")) || (lc && !strcmp(lc, "iTerm2"));
 }
-void term_title_bytes(int state, bool iterm, sbuf *out) {
-    static const struct { const char *title, *status, *dot; } S[] = {
+void term_title_bytes(int state, bool iterm, const char *dir, sbuf *out) {
+    static const struct { const char *marker, *status, *dot; } S[] = {
         { NULL, NULL, NULL },
-        { "\xF0\x9F\x9F\xA2 corbie \xC2\xB7 ready",   "Idle",    "#5fd75f" },
-        { "\xF0\x9F\x9F\xA0 corbie \xC2\xB7 working", "Working", "#ffa500" },
-        { "\xF0\x9F\x9F\xA1 corbie \xC2\xB7 waiting", "Waiting", "#f1c40f" },
+        { "\xF0\x9F\x9F\xA2 ", "Idle",    "#5fd75f" },   /* 🟢 */
+        { "\xF0\x9F\x9F\xA0 ", "Working", "#ffa500" },   /* 🟠 */
+        { "\xF0\x9F\x9F\xA1 ", "Waiting", "#f1c40f" },   /* 🟡 */
     };
     if (state < 0 || state > 3) return;
     if (!state) {   /* leaving: the title as it was, and no status on the tab */
@@ -1304,16 +1306,29 @@ void term_title_bytes(int state, bool iterm, sbuf *out) {
         if (iterm) sb_puts(out, "\x1b]21337;status=;indicator=;status-color=\x07");
         return;
     }
-    sb_printf(out, "\x1b]0;%s\x07", S[state].title);
+    /* "Corbie | folder": in iTerm2 the status says the state (dot and subtitle), so the title does not; elsewhere a marker does */
+    sb_puts(out, "\x1b]0;");
+    if (!iterm) sb_puts(out, S[state].marker);
+    sb_puts(out, "Corbie | ");
+    for (const char *p = dir && *dir ? dir : "?"; *p; p++) if ((unsigned char)*p >= 0x20 && *p != 0x7f) sb_putc(out, *p);   /* no control byte ends the title early */
+    sb_putc(out, 7);
     if (iterm) sb_printf(out, "\x1b]21337;status=%s;indicator=%s\x07", S[state].status, S[state].dot);
 }
+static void title_dir(char *dir, size_t n) {   /* the working folder's name (the last part of its path) */
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof cwd)) { snprintf(dir, n, "?"); return; }
+    const char *b = strrchr(cwd, '/');
+    snprintf(dir, n, "%s", b && b[1] ? b + 1 : cwd);
+}
 void term_title_set(int state) {
-    if (state == g_title_state) return;
+    static char shown[256];   /* the folder the title last named: a /cd changes it while the state stays */
     if (!g_cfg.title || !g_cfg.interactive || !isatty(STDOUT_FILENO)) return;
+    char dir[256]; title_dir(dir, sizeof dir);
+    if (state == g_title_state && (!state || !strcmp(dir, shown))) return;
     sbuf o; sb_init(&o);
     if (!g_title_state) { sb_puts(&o, "\x1b[22;0t"); g_title_iterm = title_iterm(); }
-    if (state) term_title_bytes(state, g_title_iterm, &o);
-    else term_title_bytes(0, g_title_iterm, &o);
+    term_title_bytes(state, g_title_iterm, dir, &o);
+    snprintf(shown, sizeof shown, "%s", dir);
     fflush(stdout);
     fd1_write(o.data, o.len);   /* to fd 1 itself: the stdout hook would record it as conversation */
     sb_free(&o);
