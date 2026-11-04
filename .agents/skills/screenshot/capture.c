@@ -4,7 +4,7 @@
  *
  * The program runs at COLS x ROWS with OLLAMA_HOST=127.0.0.1:PORT (a fake server, see SKILL.md), in CWD,
  * with a scratch config directory. notcurses asks the terminal two questions when it starts (the device
- * attributes query and the cursor report); both are answered here, so it gets past its start. The output is
+ * attributes query and the cursor report, twice: the start-up probe child asks first, then the real start); every one is answered here, so it gets past its start. The output is
  * read for SECONDS, then the program is killed. Only the child this starts is killed.
  *
  * The bytes go to OUT; screen.c draws them. Built by the Makefile next to this file. */
@@ -80,7 +80,6 @@ int main(int argc, char **argv) {
 
     size_t cap = 1 << 16, len = 0;
     unsigned char *buf = malloc(cap);
-    int said_da = 0, said_cpr = 0;
     double t0 = now();
     while (now() - t0 < secs) {
         fd_set rf;
@@ -94,13 +93,11 @@ int main(int argc, char **argv) {
         if (len + (size_t)n > cap) { cap = (len + (size_t)n) * 2; buf = realloc(buf, cap); }
         memcpy(buf + len, chunk, (size_t)n);
         len += (size_t)n;
-        if (!said_da && has(chunk, (size_t)n, "\x1b[c")) {
+        if (has(chunk, (size_t)n, "\x1b[c")) {
             if (write(fd, "\x1b[?62;22c", 9) < 0) break;
-            said_da = 1;
         }
-        if (!said_cpr && has(chunk, (size_t)n, "\x1b[6n")) {
+        if (has(chunk, (size_t)n, "\x1b[6n")) {
             if (write(fd, "\x1b[1;1R", 6) < 0) break;
-            said_cpr = 1;
         }
     }
 
