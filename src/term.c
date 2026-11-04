@@ -620,7 +620,9 @@ static int field_mentions(const char *text, size_t len, size_t (*sp)[2]) {
     return len && text[0] != '/' && text[0] != '!' ? mention_spans(text, len, sp, MENTION_MAX) : 0;
 }
 /* what is typed in the field: the theme's text colour on the window's own background (no fill; notcurses does the same) */
-static void put_field_on(sbuf *o) { sb_puts(o, th_fg(g_theme->field_text)); }
+static void put_field_on(sbuf *o, const char *text) {   /* a `!command` is typed in the shell line's colour, as it is shown once sent */
+    sb_puts(o, th_fg(text && text[0] == '!' ? g_theme->shell_text : g_theme->field_text));
+}
 /* kind[i] 1 = a paste token (reverse video), anything else a mention (cyan); kind may be NULL */
 static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_t (*sp)[2], const int *kind, int ns) {
     size_t at = from, end = from + n;
@@ -703,7 +705,7 @@ static void field_draw(sbuf *o, const char *typed, size_t caret) {
     for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;%dH\x1b[49m\x1b[K" C_RESET, top + 1 + i, FIELD_X0);
     sb_printf(o, "\x1b[%d;%dH", top + 1, FIELD_X0 + 1);
     if (!g_field_view) sb_puts(o, field_prompt());
-    put_field_on(o);
+    put_field_on(o, typed ? typed : g_field_text);
     if (typed) {
         /* not the editor's text: one line, with the block for the caret where the type-ahead's caret is (the arrow keys
          * move it). A line too long for the field keeps the caret in view: the text before it is cut at the front, with
@@ -735,7 +737,7 @@ static void field_draw(sbuf *o, const char *typed, size_t caret) {
         size_t sp[MENTION_MAX][2]; int ns = field_mentions(t, len, sp);
         if (mark) sb_puts(o, "…");
         put_mentions(o, t, from, ci - from, sp, NULL, ns);
-        sb_puts(o, C_DIM "▏" C_RESET); put_field_on(o);
+        sb_puts(o, C_DIM "▏" C_RESET); put_field_on(o, t);
         put_mentions(o, t, ci, to - ci, sp, NULL, ns);
         g_ta_caret_col = FIELD_X0 + (g_field_view ? 0 : vis_width(field_prompt())) + mark + vis_width_n(t + from, ci - from) + 1;
         free(t);
@@ -759,7 +761,7 @@ static void field_draw(sbuf *o, const char *typed, size_t caret) {
             if (to > g_field_len) to = g_field_len;
             sb_printf(o, "\x1b[%d;%dH", top + 1 + i, FIELD_X0 + 1);
             if (i == 0 && g_field_view == 0) sb_puts(o, field_prompt());
-            put_field_on(o);
+            put_field_on(o, g_field_text);
             size_t n = to > from ? to - from : 0;
             while (n && g_field_text[from + n - 1] == '\n') n--;
             put_mentions(o, g_field_text, from, n, sp, kind, ns);

@@ -928,6 +928,7 @@ static void draw_field(int top) {
     int nm = g_len && g_ed[0] != '/' && g_ed[0] != '!' ? mention_spans(g_ed, g_len, ms, 16) : 0;
     size_t ps[PASTE_MAX][2]; int pk[PASTE_MAX];   /* the paste tokens, as the ANSI field has them (reverse video there) */
     size_t np = g_len ? paste_tokens(g_ed, g_len, ps, pk, NULL, PASTE_MAX) : 0;
+    unsigned ink = g_len && g_ed[0] == '!' ? g_theme->shell_text : C_FIELD_TEXT;   /* a !command in the colour of the sent line */
     int shown = rows > FIELD_MAX ? FIELD_MAX : rows;
     int first = cr - shown + 1 > 0 ? cr - shown + 1 : 0;      /* keep the cursor's row in view */
     if (first > rows - shown) first = rows - shown > 0 ? rows - shown : 0;
@@ -982,8 +983,8 @@ static void draw_field(int top) {
         for (size_t q = 0; q < np; q++) if (at >= ps[q][0] && at < ps[q][1]) { tk = pk[q]; break; }
         if (shows) {
             /* the caret is a light cell with a dark letter (reverse video does not show here, and the hardware cursor is not moved: see nc_render); a paste token is the same look */
-            nc_style st = here ? (nc_style){ C_BAR_A, C_TEXT, 0 } : tk ? (nc_style){ C_BAR_A, C_TEXT, 0 } : (nc_style){ inmention ? C_MENTION : C_FIELD_TEXT, NC_DEFAULT, 0 };
-            paint(g_std, &st, C_FIELD_TEXT, C_FIELD_BG);
+            nc_style st = here ? (nc_style){ C_BAR_A, C_TEXT, 0 } : tk ? (nc_style){ C_BAR_A, C_TEXT, 0 } : (nc_style){ inmention ? C_MENTION : ink, NC_DEFAULT, 0 };
+            paint(g_std, &st, ink, C_FIELD_BG);
             ncplane_putstr_yx(g_std, y, x, cell.egc);
             if (tk) for (int j = 0; j < w; j++) if (y >= 0 && y < g_rows && x + j >= 0 && x + j < g_cols) g_tokmap[(size_t)y * (size_t)g_cols + (size_t)(x + j)] = (unsigned char)tk;
         }
