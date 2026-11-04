@@ -8,19 +8,19 @@
 <tspan x="18">  </tspan>
 <tspan x="34.8" fill="#ff8700">❯ </tspan>
 <tspan x="51.6" fill="#ff8700" font-weight="600">1. Yes</tspan>
-<tspan x="102" fill-opacity="0.62">  (y)</tspan>
+<tspan x="102" fill="#82888f">  (y)</tspan>
 </text>
 <text y="72" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">    2. Yes, and don't ask again for shell commands this session</tspan>
-<tspan x="547.2" fill-opacity="0.62">  (a)</tspan>
+<tspan x="547.2" fill="#82888f">  (a)</tspan>
 </text>
 <text y="92" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">    3. Yes, and always allow `git status …` in this project</tspan>
-<tspan x="513.6" fill-opacity="0.62">  (p)</tspan>
+<tspan x="513.6" fill="#82888f">  (p)</tspan>
 </text>
 <text y="112" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">    4. No, and tell the model what to do instead</tspan>
-<tspan x="421.2" fill-opacity="0.62">  (n)</tspan>
+<tspan x="421.2" fill="#82888f">  (n)</tspan>
 </text>
 <text y="132" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">  </tspan>

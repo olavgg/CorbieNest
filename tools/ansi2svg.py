@@ -44,6 +44,42 @@ def cube(n):
     return "#%02x%02x%02x" % (v, v, v)
 
 
+def _lin(c):
+    c /= 255.0
+    return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _lum(h):
+    return 0.2126 * _lin(int(h[1:3], 16)) + 0.7152 * _lin(int(h[3:5], 16)) + 0.0722 * _lin(int(h[5:7], 16))
+
+
+def contrast(a, b):
+    """WCAG contrast ratio of two #rrggbb colours (1 to 21)."""
+    x, y = sorted((_lum(a), _lum(b)), reverse=True)
+    return (x + 0.05) / (y + 0.05)
+
+
+def mix(a, b, t):
+    """The colour t of the way from b to a (t=1 is a)."""
+    return "#%02x%02x%02x" % tuple(round(int(a[i:i + 2], 16) * t + int(b[i:i + 2], 16) * (1 - t)) for i in (1, 3, 5))
+
+
+def legible(fg, bg, target):
+    """fg moved toward white (toward black on a light ground) until it has `target` contrast on bg, and no further:
+    the picture keeps its colours, a muted grey is just not too faint to read."""
+    end = "#ffffff" if _lum(bg) < 0.5 else "#000000"
+    c = fg
+    for i in range(1, 101):
+        if contrast(c, bg) >= target:
+            return c
+        c = mix(end, fg, i / 100.0)
+    return c
+
+
+TEXT_CONTRAST = 4.5     # WCAG AA for text
+DRAWING_CONTRAST = 3.0  # box lines, braille and block art are shapes, not text: WCAG's 3:1 for graphics
+
+
 def runs(line):
     """Split one line into (text, colour, bold, dim, background) runs."""
     out, col, bold, dim, bg, pos = [], None, False, False, None, 0
@@ -123,20 +159,24 @@ def render(text):
                          % (PAD + cell * CELL, PAD + i * LINE + 2, width(txt) * CELL, LINE, bg))
             cell += width(txt)
         o.append('<text y="%g" xml:space="preserve" fill="%s">' % (y, FG))
+        # (each run's ground is its own background rectangle, else the card)
         # Symbols like ● ⎿ ↳ ⏵ are drawn wider than a monospace cell by whatever
         # font the viewer falls back to, which would shift the rest of the line.
         # Pinning every run to its own column keeps the grid honest instead.
         cell = 0
-        for txt, col, bold, dim, _ in r:
+        for txt, col, bold, dim, bg in r:
             if not txt:
                 continue
             a = ' x="%g"' % (PAD + cell * CELL)
-            if col:
-                a += ' fill="%s"' % col
+            ground = bg or BG
+            fg = col or FG
+            if dim:
+                fg = mix(fg, ground, 0.62)   # dim is a fainter colour, written out so it can be checked like the others
+            fg = legible(fg, ground, TEXT_CONTRAST if any(ch.isalnum() for ch in txt) else DRAWING_CONTRAST)
+            if col or dim or fg != FG:
+                a += ' fill="%s"' % fg
             if bold:
                 a += ' font-weight="600"'
-            if dim:
-                a += ' fill-opacity="0.62"'
             o.append("<tspan%s>%s</tspan>" % (a, esc(txt)))
             cell += width(txt)
         o.append("</text>")
