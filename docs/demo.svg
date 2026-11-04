@@ -2,7 +2,7 @@
 <rect width="876" height="716" rx="8" fill="#0d1117" stroke="#30363d"/>
 <text y="32" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18" fill="#e5e9f0" font-weight="600">Corbie Nest</tspan>
-<tspan x="110.4" fill="#737578"> v0.3.0 · /banner shows the box again</tspan>
+<tspan x="110.4" fill="#737578"> v0.4.0 · /banner shows the box again</tspan>
 </text>
 <text y="52" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18" fill="#737578">/help for commands · @file to attach · !cmd for shell · shift+tab to switch mode · Ctrl-D to quit</tspan>
@@ -75,7 +75,7 @@
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
 <tspan x="93.6">         </tspan>
 <tspan x="169.2" font-weight="600">Corbie Nest</tspan>
-<tspan x="261.6"> v0.3.0 — a coding agent for local and hosted models          </tspan>
+<tspan x="261.6"> v0.4.0 — a coding agent for local and hosted models          </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
 <rect x="85.2" y="220" width="8.4" height="20" fill="#161a24"/>
