@@ -85,7 +85,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/agents", "sub-agent files: roles the main agent starts by name with task (reload; /agents alone lists them)" },
     { "/config", "display settings: show or hide the model's bash commands, and the results of read_file, grep, list_dir, web_fetch and web_search (alone lists them)" },
     { "/sandbox", "the model's shell commands in bubblewrap: the project writable, the rest read-only (on, off; alone shows it)" },
-    { "/title", "the terminal window's title is Corbie | folder, with 🟢 ready, 🟠 working or 🟡 waiting in front; iTerm2 shows the state as its status line and tab dot instead (on, off; alone shows it)" },
+    { "/title", "the terminal window's title is the folder's name, with 🟢 ready, 🟠 working or 🟡 waiting in front; iTerm2 shows the state as its status line and tab dot instead (on, off; alone shows it)" },
     { "/permissions", "the project's saved rules: always-allow ones, and deny/ask guards on a tool and a pattern: add, remove, clear" },
     { "/init", "have the model write AGENTS.md for this project" },
     { "/cost", "tokens, model calls and time of this session" },
@@ -1426,7 +1426,7 @@ static void cmd_sandbox(const char *arg) {
 /* /title: the terminal window's title says what the program does (term.c: term_title_set) */
 static void cmd_title(const char *arg) {
     if (!arg || !*arg) {
-        printf(C_DIM "title %s — the window title is Corbie | folder, with 🟢 ready / 🟠 working / 🟡 waiting in front; iTerm2 shows the state as its status line and tab dot (/title on|off)" C_RESET "\n", g_cfg.title ? "on" : "off");
+        printf(C_DIM "title %s — the window title is the folder's name, with 🟢 ready / 🟠 working / 🟡 waiting in front; iTerm2 shows the state as its status line and tab dot (/title on|off)" C_RESET "\n", g_cfg.title ? "on" : "off");
         return;
     }
     if (strcmp(arg, "on") && strcmp(arg, "off")) { printf("usage: /title [on|off]\n"); return; }
