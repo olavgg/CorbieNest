@@ -45,6 +45,7 @@ typedef struct {
     unsigned loc;                               /* the location line */
     unsigned select;                            /* the row the keys are on, in the sub-agents strip */
     unsigned user_bg, user_text;                /* the ground and the text of a line the user sent, in the conversation */
+    unsigned shell_bg, shell_text;              /* the same for a `!command` line: the user's colours, a little redder */
     unsigned brand, spark_hi, spark_mid, spark_lo;   /* the banner: its title and the spark's head, then its tail */
     unsigned crow_dark, crow_body, crow_light, crow_beak;   /* the banner's crow: outline, body, highlight, beak */
     unsigned accent, ok, bad, warn, info, blue, magenta, gray;   /* the orange, and the basic codes 32, 31, 33, 36, 34, 35, 90 */
@@ -63,6 +64,8 @@ const char *theme_base_sgr(void);              /* the SGR for the window's groun
  * recolours the conversation already on screen (the ANSI screen maps it in theme_map_bytes, notcurses in nc_sgr_parse). */
 #define THEME_ROLE_USER_TEXT 1001   /* the text of a line the user sent (theme user_text) */
 #define THEME_ROLE_USER_BG   1002   /* the ground of a line the user sent (theme user_bg) */
+#define THEME_ROLE_SHELL_TEXT 1003  /* the text of a `!command` line (theme shell_text) */
+#define THEME_ROLE_SHELL_BG  1004   /* the ground of a `!command` line (theme shell_bg) */
 bool theme_role(int code, unsigned *rgb, bool *bg);   /* the colour a role code stands for, and whether it is a background; false if it is no role */
 void theme_recolor(const char *s, sbuf *out, const unsigned *from, const unsigned *to, int count);   /* the 38;2 colours in s that are from[i] become to[i] */
 void theme_map_bytes(theme_map *m, const char *in, size_t n, sbuf *out);   /* the bytes with their themed codes mapped */

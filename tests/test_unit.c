@@ -2833,6 +2833,9 @@ static void test_theme(void) {
     a = map_all("\x1b[1002m\x1b[1001mhi");
     CHECK_STR(a, "\x1b[48;2;44;52;69m\x1b[38;2;239;188;255mhi");   /* user_bg #2C3445, user_text #EFBCFF */
     free(a);
+    a = map_all("\x1b[1004m\x1b[1003mhi");
+    CHECK_STR(a, "\x1b[48;2;67;48;63m\x1b[38;2;255;184;220mhi");   /* a !command line: shell_bg #43303F, shell_text #FFB8DC */
+    free(a);
     theme_set("bright");
     a = map_all("\x1b[1002m\x1b[1001mhi");
     CHECK_STR(a, "\x1b[48;2;227;236;247m\x1b[38;2;130;80;223mhi");  /* the bright theme's own pair */

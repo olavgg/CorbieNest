@@ -3860,8 +3860,11 @@ char *term_user_band(const char *lead, const char *text) {
      * bytes are mapped on the way out, or parsed by notcurses, so they are theme roles; without the hook they go to the
      * terminal as they are, and the theme's RGB is written. */
     char roles[64];
-    if (g_sb_active) snprintf(roles, sizeof roles, "\x1b[%dm\x1b[%dm", THEME_ROLE_USER_BG, THEME_ROLE_USER_TEXT);
-    else snprintf(roles, sizeof roles, "%s%s", th_bg(g_theme->user_bg), th_fg(g_theme->user_text));
+    bool shell = text && text[0] == '!';   /* a `!command` line: the same band, a little redder */
+    if (g_sb_active) snprintf(roles, sizeof roles, "\x1b[%dm\x1b[%dm", shell ? THEME_ROLE_SHELL_BG : THEME_ROLE_USER_BG,
+                              shell ? THEME_ROLE_SHELL_TEXT : THEME_ROLE_USER_TEXT);
+    else snprintf(roles, sizeof roles, "%s%s", th_bg(shell ? g_theme->shell_bg : g_theme->user_bg),
+                  th_fg(shell ? g_theme->shell_text : g_theme->user_text));
     char *bg = xstrdup(roles);
     int width = term_width();
     sbuf o; sb_init(&o);

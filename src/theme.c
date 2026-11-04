@@ -18,6 +18,7 @@ static const theme_t THEMES[] = {
         .field_text = 0xFFF1B8u,
         .edge_ready = 0x5FD75Fu, .edge_idle = 0x3B4252u,
         .loc = 0xAF5F87u, .select = 0x2A2F3Au, .user_bg = 0x2C3445u, .user_text = 0xEFBCFFu,
+        .shell_bg = 0x43303Fu, .shell_text = 0xFFB8DCu,
         .accent = 0xF0883Eu,
         .ok = 0xA3BE8Cu, .bad = 0xBF616Au, .warn = 0xEBCB8Bu,
         .info = 0x56B6C2u, .blue = 0x81A1C1u, .magenta = 0xB48EADu, .gray = 0x7C8799u,
@@ -31,6 +32,7 @@ static const theme_t THEMES[] = {
         .field_text = 0x1F2328u,
         .edge_ready = 0x1A7F37u, .edge_idle = 0xAFB8C1u,
         .loc = 0x8250DFu, .select = 0xDDF4FFu, .user_bg = 0xE3ECF7u, .user_text = 0x8250DFu,
+        .shell_bg = 0xF7E3E8u, .shell_text = 0xB5385Fu,
         .accent = 0xBC4C00u,
         .ok = 0x1A7F37u, .bad = 0xCF222Eu, .warn = 0x9A6700u,
         .info = 0x0550AEu, .blue = 0x0969DAu, .magenta = 0x8250DFu, .gray = 0x656D76u,
@@ -106,6 +108,8 @@ static void put_rgb_params(sbuf *o, unsigned rgb) { put_rgb_code(o, 38, rgb); }
 bool theme_role(int code, unsigned *rgb, bool *bg) {
     if (code == THEME_ROLE_USER_TEXT) { *rgb = g_theme->user_text; *bg = false; return true; }
     if (code == THEME_ROLE_USER_BG) { *rgb = g_theme->user_bg; *bg = true; return true; }
+    if (code == THEME_ROLE_SHELL_TEXT) { *rgb = g_theme->shell_text; *bg = false; return true; }
+    if (code == THEME_ROLE_SHELL_BG) { *rgb = g_theme->shell_bg; *bg = true; return true; }
     return false;
 }
 
