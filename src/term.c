@@ -1282,7 +1282,7 @@ static void fd1_write(const char *b, size_t n) {   /* a cursor move to fd 1 itse
     while (off < n) { ssize_t w = write(STDOUT_FILENO, b + off, n - off); if (w < 0) { if (errno == EINTR) continue; return; } off += (size_t)w; }
 }
 /* ---------- the terminal window's title and status ----------
- * The title is "Corbie | folder". It says what the program is doing, so a tab in the background shows it: a 🟢 while the
+ * The title is the folder's name. It says what the program is doing, so a tab in the background shows it: a 🟢 while the
  * prompt waits, a 🟠 while a turn runs, a 🟡 while a question waits for the user. A plain terminal gets the marker in front
  * of the title (a title has no colour of its own). iTerm2 has a status of its own, OSC 21337: the line under the tab's
  * title and the dot on the tab (https://iterm2.com/documentation-session-status.html); it says the state there, once,
@@ -1306,10 +1306,9 @@ void term_title_bytes(int state, bool iterm, const char *dir, sbuf *out) {
         if (iterm) sb_puts(out, "\x1b]21337;status=;indicator=;status-color=\x07");
         return;
     }
-    /* "Corbie | folder": in iTerm2 the status says the state (dot and subtitle), so the title does not; elsewhere a marker does */
+    /* the folder's name: in iTerm2 the status says the state (dot and subtitle), so the title does not; elsewhere a marker does */
     sb_puts(out, "\x1b]0;");
     if (!iterm) sb_puts(out, S[state].marker);
-    sb_puts(out, "Corbie | ");
     for (const char *p = dir && *dir ? dir : "?"; *p; p++) if ((unsigned char)*p >= 0x20 && *p != 0x7f) sb_putc(out, *p);   /* no control byte ends the title early */
     sb_putc(out, 7);
     if (iterm) sb_printf(out, "\x1b]21337;status=%s;indicator=%s\x07", S[state].status, S[state].dot);

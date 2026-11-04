@@ -2819,25 +2819,25 @@ static char *map_all(const char *in) {
 static void test_title(void) {
     sbuf o; sb_init(&o);
     term_title_bytes(1, false, "myapp", &o);
-    CHECK_STR(o.data, "\x1b]0;\xF0\x9F\x9F\xA2 Corbie | myapp\x07");   /* 🟢 and the folder: the marker is all a plain terminal has */
+    CHECK_STR(o.data, "\x1b]0;\xF0\x9F\x9F\xA2 myapp\x07");   /* 🟢 and the folder: the marker is all a plain terminal has */
     o.len = 0; if (o.data) o.data[0] = 0;
     term_title_bytes(2, true, "myapp", &o);
-    CHECK_STR(o.data, "\x1b]0;Corbie | myapp\x07\x1b]21337;status=Working;indicator=#ffa500\x07");   /* iTerm2: no marker (its dot and subtitle say it), orange */
+    CHECK_STR(o.data, "\x1b]0;myapp\x07\x1b]21337;status=Working;indicator=#ffa500\x07");   /* iTerm2: no marker (its dot and subtitle say it), orange */
     o.len = 0; if (o.data) o.data[0] = 0;
     term_title_bytes(1, true, "myapp", &o);
     CHECK(strstr(o.data, "status=Idle;indicator=#5fd75f") != NULL && !strstr(o.data, "\xF0\x9F"));   /* the green dot */
     o.len = 0; if (o.data) o.data[0] = 0;
     term_title_bytes(3, false, "myapp", &o);
-    CHECK(strstr(o.data, "\xF0\x9F\x9F\xA1 Corbie | myapp") != NULL && !strstr(o.data, "21337"));
+    CHECK(strstr(o.data, "\xF0\x9F\x9F\xA1 myapp") != NULL && !strstr(o.data, "21337"));
     o.len = 0; if (o.data) o.data[0] = 0;
     term_title_bytes(3, true, "myapp", &o);
     CHECK(strstr(o.data, "status=Waiting;indicator=#f1c40f") != NULL);
     o.len = 0; if (o.data) o.data[0] = 0;
     term_title_bytes(1, false, "a\x07" "b\x1b]0;x", &o);
-    CHECK_STR(o.data, "\x1b]0;\xF0\x9F\x9F\xA2 Corbie | ab]0;x\x07");   /* a control byte in a folder name cannot end the title early */
+    CHECK_STR(o.data, "\x1b]0;\xF0\x9F\x9F\xA2 ab]0;x\x07");   /* a control byte in a folder name cannot end the title early */
     o.len = 0; if (o.data) o.data[0] = 0;
     term_title_bytes(2, true, NULL, &o);
-    CHECK(strstr(o.data, "Corbie | ?\x07") != NULL);   /* no folder known */
+    CHECK(strstr(o.data, "?\x07") != NULL);   /* no folder known */
     o.len = 0; if (o.data) o.data[0] = 0;
     term_title_bytes(0, false, "myapp", &o);
     CHECK_STR(o.data, "\x1b[23;0t");   /* leaving: the title as it was */
