@@ -132,7 +132,7 @@
 <tspan x="421.2" fill="#a9b6cc">⣿⣿⣿</tspan>
 <tspan x="446.4" fill="#6b7890">⣿⣿⣿⣿⣿⣿⣆</tspan>
 <tspan x="505.2">⠀⠀⠀⠀⠀⠀⠀⠀                         </tspan>
-<tspan x="782.4" fill="#3a8fb8">│</tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
 <rect x="85.2" y="300" width="8.4" height="20" fill="#161a24"/>
 <rect x="93.6" y="300" width="294" height="20" fill="#161a24"/>
@@ -147,7 +147,7 @@
 <tspan x="387.6" fill="#6b7890">⠉⣽⣿</tspan>
 <tspan x="412.8" fill="#a9b6cc">⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣶⣄</tspan>
 <tspan x="530.4">⠀⠀⠀⠀⠀                         </tspan>
-<tspan x="782.4" fill="#4fb8e0">│</tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
 <rect x="85.2" y="320" width="8.4" height="20" fill="#161a24"/>
 <rect x="93.6" y="320" width="302.4" height="20" fill="#161a24"/>
@@ -164,7 +164,7 @@
 <tspan x="429.6" fill="#a9b6cc">⣿⣿⣿⣿⣿⡿⠿⢿⣿⣿⣿⣯⣁</tspan>
 <tspan x="538.8" fill="#6b7890">⡀</tspan>
 <tspan x="547.2">⠀⠀⠀                         </tspan>
-<tspan x="782.4" fill="#8fe3ff">│</tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
 <rect x="85.2" y="340" width="8.4" height="20" fill="#161a24"/>
 <rect x="93.6" y="340" width="319.2" height="20" fill="#161a24"/>
@@ -181,7 +181,7 @@
 <tspan x="463.2">⠀⠀⠀</tspan>
 <tspan x="488.4" fill="#6b7890">⠘⠻⠿⠿⣿⣿⣿⣿⡖</tspan>
 <tspan x="564">⠀                         </tspan>
-<tspan x="782.4" fill="#e6fbff">│</tspan>
+<tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
 <rect x="85.2" y="360" width="8.4" height="20" fill="#161a24"/>
 <rect x="93.6" y="360" width="294" height="20" fill="#161a24"/>
@@ -223,7 +223,7 @@
 <text y="412" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
 <tspan x="85.2" fill="#4a6a8a">│</tspan>
-<tspan x="93.6"> model: qwen3-coder:30b · ctx 32k                                                 </tspan>
+<tspan x="93.6"> model: qwen3-coder:30b · ctx 32k of 64k                                          </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
 <rect x="85.2" y="420" width="8.4" height="20" fill="#161a24"/>
@@ -257,10 +257,20 @@
 <tspan x="93.6"> ui:    notcurses · /ui to switch                                                 </tspan>
 <tspan x="782.4" fill="#4a6a8a">│</tspan>
 </text>
-<rect x="85.2" y="480" width="705.6" height="20" fill="#161a24"/>
+<rect x="85.2" y="480" width="193.2" height="20" fill="#161a24"/>
+<rect x="278.4" y="480" width="8.4" height="20" fill="#161a24"/>
+<rect x="286.8" y="480" width="8.4" height="20" fill="#161a24"/>
+<rect x="295.2" y="480" width="8.4" height="20" fill="#161a24"/>
+<rect x="303.6" y="480" width="8.4" height="20" fill="#161a24"/>
+<rect x="312" y="480" width="478.8" height="20" fill="#161a24"/>
 <text y="492" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18">        </tspan>
-<tspan x="85.2" fill="#4a6a8a">╰──────────────────────────────────────────────────────────────────────────────────╯</tspan>
+<tspan x="85.2" fill="#4a6a8a">╰──────────────────────</tspan>
+<tspan x="278.4" fill="#e6fbff">─</tspan>
+<tspan x="286.8" fill="#8fe3ff">─</tspan>
+<tspan x="295.2" fill="#4fb8e0">─</tspan>
+<tspan x="303.6" fill="#3a8fb8">─</tspan>
+<tspan x="312" fill="#4a6a8a">────────────────────────────────────────────────────────╯</tspan>
 </text>
 <text y="512" xml:space="preserve" fill="#c9d1d9">
 </text>
