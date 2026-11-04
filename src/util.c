@@ -465,6 +465,7 @@ void config_load(void) {
         else if (!strcmp(k, "memory_every")) { int n = atoi(v); if (n > 0) g_cfg.memory_every = n; }
         else if (!strcmp(k, "memory_idle")) { int n = atoi(v); if (n >= 0) g_cfg.memory_idle = n; }
         else if (!strcmp(k, "suggest")) g_cfg.suggest = atoi(v) != 0;
+        else if (!strcmp(k, "title")) g_cfg.title = atoi(v) != 0;
         else if (!strcmp(k, "keep_alive")) { free(g_cfg.keep_alive); g_cfg.keep_alive = *v ? xstrdup(v) : NULL; }
     }
     fclose(f);
@@ -522,6 +523,7 @@ static void config_text(sbuf *bp) {
     sb_printf(&b, "memory_every=%d\n", g_cfg.memory_every);
     sb_printf(&b, "memory_idle=%d\n", g_cfg.memory_idle);
     sb_printf(&b, "suggest=%d\n", g_cfg.suggest ? 1 : 0);
+    sb_printf(&b, "title=%d\n", g_cfg.title ? 1 : 0);
     sb_printf(&b, "keep_alive=%s\n", g_cfg.keep_alive ? g_cfg.keep_alive : "");
     if (g_cfg.ui) sb_printf(&b, "ui=%s\n", g_cfg.ui);
     if (g_cfg.theme) sb_printf(&b, "theme=%s\n", g_cfg.theme);

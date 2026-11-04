@@ -105,6 +105,7 @@ without thinking about them: the status bar, the field, and the strip.
 | `/mcp [add [-g] NAME COMMAND [ARGS…] \| remove NAME \| reconnect]` | external programs that offer tools, over the Model Context Protocol (stdio). See [MCP servers](#mcp-servers) |
 | `/agents [reload]` | the sub-agent files of this project and yours: roles the main agent starts by name with `task` (see [Sub-agent files](#sub-agent-files)) |
 | `/sandbox [on\|off]` | the model's shell commands in bubblewrap: the project directory writable, the rest read-only, a private `/tmp`, the network as it is. Off by default (`sandbox=bwrap` in the config). See [Sandbox](#sandbox) |
+| `/title [on\|off]` | the terminal window's title says what the program is doing: 🟢 ready, 🟠 working, 🟡 waiting for your answer. In iTerm2 the same state is also its status line under the tab title and the dot on the tab. On by default (`title=0` in the config turns it off); the title as it was comes back on exit |
 | `/permissions [add …\|remove N\|clear]` | the project's saved rules: "always allow" ones, and the guard rules `deny` and `ask` (see [Guard rules](#guard-rules-deny-and-ask)). Kept in the config directory, `permissions/`, keyed by the project's path — a file in the project itself is never read |
 | `/mode [name]` | permission mode: `manual`, `accept-edits`, `plan`, `auto` (Shift+Tab cycles) |
 | `/yolo [on\|off]` | shortcut for `/mode auto` / `/mode manual` (careful) |
@@ -1149,7 +1150,7 @@ goal, and keeps the one the metric scores best.
 
 ## Config
 
-Settings changed with `/sandbox`, `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N`, `/suggest on|off`, `/subagent` are saved to
+Settings changed with `/sandbox`, `/model`, `/ctx`, `/think`, `/effort`, `/advisor` (and its `guidance`, `effort`, `ctx`), `/mode`, `/yolo`, `/host`, `/keepalive`, `/web on|off|engine URL`, `/memory on|off|every N|idle N`, `/suggest on|off`, `/title on|off`, `/subagent` are saved to
 `~/.config/corbienest/config` (the efforts as `effort.<model>=<level>`, the advisor as `advisor=`, `advisor_ctx=` and `advisor_guidance=`, the sub-agents' model as `subagent=`, the colour theme as `theme=`, and the command that builds the project between the layers of `/plan` as `build=`, which is set by hand in that file). Environment: `OLLAMA_HOST`, `CORBIENEST_MODEL`, `CORBIENEST_NO_MIGRATE` (1: do not offer to move `.corbienest`'s skills and agents into `.agents`), `CORBIENEST_TRACE` (a file to record the session's drawing into, see below), and for a hosted model or advisor `XAI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` (never saved) and their `…_BASE_URL`s.
 
 ## Colours
