@@ -8,7 +8,7 @@
 #include <stddef.h>
 #include <cjson/cJSON.h>
 
-#define CORBIE_VERSION "0.3.0"
+#define CORBIE_VERSION "0.4.0"
 
 /* ---------- ANSI colours ---------- */
 #define C_RESET   "\x1b[0m"
