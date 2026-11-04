@@ -1,5 +1,7 @@
 # Corbie Nest
 
+[![CI](https://github.com/olavgg/CorbieNest/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/olavgg/CorbieNest/actions/workflows/ci.yml)
+
 A Claude-Code-style terminal coding agent written in plain C. It runs **local models** through
 Ollama, and **hosted models** from Anthropic, xAI, OpenAI, DeepSeek and Kimi. It streams responses,
 reads, writes and edits files, searches the codebase, and runs shell and git commands. Every mutating action is shown to you and
