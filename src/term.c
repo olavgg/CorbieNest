@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1276,11 +1277,31 @@ static void sb_feed(const char *p, size_t n) {
 }
 
 /* ---------- the cursor while a turn runs (see g_away) ---------- */
-static void fd1_write(const char *b, size_t n) {   /* a cursor move to fd 1 itself (never through stdio: the hook calls this) */
-    trace_bytes('O', b, n);
+/* All of b[0..n) to a descriptor, whatever it takes. The terminal's descriptor can be non-blocking: notcurses makes stdin
+ * so, and stdin, stdout and stderr are usually one open file description, so a write right after a big frame can come back
+ * EAGAIN with the tty's queue full. Giving up there cut an escape sequence short (an OSC with no end), and the next ESC
+ * notcurses sent ended it: "ESC[73G" printed as "3G", and the cells after it were drawn where the screen was not what
+ * notcurses believed. So it waits for the descriptor (poll) and goes on. */
+bool fd_write_all(int fd, const char *b, size_t n) {
     size_t off = 0;
-    while (off < n) { ssize_t w = write(STDOUT_FILENO, b + off, n - off); if (w < 0) { if (errno == EINTR) continue; return; } off += (size_t)w; }
+    while (off < n) {
+        ssize_t w = write(fd, b + off, n - off);
+        if (w >= 0) { off += (size_t)w; continue; }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            struct pollfd p = { fd, POLLOUT, 0 };
+            poll(&p, 1, 1000);   /* a terminal that takes nothing for a second is gone: the next write says so */
+            continue;
+        }
+        return false;
+    }
+    return true;
 }
+static void fd1_write(const char *b, size_t n) {   /* to fd 1 itself (never through stdio: the hook calls this) */
+    trace_bytes('O', b, n);
+    fd_write_all(STDOUT_FILENO, b, n);
+}
+void term_write_tty(const char *b, size_t n) { fd1_write(b, n); }
 /* ---------- the terminal window's title and status ----------
  * The title is "Corbie | folder". It says what the program is doing, so a tab in the background shows it: a 🟢 while the
  * prompt waits, a 🟠 while a turn runs, a 🟡 while a question waits for the user. A plain terminal gets the marker in front

@@ -494,7 +494,10 @@ static void sel_copy(sel_pt a, sel_pt b) {
     size_t n = strlen(t);
     char *enc = base64_encode(t, n);
     if (enc) {
-        dprintf(STDOUT_FILENO, "\x1b]52;c;%s\x07", enc);   /* the terminal's clipboard (OSC 52) */
+        sbuf osc; sb_init(&osc);
+        sb_printf(&osc, "\x1b]52;c;%s\x07", enc);   /* the terminal's clipboard (OSC 52) */
+        term_write_tty(osc.data, osc.len);   /* whole: a dprintf cut short by a full non-blocking tty left the sequence open */
+        sb_free(&osc);
         free(enc);
     }
     if (access("/usr/bin/pbcopy", X_OK) == 0) {   /* and the macOS one, for terminals that ignore OSC 52 */

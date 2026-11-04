@@ -580,6 +580,8 @@ void        term_wrap(const char *s, size_t len, int width, int col0, size_t tar
  * for a state (OSC 0 "Corbie | DIR", with a 🟢/🟠/🟡 marker unless iterm; with iterm also OSC 21337: the subtitle and the tab's dot), or for leaving it
  * (iterm: clears the status). Pure, so test_unit reaches it; term.c writes them to the terminal (term_title_set). */
 void        term_title_bytes(int state, bool iterm, const char *dir, sbuf *out);   /* the title is "Corbie | DIR", with a marker in front outside iTerm2 */
+bool        fd_write_all(int fd, const char *b, size_t n);   /* all of b[0..n), waiting (poll) when the descriptor is non-blocking and full; false on a real error */
+void        term_write_tty(const char *b, size_t n);        /* bytes to the terminal itself (fd 1), not through the captured stdout; whole, as fd_write_all */
 void        term_title_set(int state);                /* a no-op unless config title=on and the terminal is one; writes only on a change */
 bool        term_is_ready(void);                      /* the top-level prompt is waiting: the field says [ready] in green */
 int         term_mode_text(sbuf *o, int cols);        /* the mode for the field's lower rule within cols (its hint dropped when it does not fit); returns its width, 0 if none */

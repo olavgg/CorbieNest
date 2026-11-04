@@ -2815,6 +2815,39 @@ static char *map_all(const char *in) {
     theme_map_bytes(&m, in, strlen(in), &o);
     return o.data ? o.data : xstrdup("");
 }
+/* fd_write_all on a non-blocking descriptor that is full (notcurses makes the tty's description non-blocking): it waits for
+ * the reader and delivers every byte, where a write loop that gave up on EAGAIN cut an escape sequence short */
+static void test_fd_write_all(void) {
+    int pf[2];
+    CHECK(pipe(pf) == 0);
+    fcntl(pf[1], F_SETFL, fcntl(pf[1], F_GETFL) | O_NONBLOCK);
+    char junk[4096]; memset(junk, 'x', sizeof junk);
+    size_t filled = 0;
+    for (;;) { ssize_t w = write(pf[1], junk, sizeof junk); if (w < 0) break; filled += (size_t)w; }
+    CHECK(errno == EAGAIN && filled > 0);   /* the pipe is full: a plain write would now fail */
+    size_t plen = 300000;
+    char *payload = xmalloc(plen); for (size_t i = 0; i < plen; i++) payload[i] = (char)('a' + i % 26);
+    pid_t pid = fork();
+    if (pid == 0) {   /* the slow reader: it starts after the writer has had to wait, and counts what it gets */
+        close(pf[1]);
+        usleep(200 * 1000);
+        size_t got = 0, bad = 0; char buf[8192]; ssize_t r;
+        while ((r = read(pf[0], buf, sizeof buf)) > 0) {
+            for (ssize_t i = 0; i < r; i++) { size_t at = got + (size_t)i; if (at >= filled && buf[i] != (char)('a' + (at - filled) % 26)) bad++; }
+            got += (size_t)r;
+        }
+        _exit(got == filled + plen && !bad ? 0 : 1);
+    }
+    close(pf[0]);
+    CHECK(fd_write_all(pf[1], payload, plen));
+    close(pf[1]);
+    int st = 0; waitpid(pid, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);   /* all of it arrived, in order */
+    int dead[2]; CHECK(pipe(dead) == 0); close(dead[0]);
+    CHECK(!fd_write_all(dead[1], "x", 1));          /* a real error (EPIPE, SIGPIPE ignored) is still reported */
+    close(dead[1]);
+    free(payload);
+}
 /* the window title and iTerm2's status: the bytes for each state, and for leaving */
 static void test_title(void) {
     sbuf o; sb_init(&o);
@@ -2941,7 +2974,7 @@ int main(void) {
     memset(&g_cfg, 0, sizeof g_cfg);
     g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.max_iters = 10; g_cfg.interactive = false;
     struct { const char *name; void (*fn)(void); } tests[] = {
-        { "sbuf", test_sbuf }, { "util", test_util }, { "cmd head", test_cmd_head }, { "markdown", test_md }, { "highlight", test_highlight }, { "git branch", test_gitbranch },
+        { "sbuf", test_sbuf }, { "fd_write_all", test_fd_write_all }, { "util", test_util }, { "cmd head", test_cmd_head }, { "markdown", test_md }, { "highlight", test_highlight }, { "git branch", test_gitbranch },
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "fold head", test_fold_head }, { "scrollback spill", test_sb_spill }, { "modes", test_modes },
         { "close button", test_close_x }, { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
