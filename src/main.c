@@ -888,6 +888,11 @@ static void sessions_prune(void) {
     struct dirent *e;
     while ((e = readdir(d))) {
         size_t l = strlen(e->d_name);
+        if (l > 4 && !strcmp(e->d_name + l - 4, ".tmp")) {   /* a save that a crash cut off (write_whole_file_atomic); a day old is nobody's write in flight */
+            char tp[1400]; snprintf(tp, sizeof tp, "%s/%s", sessions_dir(), e->d_name);
+            struct stat ts; if (stat(tp, &ts) == 0 && time(NULL) - ts.st_mtime > 86400) unlink(tp);
+            continue;
+        }
         if (l < 6 || strcmp(e->d_name + l - 5, ".json")) continue;
         char p[1400]; snprintf(p, sizeof p, "%s/%s", sessions_dir(), e->d_name);
         struct stat st; if (stat(p, &st) != 0) continue;
@@ -6474,6 +6479,7 @@ static int process_input(char *line) {
     typed_note(s, msg);
     add_message("user", msg);
     free(msg);
+    session_save();   /* the message is on disk before the model starts: a crash during the first reply no longer loses it (/resume) */
     tools_exit_clear();
     bool aborted = run_turn();
     session_save();
@@ -6967,6 +6973,7 @@ int main(int argc, char **argv) {
         int first = begin_request();
         typed_note(oneshot, msg);
         add_message("user", msg); free(msg);
+        session_save();   /* on disk before the model starts, as at the prompt */
         time_t t0 = time(NULL);
         bool aborted = run_turn();
         session_save();
