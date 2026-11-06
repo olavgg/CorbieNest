@@ -48,6 +48,7 @@ typedef struct {
     unsigned shell_bg, shell_text;              /* the same for a `!command` line: the user's colours, a little redder */
     unsigned brand, spark_hi, spark_mid, spark_lo;   /* the banner: its title and the spark's head, then its tail */
     unsigned crow_dark, crow_body, crow_light, crow_beak;   /* the banner's crow: outline, body, highlight, beak */
+    unsigned rainbow_lo, rainbow_hi;   /* the [parallel] label's rainbow: the dimmest and the brightest channel value (0..255); a pale rainbow does not read on a white window */
     unsigned accent, ok, bad, warn, info, blue, magenta, gray;   /* the orange, and the basic codes 32, 31, 33, 36, 34, 35, 90 */
 } theme_t;
 typedef struct {

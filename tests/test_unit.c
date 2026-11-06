@@ -1,5 +1,6 @@
 /* Unit tests for corbienest internals. Build & run with `make test`. */
 #define _GNU_SOURCE
+#include <math.h>
 #include "../src/common.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -2888,16 +2889,31 @@ static void test_title(void) {
 static void test_theme(void) {
     const theme_t *def = g_theme;
     {   /* the rainbow of the [parallel] label: it moves with time and with the letter, wraps, and never goes dark */
-        CHECK(rainbow_rgb(0, 0) == 0xff4646u);   /* hue 0: red */
+        CHECK(rainbow_rgb(0, 0) == 0xff5050u);   /* hue 0: red */
         CHECK(rainbow_rgb(0, 0) != rainbow_rgb(1, 0) && rainbow_rgb(0, 0) != rainbow_rgb(0, 500));
         CHECK(rainbow_rgb(0, 3000) == rainbow_rgb(0, 0) && rainbow_rgb(3, -100) == rainbow_rgb(3, -100 + 3000));   /* a turn takes 3 s */
-        bool bright = true;
-        for (int i = 0; i < 10; i++) for (long ms = 0; ms < 3000; ms += 97) { unsigned c = rainbow_rgb(i, ms); if (((c >> 16) & 255) < 70 || ((c >> 8) & 255) < 70 || (c & 255) < 70 || (((c >> 16) & 255) != 255 && ((c >> 8) & 255) != 255 && (c & 255) != 255)) bright = false; }
-        CHECK(bright);
+        /* every colour of the wheel stays inside the theme's channel range, reaches its top, and reads on the ground it is drawn on:
+         * a contrast of 3 or more (WCAG's bar for large text) on white for the bright theme and on a dark bar for the default */
+        for (int t = 0; t < 2; t++) {
+            CHECK(theme_set(t ? "bright" : "default"));
+            unsigned ground = t ? 0xFFFFFFu : 0x161A24u, lo = g_theme->rainbow_lo, hi = g_theme->rainbow_hi;
+            double lg = 0; { double ch[3]; for (int k = 0; k < 3; k++) { double v = ((ground >> (16 - 8 * k)) & 255) / 255.0; ch[k] = v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4); } lg = 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]; }
+            bool in_range = true, reads = true; unsigned top = 0;
+            for (int i = 0; i < 12; i++) for (long ms = 0; ms < 3000; ms += 50) {
+                unsigned c = rainbow_rgb(i, ms), r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255, mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+                if (r < lo || g < lo || b < lo || mx > hi) in_range = false;
+                if (mx > top) top = mx;
+                double ch[3], rgb[3] = { r, g, b }; for (int k = 0; k < 3; k++) { double v = rgb[k] / 255.0; ch[k] = v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4); }
+                double lc = 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2], hiL = lc > lg ? lc : lg, loL = lc > lg ? lg : lc;
+                if ((hiL + 0.05) / (loL + 0.05) < 3.0) reads = false;
+            }
+            CHECK(in_range && top == hi && reads);
+        }
+        CHECK(theme_set("default"));
         sbuf pl; sb_init(&pl); g_cfg.parallel_tasks = false;
         CHECK(term_parallel_text(&pl, 0) == 0 && pl.len == 0);
         g_cfg.parallel_tasks = true;
-        CHECK(term_parallel_text(&pl, 0) == 10 && strstr(pl.data, "\x1b[38;2;255;70;70m[") && strstr(pl.data, "]"));
+        CHECK(term_parallel_text(&pl, 0) == 10 && strstr(pl.data, "\x1b[38;2;255;80;80m[") && strstr(pl.data, "]"));
         g_cfg.parallel_tasks = false; sb_free(&pl);
     }
     CHECK(theme_set("nope") == false && g_theme == def);   /* an unknown name keeps the theme in use */

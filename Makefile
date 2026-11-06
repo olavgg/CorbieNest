@@ -153,7 +153,7 @@ install: corbie
 LIBOBJ := $(filter-out src/main.o,$(OBJ)) $(NC_OBJ)
 
 tests/test_unit: tests/test_unit.c $(LIBOBJ) src/common.h
-	$(CC) $(BREW_CPPFLAGS) $(CFLAGS) $(NC_DEFS) $(ZLIB_DEFS) -o $@ tests/test_unit.c $(LIBOBJ) $(BREW_LDFLAGS) $(LDLIBS)
+	$(CC) $(BREW_CPPFLAGS) $(CFLAGS) $(NC_DEFS) $(ZLIB_DEFS) -o $@ tests/test_unit.c $(LIBOBJ) $(BREW_LDFLAGS) $(LDLIBS) -lm
 
 # `make test` is the unit tests: what a change has to pass, and what needs nothing but the build.
 # The integration tests drive the program through a pty (and tmux), which is timing a hosted CI
