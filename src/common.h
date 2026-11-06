@@ -48,6 +48,7 @@ typedef struct {
     unsigned shell_bg, shell_text;              /* the same for a `!command` line: the user's colours, a little redder */
     unsigned brand, spark_hi, spark_mid, spark_lo;   /* the banner: its title and the spark's head, then its tail */
     unsigned crow_dark, crow_body, crow_light, crow_beak;   /* the banner's crow: outline, body, highlight, beak */
+    unsigned rainbow_lo, rainbow_hi;   /* the [parallel] label's rainbow: the dimmest and the brightest channel value (0..255); a pale rainbow does not read on a white window */
     unsigned accent, ok, bad, warn, info, blue, magenta, gray;   /* the orange, and the basic codes 32, 31, 33, 36, 34, 35, 90 */
 } theme_t;
 typedef struct {
@@ -72,6 +73,7 @@ void theme_map_bytes(theme_map *m, const char *in, size_t n, sbuf *out);   /* th
 bool theme_map_pending(const theme_map *m);     /* the last write ended inside an escape sequence: its bytes are not out yet */
 const char *th_fg(unsigned rgb);                /* "\x1b[38;2;R;G;Bm" for an RGB colour (a short-lived string) */
 const char *th_bg(unsigned rgb);                /* the background form */
+unsigned rainbow_rgb(int i, long ms);           /* the colour of the i-th letter of an animated rainbow at ms (hue walks the wheel with the letter and with time) */
 
 void  sb_init(sbuf *b);
 void  sb_free(sbuf *b);
@@ -584,6 +586,7 @@ bool        fd_write_all(int fd, const char *b, size_t n);   /* all of b[0..n), 
 void        term_write_tty(const char *b, size_t n);        /* bytes to the terminal itself (fd 1), not through the captured stdout; whole, as fd_write_all */
 void        term_title_set(int state);                /* a no-op unless config title=on and the terminal is one; writes only on a change */
 bool        term_is_ready(void);                      /* the top-level prompt is waiting: the field says [ready] in green */
+int         term_parallel_text(sbuf *o, long ms);     /* "[parallel]" in rainbow colours at ms, when /effort parallel is on (escapes included); returns its width, 0 when off */
 int         term_mode_text(sbuf *o, int cols);        /* the mode for the field's lower rule within cols (its hint dropped when it does not fit); returns its width, 0 if none */
 int         term_sb_nlines(void);                     /* the conversation: the scrollback model's lines */
 void        term_tick_set(void (*fn)(bool still));     /* the banner: called every TICK_MS while the top-level prompt waits; still=true once, when it returns */

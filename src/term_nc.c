@@ -953,6 +953,12 @@ static void draw_field(int top) {
         nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 };
         put_text(top, g_cols - 8, "[ready]", 7, g_theme->edge_ready, NC_DEFAULT, false, &carry);
     }
+    {   /* [parallel], animated, before [ready] (or at its place while the model works): the loop redraws every few ms */
+        sbuf pl; sb_init(&pl);
+        int pw = term_parallel_text(&pl, (long)(now_s() * 1000)), rs = g_cols - 8, start = term_is_ready() ? rs - 1 - pw : rs + 7 - pw;
+        if (pw && start >= 2) { nc_style carry = { NC_DEFAULT, NC_DEFAULT, 0 }; put_text(top, start, pl.data, pw, NC_DEFAULT, NC_DEFAULT, false, &carry); if (term_is_ready()) put_text(top, start + pw, " ", 1, NC_DEFAULT, NC_DEFAULT, false, NULL); }
+        sb_free(&pl);
+    }
     if (first == 0) put_text(top + 1, 2, "❯", 1, C_ACCENT, C_FIELD_BG, false, NULL);   /* the prompt, inside the border */
     if (!g_len && term_hint && first == 0) put_text(top + 1, 5, term_hint, field_text_width() - 1, C_MUTED, C_FIELD_BG, false, NULL);   /* the placeholder, muted, after the caret (term_hint) */
     {   /* the mode, on the lower rule, its last cell two columns in from the edge (as the ANSI screen puts it) */
