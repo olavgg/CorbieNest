@@ -2,10 +2,10 @@
 <rect width="876" height="716" rx="8" fill="#0d1117" stroke="#30363d"/>
 <text y="32" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18" fill="#e5e9f0" font-weight="600">Corbie Nest</tspan>
-<tspan x="110.4" fill="#737578"> v0.4.0 · /banner shows the box again</tspan>
+<tspan x="110.4" fill="#7a7c7f"> v0.4.0 · /banner shows the box again</tspan>
 </text>
 <text y="52" xml:space="preserve" fill="#c9d1d9">
-<tspan x="18" fill="#737578">/help for commands · @file to attach · !cmd for shell · shift+tab to switch mode · Ctrl-D to quit</tspan>
+<tspan x="18" fill="#7a7c7f">/help for commands · @file to attach · !cmd for shell · shift+tab to switch mode · Ctrl-D to quit</tspan>
 </text>
 <text y="72" xml:space="preserve" fill="#c9d1d9">
 </text>
@@ -300,13 +300,13 @@
 <text y="672" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18" fill="#5fd75f">╰───────────────────────────────────────────────────────────────</tspan>
 <tspan x="555.6">⏵  manual mode</tspan>
-<tspan x="673.2" fill="#585858"> (shift+tab to cycle)</tspan>
+<tspan x="673.2" fill="#7d7d7d"> (shift+tab to cycle)</tspan>
 <tspan x="849.6" fill="#5fd75f">╯</tspan>
 </text>
 <text y="692" xml:space="preserve" fill="#c9d1d9">
 <tspan x="18" fill="#e5e9f0">  qwen3-coder:30b</tspan>
 <tspan x="160.8" fill="#737578"> │ </tspan>
 <tspan x="186" fill="#e5e9f0">0 tokens ↑0 ↓0                  </tspan>
-<tspan x="454.8" fill="#af5f87">        /tmp/demo/projects/myapp  · branch main</tspan>
+<tspan x="454.8" fill="#b1648b">        /tmp/demo/projects/myapp  · branch main</tspan>
 </text>
 </svg>

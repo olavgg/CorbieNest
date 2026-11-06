@@ -2815,6 +2815,43 @@ static char *map_all(const char *in) {
     theme_map_bytes(&m, in, strlen(in), &o);
     return o.data ? o.data : xstrdup("");
 }
+/* the window title and iTerm2's status: the bytes for each state, and for leaving */
+static void test_title(void) {
+    sbuf o; sb_init(&o);
+    term_title_bytes(1, false, "myapp", &o);
+    CHECK_STR(o.data, "\x1b]0;\xF0\x9F\x9F\xA2 myapp\x07");   /* 🟢 and the folder: the marker is all a plain terminal has */
+    o.len = 0; if (o.data) o.data[0] = 0;
+    term_title_bytes(2, true, "myapp", &o);
+    CHECK_STR(o.data, "\x1b]0;myapp\x07\x1b]21337;status=Working;indicator=#ffa500\x07");   /* iTerm2: no marker (its dot and subtitle say it), orange */
+    o.len = 0; if (o.data) o.data[0] = 0;
+    term_title_bytes(1, true, "myapp", &o);
+    CHECK(strstr(o.data, "status=Idle;indicator=#5fd75f") != NULL && !strstr(o.data, "\xF0\x9F"));   /* the green dot */
+    o.len = 0; if (o.data) o.data[0] = 0;
+    term_title_bytes(3, false, "myapp", &o);
+    CHECK(strstr(o.data, "\xF0\x9F\x9F\xA1 myapp") != NULL && !strstr(o.data, "21337"));
+    o.len = 0; if (o.data) o.data[0] = 0;
+    term_title_bytes(3, true, "myapp", &o);
+    CHECK(strstr(o.data, "status=Waiting;indicator=#f1c40f") != NULL);
+    o.len = 0; if (o.data) o.data[0] = 0;
+    term_title_bytes(1, false, "a\x07" "b\x1b]0;x", &o);
+    CHECK_STR(o.data, "\x1b]0;\xF0\x9F\x9F\xA2 ab]0;x\x07");   /* a control byte in a folder name cannot end the title early */
+    o.len = 0; if (o.data) o.data[0] = 0;
+    term_title_bytes(2, true, NULL, &o);
+    CHECK(strstr(o.data, "?\x07") != NULL);   /* no folder known */
+    o.len = 0; if (o.data) o.data[0] = 0;
+    term_title_bytes(0, false, "myapp", &o);
+    CHECK_STR(o.data, "\x1b[23;0t");   /* leaving: the title as it was */
+    o.len = 0; if (o.data) o.data[0] = 0;
+    term_title_bytes(0, true, "myapp", &o);
+    CHECK_STR(o.data, "\x1b[23;0t\x1b]21337;status=;indicator=;status-color=\x07");   /* and iTerm2's status cleared */
+    o.len = 0; if (o.data) o.data[0] = 0;
+    term_title_bytes(9, true, "myapp", &o);
+    CHECK(o.len == 0);   /* a state there is none of writes nothing */
+    sb_free(&o);
+    g_cfg.title = true; g_cfg.interactive = false;
+    term_title_set(2);   /* not interactive: nothing is written, nothing is remembered (no crash, no output) */
+    CHECK(true);
+}
 static void test_theme(void) {
     const theme_t *def = g_theme;
     CHECK(theme_set("nope") == false && g_theme == def);   /* an unknown name keeps the theme in use */
@@ -2908,7 +2945,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "fold head", test_fold_head }, { "scrollback spill", test_sb_spill }, { "modes", test_modes },
         { "close button", test_close_x }, { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "config merge", test_config_merge }, { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme },
+        { "config merge", test_config_merge }, { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme }, { "title", test_title },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

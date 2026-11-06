@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,6 +126,7 @@ static char g_altstack[64 * 1024];   /* a crash by stack overflow still runs the
 /* set while the program has the terminal (raw, full screen or notcurses); cleared by term_restore(). A signal
  * that comes when it has not (a SIGTERM before any screen, a run with -p) writes nothing. */
 static volatile sig_atomic_t g_tty_dirty = 0;
+static volatile sig_atomic_t g_title_state = 0, g_title_iterm = 0;   /* the window title's state (term_title_set); the fatal handler reads both */
 
 void term_fatal_restore(void) {   /* async-signal-safe: tcsetattr, isatty, write */
     if (!g_tty_dirty) return;
@@ -133,6 +135,12 @@ void term_fatal_restore(void) {   /* async-signal-safe: tcsetattr, isatty, write
     if (isatty(STDOUT_FILENO)) {
         ssize_t w = write(STDOUT_FILENO, FATAL_UNDO, sizeof FATAL_UNDO - 1);
         (void)w;   /* nothing more to do if it fails: the process is going down */
+        if (g_title_state) {   /* no "working" left on the tab (fixed strings: async-signal-safe) */
+            static const char POP[] = "\x1b[23;0t", CLR[] = "\x1b]21337;status=;indicator=;status-color=\x07";
+            w = write(STDOUT_FILENO, POP, sizeof POP - 1);
+            if (g_title_iterm) w = write(STDOUT_FILENO, CLR, sizeof CLR - 1);
+            (void)w;
+        }
     }
 }
 
@@ -191,6 +199,7 @@ void term_raw(bool on) {
 }
 
 void term_restore(void) {
+    term_title_set(0);   /* the title as it was (before the terminal is given back) */
     g_tty_dirty = 0;   /* what follows puts the terminal back itself */
     if (g_ui_nc) { nc_stop(); return; }
     term_fullscreen(false);
@@ -1271,6 +1280,60 @@ static void fd1_write(const char *b, size_t n) {   /* a cursor move to fd 1 itse
     trace_bytes('O', b, n);
     size_t off = 0;
     while (off < n) { ssize_t w = write(STDOUT_FILENO, b + off, n - off); if (w < 0) { if (errno == EINTR) continue; return; } off += (size_t)w; }
+}
+/* ---------- the terminal window's title and status ----------
+ * The title is the folder's name. It says what the program is doing, so a tab in the background shows it: a 🟢 while the
+ * prompt waits, a 🟠 while a turn runs, a 🟡 while a question waits for the user. A plain terminal gets the marker in front
+ * of the title (a title has no colour of its own). iTerm2 has a status of its own, OSC 21337: the line under the tab's
+ * title and the dot on the tab (https://iterm2.com/documentation-session-status.html); it says the state there, once,
+ * so iTerm2's title has no marker. It is sent only there (TERM_PROGRAM, or LC_TERMINAL, which an ssh session keeps),
+ * and cleared on the way out. The title as the program found it is pushed (CSI 22;0 t) at the first
+ * change and popped (CSI 23;0 t) when the terminal is given back. */
+static bool title_iterm(void) {
+    const char *tp = getenv("TERM_PROGRAM"), *lc = getenv("LC_TERMINAL");
+    return (tp && !strcmp(tp, "iTerm.app")) || (lc && !strcmp(lc, "iTerm2"));
+}
+void term_title_bytes(int state, bool iterm, const char *dir, sbuf *out) {
+    static const struct { const char *marker, *status, *dot; } S[] = {
+        { NULL, NULL, NULL },
+        { "\xF0\x9F\x9F\xA2 ", "Idle",    "#5fd75f" },   /* 🟢 */
+        { "\xF0\x9F\x9F\xA0 ", "Working", "#ffa500" },   /* 🟠 */
+        { "\xF0\x9F\x9F\xA1 ", "Waiting", "#f1c40f" },   /* 🟡 */
+    };
+    if (state < 0 || state > 3) return;
+    if (!state) {   /* leaving: the title as it was, and no status on the tab */
+        sb_puts(out, "\x1b[23;0t");
+        if (iterm) sb_puts(out, "\x1b]21337;status=;indicator=;status-color=\x07");
+        return;
+    }
+    /* the folder's name: in iTerm2 the status says the state (dot and subtitle), so the title does not; elsewhere a marker does */
+    sb_puts(out, "\x1b]0;");
+    if (!iterm) sb_puts(out, S[state].marker);
+    for (const char *p = dir && *dir ? dir : "?"; *p; p++) if ((unsigned char)*p >= 0x20 && *p != 0x7f) sb_putc(out, *p);   /* no control byte ends the title early */
+    sb_putc(out, 7);
+    if (iterm) sb_printf(out, "\x1b]21337;status=%s;indicator=%s\x07", S[state].status, S[state].dot);
+}
+static void title_dir(char *dir, size_t n) {   /* the working folder's name (the last part of its path) */
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof cwd)) { snprintf(dir, n, "?"); return; }
+    const char *b = strrchr(cwd, '/'), *name = b && b[1] ? b + 1 : cwd;
+    size_t l = strlen(name);
+    if (l >= n) { l = n - 1; while (l && ((unsigned char)name[l] & 0xC0) == 0x80) l--; }   /* cut between characters */
+    memcpy(dir, name, l); dir[l] = 0;   /* (not snprintf: a path is up to PATH_MAX, and gcc -Werror=format-truncation says so) */
+}
+void term_title_set(int state) {
+    static char shown[256];   /* the folder the title last named: a /cd changes it while the state stays */
+    if (!g_cfg.title || !g_cfg.interactive || !isatty(STDOUT_FILENO)) return;
+    char dir[256]; title_dir(dir, sizeof dir);
+    if (state == g_title_state && (!state || !strcmp(dir, shown))) return;
+    sbuf o; sb_init(&o);
+    if (!g_title_state) { sb_puts(&o, "\x1b[22;0t"); g_title_iterm = title_iterm(); }
+    term_title_bytes(state, g_title_iterm, dir, &o);
+    snprintf(shown, sizeof shown, "%s", dir);
+    fflush(stdout);
+    fd1_write(o.data, o.len);   /* to fd 1 itself: the stdout hook would record it as conversation */
+    sb_free(&o);
+    g_title_state = state;
 }
 static bool want_box(void) {
     return g_fs && g_busy && !g_field_focus && g_view_top < 0 && !g_fold_rec && !g_no_park && g_ta_caret_row > 0;
@@ -3893,6 +3956,7 @@ char *term_user_band(const char *lead, const char *text) {
 char *term_readline(const char *prompt) {
     term_hint_clear();   /* the placeholder is for this prompt only: the idle work of this one sets it again */
     g_ready = true; term_status_refresh();
+    term_title_set(1);   /* 🟢 ready */
     g_tick_live = g_tick_fn != NULL; g_tick_next = mono_ms() + TICK_MS;
     if (g_ui_nc) nc_leave_browse(); else ta_end_browse();   /* the turn is over: the message being written is back in the field */
     char *s = g_ui_nc ? nc_readline(prompt, true) : readline_impl(prompt, true);
@@ -3904,19 +3968,28 @@ char *term_readline(const char *prompt) {
     if (s && *s && term_banner_open()) term_banner_hide();
     g_tick_live = false;
     g_ready = false; term_status_refresh();
+    if (s) term_title_set(2);   /* 🟠 working (the next prompt says ready again) */
     return s;
 }
 char *term_ask_line(const char *prompt) {
-    if (g_ui_nc) { char *r = nc_readline(prompt, false); nc_echo_line(prompt, r); return r; }
-    park_hold(); char *r = readline_impl(prompt, false); park_free();
+    int before = g_title_state;
+    if (before) term_title_set(3);   /* 🟡 a question waits for the user */
+    char *r;
+    if (g_ui_nc) { r = nc_readline(prompt, false); nc_echo_line(prompt, r); }
+    else { park_hold(); r = readline_impl(prompt, false); park_free(); }
+    if (before) term_title_set(before);
     return r;
 }
 
 /* ---------- confirmation menu ---------- */
 static int confirm_impl(const char *question, const char *always_label, const char *project_label, char **reason);
 int term_confirm(const char *question, const char *always_label, const char *project_label, char **reason) {
-    if (g_ui_nc) return nc_confirm(question, always_label, project_label, reason);
-    park_hold(); int r = confirm_impl(question, always_label, project_label, reason); park_free();
+    int before = g_title_state;
+    if (before) term_title_set(3);   /* 🟡 waiting for the user */
+    int r;
+    if (g_ui_nc) r = nc_confirm(question, always_label, project_label, reason);
+    else { park_hold(); r = confirm_impl(question, always_label, project_label, reason); park_free(); }
+    if (before) term_title_set(before);
     return r;
 }
 static int confirm_impl(const char *question, const char *always_label, const char *project_label, char **reason) {

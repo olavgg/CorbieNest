@@ -85,6 +85,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/agents", "sub-agent files: roles the main agent starts by name with task (reload; /agents alone lists them)" },
     { "/config", "display settings: show or hide the model's bash commands, and the results of read_file, grep, list_dir, web_fetch and web_search (alone lists them)" },
     { "/sandbox", "the model's shell commands in bubblewrap: the project writable, the rest read-only (on, off; alone shows it)" },
+    { "/title", "the terminal window's title is the folder's name, with 🟢 ready, 🟠 working or 🟡 waiting in front; iTerm2 shows the state as its status line and tab dot instead (on, off; alone shows it)" },
     { "/permissions", "the project's saved rules: always-allow ones, and deny/ask guards on a tool and a pattern: add, remove, clear" },
     { "/init", "have the model write AGENTS.md for this project" },
     { "/cost", "tokens, model calls and time of this session" },
@@ -123,6 +124,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/config fetch", "show:print the page web_fetch returned (the default)|hide:keep the call line, drop the result (an error still shows)" },
     { "/config search", "show:print what web_search found (the default)|hide:keep the call line, drop the result (an error still shows)" },
     { "/sandbox", "on:run the model's shell commands in bwrap|off:run them without it" },
+    { "/title", "on:show ready/working/waiting in the terminal's title|off:leave the title alone" },
     { "/mcp", "add:a server: [-g] NAME COMMAND [ARGS…] (-g for every project)|remove:remove a server by name|reconnect:start them again" },
     { "/permissions", "add:save a rule: edit, bash WORDS, fetch HOST, or deny|ask TOOL PATTERN|remove:remove rule N|clear:remove them all" },
     { "/permissions add", "edit:file edits|bash:a command, by its leading words|fetch:a host|deny:stop a tool on a pattern (* any text)|ask:ask before a tool on a pattern" },
@@ -1419,6 +1421,20 @@ static void cmd_sandbox(const char *arg) {
     }
     if (!strcmp(arg, "off")) { g_cfg.sandbox = false; config_save(); printf(C_GREEN "✓ sandbox off" C_RESET "\n"); return; }
     printf("usage: /sandbox [on|off]\n");
+}
+
+/* /title: the terminal window's title says what the program does (term.c: term_title_set) */
+static void cmd_title(const char *arg) {
+    if (!arg || !*arg) {
+        printf(C_DIM "title %s — the window title is the folder's name, with 🟢 ready / 🟠 working / 🟡 waiting in front; iTerm2 shows the state as its status line and tab dot (/title on|off)" C_RESET "\n", g_cfg.title ? "on" : "off");
+        return;
+    }
+    if (strcmp(arg, "on") && strcmp(arg, "off")) { printf("usage: /title [on|off]\n"); return; }
+    bool on = !strcmp(arg, "on");
+    if (!on) term_title_set(0);   /* the title as it was, and no status on the tab */
+    g_cfg.title = on; config_save();
+    if (on) term_title_set(term_is_ready() ? 1 : 2);
+    printf(C_GREEN "✓ title %s" C_RESET "\n", on ? "on" : "off");
 }
 
 /* /agents: the sub-agent files this project and the user have (agents.c reads them) */
@@ -5591,6 +5607,7 @@ static int handle_slash(char *line) {
     else if (!strcmp(cmd, "/agents")) cmd_agents(arg);
     else if (!strcmp(cmd, "/config")) cmd_config(arg);
     else if (!strcmp(cmd, "/sandbox")) cmd_sandbox(arg);
+    else if (!strcmp(cmd, "/title")) cmd_title(arg);
     else if (!strcmp(cmd, "/cost")) cmd_cost();
     else if (!strcmp(cmd, "/usage")) cmd_usage(arg);
     else if (!strcmp(cmd, "/gzip")) cmd_gzip(arg);
@@ -6802,7 +6819,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     tools_bg_init();
     memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.suggest = true; g_cfg.show_bash = g_cfg.show_read = g_cfg.show_grep = g_cfg.show_list = g_cfg.show_fetch = g_cfg.show_search = g_cfg.show_edit = g_cfg.show_write = true; g_cfg.advisor_guidance = GUIDANCE_NORMAL; g_cfg.advisor_window = ADVISOR_WINDOW_DEFAULT;
+    g_cfg.temperature = -1; g_cfg.think = -1; g_cfg.draft = -1; g_cfg.max_iters = 100; g_cfg.num_ctx = 32768; g_cfg.color = true; g_cfg.memory = true; g_cfg.web = true; g_cfg.memory_every = 5; g_cfg.memory_idle = 15; g_cfg.suggest = true; g_cfg.title = true; g_cfg.show_bash = g_cfg.show_read = g_cfg.show_grep = g_cfg.show_list = g_cfg.show_fetch = g_cfg.show_search = g_cfg.show_edit = g_cfg.show_write = true; g_cfg.advisor_guidance = GUIDANCE_NORMAL; g_cfg.advisor_window = ADVISOR_WINDOW_DEFAULT;
     g_cfg.keep_alive = xstrdup("30m");   /* ollama's own default unloads the model after 5 idle minutes */
     g_cfg.interactive = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     config_load();
