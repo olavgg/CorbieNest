@@ -23,7 +23,8 @@ Do the steps in order. Use the bash tool; run commands from the repository root.
      && git -c user.email=demo@example.com -c user.name=demo commit -qm init && cd -
    ```
 
-3. Start a fake Ollama server on a free port. Use a port that is not 11434: a real Ollama may be
+3. Start a fake Ollama server on a free port, with the model the picture names listed (the extra argument: a
+   model the server does not know makes the start-up print a "model not found" warning above the banner). Use a port that is not 11434: a real Ollama may be
    listening there, and it must be left alone. Pick 20xxx, for example 20601, and keep its pid.
    ```sh
    python3 tests/fake_ollama.py 20601 >/tmp/shot-fake.log 2>&1 & echo $! > /tmp/shot-fake.pid
@@ -48,10 +49,17 @@ Do the steps in order. Use the bash tool; run commands from the repository root.
    the frame was taken too early: repeat steps 3 to 5 with a longer wait.
 
 6. Put the default host address in place of the fake server's port, the same width, so the box
-   still lines up. The port is the one in step 3 (five digits).
+   still lines up. The port is the one in step 3 (five digits). On macOS the program reports the demo
+   folder as `/private/tmp/demo/...` (`/tmp` is a link to it): write `/tmp/demo/...` as on Linux, and
+   keep every row as wide as it was (`/private` is 8 characters: the box row gets 8 spaces after the
+   path, the right-aligned status bar 8 before it). `-i.bak` works with both the BSD and the GNU sed.
    ```sh
-   sed -i 's/127\.0\.0\.1:20601/127.0.0.1:11434/' docs/demo.ansi
+   sed -i.bak -e 's/127\.0\.0\.1:20601/127.0.0.1:11434/' \
+     -e 's|cwd:   /private/tmp/demo/projects/myapp|cwd:   /tmp/demo/projects/myapp        |' \
+     -e 's|/private/tmp/demo/projects/myapp|        /tmp/demo/projects/myapp|' docs/demo.ansi
+   rm docs/demo.ansi.bak
    grep -c 20601 docs/demo.ansi    # expect 0
+   grep -c private docs/demo.ansi  # expect 0
    ```
 
 7. Convert the transcript to the picture, and check that the host line is the default one.

@@ -7,7 +7,8 @@ a real model. It also stands in for the hosted APIs, under /xai/v1, /openai/v1
 (Chat Completions) and /anthropic/v1 (Messages), with the key "test-key": a
 consultation is one user string, and a Messages request with tools (or any other
 shape) is the model that does the work, scripted the same way and streamed as SSE
-when asked. Run standalone: python3 fake_ollama.py PORT
+when asked. Run standalone: python3 fake_ollama.py PORT [MODEL ...]  (each MODEL is also listed, as a plain
+7B model with tools: the screenshot skill uses it to name the model its picture shows)
 """
 import gzip, json, re, ssl, sys, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -779,4 +780,7 @@ def serve(port, certfile=None, keyfile=None):
     srv.serve_forever()
 
 if __name__ == "__main__":
+    for name in sys.argv[2:]:
+        MODELS.append({"name": name, "model": name, "size": 1, "digest": "x",
+                       "details": {"parameter_size": "7B"}, "capabilities": ["completion", "tools"]})
     serve(int(sys.argv[1]) if len(sys.argv) > 1 else 11435)

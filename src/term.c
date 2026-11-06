@@ -1303,7 +1303,7 @@ static void fd1_write(const char *b, size_t n) {   /* to fd 1 itself (never thro
 }
 void term_write_tty(const char *b, size_t n) { fd1_write(b, n); }
 /* ---------- the terminal window's title and status ----------
- * The title is "Corbie | folder". It says what the program is doing, so a tab in the background shows it: a 🟢 while the
+ * The title is the folder's name. It says what the program is doing, so a tab in the background shows it: a 🟢 while the
  * prompt waits, a 🟠 while a turn runs, a 🟡 while a question waits for the user. A plain terminal gets the marker in front
  * of the title (a title has no colour of its own). iTerm2 has a status of its own, OSC 21337: the line under the tab's
  * title and the dot on the tab (https://iterm2.com/documentation-session-status.html); it says the state there, once,
@@ -1327,10 +1327,9 @@ void term_title_bytes(int state, bool iterm, const char *dir, sbuf *out) {
         if (iterm) sb_puts(out, "\x1b]21337;status=;indicator=;status-color=\x07");
         return;
     }
-    /* "Corbie | folder": in iTerm2 the status says the state (dot and subtitle), so the title does not; elsewhere a marker does */
+    /* the folder's name: in iTerm2 the status says the state (dot and subtitle), so the title does not; elsewhere a marker does */
     sb_puts(out, "\x1b]0;");
     if (!iterm) sb_puts(out, S[state].marker);
-    sb_puts(out, "Corbie | ");
     for (const char *p = dir && *dir ? dir : "?"; *p; p++) if ((unsigned char)*p >= 0x20 && *p != 0x7f) sb_putc(out, *p);   /* no control byte ends the title early */
     sb_putc(out, 7);
     if (iterm) sb_printf(out, "\x1b]21337;status=%s;indicator=%s\x07", S[state].status, S[state].dot);
@@ -1338,8 +1337,10 @@ void term_title_bytes(int state, bool iterm, const char *dir, sbuf *out) {
 static void title_dir(char *dir, size_t n) {   /* the working folder's name (the last part of its path) */
     char cwd[PATH_MAX];
     if (!getcwd(cwd, sizeof cwd)) { snprintf(dir, n, "?"); return; }
-    const char *b = strrchr(cwd, '/');
-    snprintf(dir, n, "%s", b && b[1] ? b + 1 : cwd);
+    const char *b = strrchr(cwd, '/'), *name = b && b[1] ? b + 1 : cwd;
+    size_t l = strlen(name);
+    if (l >= n) { l = n - 1; while (l && ((unsigned char)name[l] & 0xC0) == 0x80) l--; }   /* cut between characters */
+    memcpy(dir, name, l); dir[l] = 0;   /* (not snprintf: a path is up to PATH_MAX, and gcc -Werror=format-truncation says so) */
 }
 void term_title_set(int state) {
     static char shown[256];   /* the folder the title last named: a /cd changes it while the state stays */

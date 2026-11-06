@@ -313,7 +313,7 @@ typedef struct {
     bool  color;
     int   max_iters;     /* tool loop guard */
     bool  interactive;   /* stdin is a tty */
-    bool  title;         /* the terminal window's title says what the program does ("Corbie | folder", with a 🟢 ready / 🟠 working / 🟡 waiting marker in front; iTerm2 shows the state as its status line and tab dot instead) (config title=on|off; default on) */
+    bool  title;         /* the terminal window's title says what the program does (the folder's name, with a 🟢 ready / 🟠 working / 🟡 waiting marker in front; iTerm2 shows the state as its status line and tab dot instead) (config title=on|off; default on) */
     bool  memory;        /* keep .corbienest/memory.md up to date (see memory_every) */
     int   memory_every;  /* run the memory-extraction call after this many requests (also at exit, /clear, /compact, /cd) */
     int   memory_idle;   /* seconds idle at the prompt after which a pending extraction runs anyway (0 = only at memory_every / exit) */
@@ -577,9 +577,9 @@ extern bool term_confirm_quiet;                        /* the next term_confirm 
 void        term_status_text(sbuf *o, int cols);      /* the bar, as the ANSI UI draws it (escapes included) */
 void        term_wrap(const char *s, size_t len, int width, int col0, size_t target, int want, size_t *start_out, int *row_out, int *col_out);   /* the field's text wrapped at word boundaries (term.c) */
 /* The terminal window's title and, in iTerm2, its status. States: 0 none, 1 ready, 2 working, 3 waiting for the user. The bytes
- * for a state (OSC 0 "Corbie | DIR", with a 🟢/🟠/🟡 marker unless iterm; with iterm also OSC 21337: the subtitle and the tab's dot), or for leaving it
+ * for a state (OSC 0 the folder's name, with a 🟢/🟠/🟡 marker unless iterm; with iterm also OSC 21337: the subtitle and the tab's dot), or for leaving it
  * (iterm: clears the status). Pure, so test_unit reaches it; term.c writes them to the terminal (term_title_set). */
-void        term_title_bytes(int state, bool iterm, const char *dir, sbuf *out);   /* the title is "Corbie | DIR", with a marker in front outside iTerm2 */
+void        term_title_bytes(int state, bool iterm, const char *dir, sbuf *out);   /* the title is the folder's name, with a marker in front outside iTerm2 */
 bool        fd_write_all(int fd, const char *b, size_t n);   /* all of b[0..n), waiting (poll) when the descriptor is non-blocking and full; false on a real error */
 void        term_write_tty(const char *b, size_t n);        /* bytes to the terminal itself (fd 1), not through the captured stdout; whole, as fd_write_all */
 void        term_title_set(int state);                /* a no-op unless config title=on and the terminal is one; writes only on a change */
