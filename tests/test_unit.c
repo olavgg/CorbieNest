@@ -2887,6 +2887,19 @@ static void test_title(void) {
 }
 static void test_theme(void) {
     const theme_t *def = g_theme;
+    {   /* the rainbow of the [parallel] label: it moves with time and with the letter, wraps, and never goes dark */
+        CHECK(rainbow_rgb(0, 0) == 0xff4646u);   /* hue 0: red */
+        CHECK(rainbow_rgb(0, 0) != rainbow_rgb(1, 0) && rainbow_rgb(0, 0) != rainbow_rgb(0, 500));
+        CHECK(rainbow_rgb(0, 3000) == rainbow_rgb(0, 0) && rainbow_rgb(3, -100) == rainbow_rgb(3, -100 + 3000));   /* a turn takes 3 s */
+        bool bright = true;
+        for (int i = 0; i < 10; i++) for (long ms = 0; ms < 3000; ms += 97) { unsigned c = rainbow_rgb(i, ms); if (((c >> 16) & 255) < 70 || ((c >> 8) & 255) < 70 || (c & 255) < 70 || (((c >> 16) & 255) != 255 && ((c >> 8) & 255) != 255 && (c & 255) != 255)) bright = false; }
+        CHECK(bright);
+        sbuf pl; sb_init(&pl); g_cfg.parallel_tasks = false;
+        CHECK(term_parallel_text(&pl, 0) == 0 && pl.len == 0);
+        g_cfg.parallel_tasks = true;
+        CHECK(term_parallel_text(&pl, 0) == 10 && strstr(pl.data, "\x1b[38;2;255;70;70m[") && strstr(pl.data, "]"));
+        g_cfg.parallel_tasks = false; sb_free(&pl);
+    }
     CHECK(theme_set("nope") == false && g_theme == def);   /* an unknown name keeps the theme in use */
     CHECK(theme_set("default") && g_theme == def && !strcmp(g_theme->name, "default"));
     CHECK(theme_count() >= 2 && !strcmp(theme_name(0), "default") && theme_set("bright") && !strcmp(g_theme->name, "bright"));   /* the picker's list */

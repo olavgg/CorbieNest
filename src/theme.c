@@ -203,4 +203,22 @@ static const char *th_sgr(unsigned rgb, int bg) {
     return b;
 }
 const char *th_fg(unsigned rgb) { return th_sgr(rgb, 0); }
+
+/* A hue wheel at fixed saturation: 32 degrees from one letter to the next, a full turn about every three seconds. The
+ * darkest channel stays at 70 so the letters read on a dark ground and are not washed out on a light one. */
+unsigned rainbow_rgb(int i, long ms) {
+    long h = ((long)i * 32 + ms * 3 / 25) % 360; if (h < 0) h += 360;
+    int sector = (int)(h / 60), f = (int)(h % 60) * 255 / 60;
+    const int hi = 255, lo = 70;
+    int up = lo + (hi - lo) * f / 255, down = hi - (hi - lo) * f / 255, r, g, b;
+    switch (sector) {
+        case 0:  r = hi;   g = up;   b = lo;   break;
+        case 1:  r = down; g = hi;   b = lo;   break;
+        case 2:  r = lo;   g = hi;   b = up;   break;
+        case 3:  r = lo;   g = down; b = hi;   break;
+        case 4:  r = up;   g = lo;   b = hi;   break;
+        default: r = hi;   g = lo;   b = down; break;
+    }
+    return ((unsigned)r << 16) | ((unsigned)g << 8) | (unsigned)b;
+}
 const char *th_bg(unsigned rgb) { return th_sgr(rgb, 1); }
