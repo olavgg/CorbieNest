@@ -2928,8 +2928,8 @@ cfg = open(os.path.join(CFG, "corbienest", "config")).read()
 check(cfg.startswith("# corbienest config") and "model=fake-coder:latest" in cfg and cfg.endswith("\n"),
       f"the config is one whole file, not a mixture of two writes: {cfg[-140:]!r}")
 check(len([l for l in cfg.splitlines() if "=" in l]) >= 10, f"every key is there — nothing was truncated: {cfg!r}")
-check("temperature=0.3" in cfg and "keep_alive=30m" in cfg,
-      f"and it is A's whole state: the last writer wins, which atomicity does not change: {cfg!r}")
+check("temperature=0.3" in cfg and "keep_alive=7m" in cfg,
+      f"and both sessions' changes are in it: A's temperature and B's keep_alive, a save merges per key: {cfg!r}")
 check(not [f for f in os.listdir(os.path.join(CFG, "corbienest")) if ".tmp" in f], "no temporary files left behind")
 ha.send("\x04"); hb.send("\x04"); ha.close(); hb.close()
 

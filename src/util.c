@@ -469,10 +469,17 @@ void config_load(void) {
         else if (!strcmp(k, "keep_alive")) { free(g_cfg.keep_alive); g_cfg.keep_alive = *v ? xstrdup(v) : NULL; }
     }
     fclose(f);
+    /* what this session starts from, see config_save: the file as read, before the migration below, so that the migrated
+     * effort.<model> line differs from it and the next save writes it, and the old think_level key (still in the base,
+     * no longer in our text) is dropped from the file */
+    sbuf t; sb_init(&t); config_text(&t);
     /* the old global level belonged to whatever model was in use when it was set */
-    if (legacy_level && effort_name_ok(legacy_level) && g_cfg.model && !effort_get(g_cfg.model)) effort_set(g_cfg.model, legacy_level);
+    if (legacy_level && effort_name_ok(legacy_level) && g_cfg.model && !effort_get(g_cfg.model)) {
+        effort_set(g_cfg.model, legacy_level);
+        sb_printf(&t, "think_level=%s\n", legacy_level);
+    }
     free(legacy_level);
-    sbuf t; sb_init(&t); config_text(&t); free(g_cfg_base); g_cfg_base = sb_detach(&t);   /* what this session starts from, see config_save */
+    free(g_cfg_base); g_cfg_base = sb_detach(&t);
 }
 
 /* The whole file is rewritten on every setting change, and another session may be reading it
@@ -483,7 +490,20 @@ void config_load(void) {
  * process last wrote, or read), the text of this process's settings now, and the file as it is: a key
  * this session did not change is taken from the file, one it changed is its own. The lock file keeps
  * two saves from interleaving their read and write. */
-void config_set_mode(int mode) { g_cfg.mode = mode; g_mode_saved = mode; }
+/* An explicit /mode is a change even when it names the mode this session loaded: take its line out of the base, so the
+ * save writes ours (a file with no mode= yet gets one, and a mode another session saved meanwhile is overridden). */
+static void config_base_forget(const char *key) {
+    if (!g_cfg_base) return;
+    size_t kl = strlen(key);
+    sbuf o; sb_init(&o);
+    for (const char *p = g_cfg_base; *p; ) {
+        const char *e = strchr(p, '\n'); size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (!(n > kl && !strncmp(p, key, kl) && p[kl] == '=')) { sb_append(&o, p, n); sb_puts(&o, "\n"); }
+        p = e ? e + 1 : p + n;
+    }
+    free(g_cfg_base); g_cfg_base = sb_detach(&o);
+}
+void config_set_mode(int mode) { g_cfg.mode = mode; g_mode_saved = mode; config_base_forget("mode"); }
 
 static void config_text(sbuf *bp) {
     sbuf b = *bp;
