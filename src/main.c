@@ -889,8 +889,13 @@ static void sessions_prune(void) {
     while ((e = readdir(d))) {
         size_t l = strlen(e->d_name);
         if (l > 4 && !strcmp(e->d_name + l - 4, ".tmp")) {   /* a save that a crash cut off (write_whole_file_atomic); a day old is nobody's write in flight */
-            char tp[1400]; snprintf(tp, sizeof tp, "%s/%s", sessions_dir(), e->d_name);
-            struct stat ts; if (stat(tp, &ts) == 0 && time(NULL) - ts.st_mtime > 86400) unlink(tp);
+            /* judged by the open descriptor, never by a path looked at and then used (a TOCTOU race): O_NOFOLLOW keeps a symlink out */
+            int tf = openat(dirfd(d), e->d_name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+            if (tf >= 0) {
+                struct stat ts; bool old = fstat(tf, &ts) == 0 && S_ISREG(ts.st_mode) && time(NULL) - ts.st_mtime > 86400;
+                close(tf);
+                if (old) unlinkat(dirfd(d), e->d_name, 0);
+            }
             continue;
         }
         if (l < 6 || strcmp(e->d_name + l - 5, ".json")) continue;
