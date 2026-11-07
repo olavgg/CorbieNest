@@ -2097,6 +2097,17 @@ static void test_workflow(void) {
     n = workflow_parse("---\nname: team\ndescription: x\n---\nqa: a\nqa: b\ncoder: x\ncoder: none\n", &wf);
     CHECK(n == 1 && !strcmp(wf.slot[WF_QA].skill, "b") && !wf.slot[WF_CODER].set && wf.unknown[0] == 0);
     workflow_free(&wf);
+    {   /* more unknown names than the list holds: it stops at a whole name, is always terminated, and never runs past its buffer */
+        sbuf many; sb_init(&many);
+        for (int i = 0; i < 60; i++) sb_printf(&many, "bogus-slot-%02d: x\n", i);
+        sb_puts(&many, "qa: default\n");
+        n = workflow_parse(many.data, &wf);
+        size_t ul = strlen(wf.unknown);
+        CHECK(n == 1 && wf.slot[WF_QA].set && ul > 0 && ul < sizeof wf.unknown);
+        CHECK(!strncmp(wf.unknown, "bogus-slot-00, bogus-slot-01", 28) && strstr(wf.unknown, "bogus-slot-0") != NULL);
+        CHECK(wf.unknown[ul - 1] != ',' && wf.unknown[ul - 1] != ' ' && !strstr(wf.unknown, "bogus-slot-59"));
+        workflow_free(&wf); sb_free(&many);
+    }
     CHECK(workflow_parse("", &wf) == 0 && workflow_parse(NULL, &wf) == 0);
     CHECK_STR(workflow_slot_name(WF_UX_REVIEW), "ux-review");
     /* the file is found by name, project before user; a path is not a name */

@@ -845,8 +845,14 @@ int workflow_parse(const char *text, workflow *wf) {
             size_t kl = (size_t)(ke - k);
             bool word = kl > 0 && kl < 24;
             for (size_t i = 0; i < kl && word; i++) if (!isalnum((unsigned char)k[i]) && k[i] != '-' && k[i] != '_') word = false;
-            if (word && strncasecmp(k, "name", kl) && strncasecmp(k, "description", kl) && ul + kl + 3 < sizeof wf->unknown)
-                ul += (size_t)snprintf(wf->unknown + ul, sizeof wf->unknown - ul, "%s%.*s", ul ? ", " : "", (int)kl, k);
+            if (word && strncasecmp(k, "name", kl) && strncasecmp(k, "description", kl)) {
+                size_t sep = ul ? 2 : 0;   /* ", " between names; a name that does not fit whole is left out */
+                if (ul + sep + kl < sizeof wf->unknown) {   /* (the NUL fits: the sum is below the size) */
+                    if (sep) { memcpy(wf->unknown + ul, ", ", 2); ul += 2; }
+                    memcpy(wf->unknown + ul, k, kl); ul += kl;
+                    wf->unknown[ul] = 0;
+                }
+            }
             continue;
         }
         char *val = xstrndup(v, (size_t)(ve - v)), *model = NULL;
