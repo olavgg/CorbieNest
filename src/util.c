@@ -805,6 +805,119 @@ int orch_parse_plan_ex(const char *text, orch_task **tasks, char **contract) {
     return keep;
 }
 
+/* ---------- /orchestrate: the workflow file ---------- */
+static const struct { const char *name, *alias[4]; } WF_NAMES[WF_SLOTS] = {
+    [WF_OWNER]          = { "owner",          { "product-owner", "po", "product_owner", NULL } },
+    [WF_CODER]          = { "coder",          { "code", "developer", "dev", NULL } },
+    [WF_TESTS]          = { "tests",          { "test", "tester", "test-writer", NULL } },
+    [WF_QA]             = { "qa",             { "quality", "quality-assurance", NULL } },
+    [WF_CODE_REVIEW]    = { "code-review",    { "code-reviewer", "review", "reviewer", "code_review" } },
+    [WF_PRODUCT_REVIEW] = { "product-review", { "product-reviewer", "product_review", NULL } },
+    [WF_UX_REVIEW]      = { "ux-review",      { "ux-reviewer", "ux", "ux_review", NULL } },
+};
+const char *workflow_slot_name(int slot) { return slot >= 0 && slot < WF_SLOTS ? WF_NAMES[slot].name : "?"; }
+
+static int workflow_slot_of(const char *k, size_t kl) {
+    for (int i = 0; i < WF_SLOTS; i++) {
+        if (strlen(WF_NAMES[i].name) == kl && !strncasecmp(k, WF_NAMES[i].name, kl)) return i;
+        for (int a = 0; a < 4 && WF_NAMES[i].alias[a]; a++)
+            if (strlen(WF_NAMES[i].alias[a]) == kl && !strncasecmp(k, WF_NAMES[i].alias[a], kl)) return i;
+    }
+    return -1;
+}
+
+int workflow_parse(const char *text, workflow *wf) {
+    memset(wf, 0, sizeof *wf);
+    int n = 0; size_t ul = 0; bool fm = false, first = true;
+    for (const char *p = text ? text : ""; *p; ) {
+        size_t len = strcspn(p, "\n");
+        const char *l = p, *e = p + len;
+        p += len; if (*p == '\n') p++;
+        while (l < e && (*l == ' ' || *l == '\t' || *l == '-' || *l == '*' || *l == '>')) l++;
+        while (e > l && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r')) e--;
+        if (first && e - l >= 3 && !strncmp(l, "---", 3)) { fm = true; first = false; continue; }   /* a frontmatter's fences are no slot */
+        first = false;
+        if (l == e || *l == '#' || (fm && !memchr(l, ':', (size_t)(e - l)))) continue;
+        const char *colon = memchr(l, ':', (size_t)(e - l));
+        if (!colon) continue;
+        const char *k = l, *ke = colon;
+        while (ke > k && (ke[-1] == ' ' || ke[-1] == '*' || ke[-1] == '`' || ke[-1] == '_')) ke--;
+        while (k < ke && (*k == '*' || *k == '`' || *k == '_')) k++;
+        const char *v = colon + 1;
+        while (v < e && (*v == ' ' || *v == '\t' || *v == '`' || *v == '*')) v++;
+        const char *ve = e;
+        while (ve > v && (ve[-1] == ' ' || ve[-1] == '`' || ve[-1] == '*')) ve--;
+        int slot = workflow_slot_of(k, (size_t)(ke - k));
+        if (slot < 0) {   /* name, description and the like: a workflow file may carry them; only a name that looks like a slot is reported */
+            size_t kl = (size_t)(ke - k);
+            bool word = kl > 0 && kl < 24;
+            for (size_t i = 0; i < kl && word; i++) if (!isalnum((unsigned char)k[i]) && k[i] != '-' && k[i] != '_') word = false;
+            if (word && strncasecmp(k, "name", kl) && strncasecmp(k, "description", kl)) {
+                size_t sep = ul ? 2 : 0;   /* ", " between names; a name that does not fit whole is left out */
+                if (ul + sep + kl < sizeof wf->unknown) {   /* (the NUL fits: the sum is below the size) */
+                    if (sep) { memcpy(wf->unknown + ul, ", ", 2); ul += 2; }
+                    memcpy(wf->unknown + ul, k, kl); ul += kl;
+                    wf->unknown[ul] = 0;
+                }
+            }
+            continue;
+        }
+        char *val = xstrndup(v, (size_t)(ve - v)), *model = NULL;
+        char *on = strstr(val, " on ");   /* "skill on MODEL" */
+        if (on) { *on = 0; char *m = on + 4; while (*m == ' ') m++; if (*m) model = xstrdup(m); trim(val); if (model) trim(model); }
+        const char *none = "-", *deflt = "default";
+        wf_slot *s = &wf->slot[slot];
+        free(s->skill); free(s->model);
+        s->skill = NULL; s->model = model;
+        if (!strcasecmp(val, "none") || !strcasecmp(val, "off") || !strcmp(val, none)) { s->set = false; free(s->model); s->model = NULL; }   /* "qa: none" skips a slot */
+        else { s->set = true; if (*val && strcasecmp(val, deflt)) s->skill = xstrdup(val); }
+        free(val);
+    }
+    for (int i = 0; i < WF_SLOTS; i++) n += wf->slot[i].set;
+    return n;
+}
+
+void workflow_free(workflow *wf) {
+    for (int i = 0; i < WF_SLOTS; i++) { free(wf->slot[i].skill); free(wf->slot[i].model); }
+    memset(wf, 0, sizeof *wf);
+}
+
+char *workflow_find(const char *name) {
+    char rel[600], *cands[2];
+    if (name && *name) {
+        for (const char *c = name; *c; c++) if (!isalnum((unsigned char)*c) && *c != '-' && *c != '_' && *c != '.') return NULL;   /* a name, not a path */
+        if (name[0] == '.') return NULL;
+        snprintf(rel, sizeof rel, ".agents/workflows/%s.md", name); cands[0] = xstrdup(rel);
+        snprintf(rel, sizeof rel, "~/.agents/workflows/%s.md", name); cands[1] = expand_home(rel);
+    } else { cands[0] = xstrdup(".agents/workflow.md"); cands[1] = expand_home("~/.agents/workflow.md"); }
+    char *hit = NULL;
+    for (int i = 0; i < 2; i++) { if (!hit && cands[i] && is_file(cands[i])) hit = cands[i]; else free(cands[i]); }
+    return hit;
+}
+
+/* "VERDICT: PASS" or "VERDICT: FAIL why" on a line of its own, the last one of the report (a report may quote the rule first) */
+int qa_verdict(const char *report, char *why, size_t n) {
+    int v = -1;
+    if (why && n) why[0] = 0;
+    for (const char *p = report ? report : ""; *p; ) {
+        size_t len = strcspn(p, "\n");
+        const char *val; size_t vl;
+        if (plan_field(p, len, "verdict", &val, &vl)) {
+            if (vl >= 4 && !strncasecmp(val, "pass", 4)) { v = 1; if (why && n) why[0] = 0; }
+            else if (vl >= 4 && !strncasecmp(val, "fail", 4)) {
+                v = 0;
+                if (why && n) {
+                    const char *w = val + 4; size_t wl = vl - 4;
+                    while (wl && (*w == ' ' || *w == ':' || *w == '-' || *w == '.')) { w++; wl--; }
+                    snprintf(why, n, "%.*s", (int)(wl < n - 1 ? wl : n - 1), w);
+                }
+            }
+        }
+        p += len; if (*p == '\n') p++;
+    }
+    return v;
+}
+
 void orch_tasks_free(orch_task *t, int n) {
     for (int i = 0; i < n; i++) {
         free(t[i].title); free(t[i].body); free(t[i].role);

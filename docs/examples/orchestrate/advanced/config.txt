@@ -1,0 +1,6 @@
+# Lines for ~/.config/corbienest/config (or set the same with /effort and /advisor effort).
+# Effort is kept per model, and written exactly as the model is named in the workflow file.
+# The coder is the main model (/model anthropic:claude-sonnet-5-5): it is the one that reads and edits, so keep it light.
+effort.anthropic:claude-sonnet-5-5=low
+# The owner and the code reviewer are one model, so they share one setting: enough to judge a diff, no more.
+effort.anthropic:claude-opus-5-5=medium

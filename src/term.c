@@ -4242,7 +4242,7 @@ void md_finish(md_state *m) {
     if (m->in_fence && m->line.len) md_code_line(m);   /* a last line that never ended */
     fputs(C_RESET, stdout);
     m->in_fence = m->in_code = m->in_bold = m->in_info = false;
-    sb_free(&m->line); sb_free(&m->info);
+    sb_free(&m->line); sb_free(&m->info); sb_free(&m->word);   /* (the word was flushed above) */
     fflush(stdout);
 }
 
