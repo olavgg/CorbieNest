@@ -89,6 +89,8 @@ without thinking about them: the status bar, the field, and the strip.
 | `/diff [git args]` | show `git diff` of the working tree (stat, patch, untracked files) for you only — nothing is added to the conversation; `/diff --staged`, `/diff HEAD~1` … pass through |
 | `/rewind` | (or **Esc Esc** at an empty prompt) pick an earlier request and go back: undo the file changes the model made since (files are checkpointed before every `write_file`/`edit_file`), truncate the conversation to just before it (the request text returns to the editor), or both |
 | `/orchestrate REQUEST` | the advisor model in charge: it plans the request as tasks, the main model does them as workers — several at a time where the plan allows — and the advisor reviews each; see [Orchestrating](#orchestrating) |
+| `/orchestrate -w NAME\|none REQUEST` | with a workflow: `NAME` is `.agents/workflows/NAME.md` for this run, `none` leaves `.agents/workflow.md` out of it; see [Workflows](#workflows-who-does-what-in-orchestrate) |
+| `/workflow [NAME\|new [NAME]]` | the workflow `/orchestrate` would use, slot by slot (the file, the skill and the model of each), or `new` to write a starter file |
 | `/plan REQUEST` | `/orchestrate` in layers: the advisor plans the request as tasks grouped into layers (`LAYER: n`), you approve the plan, then each layer runs and the project is built before the next one starts; a failed build becomes a fix task. See [Planning in layers](#planning-in-layers-plan) |
 | `/workers [N]` | how many tasks of `/orchestrate` may run at the same time (default 3, at most 20, `1` = one after another) |
 | `/effort parallel [on\|off]` | the `task` calls of one reply run as sub-agents at the same time (off by default: one after another) |
@@ -966,6 +968,63 @@ hosted, cloud or a bigger local one) is in charge, and the model doing the work 
   queues them otherwise. Esc stops every worker; a queued message does not.
 - The expensive model never reads a worker's transcript — only plans, reports and diffs — so
   its tokens stay few; `/usage` shows what they came to.
+
+### Workflows: who does what in `/orchestrate`
+
+A project (or you) can say who plays which part of a run: who owns the product, who codes, who writes
+the tests, who is QA, and who reviews the code, the product and the UX. The roles are skills (see
+[Skills](#skills)), so a role is its instructions and, if it has a `model:` line, its model. The file is
+`.agents/workflow.md` in the project (or `~/.agents/workflow.md` for every project): **a project that has one
+gets it on every `/orchestrate`**. `/orchestrate -w NAME REQUEST` uses `.agents/workflows/NAME.md` for one run,
+`-w none` leaves the workflow out of one. `/plan` does not use workflows.
+
+```
+# .agents/workflow.md
+owner: product-owner on anthropic:claude-opus-5
+coder: default
+tests: test-writer
+qa: qa-bot
+code-review: default on openai:gpt-5.2
+product-review: product-reviewer
+ux-review: none
+```
+
+One line per slot, `slot: skill`. `default` is the built-in instructions, `skill on MODEL` (or `default on MODEL`)
+names a model, `none` leaves a slot out. A slot that is not in the file is left out, except `owner` and `coder`.
+Other names for the slots are understood (`po`, `tester`, `reviewer`, `ux`, …); a line that names no slot is
+reported when the run starts. `/workflow` shows what a run would use, `/workflow new` writes a starter file.
+
+| slot | who | what it does |
+|---|---|---|
+| `owner` | the model that plans and reviews: `/advisor`'s unless the line names one | plans the request, reviews each coder task (as the orchestrator did), and at the end **reports to you in the session** |
+| `coder` | a worker on the main model | does the tasks of the plan, and the fixes |
+| `tests` | a worker | writes the tests for the change, in the project's test files only |
+| `qa` | a worker | builds the project, runs its tests and tries the change; changes no file; ends its report with `VERDICT: PASS` or `VERDICT: FAIL why` |
+| `code-review` | a toolless reviewer | reads the diff of everything written, for bugs, edge cases, security and consistency |
+| `product-review` | a toolless reviewer | checks the change is what you asked for: all of it, and no more |
+| `ux-review` | a toolless reviewer | the experience of whoever uses it: messages, defaults, flows, naming. It reads the diff and the reports — it cannot run anything |
+
+- **Order.** The owner plans, with a note that the workflow does the tests, QA and reviews, so the plan is the
+  work that makes the change. The coder's tasks run and the owner reviews each, as before. When they are all
+  accepted: `tests`, then the checks in the order `qa`, `code-review`, `product-review`, `ux-review`.
+  Stages are one after another; only the coder's tasks may overlap (`/workers`).
+- **A check that finds something** sends the coder a fix task, with the findings and the request, at most two
+  per check; then the check runs again. A fix that wrote files sends the run back to QA first (the code the
+  checks saw has changed), and the checks after it again; a fix that wrote nothing only repeats the check
+  that failed. The repeated check is the fix's review. A check that still fails after two fixes ends the run:
+  the findings are in the report and the summary line is amber.
+- **A check that cannot run** (no model to ask, a QA report without a `VERDICT:` line) is not counted: the run
+  goes on and says so in the report.
+- **The report.** The owner is shown the plan's reports, how each check went and the files written, and
+  writes the report to you: what was done, whether it does what you asked, what is open. It is printed as a
+  reply and is what the conversation keeps first, followed by the program's own account of the tasks and checks,
+  so what you say next follows it. Esc at any point ends the run without a report; it is saved as stopped.
+- **Models and cost.** Each reviewer and the owner is a toolless call on its own model (the slot's `on MODEL`,
+  else its skill's `model:`, else the advisor). They count in `/usage` and the advisor tally. `/rewind` undoes
+  everything the run wrote, stages and fixes included.
+- **Limits.** The stages add at most 20 tasks to a run (1 for the tests, a QA run for each fix, 8 fixes); past
+  that the run stops with the findings. A role that is not a skill here runs the built-in instructions, and the
+  line at the start says so.
 
 ### Planning in layers (`/plan`)
 

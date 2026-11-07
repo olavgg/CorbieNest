@@ -2074,6 +2074,54 @@ static void test_orchestrate(void) {
     char last[32]; snprintf(last, sizeof last, "do %d", ORCH_MAX_TASKS);
     CHECK(n == ORCH_MAX_TASKS); CHECK_STR(t[n - 1].body, last);   /* no more than that, and the last one kept whole */
     orch_tasks_free(t, n); sb_free(&many);
+    n = orch_parse_plan("TASK 1: a\ndo a\n", &t);
+    CHECK(n == 1 && t[0].kind == ORCH_KIND_TASK);   /* a task of the plan is the ordinary kind */
+    orch_tasks_free(t, n);
+}
+
+/* the workflow file: slots, aliases, "default", "on MODEL", "none", what it does not understand */
+static void test_workflow(void) {
+    workflow wf;
+    int n = workflow_parse("# Our team\nowner: product-owner on anthropic:claude-opus-5\ncoder: default\n- **QA**: qa-bot\n"
+                           "ux: default on openai:gpt-5.2\ncode-reviewer: reviewer\ntests: none\nproduct-review: -\nbanana: x\nshape: y\n", &wf);
+    CHECK(n == 5);
+    CHECK(wf.slot[WF_OWNER].set && !strcmp(wf.slot[WF_OWNER].skill, "product-owner") && !strcmp(wf.slot[WF_OWNER].model, "anthropic:claude-opus-5"));
+    CHECK(wf.slot[WF_CODER].set && wf.slot[WF_CODER].skill == NULL && wf.slot[WF_CODER].model == NULL);   /* default: the built-in instructions */
+    CHECK(wf.slot[WF_QA].set && !strcmp(wf.slot[WF_QA].skill, "qa-bot"));                                 /* markdown around the line is fine */
+    CHECK(wf.slot[WF_UX_REVIEW].set && wf.slot[WF_UX_REVIEW].skill == NULL && !strcmp(wf.slot[WF_UX_REVIEW].model, "openai:gpt-5.2"));
+    CHECK(wf.slot[WF_CODE_REVIEW].set && !strcmp(wf.slot[WF_CODE_REVIEW].skill, "reviewer"));
+    CHECK(!wf.slot[WF_TESTS].set && !wf.slot[WF_PRODUCT_REVIEW].set);                                    /* none and - skip a slot */
+    CHECK_STR(wf.unknown, "banana, shape");
+    workflow_free(&wf);
+    /* a later line wins, a skip after a set is a skip; frontmatter and a name are not slots; nothing at all is nothing */
+    n = workflow_parse("---\nname: team\ndescription: x\n---\nqa: a\nqa: b\ncoder: x\ncoder: none\n", &wf);
+    CHECK(n == 1 && !strcmp(wf.slot[WF_QA].skill, "b") && !wf.slot[WF_CODER].set && wf.unknown[0] == 0);
+    workflow_free(&wf);
+    CHECK(workflow_parse("", &wf) == 0 && workflow_parse(NULL, &wf) == 0);
+    CHECK_STR(workflow_slot_name(WF_UX_REVIEW), "ux-review");
+    /* the file is found by name, project before user; a path is not a name */
+    char dir[] = "/tmp/corbie_wf_XXXXXX", old[1024];
+    CHECK(mkdtemp(dir) != NULL && getcwd(old, sizeof old) != NULL && chdir(dir) == 0);
+    char *h = getenv("HOME"), *oldhome = h ? xstrdup(h) : NULL;
+    setenv("HOME", dir, 1);
+    CHECK(workflow_find(NULL) == NULL && workflow_find("x") == NULL);
+    CHECK(mkdir(".agents", 0755) == 0 && mkdir(".agents/workflows", 0755) == 0);
+    CHECK(write_whole_file(".agents/workflow.md", "qa: default\n", 12) == 0 && write_whole_file(".agents/workflows/fast.md", "qa: none\n", 10) == 0);
+    char *f = workflow_find(NULL); CHECK(f && !strcmp(f, ".agents/workflow.md")); free(f);
+    f = workflow_find("fast"); CHECK(f && !strcmp(f, ".agents/workflows/fast.md")); free(f);
+    CHECK(workflow_find("../x") == NULL && workflow_find("a/b") == NULL && workflow_find(".hidden") == NULL);
+    if (oldhome) setenv("HOME", oldhome, 1); else unsetenv("HOME");
+    free(oldhome);
+    CHECK(chdir(old) == 0);
+    char cmd[200]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); CHECK(system(cmd) == 0);
+    /* the QA worker's verdict: the last VERDICT line of its report */
+    char why[100];
+    CHECK(qa_verdict("ran it\nVERDICT: PASS\n", why, sizeof why) == 1 && !why[0]);
+    CHECK(qa_verdict("Rule: end with VERDICT: PASS or VERDICT: FAIL\nVERDICT: FAIL the login test crashes\n", why, sizeof why) == 0);
+    CHECK_STR(why, "the login test crashes");
+    CHECK(qa_verdict("**VERDICT:** FAIL - no tests ran", why, sizeof why) == 0 && !strcmp(why, "no tests ran"));
+    CHECK(qa_verdict("VERDICT: FAIL x\nfixed it\nVERDICT: PASS", why, sizeof why) == 1);
+    CHECK(qa_verdict("looks fine to me", why, sizeof why) == -1 && qa_verdict(NULL, NULL, 0) == -1);
 }
 
 /* base64 (RFC 4648 test vectors, and bytes that are not text) */
@@ -2978,7 +3026,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "fold head", test_fold_head }, { "scrollback spill", test_sb_spill }, { "modes", test_modes },
         { "close button", test_close_x }, { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "config merge", test_config_merge }, { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme }, { "title", test_title },
+        { "config merge", test_config_merge }, { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "workflow", test_workflow }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme }, { "title", test_title },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

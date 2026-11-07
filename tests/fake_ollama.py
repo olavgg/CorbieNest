@@ -78,6 +78,14 @@ def advisor_text(brief):
         one = "TASK 1: make the file\nTOOL_WRITE the file made.txt.\nDONE WHEN: made.txt exists"
         if "ONETASK" in brief: return one
         return "Here is the plan.\n\n## " + one + "\n\n## **TASK 2:** say that it is there\nJust reply.\nDONE WHEN: you replied\n"
+    if "# REVIEW the change" in brief:   # a reviewer of a workflow: CODEFAIL finds something once, UXNEVER always, otherwise LGTM
+        check = brief.split("Check: ", 1)[1].split(" ", 1)[0] if "Check: " in brief else ""
+        rounds = brief.split("fix rounds so far: ", 1)[1].split(")", 1)[0] if "fix rounds so far: " in brief else "0"
+        if (check == "code-review" and "CODEFAIL" in brief and rounds == "0") or (check == "ux-review" and "UXNEVER" in brief):
+            return "1. made.txt: say who made it (%s)." % check
+        return "LGTM"
+    if "# REPORT to the user" in brief:   # the product owner's report
+        return "REPORT-FROM-OWNER: made.txt is there." + (" Still open: the UX review." if "still failing" in brief else " The checks passed.")
     if "# REVIEW this task" in brief:    # ... and the review of a task: sent back once for REJECT, always for NEVERACCEPT
         if "NEVERACCEPT" in brief or ("REJECT" in brief and "(attempt 1 of" in brief): return "REVIEW-FINDING the file should say who made it; check that."
         return "LGTM"
@@ -274,7 +282,7 @@ def script(model, messages, req):
             yield chunk(model, "NO_CHANGE")
         yield chunk(model, done=True)
         return
-    if messages[0]["role"] == "system" and ("You are the advisor" in messages[0]["content"] or "You are the orchestrator" in messages[0]["content"]):
+    if messages[0]["role"] == "system" and ("You are the advisor" in messages[0]["content"] or "You are the orchestrator" in messages[0]["content"] or "of a Corbie Nest (corbienest) workflow" in messages[0]["content"]):
         # the advisor: one toolless call that is shown the conversation. Keywords sit in the
         # transcript it is handed (the user's request is quoted in it).
         brief = messages[-1]["content"]
@@ -293,6 +301,7 @@ def script(model, messages, req):
                 yield chunk(model, w); time.sleep(0.5)
             yield chunk(model, done=True)
             return
+        if "SLOWCHECK" in brief and "# REVIEW the change" in brief: time.sleep(8)   # a workflow's reviewer that takes its time: a test presses Esc meanwhile
         yield chunk(model, advisor_text(brief))
         # a prompt of 30k tokens: were it taken for the conversation's, a 32k window would look 91% full
         yield chunk(model, done=True, prompt_tokens=30_000)
@@ -488,6 +497,19 @@ def script(model, messages, req):
         yield chunk(model, tool_calls=[{"function": {"name": "todo_write", "arguments": {"todos": [
             {"content": "read the code", "status": "completed"}, {"content": "make the change", "status": "in_progress"},
             {"content": "run the tests", "status": "pending"}]}}}])
+        yield chunk(model, done=True)
+        return
+    if "You are QA for a change" in text:   # a workflow's QA worker: QAFAIL makes its first run fail
+        yield chunk(model, "Ran the build and the tests.\n" + ("VERDICT: FAIL the empty input crashes" if "QAFAIL" in text and "This is run" not in text else "VERDICT: PASS"))
+        yield chunk(model, done=True)
+        return
+    if "Write the tests for the change" in text:
+        yield chunk(model, "Wrote the tests.")
+        yield chunk(model, done=True)
+        return
+    if "A check of the workflow" in text:   # a fix: it writes a file, so QA has to run again
+        who = re.search(r"check of the workflow — (\S+) —", text)
+        yield chunk(model, tool_calls=[{"function": {"name": "write_file", "arguments": {"path": "made.txt", "content": "fixed by fake for " + (who.group(1) if who else "a check") + "\n"}}}])
         yield chunk(model, done=True)
         return
     if "TOOL_WRITE" in text:

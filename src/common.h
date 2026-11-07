@@ -873,13 +873,30 @@ typedef struct {
     char *role;       /* "ROLE: name" of the plan: the skill that does this task (malloc'd; NULL = the default worker) */
     char **owns; int nowns;   /* "OWNS: a, b": the paths it may write, literal files or directory prefixes (malloc'd) */
     int layer;         /* /plan: "LAYER: n" of the plan, at least 1 and never lower than the task before (1 when the plan says none) */
+    int kind;          /* ORCH_KIND_*: 0 is a task of the plan; the others are added by a workflow's stages (tests, QA, a fix) and are not reviewed by the planner */
+    int slot;          /* ORCH_KIND_FIX only: the workflow slot (WF_*) of the check that sent it back, whose role reviews the fix */
 } orch_task;
+enum { ORCH_KIND_TASK = 0, ORCH_KIND_TESTS, ORCH_KIND_QA, ORCH_KIND_FIX };
 #define ORCH_OWNS_MAX 16
 int  orch_parse_plan(const char *text, orch_task **tasks);
 bool owns_overlap_one(const char *a, const char *b);   /* two OWNS: paths name the same file, or one holds the other */
 bool owns_overlap(char **a, int na, char **b, int nb); /* any path of one list overlaps any path of the other */
 int  orch_parse_plan_ex(const char *text, orch_task **tasks, char **contract);   /* contract: the "CONTRACT:" block before the first task, malloc'd or NULL */
 void orch_tasks_free(orch_task *t, int n);
+
+/* ---------- /orchestrate: the workflow ----------
+ * A project (or a user) may say who plays which part of a run. The file is `.agents/workflow.md` (or `~/.agents/workflow.md`;
+ * `.agents/workflows/NAME.md` for `-w NAME`): one line per slot, `slot: skill` — the skill is the role (its instructions and its
+ * `model:`) — or `slot: default` for the built-in instructions, and `slot: skill on MODEL` / `default on MODEL` to give the model.
+ * A slot left out is skipped, except the owner (the advisor, as without a workflow) and the coder (the default worker). */
+enum { WF_OWNER, WF_CODER, WF_TESTS, WF_QA, WF_CODE_REVIEW, WF_PRODUCT_REVIEW, WF_UX_REVIEW, WF_SLOTS };
+typedef struct { bool set; char *skill; char *model; } wf_slot;   /* skill NULL: the built-in instructions; model NULL: the role's, or the default */
+typedef struct { wf_slot slot[WF_SLOTS]; char unknown[200]; } workflow;
+const char *workflow_slot_name(int slot);   /* "owner", "coder", "tests", "qa", "code-review", "product-review", "ux-review" */
+int   workflow_parse(const char *text, workflow *wf);   /* the slots it sets; the names it did not understand are in wf->unknown, comma separated */
+void  workflow_free(workflow *wf);
+char *workflow_find(const char *name);   /* the file for `-w NAME` (NULL: the default one): project before user; malloc'd path or NULL */
+int   qa_verdict(const char *report, char *why, size_t n);   /* the last "VERDICT: PASS" / "VERDICT: FAIL why" line of a report: 1, 0, or -1 when there is none */
 
 /* ---------- /goal: the pure half ----------
  * `/goal "METRIC" [min|max] [-n ROUNDS] [-k CANDIDATES] TASK`. The metric is a shell command whose
