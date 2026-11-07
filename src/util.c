@@ -121,6 +121,13 @@ int write_whole_file_atomic(const char *path, const char *data, size_t len) {
     int bad = fsync(fd) != 0;
     if (close(fd) != 0) bad = 1;       /* closed whatever fsync said: a failed save must not leak the descriptor */
     if (bad || rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    /* the rename is a change of the directory: until that is on disk too, a system crash or power cut can bring back the old
+     * name (or none, for a new file) although the data is safe. Best effort: a filesystem that cannot sync a directory is no failure. */
+    char dir[1400]; snprintf(dir, sizeof dir, "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash == dir) dir[1] = 0; else if (slash) *slash = 0; else snprintf(dir, sizeof dir, ".");
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0) { (void)fsync(dfd); close(dfd); }
     return 0;
 }
 
