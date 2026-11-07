@@ -2122,6 +2122,30 @@ static void test_workflow(void) {
     CHECK(qa_verdict("**VERDICT:** FAIL - no tests ran", why, sizeof why) == 0 && !strcmp(why, "no tests ran"));
     CHECK(qa_verdict("VERDICT: FAIL x\nfixed it\nVERDICT: PASS", why, sizeof why) == 1);
     CHECK(qa_verdict("looks fine to me", why, sizeof why) == -1 && qa_verdict(NULL, NULL, 0) == -1);
+    /* the example workflows of DOCUMENTATION.md parse as the document says (skipped when run away from the checkout) */
+    size_t en; char *ex = read_whole_file("docs/examples/orchestrate/simple/workflow.md", &en, 8192);
+    if (ex) {
+        CHECK(workflow_parse(ex, &wf) == 4 && wf.unknown[0] == 0 && !wf.slot[WF_TESTS].set && !wf.slot[WF_UX_REVIEW].set);
+        CHECK(wf.slot[WF_QA].set && wf.slot[WF_QA].skill == NULL && !strcmp(wf.slot[WF_QA].model, "anthropic:claude-haiku-5") && wf.slot[WF_CODE_REVIEW].model == NULL);
+        workflow_free(&wf); free(ex);
+    }
+    ex = read_whole_file("docs/examples/orchestrate/advanced/workflow.md", &en, 8192);
+    if (ex) {
+        CHECK(workflow_parse(ex, &wf) == WF_SLOTS && wf.unknown[0] == 0);
+        CHECK(!strcmp(wf.slot[WF_OWNER].model, "anthropic:claude-opus-5-5") && wf.slot[WF_CODER].skill == NULL && !strcmp(wf.slot[WF_TESTS].skill, "wf-tests") && wf.slot[WF_TESTS].model == NULL);
+        CHECK(!strcmp(wf.slot[WF_CODE_REVIEW].skill, "wf-code-review") && !strcmp(wf.slot[WF_CODE_REVIEW].model, "anthropic:claude-opus-5-5") && !strcmp(wf.slot[WF_UX_REVIEW].skill, "wf-ux-review"));
+        /* every skill it names is shipped, with the model: line the table says */
+        static const struct { const char *skill, *model; } SK[] = { { "wf-tests", "anthropic:claude-haiku-5" }, { "wf-qa", "anthropic:claude-haiku-5" }, { "wf-code-review", NULL },
+                                                                    { "wf-product-review", "anthropic:claude-haiku-5" }, { "wf-ux-review", "anthropic:claude-sonnet-5-5" } };
+        for (size_t k = 0; k < sizeof SK / sizeof *SK; k++) {
+            char path[200], want[80]; snprintf(path, sizeof path, "docs/examples/orchestrate/advanced/skills/%s/SKILL.md", SK[k].skill);
+            size_t sn; char *sd = read_whole_file(path, &sn, 8192);
+            snprintf(want, sizeof want, "\nmodel: %s\n", SK[k].model ? SK[k].model : "");
+            CHECK(sd && strstr(sd, "\nname: ") && (SK[k].model ? strstr(sd, want) != NULL : strstr(sd, "\nmodel:") == NULL));
+            free(sd);
+        }
+        workflow_free(&wf); free(ex);
+    }
 }
 
 /* base64 (RFC 4648 test vectors, and bytes that are not text) */
