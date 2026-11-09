@@ -728,6 +728,11 @@ the current directory, `--resume` opens a picker (or `--resume ID`), and `/resum
 from inside a session. The recap is followed by the conversation as it was: the last 200 messages, what you typed, the replies, and each tool result folded as it is live. The lines you typed go into the ↑ history (the ones already there are not added again). A one-shot run (`-p`) prints none of this and leaves the history alone. A session saved before this change has no record of what was typed, so every user message is shown and nothing goes into the history. `/clear` starts a
 new session; `/status` shows the current id, which is also printed when you quit.
 
+What you were shown that is not a message of the conversation is kept too, and shown again where it happened:
+a model call that failed (the API credit is used up, a key is refused, the server could not be reached), a reply
+that was empty twice, a request the loop guard stopped. They are saved as `notices` in the session file, never
+sent to the model, and dropped with the messages they stood between by `/rewind` and `/compact`.
+
 ## Suggested next message
 
 When a reply finishes and the prompt sits idle for a moment, the working model is asked for the

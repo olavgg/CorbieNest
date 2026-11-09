@@ -931,9 +931,37 @@ static void typed_note(const char *raw, const char *msg) {
     g_typed[g_typed_n].raw = xstrdup(raw ? raw : ""); g_typed[g_typed_n].msg = xstrdup(msg ? msg : "");
     g_typed_n++;
 }
+/* What the user was shown that is not part of the conversation: a model call that failed (the API credit is used up, the key is
+ * refused, the server cannot be reached), a request that a guard stopped. The model never sees these, and a session that kept only
+ * its messages lost them, so /resume showed a conversation that ended for no visible reason. They are kept with the session and
+ * replayed where they happened: `at` is the number of messages there were then, so a notice comes before the message of that index. */
+typedef struct { int at; bool warn; char *text; } notice_t;
+#define NOTICES_MAX 200
+#define NOTICE_LEN 1024
+static notice_t *g_notices; static int g_notices_n, g_notices_cap;
+static void notices_clear(void) {
+    for (int i = 0; i < g_notices_n; i++) free(g_notices[i].text);
+    g_notices_n = 0;
+}
+static void notice_put(int at, bool warn, const char *text) {
+    if (!text || !*text) return;
+    for (int i = g_notices_n - 1; i >= 0 && g_notices[i].at == at; i--)   /* a retry that fails the same way is one notice */
+        if (!strcmp(g_notices[i].text, text)) return;
+    if (g_notices_n == NOTICES_MAX) { free(g_notices[0].text); memmove(g_notices, g_notices + 1, sizeof *g_notices * (size_t)(NOTICES_MAX - 1)); g_notices_n--; }
+    if (g_notices_n == g_notices_cap) { g_notices_cap = g_notices_cap ? g_notices_cap * 2 : 8; g_notices = xrealloc(g_notices, sizeof *g_notices * (size_t)g_notices_cap); }
+    char *t = xstrndup(text, strnlen(text, NOTICE_LEN)); char *u = utf8_fix(t); free(t);   /* (a cut can end inside a character, and the file must be JSON) */
+    g_notices[g_notices_n++] = (notice_t){ at, warn, u };
+}
+static void notice_add(bool warn, const char *text) { if (g_messages) notice_put(cJSON_GetArraySize(g_messages), warn, text); }   /* now: after the messages there are */
+static void notices_trim(int n) {   /* the conversation was cut back to n messages (/rewind): what came after is gone with it */
+    int k = 0;
+    for (int i = 0; i < g_notices_n; i++) { if (g_notices[i].at > n) free(g_notices[i].text); else g_notices[k++] = g_notices[i]; }
+    g_notices_n = k;
+}
 static void typed_clear(void) {
     for (int i = 0; i < g_typed_n; i++) { free(g_typed[i].raw); free(g_typed[i].msg); }
     g_typed_n = 0; g_typed_known = true;
+    notices_clear();   /* (every place that starts a conversation over clears the typed lines; the notices belong to the same conversation) */
 }
 
 static void session_save(void) {
@@ -963,6 +991,15 @@ static void session_save(void) {
         cJSON *t = cJSON_CreateObject();
         cJSON_AddStringToObject(t, "raw", g_typed[i].raw); cJSON_AddStringToObject(t, "msg", g_typed[i].msg);
         cJSON_AddItemToArray(ty, t);
+    }
+    notices_trim(cJSON_GetArraySize(g_messages));
+    if (g_notices_n) {   /* see notice_add() */
+        cJSON *no = cJSON_AddArrayToObject(o, "notices");
+        for (int i = 0; i < g_notices_n; i++) {
+            cJSON *t = cJSON_CreateObject();
+            cJSON_AddNumberToObject(t, "at", g_notices[i].at); cJSON_AddStringToObject(t, "kind", g_notices[i].warn ? "warn" : "error"); cJSON_AddStringToObject(t, "text", g_notices[i].text);
+            cJSON_AddItemToArray(no, t);
+        }
     }
     if (tools_todos_get()) cJSON_AddItemReferenceToObject(o, "todos", tools_todos_get());   /* the task list, if the model kept one */
     if (g_think_fp) cJSON_AddStringToObject(o, "think_prefix", g_think_fp);   /* what the saved thinking blocks were signed against */
@@ -1020,11 +1057,18 @@ static void sessions_free(session_info *v, int n) { for (int i = 0; i < n; i++) 
  * in the model's history all the same. A user message is shown only when it is one the user typed (typed_note()),
  * unless the session has no such record. */
 #define REPLAY_MAX 200
+static void replay_notices(int at) {   /* what the user was shown at this point that the conversation does not hold (notice_add()) */
+    for (int i = 0; i < g_notices_n; i++) {
+        if (g_notices[i].at != at) continue;
+        printf("%s%s %s" C_RESET "\n", g_notices[i].warn ? C_YELLOW : C_RED, g_notices[i].warn ? "⚠" : "✗", g_notices[i].text);
+    }
+}
 static void replay_conversation(void) {
     int n = cJSON_GetArraySize(g_messages), from = n > REPLAY_MAX ? n - REPLAY_MAX : 0;
     if (from) printf(C_DIM "  … %d earlier message%s not shown" C_RESET "\n", from, from == 1 ? "" : "s");
     int tp = 0;   /* the typed entries are in the order they were sent: a user message is looked for from the last one found */
     for (int i = from; i < n; i++) {
+        replay_notices(i);
         cJSON *m = cJSON_GetArrayItem(g_messages, i);
         cJSON *r = cJSON_GetObjectItemCaseSensitive(m, "role"), *c = cJSON_GetObjectItemCaseSensitive(m, "content");
         const char *role = cJSON_IsString(r) ? r->valuestring : "", *text = cJSON_IsString(c) ? c->valuestring : NULL;
@@ -1065,7 +1109,8 @@ static void replay_conversation(void) {
             else print_result_folded(text ? text : "", (!strcmp(name, "read_file") || !strcmp(name, "web_fetch")) ? 3 : 8, NULL);
         }
     }
-    if (n > from) printf(C_DIM "  — end of the earlier conversation —" C_RESET "\n");
+    replay_notices(n);
+    if (n > from || g_notices_n) printf(C_DIM "  — end of the earlier conversation —" C_RESET "\n");
 }
 
 /* Load a session into g_messages; returns false if not found / unreadable. */
@@ -1089,6 +1134,14 @@ static bool session_load(const char *id) {
     cJSON *ty = cJSON_GetObjectItemCaseSensitive(o, "typed");
     g_typed_known = cJSON_IsArray(ty);
     if (g_typed_known) { cJSON *t; cJSON_ArrayForEach(t, ty) { cJSON *r = cJSON_GetObjectItemCaseSensitive(t, "raw"), *mm = cJSON_GetObjectItemCaseSensitive(t, "msg"); if (cJSON_IsString(r) && cJSON_IsString(mm)) typed_note(r->valuestring, mm->valuestring); } }
+    {   /* typed_clear() emptied the notices above: these are the session's */
+        cJSON *no = cJSON_GetObjectItemCaseSensitive(o, "notices"), *t; int nm = cJSON_GetArraySize(g_messages);
+        cJSON_ArrayForEach(t, no) {
+            cJSON *at = cJSON_GetObjectItemCaseSensitive(t, "at"), *kd = cJSON_GetObjectItemCaseSensitive(t, "kind"), *tx = cJSON_GetObjectItemCaseSensitive(t, "text");
+            if (!cJSON_IsNumber(at) || !cJSON_IsString(tx) || at->valueint < 0 || at->valueint > nm) continue;
+            notice_put(at->valueint, cJSON_IsString(kd) && !strcmp(kd->valuestring, "warn"), tx->valuestring);
+        }
+    }
     tools_reset_permissions(); tools_checkpoint_clear();
     snprintf(g_session_id, sizeof g_session_id, "%s", id);
     cJSON *pt = cJSON_GetObjectItemCaseSensitive(o, "prompt_tokens"), *et = cJSON_GetObjectItemCaseSensitive(o, "eval_tokens");
@@ -1363,6 +1416,7 @@ static int cmd_rewind(void) {
                 cJSON *c = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(g_messages, at), "content");
                 char *text = cJSON_IsString(c) ? xstrdup(c->valuestring) : NULL;
                 while (cJSON_GetArraySize(g_messages) > at) cJSON_DeleteItemFromArray(g_messages, cJSON_GetArraySize(g_messages) - 1);
+                notices_trim(at);
                 g_session.last_prompt_tokens = 0;
                 if (text && !strchr(text, '<')) term_editor_prefill(text);   /* (skip prompts with attached files/skills) */
                 free(text);
@@ -3700,6 +3754,7 @@ static bool run_turn_body(void) {
         cJSON *last = n ? cJSON_GetArrayItem(g_messages, (int)n - 1) : NULL;
         cJSON *role = last ? cJSON_GetObjectItemCaseSensitive(last, "role") : NULL;
         if (role && cJSON_IsString(role) && !strcmp(role->valuestring, "user")) cJSON_DeleteItemFromArray(g_messages, (int)n - 1);
+        notice_add(true, g_model_err);
         return false;
     }
     int iters = 0, shrinks = 0, empties = 0, think_retries = 0;
@@ -3743,7 +3798,9 @@ static bool run_turn_body(void) {
                 drop_edited_thinking(g_messages, first);
                 if (n || compact_conversation(true, pending_request())) { round_first = -1; continue; }
             }
-            /* On failure, keep the conversation as is; the user can retry. */
+            /* On failure, keep the conversation as is; the user can retry. What the user was told (the API credit is used up, a key
+             * that is refused) is kept with the session, so that /resume shows why the conversation stops here. */
+            if (!aborted) notice_add(false, ollama_error);
             g_turn_failed = !aborted;
             return aborted;
         }
@@ -3767,6 +3824,7 @@ static bool run_turn_body(void) {
                     continue;
                 }
                 printf(C_YELLOW "⚠ empty reply again — stopping here" C_RESET "\n");
+                notice_add(true, "empty reply again — stopping here: the model generated neither text nor a tool call, and nothing was added to the conversation");
                 g_turn_failed = true;
                 printf(C_DIM "  nothing was added to the conversation; send another message to continue, or /model to try a different one" C_RESET "\n");
                 return false;
@@ -3790,6 +3848,7 @@ static bool run_turn_body(void) {
                 /* the reply that asked for these calls is already in the conversation: answer them, or the next request is refused */
                 answer_calls_unrun(calls, "not run: this request reached its tool-round limit (/max_iters) before the call ran. "
                                           "The user's next message follows; call the tool again if it is still needed.");
+                { char nt[160]; snprintf(nt, sizeof nt, "stopped after %d tool rounds (loop guard: the model was asked %d times to review its progress and is still going)", total_rounds - 1, LOOP_GUARD_CHECKS); notice_add(true, nt); }
                 return false;
             }
             printf(C_YELLOW "⚠ %d tool rounds so far (loop guard): asking the model to review its progress; the work goes on" C_RESET "\n", total_rounds - 1);
@@ -5922,6 +5981,7 @@ static bool compact_conversation(bool resuming, const char *request) {
         return false;
     }
     cJSON_Delete(g_messages); g_messages = cJSON_CreateArray(); g_prev_request_first = -1;
+    notices_clear();   /* the messages they stood between are gone: a summary is one message */
     sbuf b; sb_init(&b);
     sb_printf(&b, "This conversation was compacted. Summary of the previous conversation:\n\n%s\n\nContinue from here.", summary);
     if (resuming) {

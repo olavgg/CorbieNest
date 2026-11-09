@@ -3260,6 +3260,27 @@ check(seen(sess, "hello replay", 8), "the ↑ key recalls the typed line from th
 sess.close()
 shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
 
+print("test feature: a failed model call (an API credit used up, a refused key) is kept with the session and shown again on /resume")
+cfg, proj, env = feat("resume_err")
+out, err, rc = in_proj(proj, ["-p", "hello before"], env)
+out, err, rc = in_proj(proj, ["-p", "ERROR after"], env)
+check(rc == 1 and "boom from fake" in out, f"the failed call is printed, and -p exits 1: {rc} {out[-200:]!r}")
+files = _glob.glob(os.path.join(cfg, "corbienest", "sessions", "*.json"))
+saved = {f: json.load(open(f)) for f in files}
+errs = {f: d for f, d in saved.items() if any(m.get("content") == "ERROR after" for m in d["messages"] if m["role"] == "user")}
+fd = next(iter(errs.values()), {})
+check(len(errs) == 1 and fd.get("notices") == [{"at": 1, "kind": "error", "text": "boom from fake"}], f"the session file holds it, apart from the messages: {fd.get('notices')!r}")
+check(errs and all("boom from fake" not in str(m.get("content")) for m in fd["messages"]), "and the model never sees it: it is not a message")
+sid = os.path.basename(next(iter(errs)))[:-5] if errs else ""
+sess = Session(["--resume", sid], cwd=proj, env=env)
+check(sess.expect("› ERROR after") and sess.expect("✗ boom from fake"), f"a resumed session shows the error where it happened: {since_send(sess)[-300:]!r}")
+check(sess.expect("end of the earlier conversation"), "before the end of the replay")
+sess.send("hello again\r"); check(sess.expect("Echo: hello again"), "and the conversation goes on from it")
+sess.send("\x04"); sess.close()
+saved = json.load(open(os.path.join(cfg, "corbienest", "sessions", sid + ".json")))
+check(saved.get("notices") == [{"at": 1, "kind": "error", "text": "boom from fake"}], f"a later save keeps it where it was: {saved.get('notices')!r}")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
 print("test feature: the slash commands for the rules, hooks, MCP servers, agents and the sandbox answer")
 cfg, proj, env = feat("slash")
 sess = Session([], cwd=proj, env=env)
