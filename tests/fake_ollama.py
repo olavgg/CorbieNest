@@ -167,9 +167,23 @@ def _stale_thinking(msgs):
                 edited = True
     return False
 
+def _pause_subagent(req):
+    """A sub-agent of a /effort parallel batch on the Messages API: its system prompt says so, and its task starts "PAUSE name: ..." """
+    system = req.get("system")
+    sys_text = system if isinstance(system, str) else _flat(system)
+    if "You are a sub-agent" not in sys_text: return None
+    for m in req.get("messages") or []:
+        t = _typed(m)
+        if t and t.startswith("PAUSE"): return t.split(":")[0][:40]
+    return None
+
 def _turn_blocks(req):
     """The same keywords as script(), as Messages content blocks. A tool_result is answered
     before the keyword that produced the call is seen again, or the model never stops."""
+    sub = _pause_subagent(req)
+    if sub:   # one grep round, then a report that names the task, as the local script does
+        if _tool_results(req): return [{"type": "text", "text": "REPORT " + sub}], "end_turn"
+        return [{"type": "tool_use", "id": "toolu_sub_" + sub.split()[-1], "name": "grep", "input": {"pattern": "needle", "path": "."}}], "tool_use"
     typed = [t for t in (_typed(m) for m in (req.get("messages") or [])) if t is not None]   # what the user typed (a merged turn's text only)
     real = [t for t in typed if not t.startswith("[loop guard]")]   # the loop guard's own notes are not what the user asked
     if real and "TOOL_LOOP" in real[-1]:  # the user's own message asks for it: a call every time, until the loop guard stops it
@@ -188,6 +202,9 @@ def _turn_blocks(req):
         return [{"type": "text", "text": "Live ok"}], "end_turn"
     if typed and "TOOL_BINARY" in typed[-1] and not results:   # a command whose output is not UTF-8 (a binary file, a cut)
         return [{"type": "tool_use", "id": "toolu_bin", "name": "bash", "input": {"command": "printf 'bad \\377 byte'"}}], "tool_use"
+    if typed and "TOOL_TASKS" in typed[-1] and not results:   # two task calls in one reply: /effort parallel on runs them at the same time
+        return [{"type": "tool_use", "id": "toolu_task_a", "name": "task", "input": {"description": "alpha", "prompt": "PAUSE alpha: find the needle"}},
+                {"type": "tool_use", "id": "toolu_task_b", "name": "task", "input": {"description": "beta", "prompt": "PAUSE beta: find the needle"}}], "tool_use"
     if results:
         line = results[-1].strip().splitlines()[0][:60] if results[-1].strip() else ""
         return [{"type": "text", "text": "Tool said: " + line}], "end_turn"
@@ -682,6 +699,12 @@ class H(BaseHTTPRequestHandler):
             return self._json(200, {"type": "message", "role": "assistant", "model": model, "content": blocks,
                                     "stop_reason": "max_tokens" if "CUTADVICE" in brief else "end_turn", "usage": usage})
         blocks, stop = _turn_blocks(req)
+        if _pause_subagent(req) and req.get("stream") is not True:
+            with INFLIGHT_LOCK:   # as the local sub-agents of a batch: slow enough that two calls are under way together (/_inflight counts them)
+                INFLIGHT["now"] += 1; INFLIGHT["max"] = max(INFLIGHT["max"], INFLIGHT["now"])
+            try: time.sleep(1.2)
+            finally:
+                with INFLIGHT_LOCK: INFLIGHT["now"] -= 1
         for b in blocks:   # the signature is bound to the system prompt of this request
             if b.get("type") == "thinking" and b.get("signature"): SIG_SYSTEM[b["signature"]] = _system_key(req)
         cu = _cache_usage(req)

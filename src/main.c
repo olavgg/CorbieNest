@@ -1580,6 +1580,7 @@ static void load_project_instructions(void) {
 }
 
 static bool parallel_runs_here(void);
+static bool batch_can_call(const char *name);
 static char *build_system_prompt(void) {
     sbuf b; sb_init(&b);
     struct utsname u; uname(&u);
@@ -2731,7 +2732,9 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
  * main thread does everything else — it starts the calls, runs their tools (subagent_calls, quiet), reads the
  * answers and keeps the strip's rows. Nothing else prints while the batch runs; each report is printed when
  * the batch ends, in the order the model asked, and every call gets its result. Up to g_cfg.workers run at
- * once. A reply that mixes tools, or names a remote model, runs one sub-agent after another (run_subagent). */
+ * once. The model may be a local one (Ollama's /api/chat) or an Anthropic one (a non-streamed Messages call, as
+ * the workers of /goal make; not gzipped, so a refused body has no restart to keep). A reply that mixes tools,
+ * or whose calls are on different models, runs one sub-agent after another (run_subagent). */
 enum { SR_WAITING, SR_RUNNING, SR_DONE };
 typedef struct {
     int state;
@@ -2741,6 +2744,7 @@ typedef struct {
     subagent_rec *rec;      /* its row in the strip and its log */
     const agent_t *ag;
     const char *sm;         /* the model its calls go to (NULL: the main model) */
+    const provider_def *prov;   /* the hosted provider of that model (a Messages call), NULL for Ollama */
     cJSON *msgs, *tools;
     size_t sp_bytes;
     int iter, tool_rounds, round_first;
@@ -2764,13 +2768,19 @@ static const char *batch_model_of(const agent_t *ag) {
     const char *model = ag ? agent_model_override(ag) : NULL;
     return model ? (model_same(model, g_cfg.model) ? NULL : model) : subagent_model();
 }
-/* whether /effort parallel is on and a batch can run on the model the sub-agents use (a local one): what the system prompt tells the model */
+/* whether /effort parallel is on and a batch can run on the model the sub-agents use: what the system prompt tells the model */
 static bool parallel_runs_here(void) {
     if (!g_cfg.parallel_tasks) return false;
-    const char *sm = batch_model_of(NULL), *name = sm ? sm : g_cfg.model;
-    return name && *name && provider_find(name, NULL) == NULL;
+    const char *sm = batch_model_of(NULL);
+    return batch_can_call(sm ? sm : g_cfg.model);
 }
-/* whether a reply's calls can run as one batch: all task calls, at least two, all on the same local model */
+/* whether a model can be called by a batch: one of Ollama's, or a provider's that speaks Messages (what model_chat accepts too) */
+static bool batch_can_call(const char *name) {
+    if (!name || !*name) return false;
+    const provider_def *p = provider_find(name, NULL);
+    return !p || p->style == PROVIDER_MESSAGES;
+}
+/* whether a reply's calls can run as one batch: all task calls, at least two, all on the same model */
 static bool tasks_batchable(cJSON *calls) {
     if (!g_cfg.parallel_tasks || cJSON_GetArraySize(calls) < 2) return false;
     const char *first_sm = NULL; bool first = true;
@@ -2783,9 +2793,9 @@ static bool tasks_batchable(cJSON *calls) {
         const agent_t *ag = an && *an ? agent_find(an) : NULL;
         const char *sm = batch_model_of(ag);
         const char *name = sm ? sm : g_cfg.model;
-        bool remote = !name || !*name || provider_find(name, NULL) != NULL;
+        bool usable = batch_can_call(name);
         if (parsed) cJSON_Delete(parsed);
-        if (remote) return false;
+        if (!usable) return false;
         if (first) { first_sm = sm; first = false; } else if (!same_model(first_sm, sm)) return false;
     }
     return true;
@@ -2801,12 +2811,21 @@ static bool sub_run_start(sub_run *r) {
     }
     if (r->sm) { ollama_call.model = r->sm; ollama_call.info = &g_subagent_info; }
     ollama_call.followup = r->iter > 0;
-    char *body = ollama_chat_request(r->msgs, g_model_tools ? r->tools : NULL);
+    char *body, why[512] = "";
+    if (r->prov) {   /* a hosted model: the headers are built here (the thread reads no environment), the body is not gzipped */
+        const char *hdrs[4]; sbuf keep; bool gz;
+        body = provider_turn_request(r->msgs, r->tools);   /* reads ollama_call (the model, its info, followup): set again on every round */
+        bool ok = body && provider_call_headers(r->sm ? r->sm : g_cfg.model, hdrs, &keep, why, sizeof why);
+        r->job = ok ? provider_turn_start(r->prov, body, hdrs, false, &gz) : NULL;
+        if (ok) sb_free(&keep);
+    } else {
+        body = ollama_chat_request(r->msgs, g_model_tools ? r->tools : NULL);
+        r->job = body ? http_job_start(g_cfg.host, "/api/chat", body, NULL) : NULL;
+    }
     ollama_call_reset();
-    r->job = body ? http_job_start(g_cfg.host, "/api/chat", body, NULL) : NULL;
     free(body);
     if (!r->job) {
-        sb_puts(&r->out, "error: sub-agent model call could not be started");
+        sb_printf(&r->out, "error: sub-agent model call could not be started%s%s", why[0] ? ": " : "", why);
         r->rc = 1; r->state = SR_DONE;
         if (r->rec) r->rec->state = AG_FAILED;
         return false;
@@ -2824,7 +2843,8 @@ static void sub_run_collect(sub_run *r) {
     const char *model = r->sm ? r->sm : g_cfg.model;
     ratelimit_set(model, &res.rl);
     chat_stats st; char err[512] = "";
-    cJSON *reply = rc == 0 ? ollama_chat_reply(body.data, res.status, true, &st, err, sizeof err) : NULL;
+    cJSON *reply = rc != 0 ? NULL : r->prov ? provider_turn_reply(model, body.data, res.status, &st, err, sizeof err)
+                                            : ollama_chat_reply(body.data, res.status, true, &st, err, sizeof err);
     if (rc != 0) snprintf(err, sizeof err, "%s", res.err);
     sb_free(&body);
     if (!reply) {
@@ -2880,6 +2900,7 @@ static bool tasks_batch(cJSON *calls, bool *failed) {
         if (subagent_resolve(an, &r->ag, &r->out)) { r->rc = 1; r->state = SR_DONE; }
         else {
             r->sm = batch_model_of(r->ag);
+            r->prov = provider_find(r->sm ? r->sm : g_cfg.model, NULL);
             if (r->ag) printf("  " C_CYAN "⤷ sub-agent %s" C_RESET " " C_BOLD "%s" C_RESET "\n", r->ag->name, r->desc);
             else printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", r->desc);
             r->rec = agent_begin(r->desc, r->sm, r->ag ? r->ag->name : NULL);
