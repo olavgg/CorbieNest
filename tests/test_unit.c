@@ -1598,6 +1598,17 @@ static void test_advisor(void) {
     for (int i = 1; i < GUIDANCE_COUNT; i++) CHECK(ADVISOR_GUIDANCE[i].uses > ADVISOR_GUIDANCE[i - 1].uses && ADVISOR_GUIDANCE[i].words > ADVISOR_GUIDANCE[i - 1].words);
     g_cfg.advisor_guidance = old_guid;
 
+    {   /* the task tool's description tells the model about parallel sub-agents only while /effort parallel is on */
+        bool old_par = g_cfg.parallel_tasks;
+        g_cfg.parallel_tasks = false;
+        cJSON *d = tools_definitions(); char *j = cJSON_PrintUnformatted(d);
+        CHECK(strstr(j, "\"name\":\"task\"") && !strstr(j, "Parallel sub-agents are on")); free(j); cJSON_Delete(d);
+        g_cfg.parallel_tasks = true;
+        d = tools_definitions(); j = cJSON_PrintUnformatted(d);
+        CHECK(strstr(j, "Parallel sub-agents are on") && strstr(j, "in ONE reply")); free(j); cJSON_Delete(d);
+        g_cfg.parallel_tasks = old_par;
+    }
+
     /* the tool is on offer only while an advisor is set, and says so when called without one */
     char *old_adv = g_cfg.advisor;
     g_cfg.advisor = NULL;

@@ -1579,6 +1579,7 @@ static void load_project_instructions(void) {
     }
 }
 
+static bool parallel_runs_here(void);
 static char *build_system_prompt(void) {
     sbuf b; sb_init(&b);
     struct utsname u; uname(&u);
@@ -1618,6 +1619,12 @@ static char *build_system_prompt(void) {
             "- For work of three or more steps, keep a task list with todo_write: one task per step, at most one in_progress, and mark each completed as you finish it. Skip it for a single change or a question.\n"
             "- Use task to hand a broad, self-contained investigation (\"find all places that…\", \"how does X work across the code\") to a read-only sub-agent "
             "and get back a report, keeping the noise out of this conversation; give it a complete prompt, it knows nothing of this chat.\n");
+        if (parallel_runs_here()) sb_puts(&b,
+            "- Parallel sub-agents are on: the task calls of one reply run at the same time, so a broad investigation goes faster as several. "
+            "Split it into independent questions (one area of the code, one subsystem, one hypothesis each), give each its own complete prompt, "
+            "and send all the task calls in ONE reply with no other tool call beside them: a reply that mixes in another tool runs its sub-agents one after another. "
+            "Do not split what depends on an earlier answer, and do not start a second sub-agent on the same question. "
+            "Sub-agents only read; make the changes yourself once their reports are in.\n");
         if (g_cfg.advisor) {   /* no model name in it: changing the advisor leaves the prompt, and its cache, alone (the guidance does not) */
             const advisor_guidance_def *g = advisor_guidance();
             sb_puts(&b, "- advisor is a stronger but much slower model that is shown this whole conversation and tells you how to proceed. ");
@@ -2756,6 +2763,12 @@ static const char *arg_str(cJSON *args, const char *key) {
 static const char *batch_model_of(const agent_t *ag) {
     const char *model = ag ? agent_model_override(ag) : NULL;
     return model ? (model_same(model, g_cfg.model) ? NULL : model) : subagent_model();
+}
+/* whether /effort parallel is on and a batch can run on the model the sub-agents use (a local one): what the system prompt tells the model */
+static bool parallel_runs_here(void) {
+    if (!g_cfg.parallel_tasks) return false;
+    const char *sm = batch_model_of(NULL), *name = sm ? sm : g_cfg.model;
+    return name && *name && provider_find(name, NULL) == NULL;
 }
 /* whether a reply's calls can run as one batch: all task calls, at least two, all on the same local model */
 static bool tasks_batchable(cJSON *calls) {
@@ -5758,7 +5771,9 @@ static void effort_parallel(const char *v) {
     if (!*v) printf("parallel: %s" C_DIM " — the task calls of one reply run as sub-agents at the same time%s" C_RESET "\n",
                     g_cfg.parallel_tasks ? "on" : "off", g_cfg.parallel_tasks ? "" : " (off: one after another; /effort parallel on to change it)");
     else if (!strcmp(v, "on") || !strcmp(v, "off")) {
-        g_cfg.parallel_tasks = !strcmp(v, "on"); config_save();
+        bool want = !strcmp(v, "on");
+        if (want != g_cfg.parallel_tasks) { g_cfg.parallel_tasks = want; tools_rebuild(); }   /* the task tool's description says so */
+        config_save();
         printf(C_GREEN "✓ parallel = %s" C_RESET C_DIM "%s" C_RESET "\n", v,
                g_cfg.parallel_tasks ? " — the task calls of one reply run together; each sub-agent is in the strip while it runs" : " — one sub-agent after another");
     } else printf("usage: /effort parallel on|off\n");
