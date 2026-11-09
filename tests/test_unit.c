@@ -1,5 +1,6 @@
 /* Unit tests for corbienest internals. Build & run with `make test`. */
 #define _GNU_SOURCE
+#include <math.h>
 #include "../src/common.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -2074,6 +2075,89 @@ static void test_orchestrate(void) {
     char last[32]; snprintf(last, sizeof last, "do %d", ORCH_MAX_TASKS);
     CHECK(n == ORCH_MAX_TASKS); CHECK_STR(t[n - 1].body, last);   /* no more than that, and the last one kept whole */
     orch_tasks_free(t, n); sb_free(&many);
+    n = orch_parse_plan("TASK 1: a\ndo a\n", &t);
+    CHECK(n == 1 && t[0].kind == ORCH_KIND_TASK);   /* a task of the plan is the ordinary kind */
+    orch_tasks_free(t, n);
+}
+
+/* the workflow file: slots, aliases, "default", "on MODEL", "none", what it does not understand */
+static void test_workflow(void) {
+    workflow wf;
+    int n = workflow_parse("# Our team\nowner: product-owner on anthropic:claude-opus-5\ncoder: default\n- **QA**: qa-bot\n"
+                           "ux: default on openai:gpt-5.2\ncode-reviewer: reviewer\ntests: none\nproduct-review: -\nbanana: x\nshape: y\n", &wf);
+    CHECK(n == 5);
+    CHECK(wf.slot[WF_OWNER].set && !strcmp(wf.slot[WF_OWNER].skill, "product-owner") && !strcmp(wf.slot[WF_OWNER].model, "anthropic:claude-opus-5"));
+    CHECK(wf.slot[WF_CODER].set && wf.slot[WF_CODER].skill == NULL && wf.slot[WF_CODER].model == NULL);   /* default: the built-in instructions */
+    CHECK(wf.slot[WF_QA].set && !strcmp(wf.slot[WF_QA].skill, "qa-bot"));                                 /* markdown around the line is fine */
+    CHECK(wf.slot[WF_UX_REVIEW].set && wf.slot[WF_UX_REVIEW].skill == NULL && !strcmp(wf.slot[WF_UX_REVIEW].model, "openai:gpt-5.2"));
+    CHECK(wf.slot[WF_CODE_REVIEW].set && !strcmp(wf.slot[WF_CODE_REVIEW].skill, "reviewer"));
+    CHECK(!wf.slot[WF_TESTS].set && !wf.slot[WF_PRODUCT_REVIEW].set);                                    /* none and - skip a slot */
+    CHECK_STR(wf.unknown, "banana, shape");
+    workflow_free(&wf);
+    /* a later line wins, a skip after a set is a skip; frontmatter and a name are not slots; nothing at all is nothing */
+    n = workflow_parse("---\nname: team\ndescription: x\n---\nqa: a\nqa: b\ncoder: x\ncoder: none\n", &wf);
+    CHECK(n == 1 && !strcmp(wf.slot[WF_QA].skill, "b") && !wf.slot[WF_CODER].set && wf.unknown[0] == 0);
+    workflow_free(&wf);
+    {   /* more unknown names than the list holds: it stops at a whole name, is always terminated, and never runs past its buffer */
+        sbuf many; sb_init(&many);
+        for (int i = 0; i < 60; i++) sb_printf(&many, "bogus-slot-%02d: x\n", i);
+        sb_puts(&many, "qa: default\n");
+        n = workflow_parse(many.data, &wf);
+        size_t ul = strlen(wf.unknown);
+        CHECK(n == 1 && wf.slot[WF_QA].set && ul > 0 && ul < sizeof wf.unknown);
+        CHECK(!strncmp(wf.unknown, "bogus-slot-00, bogus-slot-01", 28) && strstr(wf.unknown, "bogus-slot-0") != NULL);
+        CHECK(wf.unknown[ul - 1] != ',' && wf.unknown[ul - 1] != ' ' && !strstr(wf.unknown, "bogus-slot-59"));
+        workflow_free(&wf); sb_free(&many);
+    }
+    CHECK(workflow_parse("", &wf) == 0 && workflow_parse(NULL, &wf) == 0);
+    CHECK_STR(workflow_slot_name(WF_UX_REVIEW), "ux-review");
+    /* the file is found by name, project before user; a path is not a name */
+    char dir[] = "/tmp/corbie_wf_XXXXXX", old[1024];
+    CHECK(mkdtemp(dir) != NULL && getcwd(old, sizeof old) != NULL && chdir(dir) == 0);
+    char *h = getenv("HOME"), *oldhome = h ? xstrdup(h) : NULL;
+    setenv("HOME", dir, 1);
+    CHECK(workflow_find(NULL) == NULL && workflow_find("x") == NULL);
+    CHECK(mkdir(".agents", 0755) == 0 && mkdir(".agents/workflows", 0755) == 0);
+    CHECK(write_whole_file(".agents/workflow.md", "qa: default\n", 12) == 0 && write_whole_file(".agents/workflows/fast.md", "qa: none\n", 10) == 0);
+    char *f = workflow_find(NULL); CHECK(f && !strcmp(f, ".agents/workflow.md")); free(f);
+    f = workflow_find("fast"); CHECK(f && !strcmp(f, ".agents/workflows/fast.md")); free(f);
+    CHECK(workflow_find("../x") == NULL && workflow_find("a/b") == NULL && workflow_find(".hidden") == NULL);
+    if (oldhome) setenv("HOME", oldhome, 1); else unsetenv("HOME");
+    free(oldhome);
+    CHECK(chdir(old) == 0);
+    char cmd[200]; snprintf(cmd, sizeof cmd, "rm -rf %s", dir); CHECK(system(cmd) == 0);
+    /* the QA worker's verdict: the last VERDICT line of its report */
+    char why[100];
+    CHECK(qa_verdict("ran it\nVERDICT: PASS\n", why, sizeof why) == 1 && !why[0]);
+    CHECK(qa_verdict("Rule: end with VERDICT: PASS or VERDICT: FAIL\nVERDICT: FAIL the login test crashes\n", why, sizeof why) == 0);
+    CHECK_STR(why, "the login test crashes");
+    CHECK(qa_verdict("**VERDICT:** FAIL - no tests ran", why, sizeof why) == 0 && !strcmp(why, "no tests ran"));
+    CHECK(qa_verdict("VERDICT: FAIL x\nfixed it\nVERDICT: PASS", why, sizeof why) == 1);
+    CHECK(qa_verdict("looks fine to me", why, sizeof why) == -1 && qa_verdict(NULL, NULL, 0) == -1);
+    /* the example workflows of DOCUMENTATION.md parse as the document says (skipped when run away from the checkout) */
+    size_t en; char *ex = read_whole_file("docs/examples/orchestrate/simple/workflow.md", &en, 8192);
+    if (ex) {
+        CHECK(workflow_parse(ex, &wf) == 4 && wf.unknown[0] == 0 && !wf.slot[WF_TESTS].set && !wf.slot[WF_UX_REVIEW].set);
+        CHECK(wf.slot[WF_QA].set && wf.slot[WF_QA].skill == NULL && !strcmp(wf.slot[WF_QA].model, "anthropic:claude-haiku-5") && wf.slot[WF_CODE_REVIEW].model == NULL);
+        workflow_free(&wf); free(ex);
+    }
+    ex = read_whole_file("docs/examples/orchestrate/advanced/workflow.md", &en, 8192);
+    if (ex) {
+        CHECK(workflow_parse(ex, &wf) == WF_SLOTS && wf.unknown[0] == 0);
+        CHECK(!strcmp(wf.slot[WF_OWNER].model, "anthropic:claude-opus-5-5") && wf.slot[WF_CODER].skill == NULL && !strcmp(wf.slot[WF_TESTS].skill, "wf-tests") && wf.slot[WF_TESTS].model == NULL);
+        CHECK(!strcmp(wf.slot[WF_CODE_REVIEW].skill, "wf-code-review") && !strcmp(wf.slot[WF_CODE_REVIEW].model, "anthropic:claude-opus-5-5") && !strcmp(wf.slot[WF_UX_REVIEW].skill, "wf-ux-review"));
+        /* every skill it names is shipped, with the model: line the table says */
+        static const struct { const char *skill, *model; } SK[] = { { "wf-tests", "anthropic:claude-haiku-5" }, { "wf-qa", "anthropic:claude-haiku-5" }, { "wf-code-review", NULL },
+                                                                    { "wf-product-review", "anthropic:claude-haiku-5" }, { "wf-ux-review", "anthropic:claude-sonnet-5-5" } };
+        for (size_t k = 0; k < sizeof SK / sizeof *SK; k++) {
+            char path[200], want[80]; snprintf(path, sizeof path, "docs/examples/orchestrate/advanced/skills/%s/SKILL.md", SK[k].skill);
+            size_t sn; char *sd = read_whole_file(path, &sn, 8192);
+            snprintf(want, sizeof want, "\nmodel: %s\n", SK[k].model ? SK[k].model : "");
+            CHECK(sd && strstr(sd, "\nname: ") && (SK[k].model ? strstr(sd, want) != NULL : strstr(sd, "\nmodel:") == NULL));
+            free(sd);
+        }
+        workflow_free(&wf); free(ex);
+    }
 }
 
 /* base64 (RFC 4648 test vectors, and bytes that are not text) */
@@ -2887,6 +2971,34 @@ static void test_title(void) {
 }
 static void test_theme(void) {
     const theme_t *def = g_theme;
+    {   /* the rainbow of the [parallel] label: it moves with time and with the letter, wraps, and never goes dark */
+        CHECK(rainbow_rgb(0, 0) == 0xff5050u);   /* hue 0: red */
+        CHECK(rainbow_rgb(0, 0) != rainbow_rgb(1, 0) && rainbow_rgb(0, 0) != rainbow_rgb(0, 500));
+        CHECK(rainbow_rgb(0, 3000) == rainbow_rgb(0, 0) && rainbow_rgb(3, -100) == rainbow_rgb(3, -100 + 3000));   /* a turn takes 3 s */
+        /* every colour of the wheel stays inside the theme's channel range, reaches its top, and reads on the ground it is drawn on:
+         * a contrast of 3 or more (WCAG's bar for large text) on white for the bright theme and on a dark bar for the default */
+        for (int t = 0; t < 2; t++) {
+            CHECK(theme_set(t ? "bright" : "default"));
+            unsigned ground = t ? 0xFFFFFFu : 0x161A24u, lo = g_theme->rainbow_lo, hi = g_theme->rainbow_hi;
+            double lg = 0; { double ch[3]; for (int k = 0; k < 3; k++) { double v = ((ground >> (16 - 8 * k)) & 255) / 255.0; ch[k] = v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4); } lg = 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]; }
+            bool in_range = true, reads = true; unsigned top = 0;
+            for (int i = 0; i < 12; i++) for (long ms = 0; ms < 3000; ms += 50) {
+                unsigned c = rainbow_rgb(i, ms), r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255, mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+                if (r < lo || g < lo || b < lo || mx > hi) in_range = false;
+                if (mx > top) top = mx;
+                double ch[3], rgb[3] = { r, g, b }; for (int k = 0; k < 3; k++) { double v = rgb[k] / 255.0; ch[k] = v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4); }
+                double lc = 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2], hiL = lc > lg ? lc : lg, loL = lc > lg ? lg : lc;
+                if ((hiL + 0.05) / (loL + 0.05) < 3.0) reads = false;
+            }
+            CHECK(in_range && top == hi && reads);
+        }
+        CHECK(theme_set("default"));
+        sbuf pl; sb_init(&pl); g_cfg.parallel_tasks = false;
+        CHECK(term_parallel_text(&pl, 0) == 0 && pl.len == 0);
+        g_cfg.parallel_tasks = true;
+        CHECK(term_parallel_text(&pl, 0) == 10 && strstr(pl.data, "\x1b[38;2;255;80;80m[") && strstr(pl.data, "]"));
+        g_cfg.parallel_tasks = false; sb_free(&pl);
+    }
     CHECK(theme_set("nope") == false && g_theme == def);   /* an unknown name keeps the theme in use */
     CHECK(theme_set("default") && g_theme == def && !strcmp(g_theme->name, "default"));
     CHECK(theme_count() >= 2 && !strcmp(theme_name(0), "default") && theme_set("bright") && !strcmp(g_theme->name, "bright"));   /* the picker's list */
@@ -2978,7 +3090,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "fold head", test_fold_head }, { "scrollback spill", test_sb_spill }, { "modes", test_modes },
         { "close button", test_close_x }, { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "config merge", test_config_merge }, { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme }, { "title", test_title },
+        { "config merge", test_config_merge }, { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "workflow", test_workflow }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme }, { "title", test_title },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

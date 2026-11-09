@@ -62,6 +62,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/goal", "candidates in git worktrees, on one or more models, race to a metric: the best score is kept" },
     { "/btw", "a side question: answered from the conversation, and not kept in it" },
     { "/workers", "how many tasks of /orchestrate may run at the same time" },
+    { "/workflow", "who does what in /orchestrate: owner, coder, tests, QA and reviewers (.agents/workflow.md)" },
     { "/mode", "permission mode: manual, accept-edits, plan, auto" },
     { "/yolo", "auto mode on or off: every tool call approved" },
     { "/tools", "tool calling on or off" },
@@ -116,6 +117,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/memory idle", "off:wait for the next update or the exit instead" },
     { "/hooks", "add:a hook line: pre|post TOOL COMMAND, start|stop COMMAND|remove:remove hook N|clear:remove them all" },
     { "/agents", "reload:read the agent files again" },
+    { "/workflow", "new:write a starter .agents/workflow.md" },
     { "/config", "bash:show or hide the model's bash commands and their output|read:show or hide the results of read_file|grep:show or hide the results of grep|list:show or hide the results of list_dir|fetch:show or hide the results of web_fetch|search:show or hide the results of web_search|edit:show or hide the diff of edit_file|write:show or hide the preview of write_file" },
     { "/config bash", "show:print the commands as now (the default)|hide:print no bash command and no output (a denial or error still shows)" },
     { "/config read", "show:print what read_file returned (the default)|hide:keep the call line, drop the result (an error still shows)" },
@@ -888,6 +890,16 @@ static void sessions_prune(void) {
     struct dirent *e;
     while ((e = readdir(d))) {
         size_t l = strlen(e->d_name);
+        if (l > 4 && !strcmp(e->d_name + l - 4, ".tmp")) {   /* a save that a crash cut off (write_whole_file_atomic); a day old is nobody's write in flight */
+            /* judged by the open descriptor, never by a path looked at and then used (a TOCTOU race): O_NOFOLLOW keeps a symlink out */
+            int tf = openat(dirfd(d), e->d_name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+            if (tf >= 0) {
+                struct stat ts; bool old = fstat(tf, &ts) == 0 && S_ISREG(ts.st_mode) && time(NULL) - ts.st_mtime > 86400;
+                close(tf);
+                if (old) unlinkat(dirfd(d), e->d_name, 0);
+            }
+            continue;
+        }
         if (l < 6 || strcmp(e->d_name + l - 5, ".json")) continue;
         char p[1400]; snprintf(p, sizeof p, "%s/%s", sessions_dir(), e->d_name);
         struct stat st; if (stat(p, &st) != 0) continue;
@@ -3049,6 +3061,37 @@ static void advisor_plan_now(advisor_plan *p) {
     advisor_plan_for(g_cfg.advisor, known ? g_advisor_info.context_length : 0, p);
 }
 
+/* What a model other than the advisor can be set to: a workflow role's reviewer (/orchestrate). The advisor's own is
+ * advisor_info(); the others are asked once and kept, a few of them (a hosted API's model endpoint, or /api/show).
+ * NULL when the model cannot be used; err says why. */
+#define ROLE_INFO_MAX 8
+static struct { char *model; model_info info; } g_role_info[ROLE_INFO_MAX];
+static int g_role_info_n = 0;
+static const model_info *role_model_info(const char *model, char *err, size_t n) {
+    err[0] = 0;
+    if (g_cfg.advisor && model_same(model, g_cfg.advisor)) {
+        if (!advisor_info()) { snprintf(err, n, "%s", g_advisor_err); return NULL; }
+        return &g_advisor_info;
+    }
+    for (int i = 0; i < g_role_info_n; i++) if (!strcmp(g_role_info[i].model, model)) return &g_role_info[i].info;
+    model_info mi; memset(&mi, 0, sizeof mi);
+    if (provider_find(model, NULL)) {
+        int r = provider_model_info(model, &mi, err, n);
+        if (r < 0) return NULL;
+    } else if (ollama_model_show(model, &mi) != 0) {
+        snprintf(err, n, "the server does not know a model '%s'", model);
+        return NULL;
+    }
+    int at = g_role_info_n < ROLE_INFO_MAX ? g_role_info_n++ : 0;   /* a ninth model replaces the first */
+    if (at == 0 && g_role_info_n == ROLE_INFO_MAX) free(g_role_info[0].model);
+    g_role_info[at].model = xstrdup(model); g_role_info[at].info = mi;
+    return &g_role_info[at].info;
+}
+static void role_info_clear(void) {   /* another host: what its server said of a model no longer holds */
+    for (int i = 0; i < g_role_info_n; i++) free(g_role_info[i].model);
+    g_role_info_n = 0;
+}
+
 /* its system prompt: only ever sent to the advisor, so it may follow the guidance freely */
 static void advisor_system(sbuf *b) {
     const advisor_guidance_def *g = advisor_guidance();
@@ -3078,12 +3121,12 @@ enum { ADVICE_GIVEN, ADVICE_NONE, ADVICE_SKIPPED };  /* what came of it (ADVICE_
  * a system prompt and one user message, accounted to it. The answer, malloc'd, or NULL: then
  * `r` says whether the user stopped it, or why it failed. */
 typedef struct { chat_stats st; bool aborted, not_found, signin, unusable; char err[512]; } advisor_reply;
-static char *advisor_call(const char *sys, const char *user, const advisor_plan *plan, bool known, int reply, const char *label, advisor_reply *r) {
+static char *advisor_call_for(const char *model, const model_info *info, const char *sys, const char *user, const advisor_plan *plan, bool known, int reply, const char *label, advisor_reply *r) {
     memset(r, 0, sizeof *r);
     char *answer = NULL;
     if (plan->api) {
-        provider_request rq = { sys, user, reply, effort_get(g_cfg.advisor), label, ADVISOR_IDLE_MS };
-        if (known) answer = provider_chat(g_cfg.advisor, &g_advisor_info, &rq, &r->st, &r->aborted, r->err, sizeof r->err);
+        provider_request rq = { sys, user, reply, effort_get(model), label, ADVISOR_IDLE_MS };
+        if (known) answer = provider_chat(model, info, &rq, &r->st, &r->aborted, r->err, sizeof r->err);
         else { snprintf(r->err, sizeof r->err, "%s", g_advisor_err); r->unusable = true; }   /* no key, the key refused, no such model */
     } else {
         cJSON *msgs = cJSON_CreateArray();
@@ -3091,7 +3134,7 @@ static char *advisor_call(const char *sys, const char *user, const advisor_plan 
         m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", user); cJSON_AddItemToArray(msgs, m);
         ollama_quiet = true;
         ollama_call.busy = label; ollama_call.num_predict = reply; ollama_call.idle_ms = ADVISOR_IDLE_MS;
-        ollama_call.model = g_cfg.advisor; ollama_call.info = known ? &g_advisor_info : NULL;
+        ollama_call.model = model; ollama_call.info = known ? info : NULL;
         ollama_call.num_ctx = plan->send_ctx; ollama_call.keep_alive = plan->keep_alive;
         cJSON *rep = ollama_chat(msgs, NULL, &r->st, &r->aborted);
         ollama_call_reset(); ollama_quiet = false;
@@ -3101,11 +3144,15 @@ static char *advisor_call(const char *sys, const char *user, const advisor_plan 
         else { snprintf(r->err, sizeof r->err, "%s", ollama_error[0] ? ollama_error : "request failed"); r->not_found = strstr(ollama_error, "not found") != NULL; r->signin = strcasestr(ollama_error, "unauthorized") != NULL; }
         if (rep) cJSON_Delete(rep);
     }
-    account_as(g_cfg.advisor, &r->st);
+    account_as(model, &r->st);
     g_session.advisor_tokens += r->st.prompt_tokens + r->st.eval_tokens; g_session.advisor_seconds += r->st.total_seconds;
     g_session.advisor_eval_tokens += r->st.eval_tokens; g_session.advisor_eval_seconds += r->st.eval_seconds;
     term_status_refresh();
     return answer;
+}
+
+static char *advisor_call(const char *sys, const char *user, const advisor_plan *plan, bool known, int reply, const char *label, advisor_reply *r) {
+    return advisor_call_for(g_cfg.advisor, &g_advisor_info, sys, user, plan, known, reply, label, r);
 }
 
 /* " · ≈ $0.03" for a call to a model that has a price (estimated as /usage does), else nothing */
@@ -3933,7 +3980,7 @@ static void orch_roles(sbuf *b) {
     for (int i = 0; i < n; i++) sb_printf(b, "- %s: %.120s\n", skill_get(i)->name, skill_get(i)->desc);
 }
 
-static void orch_system(sbuf *b, int workers, bool layered) {
+static void orch_system(sbuf *b, int workers, bool layered, const char *extra) {
     sbuf roles; sb_init(&roles); orch_roles(&roles);
     sb_printf(b,
         "You are the orchestrator of Corbie Nest (corbienest), a coding agent in the user's terminal. You do not do the work yourself. "
@@ -3953,7 +4000,7 @@ static void orch_system(sbuf *b, int workers, bool layered) {
         "%s%s"
         "- Where you would need to read the code first, make the first task an exploration that reports what it found: the later workers get that report.\n"
         "- Where the project has a build or tests, a task says to run them. When the request changes code, the last task builds the project, runs its tests and fixes what fails.\n"
-        "%s\n"
+        "%s%s\n"
         "When you are asked to REVIEW a task, you are shown the task, the worker's report and the diff of the files it wrote. "
         "If the task is done and correct, answer with " ADVISOR_REVIEW_OK " alone. Otherwise say exactly what is wrong or missing and what to do about it, "
         "briefly: your answer goes to the worker as its next instruction. Do not ask for more than the task asked for.", ORCH_MAX_TASKS,
@@ -3964,20 +4011,40 @@ static void orch_system(sbuf *b, int workers, bool layered) {
                   "Layer 1 is the foundation the rest stands on (the build file, the configuration, the core types); a later layer uses only what the layers before it made. "
                   "The project is built after each layer, so every layer must leave it compiling. Tasks of one layer may run at the same time when they own different paths and say \"AFTER: none\".\n"
                   "- The CONTRACT is what makes the layers fit: it names the packages, classes, method signatures, fields and paths that the layers share, exactly.\n" : "",
-        roles.data);
+        extra ? extra : "", roles.data);
     sb_free(&roles);
 }
 
-/* One call of the orchestrating model, with its line in the transcript. The answer, malloc'd,
- * for ADVICE_GIVEN; NULL otherwise, and the line under it has said why. */
-static char *orch_ask(const char *what, const char *user, chat_stats *st, int *how, bool layered) {
-    bool known = advisor_info();
-    advisor_plan plan; advisor_plan_now(&plan);
-    sbuf sys; sb_init(&sys); orch_system(&sys, g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT, layered);
-    printf("  " C_CYAN "⤷ orchestrator" C_RESET " " C_BOLD "%s" C_RESET C_DIM " · %s · %zu KB · esc stops the run" C_RESET "\n", g_cfg.advisor, what, (strlen(user) + 1023) / 1024);
-    char label[96]; snprintf(label, sizeof label, "orchestrator · %.70s", g_cfg.advisor);
+/* Who is asking: the model, and what it is told besides the standing instructions. NULL is the advisor, as /orchestrate always was;
+ * a workflow's owner and reviewers each have their own. */
+typedef struct {
+    const char *model;     /* NULL: g_cfg.advisor */
+    const char *name;      /* what the line in the transcript calls it ("orchestrator" when NULL) */
+    const char *persona;   /* a role's instructions (a skill's body), added under the system prompt; NULL for none */
+    const char *extra;     /* the planner's note about what the workflow does after the tasks (orch_system) */
+} orch_who;
+static const char *who_model(const orch_who *w) { return w && w->model ? w->model : g_cfg.advisor; }
+
+/* One call of a toolless model of the run — the orchestrator, or a workflow's owner or reviewer — with its line in the transcript.
+ * `sys` is its system prompt (NULL: the orchestrator's, for planning and reviewing a task). The answer, malloc'd, for ADVICE_GIVEN;
+ * NULL otherwise, and the line under it has said why. */
+static char *orch_ask_sys(const orch_who *who, const sbuf *sys_in, const char *what, const char *user, chat_stats *st, int *how, bool layered) {
+    const char *model = who_model(who), *name = who && who->name ? who->name : "orchestrator";
+    char err[400] = "";
+    const model_info *info = NULL; bool known;
+    if (model_same(model, g_cfg.advisor)) { known = advisor_info(); info = &g_advisor_info; snprintf(err, sizeof err, "%s", g_advisor_err); }
+    else { info = role_model_info(model, err, sizeof err); known = info != NULL; }
+    advisor_plan plan; advisor_plan_for(model, info ? info->context_length : 0, &plan);
+    sbuf sys; sb_init(&sys);
+    if (sys_in) sb_puts(&sys, sys_in->data);
+    else orch_system(&sys, g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT, layered, who ? who->extra : NULL);
+    if (who && who->persona && *who->persona) { sb_puts(&sys, "\n\n# Your role\n"); sb_put_cut(&sys, who->persona, 8192); }
+    printf("  " C_CYAN "⤷ %s" C_RESET " " C_BOLD "%s" C_RESET C_DIM " · %s · %zu KB · esc stops the run" C_RESET "\n", name, model, what, (strlen(user) + 1023) / 1024);
+    char label[96]; snprintf(label, sizeof label, "%s · %.70s", name, model);
     advisor_reply ar;
-    char *answer = advisor_call(sys.data, user, &plan, known, plan.reply * 2 > ORCH_REPLY_MIN ? plan.reply * 2 : ORCH_REPLY_MIN, label, &ar);
+    char *answer;
+    if (!info) { memset(&ar, 0, sizeof ar); snprintf(ar.err, sizeof ar.err, "%s", err); answer = NULL; }
+    else answer = advisor_call_for(model, info, sys.data, user, &plan, known, plan.reply * 2 > ORCH_REPLY_MIN ? plan.reply * 2 : ORCH_REPLY_MIN, label, &ar);
     sb_free(&sys);
     *st = ar.st;
     const char *text = strip_think_block(answer ? answer : "");
@@ -3988,16 +4055,19 @@ static char *orch_ask(const char *what, const char *user, chat_stats *st, int *h
         else printf("    " C_RED "⎿ no answer: %s" C_RESET "\n", ar.err);
         *how = ADVICE_NONE;
     } else if (!*text) {
-        printf("    " C_RED "⎿ no answer" C_RESET C_DIM "%s" C_RESET "\n", !strcmp(ar.st.done_reason, "length") ? " — it ran out of tokens while still thinking: lower /advisor effort" : "");
+        printf("    " C_RED "⎿ no answer" C_RESET C_DIM "%s" C_RESET "\n", !strcmp(ar.st.done_reason, "length") ? " — it ran out of tokens while still thinking: lower its /effort" : "");
         *how = ADVICE_NONE;
     } else { g_session.advisor_calls++; out = xstrdup(text); *how = ADVICE_GIVEN; }
     free(answer);
     return out;
 }
+static char *orch_ask(const orch_who *who, const char *what, const char *user, chat_stats *st, int *how, bool layered) {
+    return orch_ask_sys(who, NULL, what, user, st, how, layered);
+}
 
-/* what the orchestrator is shown of a call it made: "2.1k tokens · 9s · ≈ $0.03" */
-static void orch_spent(const chat_stats *st, char *out, size_t n) {
-    char tk[32], cost[48]; fmt_tokens(st->prompt_tokens + st->eval_tokens, tk, sizeof tk); cost_note(g_cfg.advisor, st, cost, sizeof cost);
+/* what the model is shown of a call it made: "2.1k tokens · 9s · ≈ $0.03" */
+static void orch_spent(const char *model, const chat_stats *st, char *out, size_t n) {
+    char tk[32], cost[48]; fmt_tokens(st->prompt_tokens + st->eval_tokens, tk, sizeof tk); cost_note(model, st, cost, sizeof cost);
     snprintf(out, n, "%s tokens · %.0fs%s", tk, st->total_seconds, cost);
 }
 
@@ -4035,6 +4105,9 @@ typedef struct {
     const goal_ctx *goal;        /* /goal: candidates, not tasks — no reviews, a metric instead (NULL for /orchestrate) */
     char *contract;              /* the plan's CONTRACT: block: what the tasks share, shown to every worker (NULL: none) */
     int upto;                    /* /plan: the layer the run may start up to (its tasks of later layers wait); 0 = no layers */
+    const orch_who *owner;       /* who plans and reviews the tasks (NULL: the advisor) */
+    const workflow *wf;          /* the workflow of the run: roles of the coder, tests and QA stages (NULL: none) */
+    int cap;                     /* room in tasks[] and w[]: the tasks a workflow adds must fit (stage_add() refuses past it) */
 } orch_run;
 #define GOAL_METRIC_TIMEOUT 900
 #define GOAL_GIT "GIT_AUTHOR_NAME=corbienest GIT_AUTHOR_EMAIL=corbienest@localhost GIT_COMMITTER_NAME=corbienest GIT_COMMITTER_EMAIL=corbienest@localhost "
@@ -4091,23 +4164,26 @@ static void goal_system(sbuf *sp, const orch_run *r, const orch_worker *w) {
                 "`GOAL: IMPOSSIBLE <why>` (you are sure it cannot be met), or neither (you are not sure yet).\n");
 }
 
-/* The model a role names, for the worker that does the role's task. A local model must be on the server (its
+/* The model a role (or a workflow's slot) names, for the worker that does its task. A local model must be on the server (its
  * capabilities are read now, as /goal reads them), a hosted one must have its key. Failing that the worker keeps
  * the model in use, and the line says why. */
-static void worker_role_model(orch_worker *w, const skill_t *role) {
-    if (provider_find(role->model, NULL)) {
+static void worker_role_model(orch_worker *w, const char *rname, const char *model) {
+    if (provider_find(model, NULL)) {
         const char *hd[4]; sbuf keep; char why[256]; sb_init(&keep);
-        bool ok = provider_call_headers(role->model, hd, &keep, why, sizeof why);
+        bool ok = provider_call_headers(model, hd, &keep, why, sizeof why);
         sb_free(&keep);
-        if (!ok) { printf("  " C_YELLOW "role %s: %s — the model in use" C_RESET "\n", role->name, why); return; }
-    } else if (ollama_model_show(role->model, &w->info) == 0) {
+        if (!ok) { printf("  " C_YELLOW "role %s: %s — the model in use" C_RESET "\n", rname, why); return; }
+    } else if (ollama_model_show(model, &w->info) == 0) {
         w->has_info = true;
     } else {
-        printf("  " C_YELLOW "role %s: ollama does not have %s — the model in use" C_RESET "\n", role->name, role->model);
+        printf("  " C_YELLOW "role %s: ollama does not have %s — the model in use" C_RESET "\n", rname, model);
         return;
     }
-    w->role_model = xstrdup(role->model); w->model = w->role_model;
+    w->role_model = xstrdup(model); w->model = w->role_model;
 }
+
+/* the workflow slot that does a task: the coder does the plan's tasks and the fixes */
+static int kind_slot(int kind) { return kind == ORCH_KIND_TESTS ? WF_TESTS : kind == ORCH_KIND_QA ? WF_QA : WF_CODER; }
 
 static void worker_begin(orch_run *r, int i) {
     orch_worker *w = &r->w[i];
@@ -4122,15 +4198,23 @@ static void worker_begin(orch_run *r, int i) {
                    "End with ONE final message, your report: what you changed and in which files, what you checked and how, and anything left undone or that you are unsure of. "
                    "The orchestrator sees only that report and the diff of the files you wrote.", g_cwd);
     if (g_project_instructions) sb_puts(&sp, g_project_instructions);
-    /* a role (a skill named by the plan) adds its instructions, and may name the model; one that is not there is the default worker */
+    /* a role adds its instructions, and may name the model: the skill the plan names for the task, else the workflow's skill for the
+     * slot that does it; a workflow may also name the model of a slot. One that is not a skill is the default worker. */
     const skill_t *role = NULL;
-    if (!r->goal && r->tasks[i].role) {
-        role = skill_find(r->tasks[i].role);
-        if (!role) printf("  " C_DIM "role %s is not a skill here: the default worker" C_RESET "\n", r->tasks[i].role);
-        else {
-            sb_printf(&sp, "\n\n# Your role: %s\n", role->name); sb_puts(&sp, role->body);
-            if (role->model) worker_role_model(w, role);
+    if (!r->goal) {
+        const char *rname = r->tasks[i].role, *rmodel = NULL;
+        if (r->wf) {
+            const wf_slot *ws = &r->wf->slot[kind_slot(r->tasks[i].kind)];
+            if (!rname) rname = ws->skill;
+            rmodel = ws->model;
         }
+        if (rname) {
+            role = skill_find(rname);
+            if (!role) printf("  " C_DIM "role %s is not a skill here: the default worker" C_RESET "\n", rname);
+            else { sb_printf(&sp, "\n\n# Your role: %s\n", role->name); sb_puts(&sp, role->body); }
+        }
+        if (!rmodel && role) rmodel = role->model;
+        if (rmodel) worker_role_model(w, role ? role->name : "(workflow)", rmodel);
     }
     w->sp_bytes = sp.len;
     cJSON *m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "system"); cJSON_AddStringToObject(m, "content", sp.data); cJSON_AddItemToArray(w->msgs, m);
@@ -4139,7 +4223,7 @@ static void worker_begin(orch_run *r, int i) {
     sb_puts(&u, r->goal ? "# The goal (you are one of several candidates at it)\n" : "# The user's request (for context — you do one part of it)\n"); sb_put_cut(&u, r->request, 4096);
     bool any = false;
     for (int j = 0; !r->goal && j < r->nt; j++) {   /* what is finished as this one starts, in the plan's order */
-        if (!task_ok(&r->w[j])) continue;
+        if (!task_ok(&r->w[j]) || (r->tasks[i].kind != ORCH_KIND_TASK && r->tasks[j].kind != ORCH_KIND_TASK)) continue;   /* a stage is told what the plan's tasks did, not what the stages before it did */
         if (!any) { sb_puts(&u, "\n\n# Done before you\n"); any = true; }
         sb_printf(&u, "## Task %d: %s — %s\n", j + 1, r->tasks[j].title, r->w[j].status); sb_put_cut(&u, r->w[j].out.data ? r->w[j].out.data : "", 2048); sb_puts(&u, "\n\n");
     }
@@ -4147,7 +4231,9 @@ static void worker_begin(orch_run *r, int i) {
     sb_printf(&u, "%s# Your task (%d of %d): %s\n%s", any || r->contract ? "" : "\n\n", i + 1, r->nt, r->tasks[i].title, r->tasks[i].body);
     m = cJSON_CreateObject(); cJSON_AddStringToObject(m, "role", "user"); cJSON_AddStringToObject(m, "content", u.data); cJSON_AddItemToArray(w->msgs, m);
     sb_free(&u);
-    printf("  " C_CYAN "⤷ worker %d/%d" C_RESET " " C_BOLD "%s" C_RESET "%s%s%s\n", i + 1, r->nt, r->tasks[i].title,
+    if (r->tasks[i].kind != ORCH_KIND_TASK)   /* a stage of the workflow: its title says which, and the number of its tasks does not matter */
+        printf("  " C_CYAN "⤷ stage" C_RESET " " C_BOLD "%s" C_RESET "%s%s%s\n", r->tasks[i].title, role ? C_DIM "  · role " : "", role ? role->name : "", role ? C_RESET : "");
+    else printf("  " C_CYAN "⤷ worker %d/%d" C_RESET " " C_BOLD "%s" C_RESET "%s%s%s\n", i + 1, r->nt, r->tasks[i].title,
            role ? C_DIM "  · role " : "", role ? role->name : "", role ? C_RESET : "");
     worker_call(r, i);
 }
@@ -4167,16 +4253,16 @@ static void worker_review(orch_run *r, int i) {
     sb_printf(&rb, "\n\n# REVIEW this task (attempt %d of %d)\nIs it done and correct? " ADVISOR_REVIEW_OK " alone if so; otherwise what the worker must do.", w->attempt, ORCH_ATTEMPTS);
     char what[64], spent[96]; snprintf(what, sizeof what, "reviews task %d/%d", i + 1, r->nt);
     chat_stats st; int how;
-    char *verdict = orch_ask(what, rb.data, &st, &how, false);
+    char *verdict = orch_ask(r->owner, what, rb.data, &st, &how, false);
     sb_free(&rb); sb_free(&diff);
     if (how == ADVICE_SKIPPED) { task_end(w, T_STOPPED, "done, but the run was stopped before its review"); r->aborted = true; }
     else if (how != ADVICE_GIVEN) task_end(w, T_UNREVIEWED, "done, not reviewed (the orchestrator could not be asked)");
     else if (advisor_approves(verdict)) {
-        orch_spent(&st, spent, sizeof spent);
+        orch_spent(who_model(r->owner), &st, spent, sizeof spent);
         printf("    " C_GREEN "⎿ accepted" C_RESET C_DIM " · %s" C_RESET "\n", spent);
         task_end(w, T_ACCEPTED, w->attempt == 1 ? "accepted" : "accepted after corrections");
     } else {
-        orch_spent(&st, spent, sizeof spent);
+        orch_spent(who_model(r->owner), &st, spent, sizeof spent);
         printf("    " C_YELLOW "⎿ sent back" C_RESET C_DIM " · %s:" C_RESET "\n", spent); print_result_preview(verdict, 8);
         sb_clear(&w->objection); sb_puts(&w->objection, verdict);
         if (w->attempt == ORCH_ATTEMPTS) task_end(w, T_REJECTED, "not accepted");
@@ -4257,7 +4343,9 @@ static void worker_step(orch_run *r, int i) {
         sb_clear(&w->out); sb_puts(&w->out, cJSON_IsString(content) && content->valuestring[0] ? content->valuestring : "(it returned an empty report)");
         printf("    " C_DIM "[%d] ⎿ report after %d tool round%s:" C_RESET "\n", i + 1, w->rounds, w->rounds == 1 ? "" : "s");
         print_result_preview(w->out.data, 6);
-        if (r->goal) goal_finish(r, i); else worker_review(r, i);
+        if (r->goal) goal_finish(r, i);
+        else if (r->tasks[i].kind != ORCH_KIND_TASK) task_end(w, T_ACCEPTED, "done");   /* a stage of the workflow: the check that follows it is its review */
+        else worker_review(r, i);
         return;
     }
     if (w->rounds >= SUBAGENT_ITERS) {
@@ -4306,7 +4394,7 @@ static void orch_schedule(orch_run *r, int maxpar) {
             if (r->w[i].state != T_WAITING || (r->upto && r->tasks[i].layer > r->upto)) continue;
             bool ready = true, lost = false;
             for (int j = 0; j < i; j++) {
-                if (!(r->tasks[i].after & (1u << j)) || task_ok(&r->w[j])) continue;
+                if (j >= 32 || !(r->tasks[i].after & (1u << j)) || task_ok(&r->w[j])) continue;   /* (the mask holds 32: a stage task past them waits for nothing) */
                 if (r->w[j].state == T_WAITING || r->w[j].state == T_RUNNING) ready = false; else lost = true;
             }
             /* a task that owns paths waits while a running task owns an overlapping one; a task with no OWNS: clashes with nothing */
@@ -4451,27 +4539,324 @@ static void orch_layers(orch_run *r, int nplan, int maxpar, sbuf *report) {
     }
 }
 
+/* ---------- /orchestrate with a workflow: who does what ----------
+ * `.agents/workflow.md` names a skill for each part of the run. The owner (the advisor unless the file says otherwise) plans the
+ * request and reviews each coder task, as the orchestrator always has; the coder is the worker that does the tasks. When the tasks
+ * are accepted the stages begin, in this order, each one only if its slot is set:
+ *   tests           a worker writes the tests for the change (a task of its own, kind ORCH_KIND_TESTS);
+ *   qa              a worker builds the project, runs the tests and tries the change; its report ends in `VERDICT: PASS|FAIL why`;
+ *   code-review     a reviewer is shown the diff of everything written, and the reports; `LGTM` or findings;
+ *   product-review  the same, for whether the change is what the user asked for;
+ *   ux-review       the same, for the experience of whoever uses it.
+ * A check that finds something sends the coder a fix task (kind ORCH_KIND_FIX), at most WF_FIXES per check, and the check is run again.
+ * A fix that wrote files sends the run back to QA, since the code it ran against has changed; one that did not (a fix that only
+ * says "that is fine") only repeats the check that failed. The fix is not reviewed by the owner: the repeated check is its review.
+ * A check that still fails after its fixes ends the run, and the findings are in the report. At the end the owner is shown the reports
+ * and the checks' outcomes and writes the report to the user, which is what the conversation keeps first. Only the model calls of
+ * the tasks overlap (orch_schedule()); the stages are one after another on the main thread. A reviewer is a toolless call, like the
+ * orchestrator's, on its own model (a slot's `on MODEL`, or its skill's `model:`, else the advisor). */
+#define WF_FIXES 2          /* fix rounds a check may ask for */
+#define WF_STAGE_ROOM 20    /* tasks a workflow adds at most: the tests (1), the QA runs (1 + one per fix: 9) and the fixes (4 checks x 2 = 8) */
+
+typedef struct {
+    sbuf log;                /* one line per stage, for the report and for the owner */
+    char *open;              /* the findings of the check that stopped the run (malloc'd), NULL when none did */
+    int open_slot;
+    int stages_failed;       /* checks that were not run (a model that could not be asked, a verdict missing) */
+} wf_result;
+
+/* add a stage task: the run has room for it, or -1 (and body is freed) */
+static int stage_add(orch_run *r, int kind, int slot, const char *title, char *body) {
+    if (r->nt >= r->cap) { free(body); return -1; }
+    r->tasks[r->nt] = (orch_task){ .title = xstrdup(title), .body = body, .kind = kind, .slot = slot };
+    return r->nt++;
+}
+
+/* run one stage task alone, to its end. -1 when there was no room for it; else its index (the caller looks at r->aborted and task_ok()) */
+static int stage_do(orch_run *r, int kind, int slot, const char *title, char *body) {
+    int i = stage_add(r, kind, slot, title, body);
+    if (i < 0) return -1;
+    orch_schedule(r, 1);
+    return i;
+}
+
+/* what the plan's tasks did, as the stages are told it: the title, how it ended, and its report cut short */
+static void stage_tasks_text(const orch_run *r, sbuf *b, size_t each) {
+    for (int j = 0; j < r->nt; j++) {
+        if (r->tasks[j].kind != ORCH_KIND_TASK) continue;
+        sb_printf(b, "## Task %d: %s — %s\n", j + 1, r->tasks[j].title, r->w[j].status ? r->w[j].status : "not run");
+        sb_put_cut(b, r->w[j].out.data ? r->w[j].out.data : "", each); sb_puts(b, "\n\n");
+    }
+}
+
+/* the diffs of everything the run wrote, task by task (what a shell command changed is not in them) */
+static int stage_diff(const orch_run *r, sbuf *diff) {
+    int n = 0;
+    for (int j = 0; j < r->nt; j++) n += tools_checkpoint_diff(r->first, j + 1, diff);
+    return n;
+}
+
+static void stage_files(const orch_run *r, sbuf *out) {
+    sbuf names; sb_init(&names);
+    int nf = tools_checkpoint_files(r->first, &names);
+    sb_puts(out, nf && names.data ? names.data : "(none yet)");
+    sb_free(&names);
+}
+
+/* A reviewer's default instructions: the point of view of each. A role's own skill is added under them (orch_who.persona). */
+static const char *check_view(int slot) {
+    switch (slot) {
+    case WF_CODE_REVIEW: return "the code: correctness, bugs, edge cases, error handling, security, consistency with the code around it, readability, "
+                                "and whether the change has fitting tests.";
+    case WF_PRODUCT_REVIEW: return "the product: does the change do what the user asked — all of it, and no more? Look for behaviour that is missing, "
+                                   "a wrong reading of the request, scope that crept in, and anything left half done.";
+    default: return "the experience of whoever uses the result: the command line or screen, the messages and their wording, defaults, flows, naming, "
+                    "accessibility, consistency with the rest of the product, and what happens when something goes wrong. You judge it from the diff "
+                    "and the reports, since you cannot run it: say what you could not judge for that reason rather than guessing.";
+    }
+}
+static const char *check_title(int slot) { return slot == WF_CODE_REVIEW ? "code reviewer" : slot == WF_PRODUCT_REVIEW ? "product reviewer" : "UX reviewer"; }
+
+/* The model of a slot: its `on MODEL`, else its skill's `model:`, else NULL (the caller picks the advisor, or the main model) */
+static const char *slot_model(const workflow *wf, int slot) {
+    const wf_slot *ws = &wf->slot[slot];
+    if (ws->model) return ws->model;
+    const skill_t *sk = ws->skill ? skill_find(ws->skill) : NULL;
+    return sk ? sk->model : NULL;
+}
+
+/* One check by a reviewer. 1: LGTM. 0: findings (malloc'd in *findings). -1: it could not be asked. -2: the user stopped the run. */
+static int check_review(orch_run *r, int slot, int fixes, char **findings) {
+    const workflow *wf = r->wf;
+    const skill_t *sk = wf->slot[slot].skill ? skill_find(wf->slot[slot].skill) : NULL;
+    const char *model = slot_model(wf, slot);
+    orch_who who = { .model = model ? model : g_cfg.advisor, .name = check_title(slot), .persona = sk ? sk->body : NULL };
+    if (!who.model) { printf("    " C_YELLOW "⎿ %s: no model to ask (set /advisor, or name one in the workflow)" C_RESET "\n", workflow_slot_name(slot)); return -1; }
+    sbuf sys, b, diff;
+    sb_init(&sys); sb_init(&b); sb_init(&diff);
+    sb_printf(&sys, "You are the %s of a Corbie Nest (corbienest) workflow. A coding agent's workers made a change for the user's request, and you review it "
+                    "from one point of view. You have no tools and see only what is shown here: the request, what each task did, and the files that were written, "
+                    "as diffs. Never claim to have run or opened anything.\n\nYour point of view: %s\n\n"
+                    "Answer " ADVISOR_REVIEW_OK " alone if nothing needs to change. Otherwise list what must change, the most important first, each with its file "
+                    "and what to do about it — briefly: your answer goes to the coder as its instruction. Do not ask for more than the request asked for, and leave "
+                    "to the other reviewers what is theirs.", check_title(slot), check_view(slot));
+    sb_printf(&b, "# The user's request\n"); sb_put_cut(&b, r->request, r->budget / 8);
+    sb_puts(&b, "\n\n# What the tasks did\n"); { sbuf t; sb_init(&t); stage_tasks_text(r, &t, 1500); sb_put_cut(&b, t.data ? t.data : "", r->budget / 4); sb_free(&t); }
+    int nf = stage_diff(r, &diff);
+    char *dfix = nf && diff.data ? utf8_fix(diff.data) : NULL;
+    sb_printf(&b, "\n# The files written, as a diff (%d file%s)\n", nf, nf == 1 ? "" : "s"); sb_put_cut(&b, dfix ? dfix : "(no file was written)", r->budget / 2);
+    free(dfix);
+    sb_printf(&b, "\n\n# REVIEW the change\nCheck: %s (fix rounds so far: %d)\nIs it right from your point of view? " ADVISOR_REVIEW_OK " alone if so; otherwise what the coder must do.",
+              workflow_slot_name(slot), fixes);
+    char what[96], spent[96]; snprintf(what, sizeof what, "%s", workflow_slot_name(slot));
+    chat_stats st; int how;
+    char *verdict = orch_ask_sys(&who, &sys, what, b.data, &st, &how, false);
+    sb_free(&sys); sb_free(&b); sb_free(&diff);
+    int res;
+    if (how == ADVICE_SKIPPED) { r->aborted = true; res = -2; }
+    else if (how != ADVICE_GIVEN) res = -1;
+    else {
+        orch_spent(who.model, &st, spent, sizeof spent);
+        if (advisor_approves(verdict)) { printf("    " C_GREEN "⎿ %s: passed" C_RESET C_DIM " · %s" C_RESET "\n", workflow_slot_name(slot), spent); res = 1; }
+        else { printf("    " C_YELLOW "⎿ %s: findings" C_RESET C_DIM " · %s:" C_RESET "\n", workflow_slot_name(slot), spent); print_result_preview(verdict, 8); *findings = xstrdup(verdict); res = 0; }
+    }
+    free(verdict);
+    return res;
+}
+
+/* the QA stage: a worker runs the project and the change, and ends with its verdict. Results as check_review(); a report with no verdict is -1 */
+static int check_qa(orch_run *r, int run_no, int fixes, char **findings) {
+    sbuf b, files; sb_init(&b); sb_init(&files); stage_files(r, &files);
+    sb_puts(&b, "You are QA for a change that was made for the user's request below. Verify it the way someone who uses it would, and change NO file: "
+                "you only look and run.\n- Build the project and run its tests, the new ones included (find the commands in the build file, the Makefile or the README).\n"
+                "- Then try the change itself where you can: run the program or the command, give it the input the request is about, read what it prints. "
+                "Try one input that is wrong or empty.\n- Report what you ran and what each command printed, short.\n"
+                "End your report with exactly one last line: `VERDICT: PASS`, or `VERDICT: FAIL <the first thing that is wrong, in one sentence>`.\n\n# The user's request\n");
+    sb_put_cut(&b, r->request, 4096);
+    sb_printf(&b, "\n\n# Files written for it\n%s\n", files.data);
+    if (fixes) sb_printf(&b, "\n(This is run %d: the coder has fixed what an earlier check found, %d time%s.)\n", run_no, fixes, fixes == 1 ? "" : "s");
+    char title[64]; snprintf(title, sizeof title, "QA run %d", run_no);
+    sb_free(&files);
+    int i = stage_do(r, ORCH_KIND_QA, WF_QA, title, sb_detach(&b));
+    if (i < 0) { printf("    " C_RED "⎿ no room for another QA run" C_RESET "\n"); return -1; }
+    if (r->aborted) return -2;
+    if (!task_ok(&r->w[i])) { printf("    " C_YELLOW "⎿ qa: the worker did not come back with a report" C_RESET "\n"); return -1; }
+    char why[300]; int v = qa_verdict(r->w[i].out.data, why, sizeof why);
+    if (v < 0) { printf("    " C_YELLOW "⎿ qa: no VERDICT line in its report: not counted" C_RESET "\n"); return -1; }
+    if (v == 1) { printf("    " C_GREEN "⎿ qa: passed" C_RESET "\n"); return 1; }
+    printf("    " C_YELLOW "⎿ qa: failed" C_RESET C_DIM " · %s" C_RESET "\n", why[0] ? why : "(no reason given)");
+    sbuf f; sb_init(&f);
+    sb_printf(&f, "QA says: %s\n\nIts report:\n", why[0] ? why : "it failed");
+    sb_put_cut(&f, r->w[i].out.data ? r->w[i].out.data : "", 3072);
+    *findings = sb_detach(&f);
+    return 0;
+}
+
+static void workflow_stages(orch_run *r, int nplan, wf_result *wr) {
+    const workflow *wf = r->wf;
+    for (int i = 0; i < nplan; i++)
+        if (!task_ok(&r->w[i])) { printf("  " C_DIM "the workflow's stages are not run: a task was not accepted" C_RESET "\n"); sb_puts(&wr->log, "- stages: not run, a task of the plan was not accepted\n"); return; }
+    if (r->aborted) return;
+    if (wf->slot[WF_TESTS].set) {
+        sbuf b, files; sb_init(&b); sb_init(&files); stage_files(r, &files);
+        sb_puts(&b, "Write the tests for the change that was made for the request below. Look first at how this project tests things (its test folder, the build file) "
+                    "and write yours in the same style, in the project's test files only. Change NO other file: where a test shows a bug, say so in your report and do not fix it. "
+                    "Run the tests you wrote and report what they printed.\n\n# The user's request\n");
+        sb_put_cut(&b, r->request, 4096);
+        sb_printf(&b, "\n\n# Files written for it\n%s\n", files.data);
+        sb_free(&files);
+        int i = stage_do(r, ORCH_KIND_TESTS, WF_TESTS, "Write the tests", sb_detach(&b));
+        if (r->aborted) return;
+        if (i < 0 || !task_ok(&r->w[i])) { sb_puts(&wr->log, "- tests: the stage did not finish\n"); wr->stages_failed++; }
+        else sb_puts(&wr->log, "- tests: written\n");
+    }
+    int checks[4], nc = 0, qa_at = -1;
+    static const int ORDER[4] = { WF_QA, WF_CODE_REVIEW, WF_PRODUCT_REVIEW, WF_UX_REVIEW };
+    for (int k = 0; k < 4; k++) if (wf->slot[ORDER[k]].set) { if (ORDER[k] == WF_QA) qa_at = nc; checks[nc++] = ORDER[k]; }
+    int fixes[WF_SLOTS] = { 0 }, qa_runs = 0;
+    for (int c = 0; c < nc && !r->aborted; ) {
+        int slot = checks[c];
+        char *found = NULL;
+        int v = slot == WF_QA ? check_qa(r, ++qa_runs, fixes[slot], &found) : check_review(r, slot, fixes[slot], &found);
+        if (v == -2) break;
+        if (v == -1) { sb_printf(&wr->log, "- %s: not run (it could not be asked, or gave no verdict)\n", workflow_slot_name(slot)); wr->stages_failed++; c++; continue; }
+        if (v == 1) { sb_printf(&wr->log, "- %s: passed%s\n", workflow_slot_name(slot), fixes[slot] ? " after a fix" : ""); c++; continue; }
+        if (fixes[slot] >= WF_FIXES) {
+            sb_printf(&wr->log, "- %s: still failing after %d fix%s — the run stops here\n", workflow_slot_name(slot), fixes[slot], fixes[slot] == 1 ? "" : "es");
+            wr->open = found; wr->open_slot = slot;
+            printf(C_YELLOW "⏹ %s still finds problems after %d fixes, so the run stops" C_RESET "\n", workflow_slot_name(slot), fixes[slot]);
+            break;
+        }
+        fixes[slot]++;
+        sbuf b; sb_init(&b);
+        sb_printf(&b, "A check of the workflow — %s — found problems with the change that was made for the request below. Fix exactly what it names and change nothing else. "
+                      "Where the files show the finding is wrong, say so in your report and change nothing for it. Run the build or the tests where the project has them, "
+                      "and report what you changed.\n\n# The user's request\n", workflow_slot_name(slot));
+        sb_put_cut(&b, r->request, 4096);
+        sb_puts(&b, "\n\n# What the check found\n"); sb_put_cut(&b, found, 6144);
+        char title[96]; snprintf(title, sizeof title, "Fix what %s found (%d of %d)", workflow_slot_name(slot), fixes[slot], WF_FIXES);
+        int fi = stage_do(r, ORCH_KIND_FIX, slot, title, sb_detach(&b));
+        if (fi < 0) {
+            sb_printf(&wr->log, "- %s: findings, and no room for a fix task — the run stops here\n", workflow_slot_name(slot));
+            wr->open = found; wr->open_slot = slot; printf(C_YELLOW "⏹ no room for another fix task, so the run stops" C_RESET "\n"); break;
+        }
+        if (r->aborted) { free(found); break; }
+        if (!task_ok(&r->w[fi])) {
+            sb_printf(&wr->log, "- %s: the fix was not done — the run stops here\n", workflow_slot_name(slot));
+            wr->open = found; wr->open_slot = slot; printf(C_YELLOW "⏹ the fix was not done, so the run stops" C_RESET "\n"); break;
+        }
+        free(found);
+        sbuf d; sb_init(&d);
+        bool touched = tools_checkpoint_diff(r->first, fi + 1, &d) > 0;
+        sb_free(&d);
+        sb_printf(&wr->log, "- %s: findings, fixed (%d of %d)%s\n", workflow_slot_name(slot), fixes[slot], WF_FIXES, touched ? "; files changed, so QA runs again" : "");
+        if (touched && qa_at >= 0 && c > qa_at) c = qa_at;   /* the code changed under the checks that passed: from QA again */
+    }
+}
+
+/* The owner reports to the user. One call, shown the plan's reports, the checks' outcomes and the files. NULL when it could not be asked. */
+static char *workflow_owner_report(orch_run *r, const orch_who *owner, const wf_result *wr, const sbuf *mechanical) {
+    sbuf sys, b; sb_init(&sys); sb_init(&b);
+    sb_puts(&sys, "You are the product owner of a Corbie Nest (corbienest) workflow. You planned the user's request, your coder did the tasks, and the checks of the "
+                  "workflow have run. Now you report to the user, in this session. Write the report: what was done, in the user's terms; whether it does what they asked; "
+                  "what the checks found and what is still open or was left undone; and what you suggest next. Plain prose and a few short bullets, under 250 words, "
+                  "in the user's language. Be honest: if a task was not accepted or a check still fails, say so first. Say nothing that is not in the reports below, "
+                  "and never claim that anything was run that the reports do not show.");
+    sb_puts(&b, "# The user's request\n"); sb_put_cut(&b, r->request, r->budget / 8);
+    sb_puts(&b, "\n\n# The tasks and what each reported\n"); { sbuf t; sb_init(&t); stage_tasks_text(r, &t, 1500); sb_put_cut(&b, t.data ? t.data : "", r->budget / 3); sb_free(&t); }
+    sb_puts(&b, "\n# The checks of the workflow\n"); sb_put_cut(&b, wr->log.data ? wr->log.data : "(none was run)\n", 4096);
+    if (wr->open) { sb_printf(&b, "\n# Still open: what %s found last\n", workflow_slot_name(wr->open_slot)); sb_put_cut(&b, wr->open, 2048); sb_putc(&b, '\n'); }
+    sb_puts(&b, "\n# The files written\n"); stage_files(r, &b);
+    sb_puts(&b, "\n\n# The run, as the program counted it\n"); sb_put_cut(&b, mechanical->data ? mechanical->data : "", 3072);
+    sb_puts(&b, "\n\n# REPORT to the user\nWrite your report now.");
+    chat_stats st; int how;
+    char *text = orch_ask_sys(owner, &sys, "reports to you", b.data, &st, &how, false);
+    sb_free(&sys); sb_free(&b);
+    if (how == ADVICE_SKIPPED) r->aborted = true;
+    if (text) { char spent[96]; orch_spent(who_model(owner), &st, spent, sizeof spent); printf("    " C_DIM "⎿ %s" C_RESET "\n", spent); }
+    return text;
+}
+
+/* the workflow's line in the transcript: the file, and who plays which slot */
+static void workflow_banner(const char *path, const workflow *wf) {
+    printf("  " C_DIM "workflow %s ·", path);
+    for (int i = 0; i < WF_SLOTS; i++) {
+        const wf_slot *ws = &wf->slot[i];
+        if (!ws->set && i != WF_OWNER && i != WF_CODER) continue;
+        printf(" %s%s%s", workflow_slot_name(i), ws->skill ? "=" : "", ws->skill ? ws->skill : "");
+        if (ws->model) printf("@%s", ws->model);
+    }
+    printf(C_RESET "\n");
+    for (int i = 0; i < WF_SLOTS; i++)
+        if (wf->slot[i].skill && !skill_find(wf->slot[i].skill))
+            printf("  " C_YELLOW "workflow: %s is not a skill here: the built-in instructions for %s" C_RESET "\n", wf->slot[i].skill, workflow_slot_name(i));
+    if (wf->unknown[0]) printf("  " C_YELLOW "workflow: not a slot: %s (slots: owner, coder, tests, qa, code-review, product-review, ux-review)" C_RESET "\n", wf->unknown);
+}
+
 static int orchestrate_run(const char *arg, bool plan) {
     const char *cmd = plan ? "/plan" : "/orchestrate";
-    int ntcap = 0;   /* the size of the tasks array (a /plan run keeps room for its fix tasks) */
+    int ntcap = 0;   /* the size of the tasks array (a /plan run keeps room for its fix tasks, a workflow for its stages) */
+    const char *typed_arg = arg;   /* as typed, -w and all: it is the line of the history */
+    /* -w NAME (a workflow of .agents/workflows/NAME.md for this run) or -w none (no workflow): only /orchestrate has them */
+    char wname[80] = ""; bool wnone = false, wflag = false;
+    if (!plan && arg && !strncmp(arg, "-w", 2) && (arg[2] == ' ' || !arg[2])) {
+        wflag = true; arg += 2; while (*arg == ' ') arg++;
+        size_t n = strcspn(arg, " "); snprintf(wname, sizeof wname, "%.*s", (int)(n < sizeof wname - 1 ? n : sizeof wname - 1), arg);
+        arg += n; while (*arg == ' ') arg++;
+        wnone = !strcmp(wname, "none");
+        if (!wname[0]) { printf("usage: /orchestrate -w NAME|none REQUEST\n" C_DIM "  NAME is a workflow in .agents/workflows/NAME.md; none leaves the workflow of .agents/workflow.md out of this run" C_RESET "\n"); return 0; }
+    }
     if (!arg || !*arg) {
         if (plan) printf("usage: /plan REQUEST\n" C_DIM "  the advisor model (%s) plans the request in layers, and you approve the plan; then %s builds each layer as workers and the project is built before the next one. Shift+tab's plan mode is different: it only reads" C_RESET "\n",
                          g_cfg.advisor ? g_cfg.advisor : "none set: /advisor MODEL", model_set() ? g_cfg.model : "the model");
-        else printf("usage: /orchestrate REQUEST\n" C_DIM "  the advisor model (%s) plans the request as tasks, %s does them as workers — those that do not wait for each other at the same time (/workers) — and the advisor reviews each" C_RESET "\n",
+        else printf("usage: /orchestrate [-w WORKFLOW|none] REQUEST\n" C_DIM "  the advisor model (%s) plans the request as tasks, %s does them as workers — those that do not wait for each other at the same time (/workers) — and the advisor reviews each. With a workflow (.agents/workflow.md, /workflow) tests, QA and reviews follow, each by the role it names" C_RESET "\n",
                g_cfg.advisor ? g_cfg.advisor : "none set: /advisor MODEL", model_set() ? g_cfg.model : "the model");
         return 0;
     }
-    if (!g_cfg.advisor) { printf(C_DIM "no advisor is set — /advisor MODEL names the model that plans and reviews (bare /advisor says what it can be)" C_RESET "\n"); return 0; }
-    if (!g_model_tools || g_cfg.no_tools) { printf(C_DIM "the workers are %s, and it has no tools to work with here (/tools, or another /model)" C_RESET "\n", g_cfg.model ? g_cfg.model : "the model"); return 0; }
-    if (!advisor_info()) { printf(C_RED "✗ %s" C_RESET "\n", g_advisor_err); return 0; }
-    advisor_plan ap; advisor_plan_now(&ap);
+    /* the workflow: the file of -w, else the project's or the user's workflow.md */
+    workflow wf; memset(&wf, 0, sizeof wf);
+    bool wf_on = false; char *wpath = NULL;
+    if (!plan && !wnone) {
+        wpath = workflow_find(wflag ? wname : NULL);
+        if (wflag && !wpath) { printf(C_RED "✗ no workflow named %s" C_RESET C_DIM " — it is .agents/workflows/%s.md (here, or in ~/.agents); /workflow says what there is" C_RESET "\n", wname, wname); return 0; }
+        if (wpath) {
+            size_t wl; char *wt = read_whole_file(wpath, &wl, 64 * 1024);
+            if (wt && workflow_parse(wt, &wf) > 0) wf_on = true;
+            else printf(C_DIM "  %s names no slot of a workflow: it is not used" C_RESET "\n", wpath);
+            free(wt);
+        }
+    }
+    orch_who owner; memset(&owner, 0, sizeof owner);
+    sbuf extra; sb_init(&extra);
+    if (wf_on) {
+        const wf_slot *os = &wf.slot[WF_OWNER];
+        const skill_t *osk = os->skill ? skill_find(os->skill) : NULL;
+        owner.model = slot_model(&wf, WF_OWNER);   /* NULL: the advisor */
+        owner.name = "product owner"; owner.persona = osk ? osk->body : NULL;
+        static const int AFTER[5] = { WF_TESTS, WF_QA, WF_CODE_REVIEW, WF_PRODUCT_REVIEW, WF_UX_REVIEW };
+        static const char *DOES[5] = { "a tests stage writes the tests", "QA builds, runs and tries the result", "a code review", "a product review", "a UX review" };
+        int k = 0;
+        for (int i = 0; i < 5; i++) if (wf.slot[AFTER[i]].set) { sb_printf(&extra, "%s%s", k++ ? "; " : "- A workflow follows your tasks: ", DOES[i]); }
+        if (k) sb_puts(&extra, ". So plan only the work that makes the change: no task to write tests, to review, or to run QA, and no last task that only builds and tests. "
+                               "What a check finds goes back to the coder as a fix task.\n");
+        owner.extra = extra.data;
+    }
+    const orch_who *ow = wf_on ? &owner : NULL;
+    const char *om = who_model(ow);   /* the model that plans and reviews: the owner's, else the advisor */
+    if (!om) { printf(C_DIM "no advisor is set — /advisor MODEL names the model that plans and reviews (bare /advisor says what it can be)%s" C_RESET "\n", wf_on ? "; or the workflow's owner may name one: owner: SKILL on MODEL" : ""); sb_free(&extra); workflow_free(&wf); free(wpath); return 0; }
+    if (!g_model_tools || g_cfg.no_tools) { printf(C_DIM "the workers are %s, and it has no tools to work with here (/tools, or another /model)" C_RESET "\n", g_cfg.model ? g_cfg.model : "the model"); sb_free(&extra); workflow_free(&wf); free(wpath); return 0; }
+    const model_info *oinfo = NULL;
+    if (model_same(om, g_cfg.advisor)) { if (!advisor_info()) { printf(C_RED "✗ %s" C_RESET "\n", g_advisor_err); sb_free(&extra); workflow_free(&wf); free(wpath); return 0; } oinfo = &g_advisor_info; }
+    else { char oe[400]; oinfo = role_model_info(om, oe, sizeof oe); if (!oinfo) { printf(C_RED "✗ the owner's model: %s" C_RESET "\n", oe); sb_free(&extra); workflow_free(&wf); free(wpath); return 0; } }
+    advisor_plan ap; advisor_plan_for(om, oinfo->context_length, &ap);
     size_t budget = ap.budget > 12288 ? ap.budget - 6144 : 6144;   /* (less the system prompt and the headings) */
+    if (wf_on) workflow_banner(wpath, &wf);
 
     /* what the planner is shown, taken before the request joins the conversation */
     char *before = cJSON_GetArraySize(g_messages) ? transcript_text(g_messages, -1, budget / 4) : NULL;
     char *request = expand_mentions(arg);
     int first = begin_request();
-    { sbuf raw; sb_init(&raw); sb_printf(&raw, "%s %s", cmd, arg); typed_note(raw.data, request); sb_free(&raw); }
+    { sbuf raw; sb_init(&raw); sb_printf(&raw, "%s %s", cmd, typed_arg); typed_note(raw.data, request); sb_free(&raw); }
     add_message("user", request);
     struct utsname un; uname(&un);
     sbuf brief; sb_init(&brief);
@@ -4486,8 +4871,10 @@ static int orchestrate_run(const char *arg, bool plan) {
 
     bool aborted = false;
     sbuf report; sb_init(&report);   /* the agent's side of the conversation: what came of the run */
+    wf_result wres; memset(&wres, 0, sizeof wres); sb_init(&wres.log);
+    char *owner_report = NULL;       /* the owner's report to the user (a workflow's run) */
     chat_stats st; int how;
-    char *plan_text = orch_ask("plans the request", brief.data, &st, &how, plan);
+    char *plan_text = orch_ask(ow, "plans the request", brief.data, &st, &how, plan);
     sb_free(&brief);
     orch_task *tasks = NULL;
     char *contract = NULL;
@@ -4495,12 +4882,12 @@ static int orchestrate_run(const char *arg, bool plan) {
     char spent[96];
     if (how != ADVICE_GIVEN) {
         aborted = how != ADVICE_NONE;
-        sb_printf(&report, "[%s: the orchestrator (%s) gave no plan — %s. Nothing was changed.]", cmd, g_cfg.advisor, aborted ? "the run was stopped" : "its call failed");
+        sb_printf(&report, "[%s: the orchestrator (%s) gave no plan — %s. Nothing was changed.]", cmd, om, aborted ? "the run was stopped" : "its call failed");
     } else if (!nt) {
         printf("    " C_RED "⎿ no tasks in its answer:" C_RESET "\n"); print_result_preview(plan_text, 8);
-        sb_printf(&report, "[%s: the orchestrator (%s) answered without a plan. Nothing was changed. It said:]\n%s", cmd, g_cfg.advisor, plan_text);
+        sb_printf(&report, "[%s: the orchestrator (%s) answered without a plan. Nothing was changed. It said:]\n%s", cmd, om, plan_text);
     } else {
-        orch_spent(&st, spent, sizeof spent);
+        orch_spent(om, &st, spent, sizeof spent);
         printf("    " C_DIM "⎿ plan · %d task%s%s · %s:" C_RESET "\n", nt, nt == 1 ? "" : "s", plan ? (plan_layers(tasks, nt) == 1 ? " in one layer" : "") : "", spent);
         for (int i = 0; i < nt; i++) {
             const char *title = tasks[i].title[0] ? tasks[i].title : "(untitled)";
@@ -4518,7 +4905,7 @@ static int orchestrate_run(const char *arg, bool plan) {
         bool go = true; char *reason = NULL;
         if (g_cfg.mode == MODE_PLAN) {
             printf(C_DIM "    plan mode: the tasks are not run — shift+tab leaves it, then %s again" C_RESET "\n", cmd);
-            sb_printf(&report, "[%s in plan mode: the orchestrator (%s) planned %d task%s; none was run.]\n\n%s", cmd, g_cfg.advisor, nt, nt == 1 ? "" : "s", plan_text);
+            sb_printf(&report, "[%s in plan mode: the orchestrator (%s) planned %d task%s; none was run.]\n\n%s", cmd, om, nt, nt == 1 ? "" : "s", plan_text);
             go = false;
         } else if (plan && !g_cfg.interactive) {
             printf(C_DIM "    /plan asks before it runs, and there is no terminal to ask in" C_RESET "\n");
@@ -4527,25 +4914,25 @@ static int orchestrate_run(const char *arg, bool plan) {
         } else if (plan ? !g_plan_no_ask : (g_cfg.interactive && g_cfg.mode != MODE_AUTO && !g_orch_no_ask)) {   /* /plan asks in every mode (the approval) until told not to */
             char q[200];
             if (plan) snprintf(q, sizeof q, "Build %d task%s in %d layer%s with %.60s, building after each layer?", nt, nt == 1 ? "" : "s", plan_layers(tasks, nt), plan_layers(tasks, nt) == 1 ? "" : "s", g_cfg.model);
-            else snprintf(q, sizeof q, "Run %s with %.80s?", nt == 1 ? "this task" : "these tasks", g_cfg.model);
+            else snprintf(q, sizeof q, "Run %s with %.70s%s?", nt == 1 ? "this task" : "these tasks", g_cfg.model, wf_on ? ", then the workflow's stages" : "");
             int r = term_confirm(q, "Yes, and don't ask about a plan again this session", NULL, &reason);
             if (r == 2) { if (plan) g_plan_no_ask = true; else g_orch_no_ask = true; }
             if (!r) {
                 go = false;
                 printf(C_DIM "    the plan was not run" C_RESET "\n");
                 sb_printf(&report, "[%s: the orchestrator (%s) planned %d task%s and the user declined to run them%s%s. Nothing was changed.]\n\n%s",
-                          cmd, g_cfg.advisor, nt, nt == 1 ? "" : "s", reason ? ", saying: " : "", reason ? reason : "", plan_text);
+                          cmd, om, nt, nt == 1 ? "" : "s", reason ? ", saying: " : "", reason ? reason : "", plan_text);
             }
         }
         free(reason);
-        if (go) sb_printf(&report, "[%s: %s planned %d task%s, %s did them as workers, and %s reviewed each.]\n", cmd, g_cfg.advisor, nt, nt == 1 ? "" : "s", g_cfg.model, g_cfg.advisor);
+        if (go) sb_printf(&report, "[%s: %s planned %d task%s, %s did them as workers, and %s reviewed each.]\n", cmd, om, nt, nt == 1 ? "" : "s", g_cfg.model, om);
 
         if (go) {
             int maxpar = g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT;
-            ntcap = plan ? 3 * nt : nt;   /* a layered run: two fix tasks per layer at most, and there are at most nt layers */
+            ntcap = (plan ? 3 * nt : nt) + (wf_on ? WF_STAGE_ROOM : 0);   /* a layered run: two fix tasks per layer at most, and there are at most nt layers; a workflow adds its stages */
             tasks = xrealloc(tasks, sizeof *tasks * (size_t)ntcap);
             memset(tasks + nt, 0, sizeof *tasks * (size_t)(ntcap - nt));
-            orch_run run = { arg, tasks, xmalloc(sizeof(orch_worker) * (size_t)ntcap), nt, cJSON_CreateArray(), first, budget, false, NULL, .contract = contract };
+            orch_run run = { arg, tasks, xmalloc(sizeof(orch_worker) * (size_t)ntcap), nt, cJSON_CreateArray(), first, budget, false, NULL, .contract = contract, .owner = ow, .wf = wf_on ? &wf : NULL, .cap = ntcap };
             memset(run.w, 0, sizeof(orch_worker) * (size_t)ntcap);
             for (int i = 0; i < ntcap; i++) { sb_init(&run.w[i].out); sb_init(&run.w[i].objection); }
             /* what a worker may call: everything but another agent and the advisor (its reviewer is the orchestrator) */
@@ -4557,7 +4944,17 @@ static int orchestrate_run(const char *arg, bool plan) {
             if (plan) orch_layers(&run, nt, maxpar, &report);
             else orch_schedule(&run, maxpar);
             tools_checkpoint_step(0);
+            if (wf_on && !run.aborted) workflow_stages(&run, nt, &wres);
+            tools_checkpoint_step(0);
             aborted = run.aborted;
+            if (wf_on && !run.aborted) {   /* the owner reports to the user, while the reports of the tasks are still there to read */
+                sbuf mech; sb_init(&mech);
+                int acc = 0, nrun = run.nt; for (int i = 0; i < nrun; i++) acc += task_ok(&run.w[i]);
+                sb_printf(&mech, "%d of %d tasks accepted or done (the plan's tasks, the tests, the QA runs and the fixes); %d check%s not run\n", acc, nrun, wres.stages_failed, wres.stages_failed == 1 ? " was" : "s were");
+                owner_report = workflow_owner_report(&run, &owner, &wres, &mech);
+                sb_free(&mech);
+                aborted = run.aborted;
+            }
             int nr = run.nt;   /* the plan's tasks and the fix tasks that were added */
             for (int i = 0; i < nr; i++) {
                 orch_worker *w = &run.w[i];
@@ -4576,13 +4973,30 @@ static int orchestrate_run(const char *arg, bool plan) {
             sbuf names; sb_init(&names);
             int nf = tools_checkpoint_files(first, &names);
             if (nf) sb_printf(&report, "\nFiles written: %s\n", names.data);
-            printf("%s%s %s: %d of %d task%s accepted" C_RESET C_DIM "%s%s%s" C_RESET "\n", accepted == nt ? C_GREEN : C_YELLOW, accepted == nt ? "✓" : "!", plan ? "planned run" : "orchestrated", accepted, nt, nt == 1 ? "" : "s",
-                   nf ? " · files written: " : "", nf ? names.data : "", accepted == nt ? "" : " — the tasks that are left were not run; /rewind undoes what was written");
+            if (wf_on && aborted) sb_puts(&wres.log, "- the run was stopped by the user before the workflow was done\n");
+            bool clean = accepted == nt && !wres.open && !(wf_on && aborted) && !wres.stages_failed;
+            char open_note[96] = "";
+            if (wres.open) snprintf(open_note, sizeof open_note, " — %s still finds problems, see the report", workflow_slot_name(wres.open_slot));
+            else if (wf_on && aborted) snprintf(open_note, sizeof open_note, " — stopped before the checks were done");
+            else if (wres.stages_failed) snprintf(open_note, sizeof open_note, " — %d check%s could not be run, see the report", wres.stages_failed, wres.stages_failed == 1 ? "" : "s");
+            printf("%s%s %s: %d of %d task%s accepted" C_RESET C_DIM "%s%s%s%s" C_RESET "\n", clean ? C_GREEN : C_YELLOW, clean ? "✓" : "!", plan ? "planned run" : "orchestrated", accepted, nt, nt == 1 ? "" : "s",
+                   nf ? " · files written: " : "", nf ? names.data : "", open_note, accepted == nt ? "" : " — the tasks that are left were not run; /rewind undoes what was written");
             sb_free(&names);
+            if (wf_on && wres.log.len) { sb_puts(&report, "\n[workflow]\n"); sb_puts(&report, wres.log.data); }
+            if (wres.open) { sb_printf(&report, "\nStill open — what %s found last:\n", workflow_slot_name(wres.open_slot)); sb_put_cut(&report, wres.open, 2048); sb_putc(&report, '\n'); }
+            if (owner_report) {   /* the owner's words to the user, in the transcript as a reply is, and first in what the conversation keeps */
+                md_state m; md_init(&m);
+                printf("\n" C_ORANGE "●" C_RESET " "); m.col = 2;
+                md_feed(&m, owner_report, strlen(owner_report)); md_finish(&m); printf("\n");
+                sbuf all; sb_init(&all);
+                sb_puts(&all, owner_report); sb_puts(&all, "\n\n---\n"); sb_puts(&all, report.data ? report.data : "");
+                sb_free(&report); report = all;
+            }
         }
     }
     add_message("assistant", report.data ? report.data : "[/orchestrate: nothing was done]");
     sb_free(&report); free(plan_text); free(request);
+    sb_free(&extra); workflow_free(&wf); free(wpath); sb_free(&wres.log); free(wres.open); free(owner_report);
     if (tasks) orch_tasks_free(tasks, ntcap ? ntcap : nt);
     free(contract);
     session_save();
@@ -4951,6 +5365,68 @@ static void cmd_skills(const char *arg) {
     }
 }
 
+/* /workflow [NAME]: the workflow /orchestrate would use, slot by slot; /workflow new [NAME] writes a starter file */
+static void cmd_workflow(const char *arg) {
+    char name[80] = ""; bool make = false;
+    if (arg) {
+        const char *a = arg;
+        if (!strncmp(a, "new", 3) && (a[3] == ' ' || !a[3])) { make = true; a += 3; while (*a == ' ') a++; }
+        snprintf(name, sizeof name, "%.*s", (int)strcspn(a, " "), a);
+    }
+    if (make) {
+        char path[200];
+        if (name[0]) { for (const char *c = name; *c; c++) if (!isalnum((unsigned char)*c) && *c != '-' && *c != '_') { printf("usage: /workflow new [NAME]   (letters, digits, - and _)\n"); return; } snprintf(path, sizeof path, ".agents/workflows/%s.md", name); }
+        else snprintf(path, sizeof path, ".agents/workflow.md");
+        if (is_file(path)) { printf(C_YELLOW "%s already exists" C_RESET "\n", path); return; }
+        if (mkdir_p(name[0] ? ".agents/workflows" : ".agents") != 0) { printf(C_RED "✗ cannot create %s: %s" C_RESET "\n", path, strerror(errno)); return; }
+        static const char starter[] =
+            "# Who does what in /orchestrate\n"
+            "# One line per part: `part: skill` (a skill is a role: its instructions, and its model: line), `part: default` for the built-in\n"
+            "# instructions, `part: skill on MODEL` to give it a model, and `part: none` to leave it out. A part not named here is left out,\n"
+            "# except the owner and the coder. Skills live in .agents/skills (see /skills).\n"
+            "#\n"
+            "# owner         plans the request, reviews each coder task, and reports to you at the end (default: the /advisor model)\n"
+            "# coder         the workers that do the tasks\n"
+            "# tests         a worker that writes the tests for the change\n"
+            "# qa            a worker that builds, runs the tests and tries the change; it ends with VERDICT: PASS or FAIL\n"
+            "# code-review   a reviewer that reads the diff for bugs, security and style\n"
+            "# product-review a reviewer that checks the change is what you asked for\n"
+            "# ux-review     a reviewer of the experience of whoever uses it (it reads the diff; it cannot run it)\n"
+            "owner: default\n"
+            "coder: default\n"
+            "tests: default\n"
+            "qa: default\n"
+            "code-review: default\n"
+            "product-review: default\n"
+            "ux-review: none\n";
+        if (write_whole_file(path, starter, sizeof starter - 1) != 0) { printf(C_RED "✗ cannot write %s: %s" C_RESET "\n", path, strerror(errno)); return; }
+        printf(C_GREEN "✓ created %s" C_RESET " — edit it; /orchestrate uses it from now on%s\n", path, name[0] ? C_DIM " (as /orchestrate -w NAME)" C_RESET : "");
+        return;
+    }
+    char *path = workflow_find(name[0] ? name : NULL);
+    if (!path) {
+        printf(C_DIM "no workflow%s%s: /orchestrate plans and reviews with the advisor alone" C_RESET "\n  write one with " C_BOLD "/workflow new [NAME]" C_RESET ", or by hand in .agents/workflow.md (this project) or ~/.agents/workflow.md (every project)\n",
+               name[0] ? " named " : "", name);
+        return;
+    }
+    size_t n; char *text = read_whole_file(path, &n, 64 * 1024);
+    workflow wf; int set = text ? workflow_parse(text, &wf) : 0;
+    if (!text || !set) { printf("%s" C_DIM " — names no slot of a workflow" C_RESET "\n", path); free(text); free(path); if (text) workflow_free(&wf); return; }
+    printf(C_BOLD "workflow" C_RESET " %s%s\n", path, name[0] ? "" : C_DIM " (what /orchestrate uses here; -w none leaves it out)" C_RESET);
+    for (int i = 0; i < WF_SLOTS; i++) {
+        const wf_slot *ws = &wf.slot[i];
+        bool must = i == WF_OWNER || i == WF_CODER;
+        if (!ws->set && !must) { printf("  %-15s " C_DIM "—  left out" C_RESET "\n", workflow_slot_name(i)); continue; }
+        const skill_t *sk = ws->skill ? skill_find(ws->skill) : NULL;
+        const char *m = slot_model(&wf, i);
+        printf("  " C_ORANGE "%-15s" C_RESET " %s%s%s  " C_DIM "model: %s%s" C_RESET "\n", workflow_slot_name(i), ws->skill ? ws->skill : "default",
+               ws->skill && !sk ? C_YELLOW " (not a skill here: the built-in instructions)" C_RESET : "", "", m ? m : (i == WF_OWNER || i >= WF_CODE_REVIEW ? (g_cfg.advisor ? g_cfg.advisor : "no advisor set") : "the model in use"),
+               m ? (ws->model ? " (the workflow)" : " (the skill's)") : "");
+    }
+    if (wf.unknown[0]) printf(C_YELLOW "  not a slot: %s" C_RESET "\n", wf.unknown);
+    workflow_free(&wf); free(text); free(path);
+}
+
 /* ---------- slash commands ---------- */
 static void cmd_help(void) {
     printf(C_BOLD "corbienest %s" C_RESET " — chat with local Ollama models, or Anthropic (anthropic:MODEL), with file & shell tools\n\n", CORBIE_VERSION);
@@ -4976,7 +5452,9 @@ static void cmd_help(void) {
            "                        no argument opens a picker, default leaves it to the model. Kept per model; a level is sent with every call\n"
            "  /effort parallel [on|off]  the task calls of one reply run as sub-agents at the same time (off by default: one after another)\n"
            "  /orchestrate REQUEST  the advisor model in charge: it plans the request as tasks, this model does them as workers with a fresh context\n"
-           "                        each — those that do not wait for each other at the same time — and the advisor reviews every task's report and diff\n"
+           "                        each — those that do not wait for each other at the same time — and the advisor reviews every task's report and diff.\n"
+           "                        With a workflow (.agents/workflow.md) tests, QA and reviews follow, each by its role; -w NAME picks another, -w none leaves it out\n"
+           "  /workflow [NAME|new]  who does what in /orchestrate: owner, coder, tests, qa, code-review, product-review, ux-review (see the file, or write a starter)\n"
            "  /plan REQUEST         /orchestrate with the plan in layers (LAYER: n): you approve it, then each layer runs and the project is built before the next.\n"
            "                        Build command: build=CMD in the config; else mvn, gradle or make, by the build file. Not the plan mode of shift+tab\n"
            "  /goal \"METRIC\" [min|max] [-n R] [-k K] [-m MODEL,...] GOAL\n"
@@ -5776,7 +6254,7 @@ static int handle_slash(char *line) {
                printf(C_GREEN "✓ keep_alive = %s" C_RESET " (applies from the next request)\n", g_cfg.keep_alive ? g_cfg.keep_alive : "server default"); }
     }
     else if (!strcmp(cmd, "/host")) {
-        if (!arg) printf("host: %s\n", g_cfg.host); else { free(g_cfg.host); g_cfg.host = xstrdup(arg); config_save(); free(g_advisor_info_for); g_advisor_info_for = NULL; refresh_model_caps(false); printf(C_GREEN "✓ host = %s" C_RESET "\n", g_cfg.host); host_warning("  "); }
+        if (!arg) printf("host: %s\n", g_cfg.host); else { free(g_cfg.host); g_cfg.host = xstrdup(arg); config_save(); free(g_advisor_info_for); g_advisor_info_for = NULL; role_info_clear(); refresh_model_caps(false); printf(C_GREEN "✓ host = %s" C_RESET "\n", g_cfg.host); host_warning("  "); }
     }
     else if (!strcmp(cmd, "/save")) cmd_save(arg);
     else if (!strcmp(cmd, "/history")) cmd_history(arg);
@@ -5789,6 +6267,7 @@ static int handle_slash(char *line) {
         free(d);
     }
     else if (!strcmp(cmd, "/skills")) cmd_skills(arg);
+    else if (!strcmp(cmd, "/workflow")) cmd_workflow(arg);
     else if (!strcmp(cmd, "/memory")) cmd_memory(arg);
     else {
         const skill_t *sk = skill_find(cmd);
@@ -6534,6 +7013,7 @@ static int process_input(char *line) {
     typed_note(s, msg);
     add_message("user", msg);
     free(msg);
+    session_save();   /* the message is on disk before the model starts: a crash during the first reply no longer loses it (/resume) */
     tools_exit_clear();
     bool aborted = run_turn();
     session_save();
@@ -7027,6 +7507,7 @@ int main(int argc, char **argv) {
         int first = begin_request();
         typed_note(oneshot, msg);
         add_message("user", msg); free(msg);
+        session_save();   /* on disk before the model starts, as at the prompt */
         time_t t0 = time(NULL);
         bool aborted = run_turn();
         session_save();

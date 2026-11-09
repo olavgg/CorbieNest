@@ -24,6 +24,7 @@ static const theme_t THEMES[] = {
         .info = 0x56B6C2u, .blue = 0x81A1C1u, .magenta = 0xB48EADu, .gray = 0x7C8799u,
         .brand = 0xE6FBFFu, .spark_hi = 0x8FE3FFu, .spark_mid = 0x4FB8E0u, .spark_lo = 0x3A8FB8u,
         .crow_dark = 0x4A6A8Au, .crow_body = 0x6B7890u, .crow_light = 0xA9B6CCu, .crow_beak = 0x7A6650u,
+        .rainbow_lo = 80, .rainbow_hi = 255,   /* every hue keeps a contrast of 3 or more on the dark bar (blue at 70 is 2.97) */
     },
     {   /* the bright theme: for a light terminal (the default is the dark one) */
         .name = "bright",
@@ -38,6 +39,7 @@ static const theme_t THEMES[] = {
         .info = 0x0550AEu, .blue = 0x0969DAu, .magenta = 0x8250DFu, .gray = 0x656D76u,
         .brand = 0x0550AEu, .spark_hi = 0x54AEFFu, .spark_mid = 0x218BFFu, .spark_lo = 0x0969DAu,
         .crow_dark = 0x0550AEu, .crow_body = 0x656D76u, .crow_light = 0x8C959Fu, .crow_beak = 0xBC4C00u,
+        .rainbow_lo = 20, .rainbow_hi = 150,   /* every hue keeps a contrast of 3 or more on white (yellow at 255 is 1.07) */
     },
 };
 #define THEME_COUNT ((int)(sizeof THEMES / sizeof THEMES[0]))
@@ -203,4 +205,22 @@ static const char *th_sgr(unsigned rgb, int bg) {
     return b;
 }
 const char *th_fg(unsigned rgb) { return th_sgr(rgb, 0); }
+
+/* A hue wheel at fixed saturation: 32 degrees from one letter to the next, a full turn about every three seconds. The
+ * channel range is the theme's (rainbow_lo..rainbow_hi): the dark themes get bright colours, the light one darker ones. */
+unsigned rainbow_rgb(int i, long ms) {
+    long h = ((long)i * 32 + ms * 3 / 25) % 360; if (h < 0) h += 360;
+    int sector = (int)(h / 60), f = (int)(h % 60) * 255 / 60;
+    const int hi = (int)g_theme->rainbow_hi, lo = (int)g_theme->rainbow_lo;
+    int up = lo + (hi - lo) * f / 255, down = hi - (hi - lo) * f / 255, r, g, b;
+    switch (sector) {
+        case 0:  r = hi;   g = up;   b = lo;   break;
+        case 1:  r = down; g = hi;   b = lo;   break;
+        case 2:  r = lo;   g = hi;   b = up;   break;
+        case 3:  r = lo;   g = down; b = hi;   break;
+        case 4:  r = up;   g = lo;   b = hi;   break;
+        default: r = hi;   g = lo;   b = down; break;
+    }
+    return ((unsigned)r << 16) | ((unsigned)g << 8) | (unsigned)b;
+}
 const char *th_bg(unsigned rgb) { return th_sgr(rgb, 1); }

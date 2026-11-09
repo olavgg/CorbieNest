@@ -652,6 +652,16 @@ static void put_mentions(sbuf *o, const char *text, size_t from, size_t n, size_
  * is not the one holding the field (i.e. the model is working). A field that shrinks hands
  * its upper rows back to the conversation; layout_sync() paints those again, so nothing the
  * field drew there stays behind. */
+static long mono_ms(void);
+#define PARALLEL_LABEL "[parallel]"
+#define RAINBOW_MS 80   /* the ANSI prompt redraws the label this often while /effort parallel is on (the notcurses loop redraws on its own) */
+int term_parallel_text(sbuf *o, long ms) {
+    if (!g_cfg.parallel_tasks) return 0;
+    int i = 0;
+    for (const char *p = PARALLEL_LABEL; *p; p++, i++) sb_printf(o, "%s%c", th_fg(rainbow_rgb(i, ms)), *p);
+    sb_puts(o, C_RESET);
+    return i;
+}
 /* the top or bottom edge of the field: rounded corners, green while the prompt waits */
 static void field_edge(sbuf *o, int row, bool top) {
     sb_printf(o, "\x1b[%d;1H%s%s", row, th_fg(g_ready ? g_theme->edge_ready : g_theme->edge_idle), top ? "╭" : "╰");
@@ -708,9 +718,13 @@ static void field_draw(sbuf *o, const char *typed, size_t caret) {
     int width = field_width();
     if (g_view_top >= 0) view_note(o, top - 1);
     field_edge(o, top, true);
-    if (g_ready) {   /* [ready], upper right, two cells in from the edge (as the mode is on the lower rule) */
-        int c = g_fs_cols - 7 - 1;
-        if (c >= 1) sb_printf(o, "\x1b[%d;%dH%s[ready]" C_RESET, top, c, th_fg(g_theme->edge_ready));
+    int rc = g_fs_cols - 7 - 1;   /* where [ready] starts, upper right, two cells in from the edge (as the mode is on the lower rule) */
+    if (g_ready && rc >= 1) sb_printf(o, "\x1b[%d;%dH%s[ready]" C_RESET, top, rc, th_fg(g_theme->edge_ready));
+    if (g_cfg.parallel_tasks) {   /* [parallel] in an animated rainbow, before [ready] (or at its place while the model works) */
+        sbuf pl; sb_init(&pl);
+        int pw = term_parallel_text(&pl, mono_ms()), start = g_ready ? rc - 1 - pw : rc + 7 - pw;
+        if (pw && start >= 3) { sb_printf(o, "\x1b[%d;%dH", top, start); sb_append(o, pl.data, pl.len); if (g_ready) sb_puts(o, " "); }
+        sb_free(&pl);
     }
     for (int i = 0; i < g_field_rows; i++) sb_printf(o, "\x1b[%d;%dH\x1b[49m\x1b[K" C_RESET, top + 1 + i, FIELD_X0);
     sb_printf(o, "\x1b[%d;%dH", top + 1, FIELD_X0 + 1);
@@ -2939,10 +2953,13 @@ static int read_key_prompt(bool idle) {
             long left = g_bg_next - mono_ms(); if (left < 0) left = 0;
             if (wait < 0 || left < wait) wait = (int)left;
         }
+        bool rainbow = g_fs && !g_ui_nc && g_cfg.parallel_tasks;   /* the [parallel] label moves: redraw it while the prompt waits */
+        if (rainbow && (wait < 0 || wait > RAINBOW_MS)) wait = RAINBOW_MS;
         if (wait < 0) return read_key();
         int k = read_key_wait(wait);
         if (k != K_IDLE) return k;
         term_tick_run();
+        if (rainbow) term_status_refresh();
         if (deadline >= 0 && mono_ms() >= deadline) return K_IDLE;
         if (term_bg_ready && mono_ms() >= g_bg_next) { g_bg_next = mono_ms() + TERM_BG_MS; return K_BG; }
     }
@@ -4225,7 +4242,7 @@ void md_finish(md_state *m) {
     if (m->in_fence && m->line.len) md_code_line(m);   /* a last line that never ended */
     fputs(C_RESET, stdout);
     m->in_fence = m->in_code = m->in_bold = m->in_info = false;
-    sb_free(&m->line); sb_free(&m->info);
+    sb_free(&m->line); sb_free(&m->info); sb_free(&m->word);   /* (the word was flushed above) */
     fflush(stdout);
 }
 

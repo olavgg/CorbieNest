@@ -89,6 +89,8 @@ without thinking about them: the status bar, the field, and the strip.
 | `/diff [git args]` | show `git diff` of the working tree (stat, patch, untracked files) for you only — nothing is added to the conversation; `/diff --staged`, `/diff HEAD~1` … pass through |
 | `/rewind` | (or **Esc Esc** at an empty prompt) pick an earlier request and go back: undo the file changes the model made since (files are checkpointed before every `write_file`/`edit_file`), truncate the conversation to just before it (the request text returns to the editor), or both |
 | `/orchestrate REQUEST` | the advisor model in charge: it plans the request as tasks, the main model does them as workers — several at a time where the plan allows — and the advisor reviews each; see [Orchestrating](#orchestrating) |
+| `/orchestrate -w NAME\|none REQUEST` | with a workflow: `NAME` is `.agents/workflows/NAME.md` for this run, `none` leaves `.agents/workflow.md` out of it; see [Workflows](#workflows-who-does-what-in-orchestrate) |
+| `/workflow [NAME\|new [NAME]]` | the workflow `/orchestrate` would use, slot by slot (the file, the skill and the model of each), or `new` to write a starter file |
 | `/plan REQUEST` | `/orchestrate` in layers: the advisor plans the request as tasks grouped into layers (`LAYER: n`), you approve the plan, then each layer runs and the project is built before the next one starts; a failed build becomes a fix task. See [Planning in layers](#planning-in-layers-plan) |
 | `/workers [N]` | how many tasks of `/orchestrate` may run at the same time (default 3, at most 20, `1` = one after another) |
 | `/effort parallel [on\|off]` | the `task` calls of one reply run as sub-agents at the same time (off by default: one after another) |
@@ -971,6 +973,199 @@ hosted, cloud or a bigger local one) is in charge, and the model doing the work 
   queues them otherwise. Esc stops every worker; a queued message does not.
 - The expensive model never reads a worker's transcript — only plans, reports and diffs — so
   its tokens stay few; `/usage` shows what they came to.
+
+### Workflows: who does what in `/orchestrate`
+
+A project (or you) can say who plays which part of a run: who owns the product, who codes, who writes
+the tests, who is QA, and who reviews the code, the product and the UX. The roles are skills (see
+[Skills](#skills)), so a role is its instructions and, if it has a `model:` line, its model. The file is
+`.agents/workflow.md` in the project (or `~/.agents/workflow.md` for every project): **a project that has one
+gets it on every `/orchestrate`**. `/orchestrate -w NAME REQUEST` uses `.agents/workflows/NAME.md` for one run,
+`-w none` leaves the workflow out of one. `/plan` does not use workflows.
+
+```
+# .agents/workflow.md
+owner: product-owner on anthropic:claude-opus-5
+coder: default
+tests: test-writer
+qa: qa-bot
+code-review: default on openai:gpt-5.2
+product-review: product-reviewer
+ux-review: none
+```
+
+One line per slot, `slot: skill`. `default` is the built-in instructions, `skill on MODEL` (or `default on MODEL`)
+names a model, `none` leaves a slot out. A slot that is not in the file is left out, except `owner` and `coder`.
+Other names for the slots are understood (`po`, `tester`, `reviewer`, `ux`, …); a line that names no slot is
+reported when the run starts. `/workflow` shows what a run would use, `/workflow new` writes a starter file. Two worked setups, with the models and efforts chosen for their cost, follow under [Using `/orchestrate`](#using-orchestrate-a-walkthrough-and-two-setups).
+
+| slot | who | what it does |
+|---|---|---|
+| `owner` | the model that plans and reviews: `/advisor`'s unless the line names one | plans the request, reviews each coder task (as the orchestrator did), and at the end **reports to you in the session** |
+| `coder` | a worker on the main model | does the tasks of the plan, and the fixes |
+| `tests` | a worker | writes the tests for the change, in the project's test files only |
+| `qa` | a worker | builds the project, runs its tests and tries the change; changes no file; ends its report with `VERDICT: PASS` or `VERDICT: FAIL why` |
+| `code-review` | a toolless reviewer | reads the diff of everything written, for bugs, edge cases, security and consistency |
+| `product-review` | a toolless reviewer | checks the change is what you asked for: all of it, and no more |
+| `ux-review` | a toolless reviewer | the experience of whoever uses it: messages, defaults, flows, naming. It reads the diff and the reports — it cannot run anything |
+
+- **Order.** The owner plans, with a note that the workflow does the tests, QA and reviews, so the plan is the
+  work that makes the change. The coder's tasks run and the owner reviews each, as before. When they are all
+  accepted: `tests`, then the checks in the order `qa`, `code-review`, `product-review`, `ux-review`.
+  Stages are one after another; only the coder's tasks may overlap (`/workers`).
+- **A check that finds something** sends the coder a fix task, with the findings and the request, at most two
+  per check; then the check runs again. A fix that wrote files sends the run back to QA first (the code the
+  checks saw has changed), and the checks after it again; a fix that wrote nothing only repeats the check
+  that failed. The repeated check is the fix's review. A check that still fails after two fixes ends the run:
+  the findings are in the report and the summary line is amber.
+- **A check that cannot run** (no model to ask, a QA report without a `VERDICT:` line) is not counted: the run
+  goes on and says so in the report.
+- **The report.** The owner is shown the plan's reports, how each check went and the files written, and
+  writes the report to you: what was done, whether it does what you asked, what is open. It is printed as a
+  reply and is what the conversation keeps first, followed by the program's own account of the tasks and checks,
+  so what you say next follows it. Esc at any point ends the run without a report; it is saved as stopped.
+- **Models and cost.** Each reviewer and the owner is a toolless call on its own model (the slot's `on MODEL`,
+  else its skill's `model:`, else the advisor). They count in `/usage` and the advisor tally. `/rewind` undoes
+  everything the run wrote, stages and fixes included.
+- **Limits.** The stages add at most 20 tasks to a run (1 for the tests, a QA run for each fix, 8 fixes); past
+  that the run stops with the findings. A role that is not a skill here runs the built-in instructions, and the
+  line at the start says so.
+
+### Using `/orchestrate`: a walkthrough and two setups
+
+**The steps**
+
+1. **Name who plans and reviews.** `/advisor MODEL` (a hosted one needs its key; it is kept in the config). Or leave the
+   advisor out and name the model in the workflow: `owner: default on MODEL`.
+2. **Pick who does the work.** `/model NAME`: the model that reads and edits. It must use tools. It is the *coder*.
+3. **Optionally, a workflow.** `/workflow new` writes a starter `.agents/workflow.md`; `/workflow` shows what a run would use,
+   slot by slot, with the model of each. Without a file, `/orchestrate` is the plain run described under
+   [Orchestrating](#orchestrating).
+4. **Run it.** `/orchestrate REQUEST` (`@files` work in the request). Outside auto mode you are asked before the tasks run.
+5. **Watch, stop, undo.** Every worker line is tagged `[n]` with its task; Esc stops the run; `/rewind` undoes everything it wrote;
+   `/usage` says what each model cost. Small change? `/orchestrate -w none REQUEST` skips the workflow for one run, and
+   `-w lite` runs `.agents/workflows/lite.md`, a workflow of one or two slots.
+
+**Where the tokens go.** What each call is shown decides what it costs, so that is what to tune:
+
+| call | is shown | cost shape |
+|---|---|---|
+| the owner's plan | the request, the project's instructions, a listing of the directory, the earlier conversation (cut to a budget) | one call; small |
+| the owner's review of a coder task | the task, the worker's report, the diff of the files that task wrote — never its transcript | one per coder task, again for each time it is sent back |
+| a coder, tests or QA worker | a fresh context: its task and the reports before it, then its own tool rounds | **the most tokens**: every tool round sends the whole conversation again |
+| a reviewer (code, product, UX) | the request, each task's report (cut to 1.5 KB), the whole diff of the run | one call each: input-heavy, output small |
+| the owner's report | the reports, how each check went, the list of files | one call, at the end |
+
+The levers, from the biggest:
+
+- **Put the cheapest model that can do the job on the workers.** Their tool rounds are most of the bill. On an Anthropic model a
+  worker's rounds are served from the prompt cache after the first (the program marks the system prompt and the last message of
+  every call), and a cache read costs 5% or 10% of the input price (`/usage` shows it on its own line).
+- **Put the strongest model only on what has to judge**: the owner (the plan decides how many tasks there are) and the one
+  check that reads code for bugs. A reviewer's call is one message, with no cache to lean on.
+- **Leave a slot out** when it earns nothing: a backend change needs no `ux-review`, a one-line fix needs no workflow
+  (`-w none`). A slot that is not in the file costs nothing.
+- **Keep a role's instructions short.** A skill's body goes out with every call of that role, and every skill's name and
+  description is listed in the main model's system prompt on every request: three plain sentences beat a page.
+- **Set effort per model, not per slot.** Effort is kept per model name (see [Effort](#effort)), written as the workflow file names the
+  model: roles on one model share a setting, so give a role its own model when it wants its own effort. A worker whose role names
+  a hosted model runs without extended thinking, whatever its saved effort, which is the cheap end for QA and tests; the
+  coder, when it is the main model, thinks at `/effort`.
+- **Mind the fixes.** A check that fails costs a fix task (a worker), the check again, and, if the fix wrote files, QA again: at
+  most two rounds per check. A task list the owner plans as few and clear tasks costs less than one it has to send back.
+
+The prices below are the built-in list of `/usage` (as of October 2026, per million input / output tokens: Opus 5.5 $4 / $20,
+Sonnet 5.5 $2 / $10, Haiku 5 $0.10 / $0.50). They move: `/usage price MODEL IN OUT` sets another, and what was billed is on the
+provider's usage page. As arithmetic, not a measurement: a review call that is shown 8,000 tokens and answers in 500 costs
+$0.042 on Opus 5.5, $0.021 on Sonnet 5.5 and $0.001 on Haiku 5.
+
+#### Simple: the advisor owns the run, one cheap worker does QA
+
+```
+/model anthropic:claude-sonnet-5-5       # the coder: reads, edits, runs
+/advisor anthropic:claude-opus-5-5       # the owner: plans, reviews each task, reviews the code, reports to you
+/advisor effort medium
+```
+
+`.agents/workflow.md` (the file is in `docs/examples/orchestrate/simple/`):
+
+```
+owner: default
+coder: default
+qa: default on anthropic:claude-haiku-5
+code-review: default
+```
+
+```
+› /orchestrate add a --dry-run flag to the importer, with a test
+  workflow .agents/workflow.md · owner coder qa@anthropic:claude-haiku-5 code-review
+  ⤷ product owner anthropic:claude-opus-5-5 · plans the request · …
+      1. Add the flag and thread it through the importer
+  ⤷ worker 1/1 Add the flag and thread it through the importer
+  ⤷ product owner anthropic:claude-opus-5-5 · reviews task 1/1 · …
+    ⎿ accepted
+  ⤷ stage QA run 1
+    ⎿ qa: passed
+  ⤷ code reviewer anthropic:claude-opus-5-5 · code-review · …
+    ⎿ code-review: passed
+  ⤷ product owner anthropic:claude-opus-5-5 · reports to you · …
+✓ orchestrated: 2 of 2 tasks accepted · files written: src/import.c, tests/test_import.c
+● The importer now takes --dry-run: …
+```
+
+What it spends, and why: the Sonnet coder does the reading and editing, which is where the tool rounds are, at a fifth of
+Opus's input price and with its rounds cached. Opus is called a handful of times and only ever sees reports and diffs. QA only
+runs commands and reads their output, so Haiku, without thinking, is enough. No tests stage: the coder's task says "with a test".
+Two things to notice: the code review is the advisor (no model is named, so the owner's is used), and the owner is told the
+workflow will test and review, so it plans the work and not the checking.
+
+#### Advanced: every part on the model whose price and strength fit it
+
+The files are in `docs/examples/orchestrate/advanced/`: a `workflow.md`, five small skills and the effort lines.
+
+```
+owner: default on anthropic:claude-opus-5-5
+coder: default
+tests: wf-tests
+qa: wf-qa
+code-review: wf-code-review on anthropic:claude-opus-5-5
+product-review: wf-product-review
+ux-review: wf-ux-review
+```
+
+| slot | model | why |
+|---|---|---|
+| owner | Opus 5.5, effort `medium` | the plan sets how much work there is, and it judges every task; a handful of small calls |
+| coder | Sonnet 5.5 (the main model), effort `low` | does most of the work; a coder that is told exactly what to change does not need to think hard; rounds cached at 5% |
+| tests | Haiku 5 (the `wf-tests` skill's `model:`) | mechanical: copy the project's test style; no thinking, the cheapest rounds |
+| qa | Haiku 5 | runs commands and quotes their output, ends with `VERDICT:` |
+| code-review | Opus 5.5 (named in the file: it shares the owner's `medium`) | the one check that must catch bugs; reads a diff, answers briefly |
+| product-review | Haiku 5 | compares the request with the reports point by point |
+| ux-review | Sonnet 5.5 (shares the coder's `low`) | judgement of wording and flows from a diff; skips itself with `LGTM` when nothing user-facing changed |
+
+Install it in a project, then set the efforts (the same as the lines in `config.txt`):
+
+```
+mkdir -p .agents/skills
+cp docs/examples/orchestrate/advanced/workflow.md .agents/workflow.md
+cp -r docs/examples/orchestrate/advanced/skills/* .agents/skills/
+```
+```
+/model anthropic:claude-sonnet-5-5
+/effort low
+/advisor anthropic:claude-opus-5-5
+/advisor effort medium
+/workflow                  # check the model of each slot
+/orchestrate add rate limiting to the API client, per host, with tests
+```
+
+The order of the checks is part of the saving: QA (Haiku, runs the real tests) is first, so the diff that Opus reads has already
+built and passed; the reviewers only see work that runs. A failed QA is a cheap Sonnet fix and a cheap Haiku rerun, not an Opus
+review of broken code. And a slot is a line to delete: for a backend change take out `ux-review`, for a change with no new
+behaviour take out `tests` and `product-review`, and the run gets shorter and cheaper without any other edit.
+
+To see whether a setup pays off, run the same request twice, once with `-w none`, and compare `/usage`: it lists tokens per
+model, so the Opus line is the part you meant to keep small.
 
 ### Planning in layers (`/plan`)
 

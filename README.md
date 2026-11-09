@@ -22,8 +22,9 @@ confirmed before it runs.
 - **Sub-agents.** A read-only agent investigates a question in its own context and reports
   back. A strip above the status bar lists the running ones; when they do not fit, "show all"
   opens the rest. `↓` moves into the strip and Enter opens a log.
-- **Orchestration and goals.** `/orchestrate` plans a request as tasks that the advisor reviews;
-  `/goal` races candidates in git worktrees against a metric.
+- **Orchestration and goals.** `/orchestrate` plans a request as tasks that the advisor reviews, and
+  with a `.agents/workflow.md` it also runs tests, QA and code, product and UX reviews by the roles you
+  name, with the product owner reporting to you; `/goal` races candidates in git worktrees against a metric.
 - **Sessions, memory, skills.** Sessions resume with `--continue` or `/resume`. The project keeps
   a memory file, and skills are reusable `SKILL.md` instructions.
 - **Hooks, permission rules and a sandbox.** `/hooks` runs your shell commands before and after
