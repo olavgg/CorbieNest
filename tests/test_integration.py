@@ -1247,7 +1247,9 @@ check(json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"] == 0
 tool_msgs = [m for m in requests()[-1]["messages"] if m["role"] == "tool"]
 check([m["content"] for m in tool_msgs[-2:]] == ["REPORT PAUSE alpha", "REPORT PAUSE beta"], "off: the results are in the same order")
 print("test interactive: /effort parallel on, with a hosted (Anthropic) main model, runs the task calls at the same time")
-sp = Session(["-m", "anthropic:claude-fake-haiku", "--yolo"], env=ENVK); sp.expect("Ctrl-D to quit")
+CFG_P = tempfile.mkdtemp(prefix="crowcfgp_"); os.makedirs(os.path.join(CFG_P, "corbienest"))   # a config of its own: CFG2 does not exist yet, and the /effort section makes it
+open(os.path.join(CFG_P, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\n")
+sp = Session(["-m", "anthropic:claude-fake-haiku", "--yolo"], env=dict(ENVK, XDG_CONFIG_HOME=CFG_P)); sp.expect("Ctrl-D to quit")
 sp.send("/effort parallel on\r"); check(sp.expect("parallel = on"), "hosted: /effort parallel on")
 urllib.request.urlopen(f"{HOST}/_inflight").read(); n0 = len(preqs())
 sp.send("TOOL_TASKS\r")
@@ -1261,8 +1263,8 @@ check(all({t["name"] for t in b["tools"]} <= {"read_file", "list_dir", "grep", "
 last = [r["body"] for r in preqs()[n0:] if r["provider"] == "anthropic" and "You are a sub-agent" not in json.dumps(r["body"].get("system", ""))][-1]
 res = [b["content"] for m in last["messages"] if isinstance(m["content"], list) for b in m["content"] if b.get("type") == "tool_result"]
 check(res[-2:] == ["REPORT PAUSE alpha", "REPORT PAUSE beta"], f"hosted: the results come back in the order the model asked: {res[-2:]}")
-sp.send("/effort parallel off\r"); check(sp.expect("parallel = off"), "hosted: /effort parallel off (the config is shared with later sections)")
-sp.close()
+sp.send("\x04"); sp.close()
+shutil.rmtree(CFG_P, ignore_errors=True)
 print("test interactive: ← on an empty line lists the sub-agents; the one picked shows its log")
 s.send("\x1b[D"); check(s.expect("sub-agents"), "← on an empty line opens the sub-agents list")
 check(s.expect("find the needle") and s.expect("done · 2 rounds"), "the run is listed with its state and rounds")
