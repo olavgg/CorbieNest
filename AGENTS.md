@@ -123,7 +123,7 @@ key `test-key`, the requests logged at `/_provider_requests` without the key; `g
 `claude-fake-opus`, `claude-opus-5` (refusal fallbacks) and `claude-fake-haiku` (a thinking budget), which
 read `SLOWADVICE`, `CUTADVICE`, `REFUSEADVICE`. A Messages request that is the model doing the work
 (`tools` present, or messages that are not one user string) is scripted the same way — `TOOL_BASH`,
-`TOOL_WRITE` and `TOOL_ADVISOR` become `tool_use`, a later `tool_result` is answered `Tool said:`,
+`TOOL_WRITE` and `TOOL_ADVISOR` become `tool_use` (`TOOL_TASKS`: two `task` calls; a sub-agent whose task says `PAUSE` greps, then reports, slowly, and `/_inflight` counts its unstreamed calls), a later `tool_result` is answered `Tool said:`,
 and `stream: true` is SSE — while a consultation stays one user string. `fake_ollama.serve(port, cert, key)` serves the same
 behind TLS for the https tests). Run the tests after every change to `src/`; `make test` (the unit suite) must pass and the
 build must be warning-free with `-Wall -Wextra`.

@@ -1246,6 +1246,25 @@ s.send("TOOL_TASKS\r"); check(s.expect("Both reports are in.", 40), "off: the sa
 check(json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"] == 0, "off: no sub-agent call went out unstreamed (the batch was not used)")
 tool_msgs = [m for m in requests()[-1]["messages"] if m["role"] == "tool"]
 check([m["content"] for m in tool_msgs[-2:]] == ["REPORT PAUSE alpha", "REPORT PAUSE beta"], "off: the results are in the same order")
+print("test interactive: /effort parallel on, with a hosted (Anthropic) main model, runs the task calls at the same time")
+CFG_P = tempfile.mkdtemp(prefix="crowcfgp_"); os.makedirs(os.path.join(CFG_P, "corbienest"))   # a config of its own: CFG2 does not exist yet, and the /effort section makes it
+open(os.path.join(CFG_P, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\n")
+sp = Session(["-m", "anthropic:claude-fake-haiku", "--yolo"], env=dict(ENVK, XDG_CONFIG_HOME=CFG_P)); sp.expect("Ctrl-D to quit")
+sp.send("/effort parallel on\r"); check(sp.expect("parallel = on"), "hosted: /effort parallel on")
+urllib.request.urlopen(f"{HOST}/_inflight").read(); n0 = len(preqs())
+sp.send("TOOL_TASKS\r")
+check(sp.expect("⤷ sub-agent alpha") and sp.expect("⤷ sub-agent beta"), "hosted: both sub-agents start")
+check(sp.expect("Tool said: REPORT PAUSE beta", 40), f"hosted: the main model gets both results and answers: {since_send(sp)[-300:]!r}")
+most = json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"]
+check(most == 2, f"hosted: the sub-agents' Messages calls were under way at the same time: {most}")
+subreq = [r["body"] for r in preqs()[n0:] if r["provider"] == "anthropic" and "You are a sub-agent" in json.dumps(r["body"].get("system", ""))]
+check(len(subreq) == 4 and all(not b.get("stream") for b in subreq), f"hosted: two rounds of two sub-agents, unstreamed: {len(subreq)}")
+check(all({t["name"] for t in b["tools"]} <= {"read_file", "list_dir", "grep", "bash", "web_fetch", "web_search"} for b in subreq), "hosted: the sub-agents got read-only tools only")
+last = [r["body"] for r in preqs()[n0:] if r["provider"] == "anthropic" and "You are a sub-agent" not in json.dumps(r["body"].get("system", ""))][-1]
+res = [b["content"] for m in last["messages"] if isinstance(m["content"], list) for b in m["content"] if b.get("type") == "tool_result"]
+check(res[-2:] == ["REPORT PAUSE alpha", "REPORT PAUSE beta"], f"hosted: the results come back in the order the model asked: {res[-2:]}")
+sp.send("\x04"); sp.close()
+shutil.rmtree(CFG_P, ignore_errors=True)
 print("test interactive: ← on an empty line lists the sub-agents; the one picked shows its log")
 s.send("\x1b[D"); check(s.expect("sub-agents"), "← on an empty line opens the sub-agents list")
 check(s.expect("find the needle") and s.expect("done · 2 rounds"), "the run is listed with its state and rounds")
