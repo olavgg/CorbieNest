@@ -36,7 +36,13 @@
 
 static bool g_always_write = false, g_always_edit = false, g_always_bash = false, g_always_fetch = false, g_always_mcp = false;
 bool tools_no_confirm = false;   /* set by the caller for user-typed "!cmd": no prompt, no plan-mode veto */
-void tools_reset_permissions(void) { g_always_write = g_always_edit = g_always_bash = g_always_fetch = g_always_mcp = false; }
+/* The same "don't ask again" answers given inside a copy of the project (a sub-agent's or a /goal candidate's worktree):
+ * kept apart, so an "always" given for a scratch copy never carries to the main agent's writes in the user's tree. */
+static bool g_copy_write = false, g_copy_edit = false, g_copy_bash = false, g_copy_fetch = false, g_copy_mcp = false;
+void tools_reset_permissions(void) {
+    g_always_write = g_always_edit = g_always_bash = g_always_fetch = g_always_mcp = false;
+    g_copy_write = g_copy_edit = g_copy_bash = g_copy_fetch = g_copy_mcp = false;
+}
 const char *tools_summary_line(void) {
     static char b[160];
     snprintf(b, sizeof b, "read_file, write_file, edit_file, list_dir, grep, bash, bash_job, todo_write, %stask%s", g_cfg.web ? "web_search, web_fetch, " : "", g_cfg.advisor ? ", advisor" : "");
@@ -58,9 +64,10 @@ static char *g_perm[PERM_MAX]; static int g_perm_n = 0;
 /* Where this project's rules are kept: in the user's config directory, under a name made from the
  * project's path. A file in the project itself cannot grant anything — a cloned repository could
  * carry one that says "edit" or "bash git" — so the rules are never read from the working tree. */
+static void project_dir(char *buf, size_t n);
 static const char *perm_path(void) {
     static char path[1200];
-    char cwd[1024]; if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, "?");
+    char cwd[PATH_MAX]; project_dir(cwd, sizeof cwd);
     unsigned long long h = 1469598103934665603ULL;   /* FNV-1a, 64 bit */
     for (const char *p = cwd; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
     snprintf(path, sizeof path, "%s/permissions/%016llx.rules", config_dir(), h);
@@ -86,7 +93,7 @@ void tools_permissions_load(void) {
 static void perm_save(void) {
     if (!g_perm_n) { unlink(perm_path()); return; }
     sbuf b; sb_init(&b);
-    char cwd[1024]; if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, "?");
+    char cwd[PATH_MAX]; project_dir(cwd, sizeof cwd);
     sb_printf(&b, "# corbienest project permissions for %s — one rule per line: \"edit\", \"bash <leading words>\", \"fetch <host>\", or \"deny|ask bash|edit|fetch <pattern>\" (see /permissions)\n", cwd);
     for (int i = 0; i < g_perm_n; i++) sb_printf(&b, "%s\n", g_perm[i]);
     char dir[1100]; snprintf(dir, sizeof dir, "%s/permissions", config_dir());
@@ -285,44 +292,108 @@ static ckpt_t *g_ckpt; static int g_ckpt_n, g_ckpt_cap; static size_t g_ckpt_byt
 static int g_ckpt_step = 0;   /* a part of the request that is looked at by itself (a task of /orchestrate); 0 = none */
 
 void tools_checkpoint_turn(int turn) { g_ckpt_turn = turn; g_ckpt_step = 0; }
-/* /goal: while a candidate's tool call runs, the working directory is its worktree and writes must stay in it */
+/* /goal and the sub-agents that write (task with isolation=worktree): while a candidate's or a sub-agent's tool call runs,
+ * the working directory is its worktree and writes must stay in it. Never nested: one fd is kept. */
 static const char *g_tool_root = NULL;
+static const char *g_tool_mirror = NULL;   /* the directory the copy stands for: an absolute path under it means the same path in the copy */
+static const char *g_tool_top = NULL, *g_tool_top_to = NULL;   /* the same for the repository's top and the copy's (a project in a subfolder) */
+static const char *g_tool_who = NULL;      /* who is asking, put in front of a question ("[sub-agent alpha]") */
+static bool g_tool_quiet = false;          /* a batch runs: a write that is not asked about shows nothing (its report comes at the end) */
+static char g_tool_home[PATH_MAX];         /* the directory tools_enter() left: the project, whose rules and hooks still apply */
 static int g_tool_saved = -1;
+void (*tools_copy_wrote)(const char *path) = NULL;
 bool tools_enter(const char *root) {
     if (g_tool_saved >= 0 || !root) return false;
     int fd = open(".", O_RDONLY | O_DIRECTORY);
     if (fd < 0) return false;
-    if (chdir(root) != 0) { close(fd); return false; }
+    if (!getcwd(g_tool_home, sizeof g_tool_home)) g_tool_home[0] = 0;
+    if (chdir(root) != 0) { close(fd); g_tool_home[0] = 0; return false; }
     g_tool_saved = fd; g_tool_root = root;
+    return true;
+}
+bool tools_enter_copy(const char *root, const char *mirror, const char *top, const char *top_to, const char *who, bool quiet) {
+    if (!tools_enter(root)) return false;
+    g_tool_mirror = mirror && *mirror ? mirror : NULL;
+    g_tool_top = top && *top && top_to && *top_to ? top : NULL; g_tool_top_to = g_tool_top ? top_to : NULL;
+    g_tool_who = who && *who ? who : NULL;
+    g_tool_quiet = quiet;
     return true;
 }
 void tools_leave(void) {
     if (g_tool_saved < 0) return;
     if (fchdir(g_tool_saved) != 0) fprintf(stderr, "corbienest: cannot return to the working directory: %s\n", strerror(errno));
-    close(g_tool_saved); g_tool_saved = -1; g_tool_root = NULL;
+    close(g_tool_saved); g_tool_saved = -1; g_tool_root = NULL; g_tool_mirror = NULL; g_tool_top = g_tool_top_to = NULL; g_tool_who = NULL; g_tool_quiet = false; g_tool_home[0] = 0;
+}
+/* the project's directory: the working directory, or the one a copy's tool call left (its rules and hooks are the project's) */
+static void project_dir(char *buf, size_t n) {
+    if (g_tool_saved >= 0 && g_tool_home[0]) snprintf(buf, n, "%s", g_tool_home);
+    else if (!getcwd(buf, n)) snprintf(buf, n, "?");
+}
+/* A path as a tool was given it: ~ expanded, and in a copy an absolute path under the directory the copy stands for is
+ * the same path in the copy (the main agent's prompt names the user's files; the copy has the same ones). Malloc'd. */
+static char *tool_path(const char *path) {
+    char *p = expand_home(path);
+    char cwd[PATH_MAX];   /* the copy as the working directory has it (symlinks resolved), so the rules match it as they match a relative path */
+    if (!g_tool_root || !g_tool_mirror || !getcwd(cwd, sizeof cwd)) return p;
+    char *in = copy_path_map(p, cwd, cwd), *in2 = in ? NULL : copy_path_map(p, g_tool_root, g_tool_root);
+    if (in || in2) { free(in); free(in2); return p; }   /* already the copy's (it may lie under the project: a config folder in it) */
+    char *m = copy_path_map(p, g_tool_mirror, cwd);
+    if (!m && g_tool_top) m = copy_path_map(p, g_tool_top, g_tool_top_to);   /* above the working folder, still in the repository */
+    if (m) { free(p); return m; }
+    return p;
 }
 /* p is as a tool was given it, ~ expanded, and is taken from the current directory: inside the root? A path that does
  * not exist yet is checked by its folder. Symlinks are resolved, so one out of the worktree does not pass. */
-static bool path_in_root(const char *p) {
-    if (!g_tool_root) return true;
+enum { PATH_OK = 0, PATH_OUTSIDE, PATH_GIT };
+static int path_check(const char *p) {
+    if (!g_tool_root) return PATH_OK;
     char root[PATH_MAX], full[PATH_MAX];
-    if (!realpath(g_tool_root, root)) return false;
+    if (!realpath(g_tool_root, root)) return PATH_OUTSIDE;
+    struct stat st;
+    if (lstat(p, &st) == 0 && S_ISLNK(st.st_mode) && stat(p, &st) != 0) return PATH_OUTSIDE;   /* a link to nothing: writing it would create its target, wherever that is */
     if (!realpath(p, full)) {
-        const char *slash = strrchr(p, '/'), *name = slash ? slash + 1 : p;
-        if (!*name || !strcmp(name, ".") || !strcmp(name, "..")) return false;
-        char dir[PATH_MAX];
-        if (!slash) snprintf(dir, sizeof dir, ".");
-        else if (slash == p) snprintf(dir, sizeof dir, "/");
-        else if ((size_t)(slash - p) < sizeof dir) snprintf(dir, sizeof dir, "%.*s", (int)(slash - p), p);
-        else return false;
+        /* the nearest folder above it that is there, resolved, and the rest as written: no ".." in the rest, which
+         * cannot be resolved where folders do not exist yet (mkdir_p makes them) */
+        char *d = xstrdup(p);
+        const char *rest = NULL;
         char real[PATH_MAX];
-        if (!realpath(dir, real)) return false;
-        size_t rl = strlen(real), nl = strlen(name);
-        if (rl + nl + 2 > sizeof full) return false;
-        memcpy(full, real, rl); full[rl] = '/'; memcpy(full + rl + 1, name, nl + 1);
+        bool found = false;
+        for (;;) {
+            char *slash = strrchr(d, '/');
+            if (!slash) { if (realpath(".", real)) { found = true; rest = p; } break; }
+            if (slash == d) { snprintf(real, sizeof real, "/"); found = true; rest = p + 1; break; }
+            *slash = 0;
+            if (realpath(d, real)) { found = true; rest = p + (slash - d) + 1; break; }
+        }
+        bool ok = found && *rest;
+        for (const char *q = rest; ok && q && *q; ) {
+            const char *e = strchr(q, '/'); size_t l = e ? (size_t)(e - q) : strlen(q);
+            if (l == 2 && !strncmp(q, "..", 2)) ok = false;
+            if (!e) { if (l == 0 || (l == 1 && *q == '.')) ok = false; break; }   /* the name itself */
+            q = e + 1;
+        }
+        size_t rl = ok ? strlen(real) : 0, nl = ok ? strlen(rest) : 0;
+        if (ok && rl + nl + 2 > sizeof full) ok = false;
+        if (ok) { memcpy(full, real, rl); if (rl > 1) full[rl++] = '/'; memcpy(full + rl, rest, nl + 1); }
+        free(d);
+        if (!ok) return PATH_OUTSIDE;
     }
     size_t n = strlen(root);
-    return !strncmp(full, root, n) && (full[n] == '/' || full[n] == 0);
+    if (strncmp(full, root, n) || (full[n] != '/' && full[n] != 0)) return PATH_OUTSIDE;
+    for (const char *q = full + n; *q; ) {   /* a copy's .git (or one below it) is git's, not the sub-agent's */
+        while (*q == '/') q++;
+        const char *e = strchr(q, '/'); size_t l = e ? (size_t)(e - q) : strlen(q);
+        if (l == 4 && !strncmp(q, ".git", 4)) return PATH_GIT;
+        if (!e) break;
+        q = e;
+    }
+    return PATH_OK;
+}
+static bool path_refused(const char *p, const char *path, const char *verb, sbuf *out) {
+    int pc = path_check(p);
+    if (pc == PATH_OUTSIDE) sb_printf(out, "error: %s is outside the copy of the project you work in; %s inside the working directory, with a relative path", path, verb);
+    else if (pc == PATH_GIT) sb_printf(out, "error: %s is git's own data in your copy; it is not yours to %s", path, verb);
+    return pc != PATH_OK;
 }
 static bool g_in_subagent = false;   /* a sub-agent's calls are running (t_task, or a batch of them) */
 void tools_checkpoint_step(int step) { g_ckpt_step = step; }
@@ -540,13 +611,16 @@ cJSON *tools_definitions(void) {
     prop(p, "description", "string", "A short (3-6 word) label for what the sub-agent does, shown to the user.");
     prop(p, "agent", "string", "The name of a sub-agent defined for this project (listed in the system prompt): it runs with its own role and tools. Omit for a general sub-agent.");
     prop(p, "prompt", "string", "The complete task for the sub-agent. It starts with a fresh context and sees nothing of this conversation, so include every relevant detail: what to look for, where, and exactly what to report back.");
+    cJSON *iso = prop(p, "isolation", "string", "Optional. worktree: the sub-agent changes files. It works in a git copy of the project (the files as they are now, uncommitted ones included; no build output or installed dependencies) with write_file and edit_file, and what it changed is applied to the working tree when it reports — kept as a git branch instead when it does not fit. Omit for research, which stays read-only.");
+    cJSON *ien = cJSON_AddArrayToObject(iso, "enum"); cJSON_AddItemToArray(ien, cJSON_CreateString("worktree"));
     prop(p, "skills", "string", "Optional. Names of skills (the ones listed in the system prompt, with or without the leading /), comma separated: the sub-agent is given their full instructions. Use it when a skill describes how this task is done.");
     sbuf td; sb_init(&td);
-    sb_puts(&td, "Delegate a self-contained research or exploration task to a sub-agent with its own fresh context. It can read files, list directories, grep and run read-only shell commands, but cannot modify files, and returns a text report. "
+    sb_puts(&td, "Delegate a self-contained research or exploration task to a sub-agent with its own fresh context. It can read files, list directories, grep and run read-only shell commands, but cannot modify files, and returns a text report — unless isolation is worktree: then it makes a change in a copy of its own, which is applied when it reports. "
                  "Use it for broad searches or investigations whose intermediate output would clutter your context (\"find every place X is handled and summarise\", \"figure out how the build works\"), not for simple one-file lookups.");
     if (g_cfg.parallel_tasks) {
         sb_puts(&td, " Parallel sub-agents are on: several task calls in ONE reply run at the same time (when no other tool is called in that reply), so split an investigation into independent tasks, each with its own complete prompt, and send them together. ");
         parallel_advice(&td);
+        sb_puts(&td, " A change that falls into independent parts can be split the same way: give each part a task with isolation=worktree; each works in a copy of its own, and the changes are applied one after another, in the order you asked, when they are all done (one that no longer fits is kept as a branch, and its result says so). Do not split work that edits the same lines.");
     }
     cJSON_AddItemToArray(arr, mk_tool("task", td.data, p, (const char*[]){"description", "prompt", NULL}));
     sb_free(&td);
@@ -638,10 +712,18 @@ static void preview_folded(const char *text, const char *lang) {
 enum { CONF_EDIT = CONF_EDIT_K, CONF_BASH = CONF_BASH_K, CONF_FETCH = CONF_FETCH_K, CONF_MCP = CONF_MCP_K };
 /* Would confirm() ask? The same early returns, without the output: a command that will be asked
  * about is never folded away (the user approves what they can see). Keep in step with confirm_body(). */
+static bool *always_here(bool *f) {   /* inside a copy, an "always" is the copy's (see g_copy_write); one the user gave the main agent holds there too */
+    if (!g_tool_root || !f || *f) return f;
+    return f == &g_always_write ? &g_copy_write : f == &g_always_edit ? &g_copy_edit : f == &g_always_bash ? &g_copy_bash
+         : f == &g_always_fetch ? &g_copy_fetch : f == &g_always_mcp ? &g_copy_mcp : f;
+}
 static bool confirm_will_ask(int kind, bool *always_flag, const char *cmd) {
     if (tools_no_confirm) return false;
+    always_flag = always_here(always_flag);
     const char *rule;
-    int v = perm_verdict(kind, cmd, &rule);
+    char *np = kind == CONF_EDIT && cmd ? perm_path_norm(cmd) : NULL;   /* as confirm() matches it */
+    int v = perm_verdict(kind, np ? np : cmd, &rule);
+    free(np);
     if (v == VERDICT_DENY) return false;
     if (v == VERDICT_ASK) return g_cfg.interactive;
     if (always_flag && *always_flag) return false;
@@ -679,7 +761,7 @@ static int confirm_body(const char *what, int kind, bool *always_flag, const cha
     }
     if (always_flag && *always_flag) return 1;
     if (YOLO() || (kind == CONF_EDIT && g_cfg.mode == MODE_ACCEPT_EDITS)) {
-        if (g_cfg.interactive && kind != CONF_BASH) printf("  " C_YELLOW "%s" C_RESET "  " C_DIM "auto-approved (%s mode)" C_RESET "\n", what, mode_name(g_cfg.mode));
+        if (g_cfg.interactive && kind != CONF_BASH && !g_tool_quiet) printf("  " C_YELLOW "%s" C_RESET "  " C_DIM "auto-approved (%s mode)" C_RESET "\n", what, mode_name(g_cfg.mode));
         return 1;
     }
     if (kind == CONF_EDIT && g_cfg.mode == MODE_PLAN) {
@@ -714,8 +796,10 @@ static int confirm_body(const char *what, int kind, bool *always_flag, const cha
 }
 static int confirm(const char *what, int kind, bool *always_flag, const char *cmd, char **reason) {
     char *np = kind == CONF_EDIT && cmd ? perm_path_norm(cmd) : NULL;
-    int r = confirm_body(what, kind, always_flag, np ? np : cmd, reason);
-    free(np);
+    sbuf w; sb_init(&w);
+    if (g_tool_who) sb_printf(&w, "[%s] %s", g_tool_who, what);   /* a sub-agent asks: the question says which */
+    int r = confirm_body(g_tool_who ? w.data : what, kind, always_here(always_flag), np ? np : cmd, reason);
+    sb_free(&w); free(np);
     return r;
 }
 
@@ -723,7 +807,7 @@ static int confirm(const char *what, int kind, bool *always_flag, const char *cm
 static tool_status t_read_file(cJSON *args, sbuf *out) {
     const char *path = jstr(args, "path", NULL);
     if (!path) { sb_puts(out, "error: missing 'path'"); return TOOL_ERROR; }
-    char *p = expand_home(path);
+    char *p = tool_path(path);
     if (is_dir(p)) { sb_printf(out, "error: %s is a directory (use list_dir)", path); free(p); return TOOL_ERROR; }
     size_t len = 0;
     char *d = read_whole_file(p, &len, READ_FILE_MAX);
@@ -765,12 +849,12 @@ static tool_status t_write_file(cJSON *args, sbuf *out) {
     const char *path = jstr(args, "path", NULL);
     const char *content = jstr(args, "content", NULL);
     if (!path || !content) { sb_puts(out, "error: need 'path' and 'content'"); return TOOL_ERROR; }
-    char *p = expand_home(path);
-    if (!path_in_root(p)) { sb_printf(out, "error: %s is outside this candidate's worktree; write inside the working directory", path); free(p); return TOOL_ERROR; }
+    char *p = tool_path(path);
+    if (path_refused(p, path, "write", out)) { free(p); return TOOL_ERROR; }
     bool exists = is_file(p);
     /* /config write hide: no header and no preview, unless the user is about to be asked (they approve what they see) */
-    bool asked = confirm_will_ask(CONF_EDIT, &g_always_write, path);
-    bool show_prev = g_cfg.show_write || asked;
+    bool asked = confirm_will_ask(CONF_EDIT, &g_always_write, p);
+    bool show_prev = (g_cfg.show_write && !g_tool_quiet) || asked;
     if (show_prev) printf("  " C_DIM "%s %s (%zu bytes)" C_RESET "\n", exists ? "overwrite" : "create", path, strlen(content));
     const char *dot = strrchr(path, '.'), *slash = strrchr(path, '/');
     const char *lang = dot && (!slash || dot > slash) ? dot + 1 : NULL;
@@ -780,7 +864,7 @@ static tool_status t_write_file(cJSON *args, sbuf *out) {
     else if (!asked) preview_folded(content, lang);
     else preview_lines(content, 12, C_GREEN, lang);
     char *reason = NULL;
-    if (!confirm(exists ? "Overwrite this file?" : "Create this file?", CONF_EDIT, &g_always_write, path, &reason)) {
+    if (!confirm(exists ? "Overwrite this file?" : "Create this file?", CONF_EDIT, &g_always_write, p, &reason)) {
         sb_printf(out, "User denied writing %s.%s%s", path, reason ? " Reason: " : "", reason ? reason : "");
         free(reason); free(p); return TOOL_DENIED;
     }
@@ -792,6 +876,7 @@ static tool_status t_write_file(cJSON *args, sbuf *out) {
     if (write_whole_file(p, content, strlen(content)) != 0) { sb_printf(out, "error: cannot write %s: %s", path, strerror(errno)); free(p); return TOOL_ERROR; }
     int lines = 0; for (const char *c = content; *c; c++) if (*c == '\n') lines++;
     sb_printf(out, "Wrote %zu bytes (%d lines) to %s", strlen(content), lines, path);
+    if (g_tool_root && tools_copy_wrote) tools_copy_wrote(p);
     free(p);
     return TOOL_OK;
 }
@@ -810,8 +895,8 @@ static tool_status t_edit_file(cJSON *args, sbuf *out) {
     bool all = jbool(args, "replace_all", false);
     if (!path || !olds || !news) { sb_puts(out, "error: need 'path', 'old_string' and 'new_string'"); return TOOL_ERROR; }
     if (!*olds) { sb_puts(out, "error: old_string must not be empty (use write_file to create files)"); return TOOL_ERROR; }
-    char *p = expand_home(path);
-    if (!path_in_root(p)) { sb_printf(out, "error: %s is outside this candidate's worktree; edit inside the working directory", path); free(p); return TOOL_ERROR; }
+    char *p = tool_path(path);
+    if (path_refused(p, path, "edit", out)) { free(p); return TOOL_ERROR; }
     size_t len; char *d = read_whole_file(p, &len, 0);
     if (!d) { sb_printf(out, "error: cannot read %s: %s", path, strerror(errno)); free(p); return TOOL_ERROR; }
     if (memchr(d, 0, len)) { sb_printf(out, "error: %s contains NUL bytes (binary); edit_file works on text files", path); free(d); free(p); return TOOL_ERROR; }
@@ -831,19 +916,20 @@ static tool_status t_edit_file(cJSON *args, sbuf *out) {
         if (!all) { sb_puts(&nb, s); break; }
     }
     /* /config edit hide: no diff in the transcript, unless the user is about to be asked (they approve what they see) */
-    bool show_diff = g_cfg.show_edit || confirm_will_ask(CONF_EDIT, &g_always_edit, path);
+    bool show_diff = (g_cfg.show_edit && !g_tool_quiet) || confirm_will_ask(CONF_EDIT, &g_always_edit, p);
     if (show_diff) printf("  " C_DIM "edit %s (%d replacement%s)" C_RESET "\n", path, occ, occ == 1 ? "" : "s");
     /* diff-ish preview */
     if (show_diff) { sbuf t; sb_init(&t); const char *q = olds; while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "- %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_RED, NULL); sb_free(&t); }
     if (show_diff) { sbuf t; sb_init(&t); const char *q = news; if (!*q) sb_puts(&t, "+ (deleted)\n"); while (*q) { const char *e = strchr(q, '\n'); size_t n = e ? (size_t)(e-q) : strlen(q); sb_printf(&t, "+ %.*s\n", (int)n, q); if (!e) break; q = e + 1; } preview_lines(t.data, 10, C_GREEN, NULL); sb_free(&t); }
     char *reason = NULL;
-    if (!confirm("Apply this edit?", CONF_EDIT, &g_always_edit, path, &reason)) {
+    if (!confirm("Apply this edit?", CONF_EDIT, &g_always_edit, p, &reason)) {
         sb_printf(out, "User denied editing %s.%s%s", path, reason ? " Reason: " : "", reason ? reason : "");
         free(reason); sb_free(&nb); free(d); free(p); return TOOL_DENIED;
     }
     ckpt_save(p);
     if (write_whole_file(p, nb.data ? nb.data : "", nb.len) != 0) { sb_printf(out, "error: cannot write %s: %s", path, strerror(errno)); sb_free(&nb); free(d); free(p); return TOOL_ERROR; }
     sb_printf(out, "Edited %s: %d replacement%s made.", path, occ, occ == 1 ? "" : "s");
+    if (g_tool_root && tools_copy_wrote) tools_copy_wrote(p);
     sb_free(&nb); free(d); free(p);
     return TOOL_OK;
 }
@@ -853,7 +939,7 @@ static int cmp_str(const void *a, const void *b) { return strcmp(*(char* const*)
 static tool_status t_list_dir(cJSON *args, sbuf *out) {
     const char *path = jstr(args, "path", ".");
     if (!*path) path = ".";
-    char *p = expand_home(path);
+    char *p = tool_path(path);
     DIR *d = opendir(p);
     if (!d) { sb_printf(out, "error: cannot open %s: %s", path, strerror(errno)); free(p); return TOOL_ERROR; }
     char **names = NULL; int n = 0, cap = 0;
@@ -890,6 +976,8 @@ static volatile pid_t g_fg_pgid = 0;
  * 124 on timeout, 130 if interrupted by user). A message queued meanwhile does not stop it.
  * `cap` bounds what is kept while it streams (a runaway command cannot eat the heap);
  * `busy`/`verb` label the status bar and the inline spinner while it runs. */
+static bool g_shell_hold = false;   /* tools_shell_hold(): commands run to their end, Esc stays for whoever reads next */
+void tools_shell_hold(bool on) { g_shell_hold = on; }
 static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupted,
                      size_t cap, const char *busy, const char *verb) {
     *interrupted = false;
@@ -914,7 +1002,7 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
     close(pfd[1]);
     setpgid(pid, pid);
     g_fg_pgid = pid;
-    struct pollfd fds[2] = { { pfd[0], POLLIN, 0 }, { g_cfg.interactive ? term_interrupt_fd() : -1, POLLIN, 0 } };
+    struct pollfd fds[2] = { { pfd[0], POLLIN, 0 }, { g_cfg.interactive && !g_shell_hold ? term_interrupt_fd() : -1, POLLIN, 0 } };
     bool timed_out = false, eof = false, reaped = false;
     int status = 0, eof_idle = 0;
     term_raw(true);
@@ -937,7 +1025,7 @@ static int run_shell(const char *cmd, int timeout_s, sbuf *out, bool *interrupte
                 double el = (double)(t.tv_sec - t0.tv_sec) + (double)(t.tv_usec - t0.tv_usec) / 1e6;
                 static const char *SP[] = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
                 spin = (spin + 1) % 10;
-                printf("\r\x1b[2K  " C_ORANGE "%s" C_RESET C_DIM " %s… (%.0fs)  " C_RESET "ctrl-c to interrupt", SP[spin], verb, el);
+                printf("\r\x1b[2K  " C_ORANGE "%s" C_RESET C_DIM " %s… (%.0fs)  " C_RESET "%s", SP[spin], verb, el, g_shell_hold ? "" : "ctrl-c to interrupt");
                 fflush(stdout); spin_shown = true;
             }
             continue;
@@ -1271,7 +1359,7 @@ static tool_status t_grep(cJSON *args, sbuf *out) {
     sb_puts(&cmd, "grep -rnIE --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=.venv --exclude-dir=__pycache__ ");
     if (inc && *inc) { sb_puts(&cmd, "--include="); sh_quote(&cmd, inc); sb_putc(&cmd, ' '); }
     sb_puts(&cmd, "-e "); sh_quote(&cmd, pat); sb_puts(&cmd, " -- ");
-    char *p = expand_home(path); sh_quote(&cmd, p); free(p);
+    char *p = tool_path(path); sh_quote(&cmd, p); free(p);
     sb_puts(&cmd, " 2>/dev/null | head -n 300");
     sbuf o; sb_init(&o); bool intr;
     run_shell(cmd.data, 60, &o, &intr, OUT_CAP * 2, "running command", "running");
@@ -1522,7 +1610,7 @@ static tool_status t_task(cJSON *args, sbuf *out) {
     if (g_in_subagent) { sb_puts(out, "error: a sub-agent cannot start another sub-agent; do the work yourself"); return TOOL_ERROR; }
     g_in_subagent = true;
     char *skills = tools_arg_list(args, "skills");
-    task_req t = { desc, prompt, jstr(args, "agent", NULL), skills };
+    task_req t = { desc, prompt, jstr(args, "agent", NULL), skills, jstr(args, "isolation", NULL) };
     int rc = tools_subagent(&t, out);
     free(skills);
     g_in_subagent = false;
@@ -1612,7 +1700,7 @@ static char *g_hook[HOOK_MAX]; static int g_hook_n = 0;
 
 static const char *hook_path(void) {
     static char path[1200];
-    char cwd[1024]; if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, "?");
+    char cwd[PATH_MAX]; project_dir(cwd, sizeof cwd);
     unsigned long long h = 1469598103934665603ULL;   /* FNV-1a, the same name as the project's permission rules */
     for (const char *p = cwd; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
     snprintf(path, sizeof path, "%s/hooks/%016llx.hooks", config_dir(), h);
@@ -1772,9 +1860,14 @@ tool_status tools_execute(const char *name, cJSON *args, sbuf *out) {
     cJSON *tmp = NULL;
     if (!args || !cJSON_IsObject(args)) { tmp = cJSON_CreateObject(); args = tmp; }
     bool hooked = !tools_no_confirm && g_hook_n > 0;   /* the model's calls; the user's own !lines are not hooked */
+    cJSON *hargs = args;   /* in a copy, the hooks are told the path the tool uses, not the project's one the model named */
+    if (hooked && g_tool_root && g_tool_mirror) {
+        const char *hp = jstr(args, "path", NULL);
+        if (hp) { char *m = tool_path(hp); hargs = cJSON_Duplicate(args, 1); cJSON_ReplaceItemInObjectCaseSensitive(hargs, "path", cJSON_CreateString(m)); free(m); }
+    }
     if (hooked) {
         sbuf why; sb_init(&why);
-        if (hook_pre(name, args, &why)) { sb_clear(out); sb_puts(out, why.data); sb_free(&why); if (tmp) cJSON_Delete(tmp); return TOOL_DENIED; }
+        if (hook_pre(name, hargs, &why)) { sb_clear(out); sb_puts(out, why.data); sb_free(&why); if (hargs != args) cJSON_Delete(hargs); if (tmp) cJSON_Delete(tmp); return TOOL_DENIED; }
         sb_free(&why);
     }
     tool_status st;
@@ -1793,7 +1886,8 @@ tool_status tools_execute(const char *name, cJSON *args, sbuf *out) {
     else if (mcp_is_tool(name)) st = t_mcp(name, args, out);
     else if (!strcmp(name, "exit")) st = t_exit(out);
     else { sb_printf(out, "error: unknown tool '%s'. Available tools: %s", name, tools_summary_line()); st = TOOL_ERROR; }
-    if (hooked) hook_post(name, args, out);
+    if (hooked) hook_post(name, hargs, out);
+    if (hargs != args) cJSON_Delete(hargs);
     if (tmp) cJSON_Delete(tmp);
     /* what a tool returned goes to the terminal and into the request: a binary file's bytes are not UTF-8 */
     if (out->data && !utf8_ok(out->data, out->len)) { char *fx = utf8_fix(out->data); sb_clear(out); sb_puts(out, fx); free(fx); }

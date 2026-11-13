@@ -156,6 +156,20 @@ char *expand_home(const char *path) {
     return xstrdup(path);
 }
 
+/* p under the directory `from` (the directory itself, or below it) as the same path under `to`, malloc'd; NULL when p is
+ * not under from. Only whole components count: /a/bc is not under /a/b. A trailing slash on from or to is ignored. */
+char *copy_path_map(const char *p, const char *from, const char *to) {
+    if (!p || !from || !to || p[0] != '/' || from[0] != '/') return NULL;
+    size_t fl = strlen(from), tl = strlen(to);
+    while (fl > 1 && from[fl - 1] == '/') fl--;
+    while (tl > 1 && to[tl - 1] == '/') tl--;
+    if (fl == 1) return NULL;   /* "/" stands for everything: never the copy */
+    if (strncmp(p, from, fl) || (p[fl] != '/' && p[fl] != 0)) return NULL;
+    sbuf b; sb_init(&b);
+    sb_append(&b, to, tl); sb_puts(&b, p + fl);
+    return sb_detach(&b);
+}
+
 int is_dir(const char *path) { struct stat st; return stat(path, &st) == 0 && S_ISDIR(st.st_mode); }
 int is_file(const char *path) { struct stat st; return stat(path, &st) == 0 && S_ISREG(st.st_mode); }
 
@@ -2354,6 +2368,15 @@ int parallel_parse(const char *v, bool *on, int *n) {
     if (*end || end == num || x < 1 || x > ORCH_PARALLEL_MAX) return -1;
     *n = (int)x;
     return 0;
+}
+int task_isolation(const char *task_arg, const char *agent_key) {
+    const char *v[2] = { task_arg, agent_key };
+    int r = 0;
+    for (int i = 0; i < 2; i++) {
+        if (!v[i] || !*v[i] || !strcasecmp(v[i], "none")) continue;
+        if (!strcasecmp(v[i], "worktree")) r = 1; else return -1;
+    }
+    return r;
 }
 void parallel_advice(sbuf *b) {
     if (g_cfg.parallel_n > 0) sb_printf(b, "Up to %d run at once.", g_cfg.parallel_n);
