@@ -1606,7 +1606,34 @@ static void test_advisor(void) {
         g_cfg.parallel_tasks = true;
         d = tools_definitions(); j = cJSON_PrintUnformatted(d);
         CHECK(strstr(j, "Parallel sub-agents are on") && strstr(j, "in ONE reply")); free(j); cJSON_Delete(d);
+        /* automatic: the description says up to 8, split by complexity; a fixed number says that number */
+        int old_n = g_cfg.parallel_n;
+        g_cfg.parallel_n = 0;
+        d = tools_definitions(); j = cJSON_PrintUnformatted(d);
+        CHECK(strstr(j, "Up to 8 run at once") && strstr(j, "2 to 8 sub-agents depending on how complex")); free(j); cJSON_Delete(d);
+        g_cfg.parallel_n = 5;
+        d = tools_definitions(); j = cJSON_PrintUnformatted(d);
+        CHECK(strstr(j, "Up to 5 run at once") && !strstr(j, "depending on how complex")); free(j); cJSON_Delete(d);
+        g_cfg.parallel_n = old_n;
         g_cfg.parallel_tasks = old_par;
+    }
+
+    {   /* how many sub-agents run at once, and the words after /effort parallel */
+        CHECK(parallel_slots(0, 2) == 2 && parallel_slots(0, 3) == 3 && parallel_slots(0, 8) == 8 && parallel_slots(0, 12) == 8 && parallel_slots(0, 1) == 2);   /* automatic: the reply's size, 2 to 8 */
+        CHECK(parallel_slots(5, 2) == 5 && parallel_slots(1, 9) == 1 && parallel_slots(99, 9) == ORCH_PARALLEL_MAX);   /* a fixed number is that number */
+        bool on; int n;
+        CHECK(parallel_parse("on", &on, &n) == 0 && on && n == -1);
+        CHECK(parallel_parse("off", &on, &n) == 0 && !on);
+        CHECK(parallel_parse("auto", &on, &n) == 0 && on && n == 0);
+        CHECK(parallel_parse("6", &on, &n) == 0 && on && n == 6);
+        CHECK(parallel_parse("on 4", &on, &n) == 0 && on && n == 4);
+        CHECK(parallel_parse("on auto", &on, &n) == 0 && on && n == 0);
+        CHECK(parallel_parse("  on  12 ", &on, &n) == 0 && n == 12);
+        CHECK(parallel_parse("0", &on, &n) < 0 && parallel_parse("21", &on, &n) < 0 && parallel_parse("-2", &on, &n) < 0);
+        CHECK(parallel_parse("maybe", &on, &n) < 0 && parallel_parse("off 3", &on, &n) < 0 && parallel_parse("on 3 4", &on, &n) < 0 && parallel_parse("3x", &on, &n) < 0 && parallel_parse("", &on, &n) < 0);
+        /* a session that fixed the number is merged with one that turned parallel on: both survive */
+        char *m = config_merge("a=1\n", "a=1\nparallel_agents=6\n", "a=1\nparallel=on\n");
+        CHECK(strstr(m, "parallel_agents=6\n") && strstr(m, "parallel=on\n")); free(m);
     }
 
     /* the tool is on offer only while an advisor is set, and says so when called without one */

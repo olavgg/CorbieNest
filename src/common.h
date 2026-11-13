@@ -272,6 +272,9 @@ char *advisor_brief(cJSON *msgs, int keep, size_t budget, const char *env, bool 
 int   diff_changed_lines(const char *d);                  /* lines of a unified diff that add or remove something (not the --- +++ headers) */
 bool  tool_result_failed(const char *name, const char *result, bool error);   /* an error result, or a shell command that did not exit with 0 */
 #define ADVISOR_REVIEW_OK "LGTM"   /* what the advisor answers a review or a check with when nothing needs to change */
+int   parallel_slots(int configured, int calls);   /* sub-agents that run at once for a reply of `calls` task calls: the configured number, or automatic */
+int   parallel_parse(const char *v, bool *on, int *n);   /* the words after /effort parallel: on, off, auto, N, on N, on auto. *n: -1 keep, 0 auto, else fixed. 0 ok, -1 not understood */
+void  parallel_advice(sbuf *b);                    /* the sentence that tells the model how many sub-agents may run together (the task tool's description, the system prompt) */
 bool  advisor_approves(const char *advice);   /* the answer is ADVISOR_REVIEW_OK and not much more */
 const char *strip_think_block(const char *s);   /* past a leading <think>…</think> */
 bool  model_same(const char *a, const char *b);   /* equal, a trailing ":latest" aside */
@@ -303,6 +306,7 @@ typedef struct {
     int   advisor_window;   /* seconds after which a request's count of consultations starts again (/advisor window, given in minutes); 0 = never */
     int   workers;       /* tasks of /orchestrate that may run at the same time (/workers); 0 = ORCH_WORKERS_DEFAULT */
     bool  parallel_tasks;/* /effort parallel on: the task calls of one reply run at the same time as sub-agents (default off) */
+    int   parallel_n;    /* how many of them at once: 0 = automatic (the size of the reply, 2 to PARALLEL_AUTO_MAX), else a fixed 1..ORCH_PARALLEL_MAX */
     char *build;         /* /plan: the command that builds the project after each layer (build=); NULL = detected from the project's build file */
     bool  show_thinking; /* print thinking tokens */
     bool  show_read, show_grep, show_list, show_fetch, show_search, show_edit, show_write;   /* show the result of read_file / grep / list_dir / web_fetch / web_search in the transcript (/config read|grep|list|fetch|search show|hide; default on; the call line stays); show_edit: the edit_file diff preview and its result line (/config edit show|hide; an edit the user is asked about shows its diff in the question); show_write: the same for write_file (/config write show|hide) */
@@ -884,6 +888,7 @@ extern model_info g_model_info;   /* the model in use (set by main.c) */
 #define ORCH_MAX_TASKS 24   /* the "after" set is a 32-bit mask: at most 32 */
 #define ORCH_WORKERS_DEFAULT 3   /* tasks that may run at the same time, unless /workers says otherwise */
 #define ORCH_WORKERS_MAX 8     /* /goal: candidates, and models for them */
+#define PARALLEL_AUTO_MAX 8     /* /effort parallel auto: at most this many sub-agents at once */
 #define ORCH_PARALLEL_MAX 20   /* /orchestrate: tasks that may run at the same time (/workers, workers= in the config) */
 typedef struct {
     char *title, *body;

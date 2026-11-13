@@ -444,6 +444,7 @@ void config_load(void) {
         else if (!strcmp(k, "advisor_ctx")) { int n = atoi(v); if (n == 0 || n >= ADVISOR_CTX_MIN) g_cfg.advisor_ctx = n; }
         else if (!strcmp(k, "subagent")) { free(g_cfg.subagent); g_cfg.subagent = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "workers")) { int n = atoi(v); if (n >= 1 && n <= ORCH_PARALLEL_MAX) g_cfg.workers = n; }
+        else if (!strcmp(k, "parallel_agents")) { int n = atoi(v); if (n >= 1 && n <= ORCH_PARALLEL_MAX) g_cfg.parallel_n = n; }   /* parallel_agents=N: a fixed number; no line is automatic */
         else if (!strcmp(k, "parallel")) g_cfg.parallel_tasks = !strcmp(v, "on") || atoi(v) != 0;   /* parallel=on, as /effort parallel saves it */
         else if (!strcmp(k, "build")) { free(g_cfg.build); g_cfg.build = *v ? xstrdup(v) : NULL; }
         else if (!strcmp(k, "advisor_window")) { double m = atof(v); if (m >= 0 && m <= 24 * 60) g_cfg.advisor_window = (int)(m * 60 + 0.5); }
@@ -529,6 +530,7 @@ static void config_text(sbuf *bp) {
     if (g_cfg.subagent && *g_cfg.subagent) sb_printf(&b, "subagent=%s\n", g_cfg.subagent);
     if (g_cfg.workers > 0) sb_printf(&b, "workers=%d\n", g_cfg.workers);
     if (g_cfg.parallel_tasks) sb_puts(&b, "parallel=on\n");
+    if (g_cfg.parallel_n > 0) sb_printf(&b, "parallel_agents=%d\n", g_cfg.parallel_n);
     if (g_cfg.build && *g_cfg.build) sb_printf(&b, "build=%s\n", g_cfg.build);
     if (g_cfg.advisor_window != ADVISOR_WINDOW_DEFAULT) sb_printf(&b, "advisor_window=%g\n", g_cfg.advisor_window / 60.0);   /* in minutes, as it is typed */
     if (g_cfg.advisor_guidance != GUIDANCE_NORMAL) sb_printf(&b, "advisor_guidance=%s\n", advisor_guidance()->name);
@@ -2332,6 +2334,32 @@ int advisor_guidance_parse(const char *s) {
  * for advice costs a round of the main model, which on a small machine is minutes; taking advice
  * for an approval loses what the advisor found — so a short sentence after it is still an
  * approval, one that objects to anything is not. */
+/* ---------- how many sub-agents run at once (/effort parallel) ---------- */
+int parallel_slots(int configured, int calls) {
+    if (configured > 0) return configured > ORCH_PARALLEL_MAX ? ORCH_PARALLEL_MAX : configured;
+    /* automatic: the model split the work into as many parts as it judged it has, so the reply's size is the measure of it */
+    return calls < 2 ? 2 : calls > PARALLEL_AUTO_MAX ? PARALLEL_AUTO_MAX : calls;
+}
+int parallel_parse(const char *v, bool *on, int *n) {
+    char w1[32] = "", w2[32] = "", extra[32] = "";
+    int k = sscanf(v ? v : "", "%31s %31s %31s", w1, w2, extra);
+    *on = true; *n = -1;
+    if (k < 1 || k > 2) return -1;
+    const char *num = w1;
+    if (!strcmp(w1, "off")) { if (k != 1) return -1; *on = false; return 0; }
+    if (!strcmp(w1, "on")) { if (k == 1) return 0; num = w2; }
+    else if (k != 1) return -1;
+    if (!strcmp(num, "auto")) { *n = 0; return 0; }
+    char *end; long x = strtol(num, &end, 10);
+    if (*end || end == num || x < 1 || x > ORCH_PARALLEL_MAX) return -1;
+    *n = (int)x;
+    return 0;
+}
+void parallel_advice(sbuf *b) {
+    if (g_cfg.parallel_n > 0) sb_printf(b, "Up to %d run at once.", g_cfg.parallel_n);
+    else sb_printf(b, "Up to %d run at once: split the work into 2 to %d sub-agents depending on how complex it is — 2 or 3 for a modest request, more only when it really falls into that many independent parts.", PARALLEL_AUTO_MAX, PARALLEL_AUTO_MAX);
+}
+
 bool advisor_approves(const char *advice) {
     while (advice && (*advice == ' ' || *advice == '\n' || *advice == '*')) advice++;
     if (!advice || strncasecmp(advice, ADVISOR_REVIEW_OK, strlen(ADVISOR_REVIEW_OK))) return false;

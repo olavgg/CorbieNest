@@ -388,6 +388,14 @@ def script(model, messages, req):
         else: yield chunk(model, tool_calls=[{"function": {"name": "list_dir", "arguments": {"path": "."}}}])
         yield chunk(model, done=True)
         return
+    mn = re.search(r"TOOL_TASKS(\d+)", text)
+    if mn:   # TOOL_TASKS6: that many task calls in one reply ("PAUSE t1: ..." to "PAUSE t6: ..."), for the number of sub-agents that run at once (/_inflight)
+        if last["role"] == "tool": yield chunk(model, "All %s reports are in." % mn.group(1))
+        else:
+            yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "t%d" % k, "prompt": "PAUSE t%d: find the needle" % k}}}
+                                           for k in range(1, int(mn.group(1)) + 1)])
+        yield chunk(model, done=True)
+        return
     if "TOOL_TASKS" in text:   # two task calls in one reply: /effort parallel on runs them at the same time
         if last["role"] == "tool": yield chunk(model, "Both reports are in.")
         else:

@@ -54,7 +54,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/status", "model, context usage, settings" },
     { "/system", "extra system instructions: TEXT, or clear" },
     { "/think", "when the model thinks: on, off, auto · show or hide it" },
-    { "/effort", "how hard this model thinks; /effort parallel on|off: the sub-agents of one reply at the same time" },
+    { "/effort", "how hard this model thinks; /effort parallel on|off|auto|N: the sub-agents of one reply at the same time" },
     { "/advisor", "a stronger model the agent may consult: a local one, or Claude, ChatGPT, Grok by API key" },
     { "/subagent", "the model sub-agents (task) run on, and how hard it thinks" },
     { "/orchestrate", "the advisor model plans the request as tasks, this model does them, the advisor reviews each" },
@@ -107,7 +107,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/goal", "min:a lower score is better|max:a higher score is better (the default)|-n:rounds, 1 to 10|-k:candidates, 2 to 8|-m:models, a,b,c (round-robin)" },
     { "/mode", "manual:ask before every edit and command|accept-edits:file edits go ahead, commands still ask|plan:read-only: the model proposes a plan|auto:nothing asks (dangerous)" },
     { "/think", "on:think on every call|off:do not think|auto:think once per request, not after every tool result|show:show the thinking|hide:hide the thinking" },
-    { "/effort parallel", "on:the task calls of one reply run as sub-agents at the same time|off:one sub-agent after another (the default)" },
+    { "/effort parallel", "on:the task calls of one reply run as sub-agents at the same time|off:one sub-agent after another (the default)|auto:how many at once follows the size of the reply, 2 to 8 (the default when on)|4:a number, 1 to 20: that many sub-agents at once" },
     { "/yolo", "on:approve every tool call (dangerous)|off:back to manual confirmations" },
     { "/tools", "on:the model may call tools|off:chat only" },
     { "/web", "on:the model may search and read the web|off:no web access|engine:the search engine: a URL with %s for the query, or default" },
@@ -1679,7 +1679,8 @@ static char *build_system_prompt(void) {
             "Split it into independent questions (one area of the code, one subsystem, one hypothesis each), give each its own complete prompt, "
             "and send all the task calls in ONE reply with no other tool call beside them: a reply that mixes in another tool runs its sub-agents one after another. "
             "Do not split what depends on an earlier answer, and do not start a second sub-agent on the same question. "
-            "Sub-agents only read; make the changes yourself once their reports are in.\n");
+            "Sub-agents only read; make the changes yourself once their reports are in. ");
+        if (parallel_runs_here()) { parallel_advice(&b); sb_putc(&b, '\n'); }
         if (g_cfg.advisor) {   /* no model name in it: changing the advisor leaves the prompt, and its cache, alone (the guidance does not) */
             const advisor_guidance_def *g = advisor_guidance();
             sb_puts(&b, "- advisor is a stronger but much slower model that is shown this whole conversation and tells you how to proceed. ");
@@ -2785,8 +2786,8 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
  * sub-agent's model call goes out on a thread of its own (http_job, as /orchestrate's workers do) and the
  * main thread does everything else — it starts the calls, runs their tools (subagent_calls, quiet), reads the
  * answers and keeps the strip's rows. Nothing else prints while the batch runs; each report is printed when
- * the batch ends, in the order the model asked, and every call gets its result. Up to g_cfg.workers run at
- * once. The model may be a local one (Ollama's /api/chat) or an Anthropic one (a non-streamed Messages call, as
+ * the batch ends, in the order the model asked, and every call gets its result. Up to parallel_slots() run at
+ * once (/effort parallel: 2 to 8 by the size of the reply, or a number the user fixed). The model may be a local one (Ollama's /api/chat) or an Anthropic one (a non-streamed Messages call, as
  * the workers of /goal make; not gzipped, so a refused body has no restart to keep). A reply that mixes tools,
  * or whose calls are on different models, runs one sub-agent after another (run_subagent). */
 enum { SR_WAITING, SR_RUNNING, SR_DONE };
@@ -2977,7 +2978,7 @@ static bool tasks_batch(cJSON *calls, bool *failed) {
             if (r->rec) r->rec->state = AG_FAILED;
         }
     }
-    int maxpar = g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT;
+    int maxpar = parallel_slots(g_cfg.parallel_n, n);   /* /effort parallel: a fixed number, or by the size of the reply */
     bool aborted = false;
     char label[64] = "";
     for (;;) {
@@ -5448,7 +5449,7 @@ static void cmd_help(void) {
            "  /think show|hide      show or hide thinking tokens\n"
            "  /effort [LEVEL]       how hard this model thinks, in the levels it has (gpt-oss: low medium high · qwen3.8: off low medium high · most others: off on);\n"
            "                        no argument opens a picker, default leaves it to the model. Kept per model; a level is sent with every call\n"
-           "  /effort parallel [on|off]  the task calls of one reply run as sub-agents at the same time (off by default: one after another)\n"
+           "  /effort parallel [on|off|auto|N]  the task calls of one reply run as sub-agents at the same time (off by default: one after another); auto: 2 to 8 at once by the size of the reply, N: a fixed number\n"
            "  /orchestrate REQUEST  the advisor model in charge: it plans the request as tasks, this model does them as workers with a fresh context\n"
            "                        each — those that do not wait for each other at the same time — and the advisor reviews every task's report and diff.\n"
            "                        With a workflow (.agents/workflow.md) tests, QA and reviews follow, each by its role; -w NAME picks another, -w none leaves it out\n"
@@ -5808,19 +5809,27 @@ static void effort_command(const char *who, const char *model, const model_info 
     if (r < 0) printf(C_DIM "%seffort unchanged: %s" C_RESET "\n", who, effort_label(model, mi));
     else effort_apply(who, model, mi, items[r]);
 }
-/* /effort parallel [on|off]: whether the task calls of one reply run as sub-agents at the same time (tasks_batch) */
+/* /effort parallel [on|off|auto|N]: whether the task calls of one reply run as sub-agents at the same time (tasks_batch) */
 static bool effort_is_parallel(const char *arg) { return arg && !strncmp(arg, "parallel", 8) && (arg[8] == ' ' || !arg[8]); }
 static void effort_parallel(const char *v) {
     while (*v == ' ') v++;
-    if (!*v) printf("parallel: %s" C_DIM " — the task calls of one reply run as sub-agents at the same time%s" C_RESET "\n",
-                    g_cfg.parallel_tasks ? "on" : "off", g_cfg.parallel_tasks ? "" : " (off: one after another; /effort parallel on to change it)");
-    else if (!strcmp(v, "on") || !strcmp(v, "off")) {
-        bool want = !strcmp(v, "on");
-        if (want != g_cfg.parallel_tasks) { g_cfg.parallel_tasks = want; tools_rebuild(); }   /* the task tool's description says so */
-        config_save();
-        printf(C_GREEN "✓ parallel = %s" C_RESET C_DIM "%s" C_RESET "\n", v,
-               g_cfg.parallel_tasks ? " — the task calls of one reply run together; each sub-agent is in the strip while it runs" : " — one sub-agent after another");
-    } else printf("usage: /effort parallel on|off\n");
+    if (!*v) {
+        if (!g_cfg.parallel_tasks) { printf("parallel: off" C_DIM " — the task calls of one reply run one after another; /effort parallel on to change it" C_RESET "\n"); return; }
+        if (g_cfg.parallel_n > 0) printf("parallel: on" C_DIM " — the task calls of one reply run as sub-agents at the same time, %d at once" C_RESET "\n", g_cfg.parallel_n);
+        else printf("parallel: on" C_DIM " — the task calls of one reply run as sub-agents at the same time, as many at once as the reply has (2 to %d)" C_RESET "\n", PARALLEL_AUTO_MAX);
+        return;
+    }
+    bool want; int n;
+    if (parallel_parse(v, &want, &n) != 0) { printf("usage: /effort parallel on|off|auto|N   (N: 1 to %d sub-agents at once; auto: by the size of the reply, 2 to %d)\n", ORCH_PARALLEL_MAX, PARALLEL_AUTO_MAX); return; }
+    bool changed = want != g_cfg.parallel_tasks;
+    if (want && n >= 0 && n != g_cfg.parallel_n) changed = true;
+    g_cfg.parallel_tasks = want;
+    if (want && n >= 0) g_cfg.parallel_n = n;
+    if (changed) tools_rebuild();   /* the task tool's description says so */
+    config_save();
+    if (!want) printf(C_GREEN "✓ parallel = off" C_RESET C_DIM " — one sub-agent after another" C_RESET "\n");
+    else if (g_cfg.parallel_n > 0) printf(C_GREEN "✓ parallel = on" C_RESET C_DIM " — the task calls of one reply run together, %d at once; each sub-agent is in the strip while it runs" C_RESET "\n", g_cfg.parallel_n);
+    else printf(C_GREEN "✓ parallel = on" C_RESET C_DIM " — the task calls of one reply run together, as many at once as the reply has (2 to %d); each sub-agent is in the strip while it runs" C_RESET "\n", PARALLEL_AUTO_MAX);
 }
 static void cmd_effort(const char *arg) {
     if (effort_is_parallel(arg)) { effort_parallel(arg + 8); return; }
