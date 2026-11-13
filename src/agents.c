@@ -10,7 +10,8 @@
  *   ~/.agents/agents/NAME.md       yours too (the same convention)
  *   ~/.claude/agents/NAME.md       Claude Code's own, for every project (read last)
  * The frontmatter keys: name (the file name by default), description, tools (a comma list of sub-agent tools; the
- * default is all of them), model (a model for this agent; the default is the sub-agents' model). An agent can use only
+ * default is all of them), model (a model for this agent; the default is the sub-agents' model), skills (a comma list of
+ * skills whose full text is put into the agent's prompt, as the task's own `skills` argument does). An agent can use only
  * the tools a sub-agent has (read_file, list_dir, grep, bash, web_fetch, web_search): it cannot be given more, and it
  * cannot start a sub-agent or ask the advisor. Its shell commands and fetches are confirmed like anyone's. */
 #include "common.h"
@@ -52,6 +53,7 @@ static void parse_agent(const char *text, agent_t *a) {
             else if (!strcmp(k, "description")) { free(a->description); a->description = v; v = NULL; }
             else if (!strcmp(k, "tools")) { free(a->tools); a->tools = v; v = NULL; }
             else if (!strcmp(k, "model")) { free(a->model); a->model = v; v = NULL; }
+            else if (!strcmp(k, "skills")) { free(a->skills); a->skills = v; v = NULL; }
             free(k); free(v);
         }
         if (!e) { p += n; break; }
@@ -80,7 +82,7 @@ static void read_dir(const char *dir) {
         parse_agent(text, &a);
         free(text);
         if (!a.name) a.name = xstrndup(e->d_name, n - 3);
-        if (!valid_name(a.name) || have(a.name) || !a.description || !*a.description) { free(a.name); free(a.description); free(a.tools); free(a.model); free(a.body); continue; }
+        if (!valid_name(a.name) || have(a.name) || !a.description || !*a.description) { free(a.name); free(a.description); free(a.tools); free(a.model); free(a.skills); free(a.body); continue; }
         /* the body goes into the sub-agent's system prompt, so it must be valid UTF-8 and cut on a character */
         char *fx = utf8_fix(a.body); free(a.body); a.body = fx;
         size_t bl = strlen(a.body);
@@ -93,7 +95,7 @@ static void read_dir(const char *dir) {
 
 /* (Re)reads the agent files of this project and of the user. Returns how many there are. */
 int agents_load(void) {
-    for (int i = 0; i < g_nagent; i++) { free(g_agent[i].name); free(g_agent[i].description); free(g_agent[i].tools); free(g_agent[i].model); free(g_agent[i].body); free(g_agent[i].path); }
+    for (int i = 0; i < g_nagent; i++) { free(g_agent[i].name); free(g_agent[i].description); free(g_agent[i].tools); free(g_agent[i].model); free(g_agent[i].skills); free(g_agent[i].body); free(g_agent[i].path); }
     g_nagent = 0;
     char cwd[1024], p[1200];
     if (getcwd(cwd, sizeof cwd)) {

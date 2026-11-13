@@ -1145,6 +1145,18 @@ static void test_skills(void) {
         if (ag) CHECK_STR(ag->description, "Ours");   /* .corbienest's file before .agents' */
         ag = agent_find("cc-only-agent"); CHECK(ag != NULL);
         if (ag) CHECK_STR(ag->description, "From ~/.agents/agents");   /* ~/.agents/agents before ~/.claude/agents */
+        /* skills: a comma list in the agent file; the task's own argument as a string or an array */
+        const char *c1 = "---\nname: skilled-agent\ndescription: Has skills\nskills: alpha, beta\n---\nR.\n";
+        CHECK(write_whole_file(".corbienest/agents/skilled-agent.md", c1, strlen(c1)) == 0);
+        agents_load();
+        ag = agent_find("skilled-agent"); CHECK(ag != NULL);
+        if (ag) CHECK_STR(ag->skills, "alpha, beta");
+        ag = agent_find("cc-shared-agent"); CHECK(ag != NULL && ag->skills == NULL);
+        cJSON *ja = cJSON_Parse("{\"a\":\"x,y\",\"b\":[\"p\",\"\",\"q\"],\"c\":\"\",\"d\":3}");
+        char *l = tools_arg_list(ja, "a"); CHECK(l && !strcmp(l, "x,y")); free(l);
+        l = tools_arg_list(ja, "b"); CHECK(l && !strcmp(l, "p,q")); free(l);
+        CHECK(tools_arg_list(ja, "c") == NULL && tools_arg_list(ja, "d") == NULL && tools_arg_list(ja, "zz") == NULL && tools_arg_list(NULL, "a") == NULL);
+        cJSON_Delete(ja);
         if (oh) { setenv("HOME", oh, 1); free(oh); } else unsetenv("HOME");
         agents_load();
     }

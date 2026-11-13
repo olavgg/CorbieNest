@@ -540,6 +540,7 @@ cJSON *tools_definitions(void) {
     prop(p, "description", "string", "A short (3-6 word) label for what the sub-agent does, shown to the user.");
     prop(p, "agent", "string", "The name of a sub-agent defined for this project (listed in the system prompt): it runs with its own role and tools. Omit for a general sub-agent.");
     prop(p, "prompt", "string", "The complete task for the sub-agent. It starts with a fresh context and sees nothing of this conversation, so include every relevant detail: what to look for, where, and exactly what to report back.");
+    prop(p, "skills", "string", "Optional. Names of skills (the ones listed in the system prompt, with or without the leading /), comma separated: the sub-agent is given their full instructions. Use it when a skill describes how this task is done.");
     sbuf td; sb_init(&td);
     sb_puts(&td, "Delegate a self-contained research or exploration task to a sub-agent with its own fresh context. It can read files, list directories, grep and run read-only shell commands, but cannot modify files, and returns a text report. "
                  "Use it for broad searches or investigations whose intermediate output would clutter your context (\"find every place X is handled and summarise\", \"figure out how the build works\"), not for simple one-file lookups.");
@@ -1504,6 +1505,15 @@ static tool_status t_web_search(cJSON *args, sbuf *out) {
 /* the sub-agent flag of t_task, set for a batch of sub-agents that the turn loop runs (main.c) */
 void tools_in_subagent(bool on) { g_in_subagent = on; }
 tools_subagent_fn tools_subagent = NULL;
+char *tools_arg_list(cJSON *args, const char *key) {
+    cJSON *v = args ? cJSON_GetObjectItemCaseSensitive(args, key) : NULL;
+    if (cJSON_IsString(v)) return v->valuestring[0] ? xstrdup(v->valuestring) : NULL;
+    if (!cJSON_IsArray(v)) return NULL;
+    sbuf b; sb_init(&b);
+    cJSON *e;
+    cJSON_ArrayForEach(e, v) if (cJSON_IsString(e) && e->valuestring[0]) sb_printf(&b, "%s%s", b.len ? "," : "", e->valuestring);
+    return b.len ? sb_detach(&b) : NULL;
+}
 static tool_status t_task(cJSON *args, sbuf *out) {
     const char *desc = jstr(args, "description", "sub-agent");
     const char *prompt = jstr(args, "prompt", NULL);
@@ -1511,7 +1521,10 @@ static tool_status t_task(cJSON *args, sbuf *out) {
     if (!tools_subagent) { sb_puts(out, "error: sub-agents are not available here"); return TOOL_ERROR; }
     if (g_in_subagent) { sb_puts(out, "error: a sub-agent cannot start another sub-agent; do the work yourself"); return TOOL_ERROR; }
     g_in_subagent = true;
-    int rc = tools_subagent(desc, prompt, jstr(args, "agent", NULL), out);
+    char *skills = tools_arg_list(args, "skills");
+    task_req t = { desc, prompt, jstr(args, "agent", NULL), skills };
+    int rc = tools_subagent(&t, out);
+    free(skills);
     g_in_subagent = false;
     return rc == 0 ? TOOL_OK : TOOL_ERROR;
 }

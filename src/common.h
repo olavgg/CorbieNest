@@ -706,7 +706,7 @@ void stream_messages(stream_st *st, cJSON *msgs, int from, const char *session_i
 char *stream_input_text(const char *line);   /* the text of one stream-json input line (malloc'd), or NULL */
 
 /* ---------- agents.c: sub-agent files (task with agent=NAME) ---------- */
-typedef struct { char *name, *description, *tools, *model, *body, *path; } agent_t;
+typedef struct { char *name, *description, *tools, *model, *skills, *body, *path; } agent_t;   /* skills: a comma list of skills preloaded into the sub-agent's prompt */
 int   agents_load(void);                    /* the agent files of this project and of the user; returns how many */
 int   agents_count(void);
 const agent_t *agent_get(int i);
@@ -782,7 +782,9 @@ int  tools_checkpoint_restore(int turn);           /* put them back; returns fil
 void tools_checkpoint_clear(void);
 /* The `task` tool runs a sub-agent; main.c provides the implementation (it owns the agent
  * loop). Writes the report into out; returns 0 ok, nonzero error. */
-typedef int (*tools_subagent_fn)(const char *description, const char *prompt, const char *agent, sbuf *out);
+typedef struct { const char *description, *prompt, *agent, *skills; } task_req;   /* a task call: skills is a comma list (NULL: none) */
+typedef int (*tools_subagent_fn)(const task_req *t, sbuf *out);
+char *tools_arg_list(cJSON *args, const char *key);   /* a string argument, or an array of strings, as one comma list (malloc'd); NULL when absent or empty */
 extern tools_subagent_fn tools_subagent;
 void tools_in_subagent(bool on);                    /* the calls made now are a sub-agent's (no sub-agent, no background command): set around a run of sub-agents */
 /* The `advisor` tool puts a question to a stronger model (/advisor); main.c provides it too, since

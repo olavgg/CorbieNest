@@ -1674,6 +1674,7 @@ static char *build_system_prompt(void) {
             "- For work of three or more steps, keep a task list with todo_write: one task per step, at most one in_progress, and mark each completed as you finish it. Skip it for a single change or a question.\n"
             "- Use task to hand a broad, self-contained investigation (\"find all places that…\", \"how does X work across the code\") to a read-only sub-agent "
             "and get back a report, keeping the noise out of this conversation; give it a complete prompt, it knows nothing of this chat.\n");
+        if (skills_count() > 0) sb_puts(&b, "- When one of the skills listed below describes how a task is done, name it in the task's skills argument: the sub-agent is given its full instructions.\n");
         if (parallel_runs_here()) sb_puts(&b,
             "- Parallel sub-agents are on: the task calls of one reply run at the same time, so a broad investigation goes faster as several. "
             "Split it into independent questions (one area of the code, one subsystem, one hypothesis each), give each its own complete prompt, "
@@ -2606,7 +2607,7 @@ static void agents_menu(void) {
     free(items); free(descs);
 }
 
-static int run_subagent_as(const char *description, const char *prompt, const agent_t *ag, const char *model, sbuf *out);
+static int run_subagent_as(const char *description, const char *prompt, const agent_t *ag, const char *model, const char *skills_text, sbuf *out);
 /* task: a general sub-agent, or the one a file names (agents.c): its tools and role, and its model when it names one. The
  * model is a parameter of the run, not a setting: /subagent and the config are not touched. */
 /* the agent a task names (none: a general sub-agent): 0 when it may run, else 1 with what went wrong in out */
@@ -2630,10 +2631,61 @@ static int subagent_resolve(const char *agent_name, const agent_t **ag_out, sbuf
     *ag_out = ag;
     return 0;
 }
-static int run_subagent(const char *description, const char *prompt, const char *agent_name, sbuf *out) {
+/* The skills a sub-agent is given: the ones its agent file names and the ones the task names, each once, their full text
+ * (skill_expand, no arguments: the task is the prompt) cut to a size, in text for the sub-agent's system prompt. 0 when
+ * there is nothing wrong; else 1, with what went wrong in err (a skill that is not there: the task does not run). */
+#define SUBAGENT_SKILLS_MAX 6               /* skills one sub-agent may be given */
+#define SUBAGENT_SKILL_BYTES (16 * 1024)    /* of each one's text */
+static int subagent_skills(const agent_t *ag, const char *asked, sbuf *text, sbuf *err) {
+    sbuf names; sb_init(&names);
+    if (ag && ag->skills) sb_printf(&names, "%s", ag->skills);
+    if (asked && *asked) sb_printf(&names, "%s%s", names.len ? "," : "", asked);
+    const skill_t *got[SUBAGENT_SKILLS_MAX]; int ng = 0;
+    sbuf missing; sb_init(&missing);
+    bool too_many = false;
+    for (const char *p = names.data ? names.data : ""; *p; ) {
+        while (*p == ',' || *p == ' ' || *p == '\t' || *p == '\n') p++;
+        const char *e = p; while (*e && *e != ',' && *e != ' ' && *e != '\t' && *e != '\n') e++;
+        if (e > p) {
+            char *nm = xstrndup(p, (size_t)(e - p));
+            const skill_t *sk = skill_find(nm);
+            if (!sk) sb_printf(&missing, "%s/%s", missing.len ? ", /" : "", *nm == '/' ? nm + 1 : nm);
+            else {
+                bool dup = false; for (int i = 0; i < ng; i++) if (got[i] == sk) dup = true;
+                if (!dup) { if (ng < SUBAGENT_SKILLS_MAX) got[ng++] = sk; else too_many = true; }
+            }
+            free(nm);
+        }
+        p = e;
+    }
+    int rc = 0;
+    if (missing.len || too_many) {
+        if (missing.len) sb_printf(err, "error: no skill named %s. The skills there are:", missing.data);
+        else sb_printf(err, "error: a sub-agent can be given at most %d skills.", SUBAGENT_SKILLS_MAX);
+        if (missing.len) { for (int i = 0; i < skills_count(); i++) sb_printf(err, " /%s", skill_get(i)->name); if (!skills_count()) sb_puts(err, " none"); }
+        sb_puts(err, missing.len ? ". Name one of these, or run the task without it." : " Give it fewer.");
+        rc = 1;
+    } else if (ng) {
+        sb_puts(text, "\n\nSkills you were given: follow them for this task, as the instructions of the user who set it up.\n");
+        for (int i = 0; i < ng; i++) {
+            char *x = skill_expand(got[i], "");
+            size_t xl = strlen(x);
+            if (xl > SUBAGENT_SKILL_BYTES) { x[utf8_cut(x, xl, SUBAGENT_SKILL_BYTES)] = 0; sb_puts(text, x); sb_printf(text, "\n[the skill /%s is cut here: read %s for the rest]\n", got[i]->name, got[i]->path); }
+            else sb_printf(text, "%s\n", x);
+            free(x);
+        }
+    }
+    sb_free(&names); sb_free(&missing);
+    return rc;
+}
+static int run_subagent(const task_req *t, sbuf *out) {
     const agent_t *ag = NULL;
-    if (subagent_resolve(agent_name, &ag, out)) return 1;
-    return run_subagent_as(description, prompt, ag, ag ? agent_model_override(ag) : NULL, out);
+    if (subagent_resolve(t->agent, &ag, out)) return 1;
+    sbuf st; sb_init(&st);
+    if (subagent_skills(ag, t->skills, &st, out)) { sb_free(&st); return 1; }
+    int rc = run_subagent_as(t->description, t->prompt, ag, ag ? agent_model_override(ag) : NULL, st.data, out);
+    sb_free(&st);
+    return rc;
 }
 static bool tool_offered(cJSON *tools, const char *name) {
     cJSON *t;
@@ -2678,7 +2730,7 @@ static void subagent_calls(subagent_rec *rec, cJSON *msgs, cJSON *calls, cJSON *
 
 /* a sub-agent's conversation (its system prompt and the task) and the tools it may call: the same for a run on its own
  * and for a run of several at once. *sp_bytes_out is the size of the system prompt in it, which the window is kept inside. */
-static void subagent_setup(const agent_t *ag, const char *prompt, cJSON **msgs_out, cJSON **tools_out, size_t *sp_bytes_out) {
+static void subagent_setup(const agent_t *ag, const char *prompt, const char *skills_text, cJSON **msgs_out, cJSON **tools_out, size_t *sp_bytes_out) {
     cJSON *msgs = cJSON_CreateArray();
     cJSON *sys = cJSON_CreateObject();
     cJSON_AddStringToObject(sys, "role", "system");
@@ -2691,6 +2743,7 @@ static void subagent_setup(const agent_t *ag, const char *prompt, cJSON **msgs_o
                    "the main agent sees only that final message, nothing else you did. Do not ask questions; make reasonable assumptions and state them.",
                    g_cwd, g_cfg.web ? " and web_search/web_fetch for the documentation of external projects" : "");
     if (ag) sb_printf(&sp, "\n\nYour role (from %s):\n%s", ag->path, ag->body);
+    if (skills_text) sb_puts(&sp, skills_text);
     if (g_project_instructions) sb_puts(&sp, g_project_instructions);
     *sp_bytes_out = sp.len;
     cJSON_AddStringToObject(sys, "content", sp.data); sb_free(&sp);
@@ -2709,7 +2762,7 @@ static void subagent_setup(const agent_t *ag, const char *prompt, cJSON **msgs_o
     *tools_out = tools;
 }
 
-static int run_subagent_as(const char *description, const char *prompt, const agent_t *ag, const char *model, sbuf *out) {
+static int run_subagent_as(const char *description, const char *prompt, const agent_t *ag, const char *model, const char *skills_text, sbuf *out) {
     if (ag) printf("  " C_CYAN "⤷ sub-agent %s" C_RESET " " C_BOLD "%s" C_RESET "\n", ag->name, description);
     else printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", description);
     const char *sm = model ? (model_same(model, g_cfg.model) ? NULL : model) : subagent_model();
@@ -2726,7 +2779,7 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
     }
     cJSON *msgs = NULL, *tools = NULL;
     size_t sp_bytes = 0;
-    subagent_setup(ag, prompt, &msgs, &tools, &sp_bytes);
+    subagent_setup(ag, prompt, skills_text, &msgs, &tools, &sp_bytes);
     int rc = 1, tool_rounds = 0, round_first = -1;
     bool interrupted = false;     /* the user stopped it (Esc / Ctrl-C) */
     const char *final = NULL;
@@ -2952,7 +3005,9 @@ static bool tasks_batch(cJSON *calls, bool *failed) {
         const char *an = arg_str(args, "agent");
         snprintf(r->desc, sizeof r->desc, "%s", desc && *desc ? desc : "sub-agent");
         if (prompt == NULL) prompt = "";
-        if (subagent_resolve(an, &r->ag, &r->out)) { r->rc = 1; r->state = SR_DONE; }
+        sbuf skills_text; sb_init(&skills_text);
+        char *asked = tools_arg_list(args, "skills");
+        if (subagent_resolve(an, &r->ag, &r->out) || subagent_skills(r->ag, asked, &skills_text, &r->out)) { r->rc = 1; r->state = SR_DONE; }
         else {
             r->sm = batch_model_of(r->ag);
             r->prov = provider_find(r->sm ? r->sm : g_cfg.model, NULL);
@@ -2960,9 +3015,10 @@ static bool tasks_batch(cJSON *calls, bool *failed) {
             else printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", r->desc);
             r->rec = agent_begin(r->desc, r->sm, r->ag ? r->ag->name : NULL);
             agent_say(r->rec, "task: "); agent_say(r->rec, prompt); agent_say(r->rec, "\n");
-            subagent_setup(r->ag, prompt, &r->msgs, &r->tools, &r->sp_bytes);
+            subagent_setup(r->ag, prompt, skills_text.data, &r->msgs, &r->tools, &r->sp_bytes);
             r->state = SR_WAITING;
         }
+        free(asked); sb_free(&skills_text);
         if (parsed) cJSON_Delete(parsed);
     }
     /* the model the batch runs on, checked once, as run_subagent_as checks it */
