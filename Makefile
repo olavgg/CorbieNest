@@ -84,7 +84,7 @@ NC_GEN   := build/notcurses/version.h build/notcurses/builddef.h
 # clang's names of the upstream GCC warnings (gcc ignores the unknown ones)
 NC_VFLAGS := -D_XOPEN_SOURCE=700 -D_GNU_SOURCE -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -I$(NC_DIR)/include -I$(NC_DIR)/src -I$(NC_DIR)/src/lib -I$(NC_DIR)/src/compat -Ibuild/notcurses -Wno-clobbered -Wno-discarded-qualifiers -Wno-unknown-warning-option -Wno-incompatible-pointer-types-discards-qualifiers
 
-SRC := src/main.c src/util.c src/http.c src/term.c src/term_nc.c src/tools.c src/ollama.c src/provider.c src/skills.c src/theme.c src/mcp.c src/agents.c src/stream.c
+SRC := src/main.c src/util.c src/http.c src/term.c src/term_nc.c src/tools.c src/ollama.c src/provider.c src/skills.c src/theme.c src/mcp.c src/agents.c src/stream.c src/worktree.c
 OBJ := $(SRC:.c=.o)
 
 corbie: $(OBJ) $(NC_OBJ)

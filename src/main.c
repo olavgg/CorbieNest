@@ -4144,7 +4144,7 @@ typedef struct {
     int cap;                     /* room in tasks[] and w[]: the tasks a workflow adds must fit (stage_add() refuses past it) */
 } orch_run;
 #define GOAL_METRIC_TIMEOUT 900
-#define GOAL_GIT "GIT_AUTHOR_NAME=corbienest GIT_AUTHOR_EMAIL=corbienest@localhost GIT_COMMITTER_NAME=corbienest GIT_COMMITTER_EMAIL=corbienest@localhost "
+#define GOAL_GIT WT_GIT
 static const char *worker_model(const orch_worker *w) { return w->model ? w->model : g_cfg.model; }
 static bool worker_remote(const orch_worker *w) { return provider_find(worker_model(w), NULL) != NULL; }
 static bool task_ok(const orch_worker *w) { return w->state == T_ACCEPTED || w->state == T_UNREVIEWED; }
@@ -5065,33 +5065,17 @@ static void sbq(sbuf *b, const char *s) {
     sb_putc(b, '\'');
 }
 
-/* a copy of s without its trailing newlines and blanks, malloc'd */
-static char *goal_trim(const char *s) {
-    size_t n = s ? strlen(s) : 0;
-    while (n && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
-    char *t = xmalloc(n + 1); memcpy(t, s ? s : "", n); t[n] = 0;
-    return t;
-}
-
 /* git worktree remove of one copy, and nothing else */
-static void goal_remove_copy(const char *top, const char *dir) {
-    sbuf c, o; sb_init(&c); sb_init(&o); bool intr = false;
-    sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " worktree remove --force "); sbq(&c, dir); sb_puts(&c, " >/dev/null 2>&1");
-    tools_shell_in(NULL, c.data, 120, &o, &intr, "removing a copy", "worktree");
-    sb_free(&c); sb_free(&o);
-}
+static void goal_remove_copy(const char *top, const char *dir) { wt_remove(top, dir); }
 
 /* the metric of a commit, in a copy of its own that is made and removed here: 1 scored, 0 not, -1 stopped */
 static int goal_measure(const char *top, const char *commit, const char *dir, const goal_spec *spec, const char *what, double *v) {
-    sbuf c, o; sb_init(&c); sb_init(&o); bool intr = false;
-    sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " worktree add --detach "); sbq(&c, dir); sb_putc(&c, ' '); sbq(&c, commit); sb_puts(&c, " >/dev/null 2>&1");
-    if (tools_shell_in(NULL, c.data, 120, &o, &intr, what, "worktree") != 0) { sb_free(&c); sb_free(&o); printf("  " C_RED "⎿ cannot make a copy to measure in" C_RESET "\n"); return 0; }
-    sb_clear(&o);
+    sbuf o; sb_init(&o); bool intr = false;
+    if (!wt_add(top, dir, commit)) { sb_free(&o); printf("  " C_RED "⎿ cannot make a copy to measure in" C_RESET "\n"); return 0; }
     int rc = tools_shell_in(dir, spec->metric, GOAL_METRIC_TIMEOUT, &o, &intr, what, "measuring");
     int got = intr ? -1 : (rc == 0 && goal_number(o.data, v)) ? 1 : 0;
     sb_free(&o);
     goal_remove_copy(top, dir);
-    sb_free(&c);
     return got;
 }
 
@@ -5124,20 +5108,11 @@ static int cmd_goal(const char *arg) {
     sb_clear(&c); sb_clear(&o);
 
     /* the snapshot: the tree as it is, in a commit of its own */
-    sb_puts(&c, "git rev-parse --show-toplevel");
-    int rc = tools_shell_in(NULL, c.data, 30, &o, &intr, "reading the repository", "repository");
-    char *top = goal_trim(rc == 0 ? o.data : "");
+    char *top = wt_toplevel();
+    char tree[WT_ID] = "", snap[WT_ID] = "";
+    bool snapped = top && wt_snapshot(top, tree, snap);
     sb_clear(&c); sb_clear(&o);
-    char tree[64] = "", snap[64] = "";
-    if (rc == 0 && top[0]) {
-        sb_puts(&c, "cd "); sbq(&c, top);
-        sb_puts(&c, " && T=$(mktemp -u) && GIT_INDEX_FILE=$T git add -A && TREE=$(GIT_INDEX_FILE=$T git write-tree) && rm -f $T && P= && if git rev-parse -q --verify HEAD >/dev/null; then P='-p HEAD'; fi"
-                    " && S=$(" GOAL_GIT "git commit-tree $TREE $P -m corbie-goal-snapshot) && echo \"$TREE $S\"");
-        rc = tools_shell_in(NULL, c.data, 300, &o, &intr, "snapshotting the working tree", "snapshot");
-        if (rc != 0 || sscanf(o.data ? o.data : "", "%63s %63s", tree, snap) != 2) rc = -1;
-    }
-    sb_clear(&c); sb_clear(&o);
-    if (rc != 0 || !snap[0]) {
+    if (!snapped) {
         printf(C_RED "✗ cannot snapshot the working tree of this repository" C_RESET "\n");
         sb_puts(&c, "rm -rf "); sbq(&c, root); tools_shell_in(NULL, c.data, 60, &o, &intr, "cleaning up", "goal");
         sb_free(&c); sb_free(&o); free(top); free(root); goal_spec_free(&spec);
@@ -5184,16 +5159,13 @@ static int cmd_goal(const char *arg) {
             }
             dirs[k] = xmalloc(1200);
             snprintf(dirs[k], 1200, "%s/r%d-%d", root, round, k + 1);
-            sb_clear(&c);
-            sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " worktree add --detach "); sbq(&c, dirs[k]); sb_putc(&c, ' '); sbq(&c, cur); sb_puts(&c, " >/dev/null 2>&1");
-            if (tools_shell_in(NULL, c.data, 120, &o, &intr, "making a candidate's copy", "worktree") != 0) {
+            if (!wt_add(top, dirs[k], cur)) {
                 printf("  " C_RED "⎿ candidate %d: its copy could not be made" C_RESET "\n", k + 1);
                 ws[k].state = T_FAILED; ws[k].status = "failed: its copy could not be made";
                 free(dirs[k]); dirs[k] = NULL;
                 continue;
             }
             ws[k].root = dirs[k];
-            sb_clear(&o);
         }
         orch_run run = { .request = spec.task, .tasks = tasks, .w = ws, .nt = K, .tools = cJSON_CreateArray(), .first = first, .goal = &gc };
         cJSON *t;
@@ -5254,15 +5226,11 @@ static int cmd_goal(const char *arg) {
     int applied = 0;
     if (kept) {
         sb_clear(&c); sb_clear(&o);
-        sb_puts(&c, "cd "); sbq(&c, top);
-        sb_puts(&c, " && T=$(mktemp -u) && GIT_INDEX_FILE=$T git add -A && GIT_INDEX_FILE=$T git write-tree; rm -f $T");
-        tools_shell_in(NULL, c.data, 300, &o, &intr, "checking the working tree", "checking");
-        bool same = o.data && !strncmp(o.data, tree, strlen(tree)) && strlen(tree) > 0;
-        sb_clear(&c); sb_clear(&o);
+        char now_tree[WT_ID];
+        bool same = wt_tree_of_working(top, now_tree) && !strcmp(now_tree, tree) && tree[0];
         if (!same) printf("  " C_YELLOW "⎿ the working tree changed during the goal: nothing is applied; the result is branch %s" C_RESET "\n", id_branch);
         else {
-            sb_puts(&c, "cd "); sbq(&c, top); sb_puts(&c, " && git diff --name-only "); sb_puts(&c, snap); sb_putc(&c, ' '); sb_puts(&c, winner);
-            tools_shell_in(NULL, c.data, 120, &o, &intr, "reading the result", "result");
+            wt_changed(top, snap, winner, &o);
             for (char *p = o.data; p && *p; ) {   /* each file the result changes is saved first, so /rewind undoes the goal */
                 char *e = strchr(p, '\n'); size_t len = e ? (size_t)(e - p) : strlen(p);
                 if (len) { char *abs = xmalloc(strlen(top) + len + 2); sprintf(abs, "%s/%.*s", top, (int)len, p); tools_checkpoint_path(abs); free(abs); }
@@ -5270,17 +5238,13 @@ static int cmd_goal(const char *arg) {
                 p = e + 1;
             }
             sb_clear(&c); sb_clear(&o);
-            sb_puts(&c, "cd "); sbq(&c, top); sb_puts(&c, " && git diff --binary "); sb_puts(&c, snap); sb_putc(&c, ' '); sb_puts(&c, winner); sb_puts(&c, " | git apply");
-            rc = tools_shell_in(NULL, c.data, 300, &o, &intr, "applying the kept candidate", "applying");
-            if (rc == 0) {
+            if (wt_apply(top, snap, winner, NULL)) {
                 applied = 1;
                 printf("  " C_GREEN "✓ applied as uncommitted changes" C_RESET C_DIM " · %s" C_RESET "\n", id_branch);
             } else printf("  " C_RED "⎿ the result did not apply cleanly: it is branch %s" C_RESET "\n", id_branch);
         }
         sb_clear(&c); sb_clear(&o);
-        sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " branch "); sb_puts(&c, id_branch); sb_putc(&c, ' '); sb_puts(&c, winner);
-        tools_shell_in(NULL, c.data, 60, &o, &intr, "keeping the result", "branch");
-        sb_clear(&c); sb_clear(&o);
+        wt_branch(top, id_branch, winner);
     }
     printf("%s%s goal: score %.6g → %.6g%s" C_RESET "\n", aborted ? C_YELLOW : applied ? C_GREEN : C_YELLOW, aborted ? "!" : applied ? "✓" : "·",
            base0, best, aborted ? " — the run was stopped" : applied ? "" : " — nothing applied");

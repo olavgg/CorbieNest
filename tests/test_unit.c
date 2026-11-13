@@ -3092,6 +3092,62 @@ static void test_theme(void) {
     CHECK(!strcmp(th_bg(0x151922u), "\x1b[48;2;21;25;34m"));
 }
 
+/* ---------- worktree.c: a copy of the project in a git worktree, and what it changed brought back ---------- */
+static void test_worktree(void) {
+    if (system("git --version >/dev/null 2>&1") != 0) return;   /* no git here: nothing to test */
+    char base[] = "/tmp/corbie_wt_XXXXXX";
+    if (!mkdtemp(base)) return;
+    char old[1024]; if (!getcwd(old, sizeof old)) return;
+    char cmd[2048];
+    snprintf(cmd, sizeof cmd, "cd %s && mkdir repo repo/sub && cd repo && git init -q && git config user.email t@t && git config user.name t && "
+             "echo one > a.txt && echo keep > b.txt && echo deep > sub/d.txt && git add -A && git commit -q -m first && "
+             "echo dirty >> a.txt && echo fresh > untracked.txt", base);
+    CHECK(system(cmd) == 0);
+    char repo[1100]; snprintf(repo, sizeof repo, "%s/repo", base);
+    CHECK(chdir(repo) == 0);
+    char *top = wt_toplevel(), *pre = wt_prefix();
+    char real[PATH_MAX]; CHECK(realpath(repo, real) != NULL);
+    CHECK(top && !strcmp(top, real)); CHECK(pre && pre[0] == 0);
+    char tree[WT_ID], snap[WT_ID], now[WT_ID];
+    CHECK(wt_snapshot(top, tree, snap) && strlen(tree) >= 40 && strlen(snap) >= 40);
+    CHECK(wt_tree_of_working(top, now) && !strcmp(now, tree));   /* the snapshot touched neither the files nor the index */
+    sbuf st; sb_init(&st); { bool intr = false; tools_shell_in(NULL, "git status --porcelain", 30, &st, &intr, NULL, NULL); }
+    CHECK(st.data && strstr(st.data, " M a.txt") && strstr(st.data, "?? untracked.txt") && !strstr(st.data, "A "));   /* nothing staged by it */
+    sb_free(&st);
+    char wdir[1200]; snprintf(wdir, sizeof wdir, "%s/copies/c1", base);
+    CHECK(wt_add(top, wdir, snap));
+    char path[1300];
+    snprintf(path, sizeof path, "%s/untracked.txt", wdir);
+    size_t n; char *t = read_whole_file(path, &n, 0);
+    CHECK(t && !strcmp(t, "fresh\n")); free(t);   /* an untracked file is in the copy */
+    snprintf(cmd, sizeof cmd, "cd %s && echo edited > b.txt && rm sub/d.txt && echo new > added.txt && echo ignored > /dev/null", wdir);
+    CHECK(system(cmd) == 0);
+    char commit[WT_ID];
+    CHECK(wt_commit(wdir, commit) && strlen(commit) >= 40);
+    sbuf names; sb_init(&names);
+    CHECK(wt_changed(top, snap, commit, &names) == 3);
+    CHECK(strstr(names.data, "b.txt\n") && strstr(names.data, "sub/d.txt\n") && strstr(names.data, "added.txt\n"));
+    CHECK(wt_apply_check(top, snap, commit, NULL));
+    CHECK(wt_apply(top, snap, commit, NULL));
+    t = read_whole_file("b.txt", &n, 0); CHECK(t && !strcmp(t, "edited\n")); free(t);
+    CHECK(!is_file("sub/d.txt") && is_file("added.txt"));
+    t = read_whole_file("a.txt", &n, 0); CHECK(t && !strcmp(t, "one\ndirty\n")); free(t);   /* the user's own uncommitted change is still there */
+    /* the same change does not fit twice: nothing is touched */
+    sbuf why; sb_init(&why);
+    CHECK(!wt_apply_check(top, snap, commit, &why) && why.len > 0);
+    CHECK(wt_branch(top, "corbie-sub/test", commit));
+    { sbuf o; sb_init(&o); bool intr = false; tools_shell_in(NULL, "git branch --list 'corbie-sub/*'", 30, &o, &intr, NULL, NULL); CHECK(o.data && strstr(o.data, "corbie-sub/test")); sb_free(&o); }
+    /* a copy that changed nothing */
+    char c2[WT_ID], w2[1200]; snprintf(w2, sizeof w2, "%s/copies/c2", base);
+    CHECK(wt_add(top, w2, snap) && wt_commit(w2, c2));
+    sb_clear(&names); CHECK(wt_changed(top, snap, c2, &names) == 0);
+    wt_remove(top, wdir); wt_remove(top, w2); wt_prune(top);
+    CHECK(!is_dir(wdir) && !is_dir(w2));
+    sb_free(&names); sb_free(&why); free(top); free(pre);
+    CHECK(chdir(old) == 0);
+    snprintf(cmd, sizeof cmd, "rm -rf %s", base); CHECK(system(cmd) == 0);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -3101,7 +3157,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "fold head", test_fold_head }, { "scrollback spill", test_sb_spill }, { "modes", test_modes },
         { "close button", test_close_x }, { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "config merge", test_config_merge }, { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "workflow", test_workflow }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme }, { "title", test_title },
+        { "config merge", test_config_merge }, { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "workflow", test_workflow }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme }, { "title", test_title }, { "worktree", test_worktree },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

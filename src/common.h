@@ -789,6 +789,22 @@ extern tools_advisor_fn tools_advisor;   /* how many one request may make: advis
 extern bool tools_no_confirm;   /* while true, tools run without asking (user-typed "!cmd") */
 const char *tools_summary_line(void);   /* short list for help */
 
+/* ---------- worktree.c: git worktrees as scratch copies (/goal's candidates, sub-agents that write) ---------- */
+#define WT_ID 64   /* room for a commit or tree id */
+#define WT_GIT "GIT_AUTHOR_NAME=corbienest GIT_AUTHOR_EMAIL=corbienest@localhost GIT_COMMITTER_NAME=corbienest GIT_COMMITTER_EMAIL=corbienest@localhost "   /* a shell prefix: the identity of the commits made for a copy */
+char *wt_toplevel(void);                                   /* the repository's top folder (malloc'd), NULL when this is not a git repository */
+char *wt_prefix(void);                                     /* where in it we are: "" at the top, "sub/dir/" below it (malloc'd) */
+bool  wt_snapshot(const char *top, char tree[WT_ID], char snap[WT_ID]);   /* the working tree as it is, in a commit made through a temporary index; false if it cannot */
+bool  wt_tree_of_working(const char *top, char tree[WT_ID]);              /* the tree id the working tree has now (compare with a snapshot's) */
+bool  wt_add(const char *top, const char *dir, const char *commit);       /* a detached worktree of the commit in dir */
+void  wt_remove(const char *top, const char *dir);
+void  wt_prune(const char *top);                           /* forgets worktrees whose folder is gone (a killed run) */
+bool  wt_commit(const char *dir, char commit[WT_ID]);      /* everything in the copy, committed (hooks off); HEAD's id */
+int   wt_changed(const char *top, const char *snap, const char *commit, sbuf *names);   /* files that differ, one per line appended to names (may be NULL); -1 on error */
+bool  wt_apply_check(const char *top, const char *snap, const char *commit, sbuf *why); /* does the change from snap to commit fit the tree now (why: git's complaint) */
+bool  wt_apply(const char *top, const char *snap, const char *commit, sbuf *why);       /* applies it to the working tree, all or nothing */
+bool  wt_branch(const char *top, const char *name, const char *commit);
+
 /* ---------- skills.h ---------- */
 typedef struct {
     char *name, *desc, *path, *dir, *body;
