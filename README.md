@@ -20,7 +20,8 @@ confirmed before it runs.
 - **Tools with confirmation.** Read, write and edit files, grep, run shell and git commands,
   and look documentation up on the web. Four permission modes, from `manual` to `auto`.
 - **Sub-agents.** A read-only agent investigates a question in its own context and reports
-  back. A strip above the status bar lists the running ones; when they do not fit, "show all"
+  back. With `isolation=worktree` one makes a change instead, in a git copy of the project of its
+  own, which is applied to your working tree when it reports (kept as a branch when it does not fit). A strip above the status bar lists the running ones; when they do not fit, "show all"
   opens the rest. `↓` moves into the strip and Enter opens a log.
 - **Orchestration and goals.** `/orchestrate` plans a request as tasks that the advisor reviews, and
   with a `.agents/workflow.md` it also runs tests, QA and code, product and UX reviews by the roles you

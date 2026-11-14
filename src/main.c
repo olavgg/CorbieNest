@@ -54,7 +54,7 @@ static const struct { const char *name, *desc; } SLASH_CMDS[] = {
     { "/status", "model, context usage, settings" },
     { "/system", "extra system instructions: TEXT, or clear" },
     { "/think", "when the model thinks: on, off, auto · show or hide it" },
-    { "/effort", "how hard this model thinks; /effort parallel on|off: the sub-agents of one reply at the same time" },
+    { "/effort", "how hard this model thinks; /effort parallel on|off|auto|N: the sub-agents of one reply at the same time" },
     { "/advisor", "a stronger model the agent may consult: a local one, or Claude, ChatGPT, Grok by API key" },
     { "/subagent", "the model sub-agents (task) run on, and how hard it thinks" },
     { "/orchestrate", "the advisor model plans the request as tasks, this model does them, the advisor reviews each" },
@@ -107,7 +107,7 @@ static const struct { const char *after, *opts; } SLASH_ARGS[] = {
     { "/goal", "min:a lower score is better|max:a higher score is better (the default)|-n:rounds, 1 to 10|-k:candidates, 2 to 8|-m:models, a,b,c (round-robin)" },
     { "/mode", "manual:ask before every edit and command|accept-edits:file edits go ahead, commands still ask|plan:read-only: the model proposes a plan|auto:nothing asks (dangerous)" },
     { "/think", "on:think on every call|off:do not think|auto:think once per request, not after every tool result|show:show the thinking|hide:hide the thinking" },
-    { "/effort parallel", "on:the task calls of one reply run as sub-agents at the same time|off:one sub-agent after another (the default)" },
+    { "/effort parallel", "on:the task calls of one reply run as sub-agents at the same time|off:one sub-agent after another (the default)|auto:how many at once follows the size of the reply, 2 to 8 (the default when on)|4:a number, 1 to 20: that many sub-agents at once" },
     { "/yolo", "on:approve every tool call (dangerous)|off:back to manual confirmations" },
     { "/tools", "on:the model may call tools|off:chat only" },
     { "/web", "on:the model may search and read the web|off:no web access|engine:the search engine: a URL with %s for the query, or default" },
@@ -1674,12 +1674,14 @@ static char *build_system_prompt(void) {
             "- For work of three or more steps, keep a task list with todo_write: one task per step, at most one in_progress, and mark each completed as you finish it. Skip it for a single change or a question.\n"
             "- Use task to hand a broad, self-contained investigation (\"find all places that…\", \"how does X work across the code\") to a read-only sub-agent "
             "and get back a report, keeping the noise out of this conversation; give it a complete prompt, it knows nothing of this chat.\n");
+        if (skills_count() > 0) sb_puts(&b, "- When one of the skills listed below describes how a task is done, name it in the task's skills argument: the sub-agent is given its full instructions.\n");
         if (parallel_runs_here()) sb_puts(&b,
             "- Parallel sub-agents are on: the task calls of one reply run at the same time, so a broad investigation goes faster as several. "
             "Split it into independent questions (one area of the code, one subsystem, one hypothesis each), give each its own complete prompt, "
             "and send all the task calls in ONE reply with no other tool call beside them: a reply that mixes in another tool runs its sub-agents one after another. "
             "Do not split what depends on an earlier answer, and do not start a second sub-agent on the same question. "
-            "Sub-agents only read; make the changes yourself once their reports are in.\n");
+            "Sub-agents only read; make the changes yourself once their reports are in. ");
+        if (parallel_runs_here()) { parallel_advice(&b); sb_putc(&b, '\n'); }
         if (g_cfg.advisor) {   /* no model name in it: changing the advisor leaves the prompt, and its cache, alone (the guidance does not) */
             const advisor_guidance_def *g = advisor_guidance();
             sb_puts(&b, "- advisor is a stronger but much slower model that is shown this whole conversation and tells you how to proceed. ");
@@ -2605,7 +2607,270 @@ static void agents_menu(void) {
     free(items); free(descs);
 }
 
-static int run_subagent_as(const char *description, const char *prompt, const agent_t *ag, const char *model, sbuf *out);
+/* ---------- sub-agents that write: each in a copy of the project (task with isolation=worktree) ----------
+ * The working tree is snapshotted once per run of sub-agents (one task call, or a batch of them): the files as they are,
+ * uncommitted and untracked ones included, in a commit made through a temporary index (worktree.c, as /goal does; the
+ * user's index and HEAD are not touched). Each such sub-agent gets a detached git worktree of that commit under
+ * <config>/worktrees/ID/K, made when it starts; its tool calls run in it one at a time on this thread (tools_enter_copy:
+ * the working directory is the copy, write_file and edit_file refuse paths outside it and its .git, an absolute path
+ * under the project is the same path in the copy, a question it asks names it). When it is done its copy is committed
+ * through the git directory read when it was made, leaving out what the user's HEAD did not track and no tool call
+ * wrote (a build's output), and the change from the snapshot is applied to the working tree, all or nothing, in the
+ * order the model asked — checked first, each file checkpointed so /rewind undoes it. A change that does not fit any
+ * more, or one of a sub-agent that failed or was stopped, or one made while the user switched to plan mode, is kept as
+ * the branch corbie-sub/ID-K. A copy is removed once what it holds is applied or on a branch; one whose work could be
+ * kept neither way stays where it is (a KEPT file marks its folder) and the result says where. The copies of a run that
+ * was killed are swept by the next run (copies_sweep). Bash is the one escape (a command can name a path outside its
+ * copy), as for /goal's candidates. */
+typedef struct {
+    char *top;              /* the repository's top folder (NULL: not taken yet, or not a repository) */
+    char *prefix;           /* where the working directory is in it: "" or "sub/dir/" */
+    char *base;             /* <config>/worktrees/ID: the copies' folder (symlinks resolved, as the working directory in a copy reads) */
+    char id[64];
+    char snap[WT_ID], tree[WT_ID];
+    int state;              /* 0 not tried, 1 ready, -1 it could not be: why says why */
+    bool kept;              /* a copy is left on disk: the folder is not removed */
+    int lock;               /* the folder's LOCK, held while the run lives (fd + 1; 0: none): another session's sweep leaves it alone */
+    char why[480];
+} sub_copies;
+typedef struct {
+    char *dir, *root;       /* the worktree; where the sub-agent works in it (dir + prefix) */
+    int k;
+    bool made;              /* it is there */
+    char gitdir[1024];      /* its git directory, read when it was made (its .git file is the sub-agent's to change) */
+    const char *top;        /* the repository's top, which dir stands for (a path above the working folder is mapped too) */
+    sbuf wrote;             /* the files its write_file and edit_file calls wrote, real paths, one per line */
+    char who[80];           /* "sub-agent DESC", in front of its questions */
+} sub_copy;
+
+static void copy_q(sbuf *b, const char *s) {   /* a string as one shell word */
+    sb_putc(b, '\'');
+    for (; *s; s++) { if (*s == '\'') sb_puts(b, "'\\''"); else sb_putc(b, *s); }
+    sb_putc(b, '\'');
+}
+/* the copy whose tool call runs now: tools.c tells it what write_file and edit_file wrote */
+static sub_copy *g_copy_cur = NULL;
+static void copy_wrote(const char *path) {
+    char real[PATH_MAX];
+    if (!g_copy_cur || !realpath(path, real)) return;
+    sb_puts(&g_copy_cur->wrote, real); sb_putc(&g_copy_cur->wrote, '\n');
+}
+/* wt_commit's question: is a file the user's HEAD did not track one the sub-agent wrote? (name: from the copy's top) */
+static bool copy_keeps(const char *name, void *ctx) {
+    sub_copy *c = ctx;
+    sbuf a; sb_init(&a); sb_printf(&a, "%s/%s", c->dir, name);
+    char real[PATH_MAX];
+    bool keep = false;
+    if (realpath(a.data, real) && c->wrote.data) {
+        size_t rl = strlen(real);
+        for (const char *q = c->wrote.data; (q = strstr(q, real)); q += rl)
+            if ((q == c->wrote.data || q[-1] == '\n') && q[rl] == '\n') { keep = true; break; }
+    }
+    sb_free(&a);
+    return keep;
+}
+/* The copies of runs that are over (killed, or the terminal closed): a run holds its folder's LOCK (flock) while it lives,
+ * so a folder whose lock can be taken is no one's — whatever process or machine made it. Each copy in it is removed
+ * through git (a copy of another repository fails, harmlessly), then the folder; one kept on purpose (KEPT) stays. */
+static void copies_sweep(const char *folder, const char *top) {
+    DIR *d = opendir(folder);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        sbuf p; sb_init(&p); sb_printf(&p, "%s/%s", folder, e->d_name);
+        sbuf k; sb_init(&k); sb_printf(&k, "%s/KEPT", p.data);
+        bool keep = is_file(k.data);
+        sb_clear(&k); sb_printf(&k, "%s/LOCK", p.data);
+        int fd = keep ? -1 : open(k.data, O_RDWR | O_CLOEXEC);
+        if (fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0) {   /* no one's: removed while it is held, so no one starts in it meanwhile */
+            DIR *cd = opendir(p.data);
+            struct dirent *ce;
+            while (cd && (ce = readdir(cd))) {
+                if (ce->d_name[0] == '.') continue;
+                sbuf c; sb_init(&c); sb_printf(&c, "%s/%s", p.data, ce->d_name);
+                if (is_dir(c.data)) wt_remove(top, c.data);
+                sb_free(&c);
+            }
+            if (cd) closedir(cd);
+            sbuf c, o; sb_init(&c); sb_init(&o); bool intr = false;
+            sb_puts(&c, "rm -rf "); copy_q(&c, p.data);
+            tools_shell_hold(true);
+            tools_shell_in(NULL, c.data, 300, &o, &intr, "cleaning up", "worktree");
+            tools_shell_hold(false);
+            sb_free(&c); sb_free(&o);
+        }
+        if (fd >= 0) close(fd);
+        sb_free(&k); sb_free(&p);
+    }
+    closedir(d);
+}
+/* the snapshot the copies are made of, taken the first time one is wanted; false (and cs->why) when it cannot be */
+static bool copies_ready(sub_copies *cs) {
+    if (cs->state) return cs->state > 0;
+    cs->state = -1;
+    if (g_cfg.mode == MODE_PLAN) { snprintf(cs->why, sizeof cs->why, "plan mode is read-only: a sub-agent cannot change files now. Run it without isolation, or present your plan as text"); return false; }
+    cs->top = wt_toplevel();
+    if (!cs->top) { snprintf(cs->why, sizeof cs->why, "isolation=worktree needs a git repository, and %.120s is not in one. Run the task without isolation (read-only), or make the change yourself", g_cwd); return false; }
+    cs->prefix = wt_prefix();
+    if (wt_ignored(cs->top, cs->prefix)) { snprintf(cs->why, sizeof cs->why, "isolation=worktree: this folder is one the git repository at %.120s ignores, so a copy would hold nothing of it. Run the task without isolation, or make the change yourself", cs->top); return false; }
+    char cfg[PATH_MAX];   /* the copies' folder as the working directory in one reads, so a path the prompt gives is the one getcwd() says */
+    if (!realpath(config_dir(), cfg)) snprintf(cfg, sizeof cfg, "%s", config_dir());
+    sbuf f; sb_init(&f); sb_printf(&f, "%s/worktrees", cfg);
+    copies_sweep(f.data, cs->top);
+    if (!wt_snapshot(cs->top, cs->tree, cs->snap)) { sb_free(&f); snprintf(cs->why, sizeof cs->why, "the working tree could not be snapshotted for a copy. Run the task without isolation, or make the change yourself"); return false; }
+    static int seq = 0;
+    snprintf(cs->id, sizeof cs->id, "%ld-%ld-%d", (long)time(NULL), (long)getpid(), ++seq);
+    sb_printf(&f, "/%s", cs->id); cs->base = sb_detach(&f);
+    mkdir_p(cs->base);
+    sbuf l; sb_init(&l); sb_printf(&l, "%s/LOCK", cs->base);
+    int fd = open(l.data, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    sb_free(&l);
+    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (fd >= 0) close(fd);
+        snprintf(cs->why, sizeof cs->why, "the folder for the copies could not be made under %.200s. Run the task without isolation, or make the change yourself", cfg);
+        return false;
+    }
+    cs->lock = fd + 1;
+    cs->state = 1;
+    return true;
+}
+/* where the copy of sub-agent k (1-based, the order the model asked) will be, so its prompt can say so before it is
+ * made (copy_add); false with why in err when the snapshot cannot be taken */
+static bool copy_plan(sub_copies *cs, int k, const char *desc, sub_copy *c, sbuf *err) {
+    memset(c, 0, sizeof *c);
+    if (!copies_ready(cs)) { sb_printf(err, "error: %s.", cs->why); return false; }
+    sbuf d; sb_init(&d); sb_printf(&d, "%s/%d", cs->base, k);
+    c->dir = sb_detach(&d);
+    sbuf r; sb_init(&r); sb_puts(&r, c->dir);
+    if (cs->prefix && *cs->prefix) { sb_putc(&r, '/'); sb_puts(&r, cs->prefix); while (r.len > 1 && r.data[r.len - 1] == '/') r.data[--r.len] = 0; }
+    c->root = sb_detach(&r);
+    c->k = k;
+    c->top = cs->top;
+    const char *dd = desc && *desc ? desc : "";
+    size_t dl = strlen(dd), cut = utf8_cut(dd, dl, 60);
+    snprintf(c->who, sizeof c->who, "sub-agent %.*s%s", (int)cut, dd, cut < dl ? "…" : "");
+    return true;
+}
+static void copy_drop(sub_copy *c) { free(c->dir); free(c->root); c->dir = c->root = NULL; sb_free(&c->wrote); }
+/* the planned copy, made now: a detached worktree of the snapshot; false with why in err (and the plan dropped) */
+static bool copy_add(sub_copies *cs, sub_copy *c, sbuf *err) {
+    if (c->made) return true;
+    if (!wt_add(cs->top, c->dir, cs->snap)) {
+        sb_puts(err, "error: the sub-agent's copy of the project (a git worktree) could not be made. Run the task without isolation, or make the change yourself.");
+        copy_drop(c);
+        return false;
+    }
+    c->made = true;
+    if (!wt_gitdir(c->dir, c->gitdir, sizeof c->gitdir)) c->gitdir[0] = 0;
+    if (!is_dir(c->root)) mkdir_p(c->root);   /* a working directory git has no file in */
+    return true;
+}
+/* the names of a list (one per line) as "a, b, c" */
+static void names_joined(const char *names, sbuf *out) {
+    for (const char *q = names; q && *q; ) {
+        const char *e = strchr(q, '\n'); size_t len = e ? (size_t)(e - q) : strlen(q);
+        if (len) { if (out->len) sb_puts(out, ", "); sb_append(out, q, len); }
+        if (!e) break;
+        q = e + 1;
+    }
+}
+/* A sub-agent's copy when it is done: what it changed, applied to the working tree when it fits — unless held says why
+ * not (it did not finish, the user stopped it) or plan mode is on now — else kept as a branch. The copy is removed once
+ * its work is applied or on a branch, and left where it is otherwise. What came of it is appended to note, for its task
+ * result. */
+static void copy_merge(sub_copies *cs, sub_copy *c, const char *held, sbuf *note) {
+    if (!c->dir) return;
+    if (!c->made) { copy_drop(c); return; }   /* never started: nothing to collect */
+    if (!held && g_cfg.mode == MODE_PLAN) held = "plan mode is on now, so nothing was applied";
+    char commit[WT_ID] = "", all[WT_ID] = "";
+    sbuf names, left; sb_init(&names); sb_init(&left);
+    int n = wt_commit(c->dir, c->gitdir[0] ? c->gitdir : NULL, cs->snap, copy_keeps, c, &left, all, commit) ? wt_changed(cs->top, cs->snap, commit, &names) : -1;
+    char branch[128]; snprintf(branch, sizeof branch, "corbie-sub/%s-%d", cs->id, c->k);
+    bool safe = n == 0;   /* what the copy holds is applied, or on a branch, or nothing: it may go */
+    bool all_kept = true;   /* the whole copy, what was left out included, is on a branch when anything was left out */
+    char branch_all[160] = "";
+    if (left.len && all[0]) { snprintf(branch_all, sizeof branch_all, "%s-all", branch); all_kept = wt_branch(cs->top, branch_all, all); }
+    if (n < 0) sb_puts(note, "\n\n[its copy: what it changed could not be collected; nothing was applied");
+    else if (n == 0) sb_puts(note, "\n\n[its copy: no file was changed");
+    else {
+        sbuf list; sb_init(&list);
+        names_joined(names.data, &list);
+        sbuf why; sb_init(&why);
+        bool applied = false;
+        if (!held && wt_apply_check(cs->top, cs->snap, commit, &why)) {
+            for (char *q = names.data; q && *q; ) {   /* each file is saved first, so /rewind undoes it */
+                char *e = strchr(q, '\n'); size_t len = e ? (size_t)(e - q) : strlen(q);
+                if (len) { sbuf a; sb_init(&a); sb_printf(&a, "%s/%.*s", cs->top, (int)len, q); tools_checkpoint_path(a.data); sb_free(&a); }
+                if (!e) break;
+                q = e + 1;
+            }
+            sb_clear(&why);
+            applied = wt_apply(cs->top, cs->snap, commit, &why);
+        }
+        if (applied) { safe = true; sb_printf(note, "\n\n[its changes are applied to the working tree (uncommitted): %d file%s — %s", n, n == 1 ? "" : "s", list.data); }
+        else {
+            safe = wt_branch(cs->top, branch, commit);
+            sb_printf(note, "\n\n[its changes (%d file%s — %s): %s", n, n == 1 ? "" : "s", list.data, held ? held : "they no longer fit the working tree, so nothing was applied");
+            if (why.len) { char *w = xstrdup(why.data); for (char *x = w; *x; x++) if (*x == '\n') *x = ' '; sb_printf(note, " (git: %.300s)", w); free(w); }
+            if (safe) sb_printf(note, "; they are kept as the branch %s, on a snapshot of the working tree (git diff %.12s %s shows them)", branch, cs->snap, branch);
+            else sb_puts(note, "; the branch to keep them could not be made");
+        }
+        sb_free(&why); sb_free(&list);
+    }
+    if (left.len) {   /* build output and the like: not the sub-agent's change */
+        sbuf l; sb_init(&l); names_joined(left.data, &l);
+        sb_printf(note, ". Left out, as new files no write_file or edit_file wrote (a build's output): %.600s%s", l.data, l.len > 600 ? "…" : "");
+        if (all_kept && branch_all[0]) sb_printf(note, "; the copy with them is the branch %s", branch_all);
+        sb_free(&l);
+    }
+    if (!all_kept) safe = false;
+    if (safe) wt_remove(cs->top, c->dir);
+    else {   /* the only place its work is: it stays, and the sweep of a later run leaves it alone */
+        cs->kept = true;
+        sbuf k; sb_init(&k); sb_printf(&k, "%s/KEPT", cs->base);
+        write_whole_file(k.data, "a sub-agent's copy whose changes could not be applied or kept as a branch\n", 75);
+        sb_free(&k);
+        sb_printf(note, "; its copy is left at %s", c->dir);
+    }
+    sb_puts(note, "]");
+    sb_free(&names); sb_free(&left);
+    copy_drop(c);
+}
+/* the run is over: its folder, and git's record of the copies, go — unless a copy was left in it */
+static void copies_end(sub_copies *cs) {
+    if (cs->base && !cs->kept) {
+        sbuf c, o; sb_init(&c); sb_init(&o); bool intr = false;
+        sb_puts(&c, "rm -rf "); copy_q(&c, cs->base);
+        tools_shell_hold(true);
+        tools_shell_in(NULL, c.data, 120, &o, &intr, "cleaning up", "worktree");
+        tools_shell_hold(false);
+        sb_free(&c); sb_free(&o);
+    }
+    if (cs->lock) close(cs->lock - 1);   /* (each copy was removed by git itself: nothing to prune, and a prune would touch the user's own worktrees too) */
+    free(cs->top); free(cs->prefix); free(cs->base);
+    memset(cs, 0, sizeof *cs);
+}
+/* The isolation a task asks for (its argument, its agent file's key): 1 a copy, 0 none, -1 not understood or not
+ * possible (err says). *from_file: only the agent file asked for it, so the task cannot turn it off. */
+static int subagent_isolation(const char *arg, const agent_t *ag, bool *from_file, sbuf *err) {
+    int iso = task_isolation(arg, ag ? ag->isolation : NULL);
+    *from_file = iso == 1 && task_isolation(arg, NULL) != 1;
+    if (iso < 0) sb_printf(err, "error: isolation is \"worktree\" (the sub-agent changes files in a copy of its own) or left out (it only reads); not \"%s\"%s.",
+                           arg && *arg && strcasecmp(arg, "worktree") && strcasecmp(arg, "none") ? arg : ag && ag->isolation ? ag->isolation : "",
+                           !(arg && *arg && strcasecmp(arg, "worktree") && strcasecmp(arg, "none")) && ag ? " (in its agent file)" : "");
+    else if (iso == 1 && ag && !agent_allows(ag, "write_file") && !agent_allows(ag, "edit_file")) {
+        sb_printf(err, "error: sub-agent %s works in a copy to change files, but its file gives it neither write_file nor edit_file (its tools: %s). Fix its file, or run a general sub-agent.", ag->name, ag->tools);
+        iso = -1;
+    }
+    return iso;
+}
+/* a copy could not be had: say so, and why the task cannot simply run without it when its agent file asks for it */
+static void copy_unavailable(const agent_t *ag, bool from_file, sbuf *err) {
+    if (from_file && ag) sb_printf(err, " (sub-agent %s always works in a copy: its file says isolation: worktree; it cannot run here — use a general sub-agent to read, or do the work yourself)", ag->name);
+}
+
+static int run_subagent_as(const char *description, const char *prompt, const agent_t *ag, const char *model, const char *skills_text, int iso, sbuf *out);
 /* task: a general sub-agent, or the one a file names (agents.c): its tools and role, and its model when it names one. The
  * model is a parameter of the run, not a setting: /subagent and the config are not touched. */
 /* the agent a task names (none: a general sub-agent): 0 when it may run, else 1 with what went wrong in out */
@@ -2629,10 +2894,65 @@ static int subagent_resolve(const char *agent_name, const agent_t **ag_out, sbuf
     *ag_out = ag;
     return 0;
 }
-static int run_subagent(const char *description, const char *prompt, const char *agent_name, sbuf *out) {
+/* The skills a sub-agent is given: the ones its agent file names and the ones the task names, each once, their full text
+ * (skill_expand, no arguments: the task is the prompt) cut to a size, in text for the sub-agent's system prompt. 0 when
+ * there is nothing wrong; else 1, with what went wrong in err (a skill that is not there: the task does not run). */
+#define SUBAGENT_SKILLS_MAX 6               /* skills one sub-agent may be given */
+#define SUBAGENT_SKILL_BYTES (16 * 1024)    /* of each one's text */
+static int subagent_skills(const agent_t *ag, const char *asked, sbuf *text, sbuf *err) {
+    sbuf names; sb_init(&names);
+    if (ag && ag->skills) sb_printf(&names, "%s", ag->skills);
+    if (asked && *asked) sb_printf(&names, "%s%s", names.len ? "," : "", asked);
+    const skill_t *got[SUBAGENT_SKILLS_MAX]; int ng = 0;
+    sbuf missing; sb_init(&missing);
+    bool too_many = false;
+    for (const char *p = names.data ? names.data : ""; *p; ) {
+        while (*p == ',' || *p == ' ' || *p == '\t' || *p == '\n') p++;
+        const char *e = p; while (*e && *e != ',' && *e != ' ' && *e != '\t' && *e != '\n') e++;
+        if (e > p) {
+            char *nm = xstrndup(p, (size_t)(e - p));
+            const skill_t *sk = skill_find(nm);
+            if (!sk) sb_printf(&missing, "%s/%s", missing.len ? ", /" : "", *nm == '/' ? nm + 1 : nm);
+            else {
+                bool dup = false; for (int i = 0; i < ng; i++) if (got[i] == sk) dup = true;
+                if (!dup) { if (ng < SUBAGENT_SKILLS_MAX) got[ng++] = sk; else too_many = true; }
+            }
+            free(nm);
+        }
+        p = e;
+    }
+    int rc = 0;
+    if (missing.len || too_many) {
+        if (missing.len) sb_printf(err, "error: no skill named %s. The skills there are:", missing.data);
+        else sb_printf(err, "error: a sub-agent can be given at most %d skills.", SUBAGENT_SKILLS_MAX);
+        if (missing.len) { for (int i = 0; i < skills_count(); i++) sb_printf(err, " /%s", skill_get(i)->name); if (!skills_count()) sb_puts(err, " none"); }
+        sb_puts(err, missing.len ? ". Name one of these, or run the task without it." : " Give it fewer.");
+        rc = 1;
+    } else if (ng) {
+        sb_puts(text, "\n\nSkills you were given: follow them for this task, as the instructions of the user who set it up.\n");
+        for (int i = 0; i < ng; i++) {
+            char *x = skill_expand(got[i], "");
+            size_t xl = strlen(x);
+            if (xl > SUBAGENT_SKILL_BYTES) { x[utf8_cut(x, xl, SUBAGENT_SKILL_BYTES)] = 0; sb_puts(text, x); sb_printf(text, "\n[the skill /%s is cut here: read %s for the rest]\n", got[i]->name, got[i]->path); }
+            else sb_printf(text, "%s\n", x);
+            free(x);
+        }
+    }
+    sb_free(&names); sb_free(&missing);
+    return rc;
+}
+static int run_subagent(const task_req *t, sbuf *out) {
     const agent_t *ag = NULL;
-    if (subagent_resolve(agent_name, &ag, out)) return 1;
-    return run_subagent_as(description, prompt, ag, ag ? agent_model_override(ag) : NULL, out);
+    if (subagent_resolve(t->agent, &ag, out)) return 1;
+    bool from_file = false;
+    int iso = subagent_isolation(t->isolation, ag, &from_file, out);
+    if (iso < 0) return 1;
+    if (iso && from_file) iso = 2;
+    sbuf st; sb_init(&st);
+    if (subagent_skills(ag, t->skills, &st, out)) { sb_free(&st); return 1; }
+    int rc = run_subagent_as(t->description, t->prompt, ag, ag ? agent_model_override(ag) : NULL, st.data, iso, out);
+    sb_free(&st);
+    return rc;
 }
 static bool tool_offered(cJSON *tools, const char *name) {
     cJSON *t;
@@ -2645,8 +2965,9 @@ static bool tool_offered(cJSON *tools, const char *name) {
 }
 /* the tool calls of one sub-agent reply, run on this thread; each result is appended to msgs in the order asked.
  * offered: the tools this sub-agent was given; a call to any other is answered with an error, not run.
- * quiet: print nothing (a batch of sub-agents runs at once and prints its results when it ends). */
-static void subagent_calls(subagent_rec *rec, cJSON *msgs, cJSON *calls, cJSON *offered, bool quiet) {
+ * quiet: print nothing (a batch of sub-agents runs at once and prints its results when it ends).
+ * copy: the copy of the project it works in (isolation=worktree; NULL: it only reads): each call runs in it. */
+static void subagent_calls(subagent_rec *rec, cJSON *msgs, cJSON *calls, cJSON *offered, bool quiet, sub_copy *copy) {
     cJSON *call;
     cJSON_ArrayForEach(call, calls) {
         cJSON *fn = cJSON_GetObjectItemCaseSensitive(call, "function");
@@ -2663,10 +2984,16 @@ static void subagent_calls(subagent_rec *rec, cJSON *msgs, cJSON *calls, cJSON *
         sbuf o; sb_init(&o);
         g_session.tool_calls++;
         tool_status ts;
-        if (!strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "task")) { sb_printf(&o, "error: %s is not available to a sub-agent (read-only)", name); ts = TOOL_ERROR; }
+        bool writes = !strcmp(name, "write_file") || !strcmp(name, "edit_file");
+        if (!strcmp(name, "task") || (writes && !copy)) { sb_printf(&o, "error: %s is not available to a sub-agent (read-only)", name); ts = TOOL_ERROR; }
         else if (!strcmp(name, "advisor")) { sb_puts(&o, "error: the advisor is not available to a sub-agent (it would be shown the wrong conversation); report what you found"); ts = TOOL_ERROR; }
         else if (!tool_offered(offered, name)) { sb_printf(&o, "error: %s is not available to this sub-agent", name); ts = TOOL_ERROR; }
-        else ts = tools_execute(name, args, &o);
+        else if (copy && !tools_enter_copy(copy->root, g_cwd, copy->top, copy->dir, copy->who, quiet)) { sb_puts(&o, "error: the sub-agent's copy of the project cannot be entered; report what you have"); ts = TOOL_ERROR; }
+        else {
+            if (copy) { g_copy_cur = copy; tools_copy_wrote = copy_wrote; }
+            ts = tools_execute(name, args, &o);
+            if (copy) { tools_leave(); g_copy_cur = NULL; tools_copy_wrote = NULL; }
+        }   /* one call at a time in the copy: the strip, the bar and the session see the real directory between them */
         (void)ts;
         agent_say_result(rec, o.data);
         cJSON_AddItemToArray(msgs, tool_result_message(name, tool_call_id(call), o.data ? o.data : ""));
@@ -2677,12 +3004,39 @@ static void subagent_calls(subagent_rec *rec, cJSON *msgs, cJSON *calls, cJSON *
 
 /* a sub-agent's conversation (its system prompt and the task) and the tools it may call: the same for a run on its own
  * and for a run of several at once. *sp_bytes_out is the size of the system prompt in it, which the window is kept inside. */
-static void subagent_setup(const agent_t *ag, const char *prompt, cJSON **msgs_out, cJSON **tools_out, size_t *sp_bytes_out) {
+static void subagent_setup(const agent_t *ag, const char *prompt, const char *skills_text, const char *root, cJSON **msgs_out, cJSON **tools_out, size_t *sp_bytes_out) {
     cJSON *msgs = cJSON_CreateArray();
     cJSON *sys = cJSON_CreateObject();
     cJSON_AddStringToObject(sys, "role", "system");
+    cJSON *tools = cJSON_CreateArray(), *t;
+    cJSON_ArrayForEach(t, g_tools) {
+        cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
+        cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+        const char *name = cJSON_IsString(nm) ? nm->valuestring : "";
+        if ((!strcmp(name, "read_file") || !strcmp(name, "list_dir") || !strcmp(name, "grep") || !strcmp(name, "bash") ||
+            !strcmp(name, "web_fetch") || !strcmp(name, "web_search") ||
+            (root && (!strcmp(name, "write_file") || !strcmp(name, "edit_file")))) && (!ag || agent_allows(ag, name))) cJSON_AddItemReferenceToArray(tools, t);
+    }
+    sbuf have; sb_init(&have);   /* the tools it was given, as the prompt names them: an agent file may leave some out */
+    { const char *nms[16]; int nn = 0;
+      cJSON_ArrayForEach(t, tools) {
+          cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function"), *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
+          if (cJSON_IsString(nm) && strncmp(nm->valuestring, "web_", 4) && nn < 16) nms[nn++] = nm->valuestring;
+      }
+      for (int k = 0; k < nn; k++) sb_printf(&have, "%s%s", k == 0 ? "" : k == nn - 1 ? " and " : ", ", nms[k]); }
     sbuf sp; sb_init(&sp);
-    sb_printf(&sp, "You are a sub-agent of Corbie Nest (corbienest), a terminal coding agent. The main agent delegated one self-contained task to you.\n"
+    if (root) sb_printf(&sp, "You are a sub-agent of Corbie Nest (corbienest), a terminal coding agent. The main agent delegated one self-contained change to you.\n"
+                   "You work in a copy of the user's project: a git worktree made for you from their files as they are now (uncommitted changes included; files git ignores, such as build output and installed dependencies, are not there).\n"
+                   "Working directory: %s — it stands for %s: a path there is the same path here. Use relative paths.\n"
+                   "You have %s%s (bash runs in this copy only: builds and tests are fine here, changing anything outside it is not; no interactive programs)%s. "
+                   "Make the whole change the task asks for, and check it (build, run the tests) where that is possible in this copy. "
+                   "When you report, what you changed here is applied to the user's working tree — all of it, or, when it no longer fits there, none, kept as a git branch; files git ignores are not carried over, and neither is a new file that a command made (build output): create new files with write_file. Do not commit; the copy is collected for you. "
+                   "Batch independent calls: when you need several reads or searches that do not depend on each other's results, request them all in one reply rather than one per turn. "
+                   "Finish with ONE final message: what you changed, file by file, and how you checked it — the main agent sees only that final message, nothing else you did. "
+                   "Do not ask questions; make reasonable assumptions and state them.",
+                   root, g_cwd, have.data ? have.data : "read_file", strstr(have.data ? have.data : "", "write_file") || strstr(have.data ? have.data : "", "edit_file") ? "" : " (no write_file or edit_file: report the change you would make)",
+                   g_cfg.web ? ", and web_search/web_fetch for the documentation of external projects" : "");
+    else sb_printf(&sp, "You are a sub-agent of Corbie Nest (corbienest), a terminal coding agent. The main agent delegated one self-contained task to you.\n"
                    "Working directory: %s\n"
                    "You have read-only tools: read_file, list_dir, grep, bash (for read-only shell commands such as git log, find, wc; do not modify files, do not run interactive programs)%s. "
                    "Batch independent calls: when you need several reads, searches or fetches that do not depend on each other's results, request them all in one reply rather than one per turn. "
@@ -2690,25 +3044,19 @@ static void subagent_setup(const agent_t *ag, const char *prompt, cJSON **msgs_o
                    "the main agent sees only that final message, nothing else you did. Do not ask questions; make reasonable assumptions and state them.",
                    g_cwd, g_cfg.web ? " and web_search/web_fetch for the documentation of external projects" : "");
     if (ag) sb_printf(&sp, "\n\nYour role (from %s):\n%s", ag->path, ag->body);
+    if (skills_text) sb_puts(&sp, skills_text);
     if (g_project_instructions) sb_puts(&sp, g_project_instructions);
     *sp_bytes_out = sp.len;
+    sb_free(&have);
     cJSON_AddStringToObject(sys, "content", sp.data); sb_free(&sp);
     cJSON_AddItemToArray(msgs, sys);
     cJSON *u = cJSON_CreateObject(); cJSON_AddStringToObject(u, "role", "user"); cJSON_AddStringToObject(u, "content", prompt);
     cJSON_AddItemToArray(msgs, u);
-    cJSON *tools = cJSON_CreateArray(), *t;
-    cJSON_ArrayForEach(t, g_tools) {
-        cJSON *fn = cJSON_GetObjectItemCaseSensitive(t, "function");
-        cJSON *nm = fn ? cJSON_GetObjectItemCaseSensitive(fn, "name") : NULL;
-        const char *name = cJSON_IsString(nm) ? nm->valuestring : "";
-        if ((!strcmp(name, "read_file") || !strcmp(name, "list_dir") || !strcmp(name, "grep") || !strcmp(name, "bash") ||
-            !strcmp(name, "web_fetch") || !strcmp(name, "web_search")) && (!ag || agent_allows(ag, name))) cJSON_AddItemReferenceToArray(tools, t);
-    }
     *msgs_out = msgs;
     *tools_out = tools;
 }
 
-static int run_subagent_as(const char *description, const char *prompt, const agent_t *ag, const char *model, sbuf *out) {
+static int run_subagent_as(const char *description, const char *prompt, const agent_t *ag, const char *model, const char *skills_text, int iso, sbuf *out) {   /* iso: 1 in a copy, 2 the same because its agent file says so */
     if (ag) printf("  " C_CYAN "⤷ sub-agent %s" C_RESET " " C_BOLD "%s" C_RESET "\n", ag->name, description);
     else printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", description);
     const char *sm = model ? (model_same(model, g_cfg.model) ? NULL : model) : subagent_model();
@@ -2723,9 +3071,22 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
         }
         printf(C_DIM "    on %s (/subagent)" C_RESET "\n", sm);
     }
+    sub_copies cs; memset(&cs, 0, sizeof cs);
+    sub_copy copy; memset(&copy, 0, sizeof copy);
+    if (iso) {   /* it writes: in a copy of the project of its own, made now */
+        if (!copy_plan(&cs, 1, description, &copy, out) || !copy_add(&cs, &copy, out)) {
+            copy_unavailable(ag, iso == 2, out);
+            agent_say(rec, out->data); if (rec) rec->state = AG_FAILED;
+            printf("    " C_RED "⎿ %s" C_RESET "\n", out->data);
+            copies_end(&cs);
+            return 1;
+        }
+        printf(C_DIM "    in a copy of the project (a git worktree): its changes are applied when it reports" C_RESET "\n");
+        agent_say(rec, "works in a copy: "); agent_say(rec, copy.root); agent_say(rec, "\n");
+    }
     cJSON *msgs = NULL, *tools = NULL;
     size_t sp_bytes = 0;
-    subagent_setup(ag, prompt, &msgs, &tools, &sp_bytes);
+    subagent_setup(ag, prompt, skills_text, iso ? copy.root : NULL, &msgs, &tools, &sp_bytes);
     int rc = 1, tool_rounds = 0, round_first = -1;
     bool interrupted = false;     /* the user stopped it (Esc / Ctrl-C) */
     const char *final = NULL;
@@ -2759,7 +3120,7 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
         if (!calls || cJSON_GetArraySize(calls) == 0) { final = cJSON_IsString(content) ? content->valuestring : ""; rc = 0; break; }
         if (iter == SUBAGENT_ITERS) { sb_printf(out, "error: sub-agent stopped after %d tool rounds without a report", SUBAGENT_ITERS); if (cJSON_IsString(content) && content->valuestring[0]) sb_printf(out, "\nIts last message:\n%s", content->valuestring); break; }
         round_first = cJSON_GetArraySize(msgs);
-        subagent_calls(rec, msgs, calls, tools, false);
+        subagent_calls(rec, msgs, calls, tools, false, iso ? &copy : NULL);
         tool_rounds++;
         if (term_poll_interrupt()) { sb_puts(out, "error: sub-agent interrupted by the user"); interrupted = true; break; }
     }
@@ -2768,6 +3129,13 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
         printf("    " C_DIM "⎿ report after %d tool round%s:" C_RESET "\n", tool_rounds, tool_rounds == 1 ? "" : "s");
         print_result_preview(final && *final ? final : "(empty)", 8);
     } else printf("    " C_RED "⎿ %s" C_RESET "\n", out->data ? out->data : "sub-agent failed");
+    if (iso) {   /* what it changed: applied when it reported, else kept as a branch; the copy goes */
+        sbuf note; sb_init(&note);
+        copy_merge(&cs, &copy, rc == 0 && !interrupted ? NULL : interrupted ? "the user stopped it, so nothing was applied" : "it did not finish, so nothing was applied", &note);
+        copies_end(&cs);
+        if (note.len) { sb_puts(out, note.data); printf("    " C_DIM "⎿ %s" C_RESET "\n", note.data + 2); }
+        sb_free(&note);
+    }
     if (rec) {
         rec->state = interrupted ? AG_STOPPED : rc == 0 ? AG_DONE : AG_FAILED;
         agent_say(rec, rc == 0 ? "report:\n" : "result:\n");
@@ -2785,8 +3153,8 @@ static int run_subagent_as(const char *description, const char *prompt, const ag
  * sub-agent's model call goes out on a thread of its own (http_job, as /orchestrate's workers do) and the
  * main thread does everything else — it starts the calls, runs their tools (subagent_calls, quiet), reads the
  * answers and keeps the strip's rows. Nothing else prints while the batch runs; each report is printed when
- * the batch ends, in the order the model asked, and every call gets its result. Up to g_cfg.workers run at
- * once. The model may be a local one (Ollama's /api/chat) or an Anthropic one (a non-streamed Messages call, as
+ * the batch ends, in the order the model asked, and every call gets its result. Up to parallel_slots() run at
+ * once (/effort parallel: 2 to 8 by the size of the reply, or a number the user fixed). The model may be a local one (Ollama's /api/chat) or an Anthropic one (a non-streamed Messages call, as
  * the workers of /goal make; not gzipped, so a refused body has no restart to keep). A reply that mixes tools,
  * or whose calls are on different models, runs one sub-agent after another (run_subagent). */
 enum { SR_WAITING, SR_RUNNING, SR_DONE };
@@ -2804,6 +3172,8 @@ typedef struct {
     int iter, tool_rounds, round_first;
     http_job *job;
     bool interrupted;
+    sub_copies *cs;         /* the batch's copies (isolation=worktree), and this one's: dir NULL when it only reads */
+    sub_copy copy;
 } sub_run;
 
 static bool same_model(const char *a, const char *b) { return (!a && !b) || (a && b && !strcmp(a, b)); }
@@ -2862,6 +3232,11 @@ static bool sub_run_start(sub_run *r) {
         int first = -1;
         elide_tool_results(r->msgs, r->round_first, &first);
         drop_edited_thinking(r->msgs, first);
+    }
+    if (r->copy.dir && !r->copy.made && !copy_add(r->cs, &r->copy, &r->out)) {   /* a sub-agent that writes: its copy is made when it starts */
+        r->rc = 1; r->state = SR_DONE;
+        if (r->rec) { r->rec->state = AG_FAILED; agent_say(r->rec, r->out.data); }
+        return false;
     }
     if (r->sm) { ollama_call.model = r->sm; ollama_call.info = &g_subagent_info; }
     ollama_call.followup = r->iter > 0;
@@ -2926,7 +3301,7 @@ static void sub_run_collect(sub_run *r) {
         return;
     }
     r->round_first = cJSON_GetArraySize(r->msgs);
-    subagent_calls(r->rec, r->msgs, calls, r->tools, true);
+    subagent_calls(r->rec, r->msgs, calls, r->tools, true, r->copy.dir ? &r->copy : NULL);
     r->tool_rounds++; r->iter++;
     r->state = SR_WAITING;
 }
@@ -2937,6 +3312,7 @@ static bool tasks_batch(cJSON *calls, bool *failed) {
     int n = cJSON_GetArraySize(calls);
     sub_run *rs = xmalloc(sizeof *rs * (size_t)n);
     memset(rs, 0, sizeof *rs * (size_t)n);
+    sub_copies cs; memset(&cs, 0, sizeof cs);   /* one snapshot for the batch, taken when the first that writes is seen */
     tools_in_subagent(true);
     int i = 0;
     cJSON *c;
@@ -2951,7 +3327,13 @@ static bool tasks_batch(cJSON *calls, bool *failed) {
         const char *an = arg_str(args, "agent");
         snprintf(r->desc, sizeof r->desc, "%s", desc && *desc ? desc : "sub-agent");
         if (prompt == NULL) prompt = "";
-        if (subagent_resolve(an, &r->ag, &r->out)) { r->rc = 1; r->state = SR_DONE; }
+        sbuf skills_text; sb_init(&skills_text);
+        char *asked = tools_arg_list(args, "skills");
+        r->cs = &cs;
+        int iso = 0; bool from_file = false;
+        if (subagent_resolve(an, &r->ag, &r->out) || (iso = subagent_isolation(arg_str(args, "isolation"), r->ag, &from_file, &r->out)) < 0 ||
+            subagent_skills(r->ag, asked, &skills_text, &r->out)) { r->rc = 1; r->state = SR_DONE; }
+        else if (iso && !copy_plan(&cs, i, r->desc, &r->copy, &r->out)) { copy_unavailable(r->ag, from_file, &r->out); r->rc = 1; r->state = SR_DONE; }
         else {
             r->sm = batch_model_of(r->ag);
             r->prov = provider_find(r->sm ? r->sm : g_cfg.model, NULL);
@@ -2959,9 +3341,11 @@ static bool tasks_batch(cJSON *calls, bool *failed) {
             else printf("  " C_CYAN "⤷ sub-agent" C_RESET " " C_BOLD "%s" C_RESET "\n", r->desc);
             r->rec = agent_begin(r->desc, r->sm, r->ag ? r->ag->name : NULL);
             agent_say(r->rec, "task: "); agent_say(r->rec, prompt); agent_say(r->rec, "\n");
-            subagent_setup(r->ag, prompt, &r->msgs, &r->tools, &r->sp_bytes);
+            if (r->copy.dir) { agent_say(r->rec, "works in a copy: "); agent_say(r->rec, r->copy.root); agent_say(r->rec, "\n"); }
+            subagent_setup(r->ag, prompt, skills_text.data, r->copy.root, &r->msgs, &r->tools, &r->sp_bytes);
             r->state = SR_WAITING;
         }
+        free(asked); sb_free(&skills_text);
         if (parsed) cJSON_Delete(parsed);
     }
     /* the model the batch runs on, checked once, as run_subagent_as checks it */
@@ -2977,7 +3361,7 @@ static bool tasks_batch(cJSON *calls, bool *failed) {
             if (r->rec) r->rec->state = AG_FAILED;
         }
     }
-    int maxpar = g_cfg.workers > 0 ? g_cfg.workers : ORCH_WORKERS_DEFAULT;
+    int maxpar = parallel_slots(g_cfg.parallel_n, n);   /* /effort parallel: a fixed number, or by the size of the reply */
     bool aborted = false;
     char label[64] = "";
     for (;;) {
@@ -3016,10 +3400,17 @@ static bool tasks_batch(cJSON *calls, bool *failed) {
         printf(C_YELLOW "⏹ the sub-agents were stopped" C_RESET "\n");
     }
     tools_in_subagent(false);
-    /* the results, in the order the model asked */
+    /* the results, in the order the model asked; the changes of the ones that write are applied in that order too */
     i = 0;
     cJSON_ArrayForEach(c, calls) {
         sub_run *r = &rs[i++];
+        if (r->copy.dir) {
+            sbuf note; sb_init(&note);
+            copy_merge(&cs, &r->copy, aborted ? "the user stopped the sub-agents, so nothing was applied"
+                                     : r->rc != 0 ? "it did not finish, so nothing was applied" : NULL, &note);
+            sb_puts(&r->out, note.data ? note.data : "");
+            sb_free(&note);
+        }
         const char *res = r->out.data ? r->out.data : "";
         if (r->rec) {
             r->rec->state = r->interrupted ? AG_STOPPED : r->rc == 0 ? AG_DONE : AG_FAILED;
@@ -3038,6 +3429,7 @@ static bool tasks_batch(cJSON *calls, bool *failed) {
         if (r->tools) cJSON_Delete(r->tools);
         sb_free(&r->out);
     }
+    copies_end(&cs);
     free(rs);
     return aborted;
 }
@@ -4144,7 +4536,7 @@ typedef struct {
     int cap;                     /* room in tasks[] and w[]: the tasks a workflow adds must fit (stage_add() refuses past it) */
 } orch_run;
 #define GOAL_METRIC_TIMEOUT 900
-#define GOAL_GIT "GIT_AUTHOR_NAME=corbienest GIT_AUTHOR_EMAIL=corbienest@localhost GIT_COMMITTER_NAME=corbienest GIT_COMMITTER_EMAIL=corbienest@localhost "
+#define GOAL_GIT WT_GIT
 static const char *worker_model(const orch_worker *w) { return w->model ? w->model : g_cfg.model; }
 static bool worker_remote(const orch_worker *w) { return provider_find(worker_model(w), NULL) != NULL; }
 static bool task_ok(const orch_worker *w) { return w->state == T_ACCEPTED || w->state == T_UNREVIEWED; }
@@ -5065,33 +5457,17 @@ static void sbq(sbuf *b, const char *s) {
     sb_putc(b, '\'');
 }
 
-/* a copy of s without its trailing newlines and blanks, malloc'd */
-static char *goal_trim(const char *s) {
-    size_t n = s ? strlen(s) : 0;
-    while (n && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
-    char *t = xmalloc(n + 1); memcpy(t, s ? s : "", n); t[n] = 0;
-    return t;
-}
-
 /* git worktree remove of one copy, and nothing else */
-static void goal_remove_copy(const char *top, const char *dir) {
-    sbuf c, o; sb_init(&c); sb_init(&o); bool intr = false;
-    sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " worktree remove --force "); sbq(&c, dir); sb_puts(&c, " >/dev/null 2>&1");
-    tools_shell_in(NULL, c.data, 120, &o, &intr, "removing a copy", "worktree");
-    sb_free(&c); sb_free(&o);
-}
+static void goal_remove_copy(const char *top, const char *dir) { wt_remove(top, dir); }
 
 /* the metric of a commit, in a copy of its own that is made and removed here: 1 scored, 0 not, -1 stopped */
 static int goal_measure(const char *top, const char *commit, const char *dir, const goal_spec *spec, const char *what, double *v) {
-    sbuf c, o; sb_init(&c); sb_init(&o); bool intr = false;
-    sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " worktree add --detach "); sbq(&c, dir); sb_putc(&c, ' '); sbq(&c, commit); sb_puts(&c, " >/dev/null 2>&1");
-    if (tools_shell_in(NULL, c.data, 120, &o, &intr, what, "worktree") != 0) { sb_free(&c); sb_free(&o); printf("  " C_RED "⎿ cannot make a copy to measure in" C_RESET "\n"); return 0; }
-    sb_clear(&o);
+    sbuf o; sb_init(&o); bool intr = false;
+    if (!wt_add(top, dir, commit)) { sb_free(&o); printf("  " C_RED "⎿ cannot make a copy to measure in" C_RESET "\n"); return 0; }
     int rc = tools_shell_in(dir, spec->metric, GOAL_METRIC_TIMEOUT, &o, &intr, what, "measuring");
     int got = intr ? -1 : (rc == 0 && goal_number(o.data, v)) ? 1 : 0;
     sb_free(&o);
     goal_remove_copy(top, dir);
-    sb_free(&c);
     return got;
 }
 
@@ -5124,20 +5500,11 @@ static int cmd_goal(const char *arg) {
     sb_clear(&c); sb_clear(&o);
 
     /* the snapshot: the tree as it is, in a commit of its own */
-    sb_puts(&c, "git rev-parse --show-toplevel");
-    int rc = tools_shell_in(NULL, c.data, 30, &o, &intr, "reading the repository", "repository");
-    char *top = goal_trim(rc == 0 ? o.data : "");
+    char *top = wt_toplevel();
+    char tree[WT_ID] = "", snap[WT_ID] = "";
+    bool snapped = top && wt_snapshot(top, tree, snap);
     sb_clear(&c); sb_clear(&o);
-    char tree[64] = "", snap[64] = "";
-    if (rc == 0 && top[0]) {
-        sb_puts(&c, "cd "); sbq(&c, top);
-        sb_puts(&c, " && T=$(mktemp -u) && GIT_INDEX_FILE=$T git add -A && TREE=$(GIT_INDEX_FILE=$T git write-tree) && rm -f $T && P= && if git rev-parse -q --verify HEAD >/dev/null; then P='-p HEAD'; fi"
-                    " && S=$(" GOAL_GIT "git commit-tree $TREE $P -m corbie-goal-snapshot) && echo \"$TREE $S\"");
-        rc = tools_shell_in(NULL, c.data, 300, &o, &intr, "snapshotting the working tree", "snapshot");
-        if (rc != 0 || sscanf(o.data ? o.data : "", "%63s %63s", tree, snap) != 2) rc = -1;
-    }
-    sb_clear(&c); sb_clear(&o);
-    if (rc != 0 || !snap[0]) {
+    if (!snapped) {
         printf(C_RED "✗ cannot snapshot the working tree of this repository" C_RESET "\n");
         sb_puts(&c, "rm -rf "); sbq(&c, root); tools_shell_in(NULL, c.data, 60, &o, &intr, "cleaning up", "goal");
         sb_free(&c); sb_free(&o); free(top); free(root); goal_spec_free(&spec);
@@ -5184,16 +5551,13 @@ static int cmd_goal(const char *arg) {
             }
             dirs[k] = xmalloc(1200);
             snprintf(dirs[k], 1200, "%s/r%d-%d", root, round, k + 1);
-            sb_clear(&c);
-            sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " worktree add --detach "); sbq(&c, dirs[k]); sb_putc(&c, ' '); sbq(&c, cur); sb_puts(&c, " >/dev/null 2>&1");
-            if (tools_shell_in(NULL, c.data, 120, &o, &intr, "making a candidate's copy", "worktree") != 0) {
+            if (!wt_add(top, dirs[k], cur)) {
                 printf("  " C_RED "⎿ candidate %d: its copy could not be made" C_RESET "\n", k + 1);
                 ws[k].state = T_FAILED; ws[k].status = "failed: its copy could not be made";
                 free(dirs[k]); dirs[k] = NULL;
                 continue;
             }
             ws[k].root = dirs[k];
-            sb_clear(&o);
         }
         orch_run run = { .request = spec.task, .tasks = tasks, .w = ws, .nt = K, .tools = cJSON_CreateArray(), .first = first, .goal = &gc };
         cJSON *t;
@@ -5254,33 +5618,26 @@ static int cmd_goal(const char *arg) {
     int applied = 0;
     if (kept) {
         sb_clear(&c); sb_clear(&o);
-        sb_puts(&c, "cd "); sbq(&c, top);
-        sb_puts(&c, " && T=$(mktemp -u) && GIT_INDEX_FILE=$T git add -A && GIT_INDEX_FILE=$T git write-tree; rm -f $T");
-        tools_shell_in(NULL, c.data, 300, &o, &intr, "checking the working tree", "checking");
-        bool same = o.data && !strncmp(o.data, tree, strlen(tree)) && strlen(tree) > 0;
-        sb_clear(&c); sb_clear(&o);
+        char now_tree[WT_ID];
+        bool same = wt_tree_of_working(top, now_tree) && !strcmp(now_tree, tree) && tree[0];
         if (!same) printf("  " C_YELLOW "⎿ the working tree changed during the goal: nothing is applied; the result is branch %s" C_RESET "\n", id_branch);
         else {
-            sb_puts(&c, "cd "); sbq(&c, top); sb_puts(&c, " && git diff --name-only "); sb_puts(&c, snap); sb_putc(&c, ' '); sb_puts(&c, winner);
-            tools_shell_in(NULL, c.data, 120, &o, &intr, "reading the result", "result");
-            for (char *p = o.data; p && *p; ) {   /* each file the result changes is saved first, so /rewind undoes the goal */
+            int nch = wt_changed(top, snap, winner, &o);
+            if (nch < 0) { sb_clear(&o); printf("  " C_YELLOW "⎿ the files the result changes could not be listed: nothing is applied; the result is branch %s" C_RESET "\n", id_branch); }
+            for (char *p = nch < 0 ? NULL : o.data; p && *p; ) {   /* each file the result changes is saved first, so /rewind undoes the goal */
                 char *e = strchr(p, '\n'); size_t len = e ? (size_t)(e - p) : strlen(p);
                 if (len) { char *abs = xmalloc(strlen(top) + len + 2); sprintf(abs, "%s/%.*s", top, (int)len, p); tools_checkpoint_path(abs); free(abs); }
                 if (!e) break;
                 p = e + 1;
             }
             sb_clear(&c); sb_clear(&o);
-            sb_puts(&c, "cd "); sbq(&c, top); sb_puts(&c, " && git diff --binary "); sb_puts(&c, snap); sb_putc(&c, ' '); sb_puts(&c, winner); sb_puts(&c, " | git apply");
-            rc = tools_shell_in(NULL, c.data, 300, &o, &intr, "applying the kept candidate", "applying");
-            if (rc == 0) {
+            if (nch >= 0 && wt_apply(top, snap, winner, NULL)) {
                 applied = 1;
                 printf("  " C_GREEN "✓ applied as uncommitted changes" C_RESET C_DIM " · %s" C_RESET "\n", id_branch);
-            } else printf("  " C_RED "⎿ the result did not apply cleanly: it is branch %s" C_RESET "\n", id_branch);
+            } else if (nch >= 0) printf("  " C_RED "⎿ the result did not apply cleanly: it is branch %s" C_RESET "\n", id_branch);
         }
         sb_clear(&c); sb_clear(&o);
-        sb_puts(&c, "git -C "); sbq(&c, top); sb_puts(&c, " branch "); sb_puts(&c, id_branch); sb_putc(&c, ' '); sb_puts(&c, winner);
-        tools_shell_in(NULL, c.data, 60, &o, &intr, "keeping the result", "branch");
-        sb_clear(&c); sb_clear(&o);
+        wt_branch(top, id_branch, winner);
     }
     printf("%s%s goal: score %.6g → %.6g%s" C_RESET "\n", aborted ? C_YELLOW : applied ? C_GREEN : C_YELLOW, aborted ? "!" : applied ? "✓" : "·",
            base0, best, aborted ? " — the run was stopped" : applied ? "" : " — nothing applied");
@@ -5484,7 +5841,8 @@ static void cmd_help(void) {
            "  /think show|hide      show or hide thinking tokens\n"
            "  /effort [LEVEL]       how hard this model thinks, in the levels it has (gpt-oss: low medium high · qwen3.8: off low medium high · most others: off on);\n"
            "                        no argument opens a picker, default leaves it to the model. Kept per model; a level is sent with every call\n"
-           "  /effort parallel [on|off]  the task calls of one reply run as sub-agents at the same time (off by default: one after another)\n"
+           "  /effort parallel [on|off|auto|N]  the task calls of one reply run as sub-agents at the same time (off by default: one after another); auto: 2 to 8 at once by the size of the reply, N: a fixed number\n"
+           "                        a task with isolation=worktree changes files in a git copy of its own; its change is applied when it reports\n"
            "  /orchestrate REQUEST  the advisor model in charge: it plans the request as tasks, this model does them as workers with a fresh context\n"
            "                        each — those that do not wait for each other at the same time — and the advisor reviews every task's report and diff.\n"
            "                        With a workflow (.agents/workflow.md) tests, QA and reviews follow, each by its role; -w NAME picks another, -w none leaves it out\n"
@@ -5844,19 +6202,27 @@ static void effort_command(const char *who, const char *model, const model_info 
     if (r < 0) printf(C_DIM "%seffort unchanged: %s" C_RESET "\n", who, effort_label(model, mi));
     else effort_apply(who, model, mi, items[r]);
 }
-/* /effort parallel [on|off]: whether the task calls of one reply run as sub-agents at the same time (tasks_batch) */
+/* /effort parallel [on|off|auto|N]: whether the task calls of one reply run as sub-agents at the same time (tasks_batch) */
 static bool effort_is_parallel(const char *arg) { return arg && !strncmp(arg, "parallel", 8) && (arg[8] == ' ' || !arg[8]); }
 static void effort_parallel(const char *v) {
     while (*v == ' ') v++;
-    if (!*v) printf("parallel: %s" C_DIM " — the task calls of one reply run as sub-agents at the same time%s" C_RESET "\n",
-                    g_cfg.parallel_tasks ? "on" : "off", g_cfg.parallel_tasks ? "" : " (off: one after another; /effort parallel on to change it)");
-    else if (!strcmp(v, "on") || !strcmp(v, "off")) {
-        bool want = !strcmp(v, "on");
-        if (want != g_cfg.parallel_tasks) { g_cfg.parallel_tasks = want; tools_rebuild(); }   /* the task tool's description says so */
-        config_save();
-        printf(C_GREEN "✓ parallel = %s" C_RESET C_DIM "%s" C_RESET "\n", v,
-               g_cfg.parallel_tasks ? " — the task calls of one reply run together; each sub-agent is in the strip while it runs" : " — one sub-agent after another");
-    } else printf("usage: /effort parallel on|off\n");
+    if (!*v) {
+        if (!g_cfg.parallel_tasks) { printf("parallel: off" C_DIM " — the task calls of one reply run one after another; /effort parallel on to change it" C_RESET "\n"); return; }
+        if (g_cfg.parallel_n > 0) printf("parallel: on" C_DIM " — the task calls of one reply run as sub-agents at the same time, %d at once" C_RESET "\n", g_cfg.parallel_n);
+        else printf("parallel: on" C_DIM " — the task calls of one reply run as sub-agents at the same time, as many at once as the reply has (2 to %d)" C_RESET "\n", PARALLEL_AUTO_MAX);
+        return;
+    }
+    bool want; int n;
+    if (parallel_parse(v, &want, &n) != 0) { printf("usage: /effort parallel on|off|auto|N   (N: 1 to %d sub-agents at once; auto: by the size of the reply, 2 to %d)\n", ORCH_PARALLEL_MAX, PARALLEL_AUTO_MAX); return; }
+    bool changed = want != g_cfg.parallel_tasks;
+    if (want && n >= 0 && n != g_cfg.parallel_n) changed = true;
+    g_cfg.parallel_tasks = want;
+    if (want && n >= 0) g_cfg.parallel_n = n;
+    if (changed) tools_rebuild();   /* the task tool's description says so */
+    config_save();
+    if (!want) printf(C_GREEN "✓ parallel = off" C_RESET C_DIM " — one sub-agent after another" C_RESET "\n");
+    else if (g_cfg.parallel_n > 0) printf(C_GREEN "✓ parallel = on" C_RESET C_DIM " — the task calls of one reply run together, %d at once; each sub-agent is in the strip while it runs" C_RESET "\n", g_cfg.parallel_n);
+    else printf(C_GREEN "✓ parallel = on" C_RESET C_DIM " — the task calls of one reply run together, as many at once as the reply has (2 to %d); each sub-agent is in the strip while it runs" C_RESET "\n", PARALLEL_AUTO_MAX);
 }
 static void cmd_effort(const char *arg) {
     if (effort_is_parallel(arg)) { effort_parallel(arg + 8); return; }

@@ -440,6 +440,37 @@ def make_repo():
     subprocess.run(["git", "-C", d, "commit", "-qm", "init"], check=True)
     return d
 
+# The sub-agents that write (task with isolation=worktree): each feature section of them has a config and a git repository
+# of its own; the helpers are here, not with feat() below, so that run_section.py --alone can run one of those sections.
+def wt_feat(name):   # feat()'s folders, made here (feat is defined in a later section)
+    cfg = tempfile.mkdtemp(prefix=f"crow_{name}_cfg_"); proj = os.path.realpath(tempfile.mkdtemp(prefix=f"crow_{name}_proj_"))
+    os.makedirs(os.path.join(cfg, "corbienest"))
+    open(os.path.join(cfg, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\n")
+    return cfg, proj, dict(ENV, XDG_CONFIG_HOME=cfg)
+def wt_run(proj, args, env):   # in_proj(), as below
+    p = subprocess.run([BIN] + args, cwd=proj, env=env, capture_output=True, timeout=120)
+    return clean(p.stdout.decode("utf-8", "replace")), clean(p.stderr.decode("utf-8", "replace")), p.returncode
+def git(d, *a): return subprocess.run(["git", "-C", d] + list(a), capture_output=True, text=True).stdout.strip()
+def wt_repo(name, files=None):   # a feature section's project as a git repository with one commit (feat's folders, plus git)
+    cfg, proj, env = wt_feat(name)
+    subprocess.run(["git", "init", "-q", proj], check=True)
+    for k, v in (("user.name", "t"), ("user.email", "t@t")): git(proj, "config", k, v)
+    for f, t in (files or {"README.md": "hi\n"}).items(): open(os.path.join(proj, f), "w").write(t)
+    git(proj, "add", "-A"); git(proj, "commit", "-qm", "init")
+    return cfg, proj, env
+def wt_results(n0):   # the task results the main agent was given, from the last of its requests since n0
+    main = [r for r in requests()[n0:] if r["messages"][0]["role"] == "system" and "You are a sub-agent" not in r["messages"][0]["content"]
+            and any(m["role"] == "tool" for m in r["messages"])]
+    return [m["content"] for m in main[-1]["messages"] if m["role"] == "tool" and m.get("tool_name", "task") == "task"] if main else []
+def wt_subs(n0): return [r for r in requests()[n0:] if r["messages"][0]["role"] == "system" and "You are a sub-agent" in r["messages"][0]["content"]]
+def wt_clean(cfg, proj):   # no copy is left: git knows only the main worktree, and the copies' folder is empty or gone
+    wtl = git(proj, "worktree", "list").splitlines()
+    d = os.path.join(cfg, "corbienest", "worktrees")
+    left = [x for x in os.listdir(d)] if os.path.isdir(d) else []
+    return len(wtl) == 1 and left == [], (wtl, left)
+def readf(*p):
+    p = os.path.join(*p)
+    return open(p).read() if os.path.exists(p) else None
 def provider_requests(): return json.loads(urllib.request.urlopen(f"{HOST}/_provider_requests").read())
 
 def worker(task): return [r for r in reqs if "You are a worker agent" in r["messages"][0]["content"] and f"# Your task ({task} of 3)" in r["messages"][1]["content"]]
@@ -1265,6 +1296,80 @@ res = [b["content"] for m in last["messages"] if isinstance(m["content"], list) 
 check(res[-2:] == ["REPORT PAUSE alpha", "REPORT PAUSE beta"], f"hosted: the results come back in the order the model asked: {res[-2:]}")
 sp.send("\x04"); sp.close()
 shutil.rmtree(CFG_P, ignore_errors=True)
+print("test interactive: /effort parallel auto and N: how many sub-agents run at once, and what the model is told")
+CFG_Q = tempfile.mkdtemp(prefix="crowcfgq_"); os.makedirs(os.path.join(CFG_Q, "corbienest"))   # a config of its own, as the hosted section has
+open(os.path.join(CFG_Q, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\n")
+CFGQ_FILE = os.path.join(CFG_Q, "corbienest", "config")
+sq = Session(["--yolo", "-m", "fake-coder:latest"], env=dict(ENV, XDG_CONFIG_HOME=CFG_Q)); sq.expect("Ctrl-D to quit")
+def inflight_max(): return json.loads(urllib.request.urlopen(f"{HOST}/_inflight").read())["max"]
+def main_task_description():
+    reqs = [r for r in requests() if r["messages"][0]["role"] == "system" and "You are a sub-agent" not in r["messages"][0]["content"] and r.get("tools")]
+    return next((t["function"]["description"] for t in reqs[-1]["tools"] if t["function"]["name"] == "task"), "")
+sq.send("/effort parallel auto\r"); check(sq.expect("parallel = on") and sq.expect("2 to 8"), "/effort parallel auto: on, by the size of the reply")
+cfg = open(CFGQ_FILE).read()
+check("parallel=on" in cfg and "parallel_agents" not in cfg, f"auto is saved as on, with no number: {cfg!r}")
+inflight_max(); sq.send("TOOL_TASKS6\r")
+check(sq.expect("All 6 reports are in.", 60), f"six sub-agents report: {since_send(sq)[-300:]!r}")
+check(inflight_max() == 6, "auto: a reply of six task calls runs all six at once")
+check("Up to 8 run at once" in main_task_description() and "depending on how complex" in main_task_description(), f"the model is told it may split into 2 to 8 by complexity: {main_task_description()[-300:]!r}")
+inflight_max(); sq.send("TOOL_TASKS10\r")
+check(sq.expect("All 10 reports are in.", 90), f"ten sub-agents report: {since_send(sq)[-300:]!r}")
+check(inflight_max() == 8, "auto: ten task calls run eight at a time")
+sq.send("/effort parallel 3\r"); check(sq.expect("3 at once"), "/effort parallel 3: a fixed number")
+check("parallel_agents=3" in open(CFGQ_FILE).read(), "the number is saved")
+inflight_max(); sq.send("TOOL_TASKS6\r")
+check(sq.expect("All 6 reports are in.", 60), f"six sub-agents report again: {since_send(sq)[-300:]!r}")
+check(inflight_max() == 3, "a fixed 3: six task calls run three at a time")
+check("Up to 3 run at once" in main_task_description() and "depending on how complex" not in main_task_description(), "the model is told the fixed number")
+sq.send("/effort parallel 21\r"); check(sq.expect("usage: /effort parallel on|off|auto|N"), "a number out of range is refused (the limit is 20)")
+sq.send("/effort parallel\r"); check(sq.expect("3 at once"), "/effort parallel alone says the number")
+sq.send("/effort parallel auto\r"); check(sq.expect("2 to 8") and "parallel_agents" not in open(CFGQ_FILE).read(), "auto again takes the number out of the config")
+sq.send("\x04"); sq.close()
+shutil.rmtree(CFG_Q, ignore_errors=True)
+print("test interactive: a sub-agent is given skills: the task's own, its agent file's, both once; a skill that is not there stops the task")
+CFG_K = tempfile.mkdtemp(prefix="crowcfgk_"); os.makedirs(os.path.join(CFG_K, "corbienest"))
+open(os.path.join(CFG_K, "corbienest", "config"), "w").write("memory=0\nmemory_idle=0\n")
+PROJ_K = os.path.realpath(tempfile.mkdtemp(prefix="crowprojk_"))
+for nm, mark in (("needle-skill", "SKILL_NEEDLE_MARK"), ("agent-skill", "SKILL_AGENT_MARK")):
+    os.makedirs(os.path.join(PROJ_K, ".agents", "skills", nm))
+    open(os.path.join(PROJ_K, ".agents", "skills", nm, "SKILL.md"), "w").write(f"---\nname: {nm}\ndescription: test skill {nm}\n---\n{mark}: how this is done.\n")
+os.makedirs(os.path.join(PROJ_K, ".agents", "agents"))
+open(os.path.join(PROJ_K, ".agents", "agents", "skilled.md"), "w").write("---\nname: skilled\ndescription: a sub-agent that has a skill\ntools: grep\nskills: agent-skill\n---\nROLE_K: report.\n")
+open(os.path.join(PROJ_K, "hay.txt"), "w").write("needle\n")
+sk = Session(["--yolo", "-m", "fake-coder:latest"], cwd=PROJ_K, env=dict(ENV, XDG_CONFIG_HOME=CFG_K)); sk.expect("Ctrl-D to quit")
+def sub_systems():
+    return [r["messages"][0]["content"] for r in requests() if r["messages"][0]["role"] == "system" and "You are a sub-agent" in r["messages"][0]["content"]]
+n0 = len(sub_systems())
+sk.send("TOOL_TASKX SKILLS=needle-skill\r")
+check(sk.expect("Skill task said: REPORT PAUSE sk1", 30), f"the task with a skill runs: {since_send(sk)[-300:]!r}")
+sy = sub_systems()[n0:]
+check(len(sy) == 2 and all("SKILL_NEEDLE_MARK" in x and '<skill name="needle-skill"' in x and "SKILL_AGENT_MARK" not in x for x in sy), f"the sub-agent's prompt holds the named skill's text, and only that: {[x[-200:] for x in sy]}")
+tdef = [t["function"]["parameters"]["properties"] for r in requests()[-1:] for t in r.get("tools", []) if t["function"]["name"] == "task"]
+check(tdef and "skills" in tdef[0], f"the task tool has a skills argument: {tdef}")
+n0 = len(sub_systems())
+sk.send("TOOL_TASKX AGENT=skilled\r")
+check(sk.expect("Skill task said: REPORT PAUSE sk1", 30), "an agent whose file names a skill runs")
+sy = sub_systems()[n0:]
+check(sy and all("SKILL_AGENT_MARK" in x and "ROLE_K" in x and "SKILL_NEEDLE_MARK" not in x for x in sy), "the agent file's skill is in the prompt, next to its role")
+n0 = len(sub_systems())
+sk.send("TOOL_TASKX AGENT=skilled SKILLS=/needle-skill,agent-skill\r")
+check(sk.expect("Skill task said: REPORT PAUSE sk1", 30), "both: the task's skills and the agent file's")
+sy = sub_systems()[n0:]
+check(sy and all(x.count("SKILL_AGENT_MARK") == 1 and x.count("SKILL_NEEDLE_MARK") == 1 for x in sy), "each skill is there once, whoever named it, with or without the /")
+n0 = len(sub_systems())
+sk.send("TOOL_TASKX SKILLS=nope\r")
+check(sk.expect("no skill named /nope", 20) and sk.expect("/needle-skill"), f"a skill that is not there: the task says so and lists the ones there are: {since_send(sk)[-300:]!r}")
+check(len(sub_systems()) == n0, "and no sub-agent was started")
+sk.send("/effort parallel on\r"); sk.expect("parallel = on")
+n0 = len(sub_systems())
+sk.send("TOOL_TASKX TWICE SKILLS=needle-skill\r")
+check(sk.expect("Skill task said: REPORT PAUSE sk2", 40), f"batch: two tasks with a skill run: {since_send(sk)[-300:]!r}")
+sy = sub_systems()[n0:]
+check(len(sy) == 4 and all("SKILL_NEEDLE_MARK" in x for x in sy), f"batch: each sub-agent's prompt holds the skill: {len(sy)}")
+sk.send("TOOL_TASKX TWICE SKILLS=nope\r")
+check(sk.expect("no skill named /nope", 20), "batch: a skill that is not there is said, as in a single task")
+sk.send("\x04"); sk.close()
+shutil.rmtree(CFG_K, ignore_errors=True); shutil.rmtree(PROJ_K, ignore_errors=True)
 print("test interactive: ← on an empty line lists the sub-agents; the one picked shows its log")
 s.send("\x1b[D"); check(s.expect("sub-agents"), "← on an empty line opens the sub-agents list")
 check(s.expect("find the needle") and s.expect("done · 2 rounds"), "the run is listed with its state and rounds")
@@ -3235,6 +3340,123 @@ check(sub and sorted(t["function"]["name"] for t in sub[-1].get("tools", [])) ==
 n1 = len(requests())
 out, err, rc = in_proj(proj, ["--yolo", "-p", "TOOL_AGENT_NOSUCH please"], env)
 check("no sub-agent named nosuch" in out or "no sub-agent named nosuch" in json.dumps(requests()[n1:]), "an unknown agent name is an error for the model")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: a sub-agent with isolation=worktree writes in a copy; its change is applied, the copy goes, HEAD and the index stay")
+cfg, proj, env = wt_repo("wtask", {"README.md": "hi\nfirst line\n", "staged.txt": "s1\n"})
+open(os.path.join(proj, "README.md"), "a").write("uncommitted line\n")   # a change the user has not committed: the copy has it
+open(os.path.join(proj, "staged.txt"), "w").write("s2\n"); git(proj, "add", "staged.txt")   # and one they staged: the index must stay as it is
+open(os.path.join(proj, "untracked.txt"), "w").write("u\n")
+outside = tempfile.mkdtemp(prefix="crow_wt_outside_")
+head0, cached0 = git(proj, "rev-parse", "HEAD"), git(proj, "diff", "--cached")
+n0 = len(requests())
+out, err, rc = wt_run(proj, ["--yolo", "-p", f"TOOL_WTASK WRITE wt_a.txt: hello from the copy ;; WRITE {proj}/wt_abs.txt: by its absolute path ;; "
+                                              f"EDIT README.md: uncommitted line => edited in the copy ;; WRITE {outside}/escape.txt: never"], env)
+res = wt_results(n0)
+check(rc == 0 and len(res) == 1, f"one task result: rc={rc} {res!r} {out[-300:]!r}")
+r0 = res[0] if res else ""
+check(readf(proj, "wt_a.txt") == "hello from the copy\n", f"the file the sub-agent wrote in its copy is in the working tree: {readf(proj, 'wt_a.txt')!r}")
+check(readf(proj, "wt_abs.txt") == "by its absolute path\n", "an absolute path under the project is written in the copy, and applied")
+check(readf(proj, "README.md") == "hi\nfirst line\nedited in the copy\n", f"the copy had the uncommitted change, and the edit of it is applied: {readf(proj, 'README.md')!r}")
+check(not os.path.exists(os.path.join(outside, "escape.txt")) and "outside the copy" in r0, f"a path outside the project is refused: {r0[:400]!r}")
+check("applied to the working tree" in r0 and "3 files" in r0 and "wt_a.txt" in r0 and "README.md" in r0, f"the result says what was applied: {r0[-300:]!r}")
+check("Wtask results:" in out and "applied" in out, f"the main agent answers with it: {out[-300:]!r}")
+subs = wt_subs(n0)
+check(subs and "You work in a copy" in subs[0]["messages"][0]["content"] and {"write_file", "edit_file"} <= {t["function"]["name"] for t in subs[0].get("tools", [])},
+      f"the sub-agent is told it works in a copy and is given write_file and edit_file: {[t['function']['name'] for t in subs[0].get('tools', [])] if subs else None}")
+ok, why = wt_clean(cfg, proj); check(ok, f"the copy is gone: {why}")
+check(git(proj, "branch", "--list", "corbie-sub/*") == "", "nothing kept as a branch when it was applied")
+check(git(proj, "rev-parse", "HEAD") == head0 and git(proj, "diff", "--cached") == cached0 and cached0 and "wt_a.txt" not in cached0,
+      f"HEAD and the index are the user's as they were: {git(proj, 'diff', '--cached', '--name-only')!r}")
+check(readf(proj, "staged.txt") == "s2\n" and readf(proj, "untracked.txt") == "u\n" and "?? wt_a.txt" in git(proj, "status", "--porcelain"),
+      f"the user's own changes are kept and the new file is uncommitted: {git(proj, 'status', '--porcelain')!r}")
+shutil.rmtree(outside, ignore_errors=True); shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: /effort parallel on: sub-agents with isolation=worktree write in copies of their own at once; both changes are applied")
+cfg, proj, env = wt_repo("wtpar")
+open(os.path.join(cfg, "corbienest", "config"), "a").write("parallel=on\n")
+n0 = len(requests())
+out, err, rc = wt_run(proj, ["--yolo", "-p", "TOOL_WTASKS2 please"], env)
+res = wt_results(n0)
+check(len(res) == 2 and all("applied to the working tree" in r for r in res), f"two results, each applied: {res!r} {out[-300:]!r}")
+check(len(res) == 2 and "wt_b.txt" in res[0] and "wt_c.txt" in res[1], "the results come back in the order the model asked")
+check(readf(proj, "wt_b.txt") == "from task b\n" and readf(proj, "wt_c.txt") == "from task c\n", "both files are in the working tree")
+subs = wt_subs(n0)
+check(len(subs) == 4 and all(r.get("stream") is False for r in subs), f"two rounds of two sub-agents, run as a batch (unstreamed): {len(subs)}")
+roots = {re.search(r"Working directory: (\S+)", r["messages"][0]["content"]).group(1) for r in subs if "Working directory: " in r["messages"][0]["content"]}
+check(len(roots) == 2 and all(r.startswith(os.path.join(cfg, "corbienest", "worktrees")) for r in roots), f"each works in a copy of its own: {roots}")
+ok, why = wt_clean(cfg, proj); check(ok, f"the copies are gone: {why}")
+check(git(proj, "branch", "--list", "corbie-sub/*") == "", "no branch kept")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: two sub-agents in copies change the same line: the first is applied, the other is kept as a branch and its result says so")
+cfg, proj, env = wt_repo("wtclash", {"clash.txt": "line one\nline two\n"})
+open(os.path.join(cfg, "corbienest", "config"), "a").write("parallel=on\n")
+head0 = git(proj, "rev-parse", "HEAD")
+n0 = len(requests())
+out, err, rc = wt_run(proj, ["--yolo", "-p", "TOOL_WTASKCLASH please"], env)
+res = wt_results(n0)
+check(len(res) == 2 and "applied to the working tree" in res[0], f"the first change is applied: {res[:1]!r}")
+check(len(res) == 2 and "no longer fit" in res[1] and "corbie-sub/" in res[1] and "applied to the working tree" not in res[1], f"the second is not, and says where it is kept: {res[1:]!r}")
+check(readf(proj, "clash.txt") == "line ONE-A\nline two\n", f"the working tree has the first one's change only: {readf(proj, 'clash.txt')!r}")
+br = git(proj, "branch", "--list", "corbie-sub/*").strip(" *")
+check(br and "\n" not in br and br in (res[1] if len(res) == 2 else ""), f"one branch kept, the one the result names: {br!r}")
+check(br and "line ONE-B" in git(proj, "show", f"{br}:clash.txt"), "the branch has the change that did not fit")
+check(git(proj, "rev-parse", "HEAD") == head0 and git(proj, "diff", "--cached") == "", "HEAD and the index are untouched")
+ok, why = wt_clean(cfg, proj); check(ok, f"the copies are gone: {why}")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test feature: isolation=worktree is refused outside git, in plan mode and for another value; an agent file's key asks for it; without it a sub-agent stays read-only")
+cfg, proj, env = wt_feat("wtno")
+n0 = len(requests())
+out, err, rc = wt_run(proj, ["--yolo", "-p", "TOOL_WTASK WRITE wt_x.txt: no repo"], env)
+res = wt_results(n0)
+check(res and "needs a git repository" in res[0] and not wt_subs(n0), f"not a git repository: an error result, no sub-agent ran: {res!r}")
+check(not os.path.exists(os.path.join(proj, "wt_x.txt")), "nothing written")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+cfg, proj, env = wt_repo("wtrefuse")
+n0 = len(requests())
+out, err, rc = wt_run(proj, ["--yolo", "-p", "TOOL_WTASK ISO=copy WRITE wt_x.txt: odd value"], env)
+res = wt_results(n0)
+check(res and 'isolation is "worktree"' in res[0] and '"copy"' in res[0] and not wt_subs(n0), f"an unknown isolation value is an error result: {res!r}")
+n0 = len(requests())
+out, err, rc = wt_run(proj, ["--mode", "plan", "-p", "TOOL_WTASK WRITE wt_x.txt: plan mode"], env)
+res = wt_results(n0)
+check(res and "plan mode is read-only" in res[0] and not wt_subs(n0), f"plan mode: an error result: {res!r}")
+n0 = len(requests())
+out, err, rc = wt_run(proj, ["--yolo", "-p", "TOOL_WTASK NOISO WRITE wt_x.txt: no isolation"], env)
+res, subs = wt_results(n0), wt_subs(n0)
+check(res and "write_file is not available to a sub-agent (read-only)" in res[0] and "REPORT (read-only)" in res[0], f"without isolation the sub-agent's write is refused: {res!r}")
+check(subs and not {"write_file", "edit_file"} & {t["function"]["name"] for t in subs[0].get("tools", [])}, "and it is not offered write_file or edit_file")
+check(not os.path.exists(os.path.join(proj, "wt_x.txt")), "nothing written by any of them")
+os.makedirs(os.path.join(proj, ".corbienest", "agents"))
+open(os.path.join(proj, ".corbienest", "agents", "writer.md"), "w").write(
+    "---\nname: writer\ndescription: Writes in a copy\nisolation: worktree\ntools: Read, Write\n---\nWRITER_ROLE: make the change.\n")
+n0 = len(requests())
+out, err, rc = wt_run(proj, ["--yolo", "-p", "TOOL_WTASK NOISO AGENT=writer WRITE wt_agent.txt: by the agent file"], env)
+res, subs = wt_results(n0), wt_subs(n0)
+check(res and "applied to the working tree" in res[0] and readf(proj, "wt_agent.txt") == "by the agent file\n", f"the agent file's isolation: worktree gives it a copy, and its change is applied: {res!r}")
+check(subs and "WRITER_ROLE" in subs[0]["messages"][0]["content"] and sorted(t["function"]["name"] for t in subs[0].get("tools", [])) == ["read_file", "write_file"],
+      f"its tools are its file's (Claude Code's Write is write_file): {[t['function']['name'] for t in subs[0].get('tools', [])] if subs else None}")
+ok, why = wt_clean(cfg, proj); check(ok, f"the copy is gone: {why}")
+shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
+
+print("test interactive: a sub-agent's change applied from its copy is undone by /rewind; a question it asks names it")
+cfg, proj, env = wt_repo("wtrewind", {"README.md": "hi\nfirst line\n"})
+w = Session(["-m", "fake-coder:latest"], cwd=proj, env=env); w.expect("Ctrl-D to quit")
+w.send("TOOL_WTASK EDIT README.md: first line => changed by the copy ;; WRITE wt_new.txt: new from the copy\r")
+check(w.expect("[sub-agent writer]", 20), f"the write it asks about says which sub-agent asks: {w.text()[-400:]!r}")
+w.send("\r"); check(w.expect("[sub-agent writer]", 20), "a second question, for the second write")   # Yes, once: each write is asked about
+w.send("\r"); check(w.expect("Wtask results:", 30), f"the main agent gets the result: {w.text()[-300:]!r}")
+check(readf(proj, "README.md") == "hi\nchanged by the copy\n" and readf(proj, "wt_new.txt") == "new from the copy\n", "both changes are applied")
+w.send("\x1b"); w.expect("press Esc again to rewind")
+w.send("\x1b"); check(w.expect("Rewind to before which request?"), "the rewind picker")
+check(w.expect("TOOL_WTASK") and "2 files changed since" in w.text(), f"the request is listed with the two files the sub-agent changed: {w.text()[-400:]!r}")
+w.send("\r"); w.expect("Restore conversation and files"); w.send("\r")
+check(w.expect("rewound to before request"), "rewound")
+check(readf(proj, "README.md") == "hi\nfirst line\n" and readf(proj, "wt_new.txt") is None, f"the edit is undone and the new file is gone: {readf(proj, 'README.md')!r} {readf(proj, 'wt_new.txt')!r}")
+w.send("\x04"); w.close()
+ok, why = wt_clean(cfg, proj); check(ok, f"the copy is gone: {why}")
 shutil.rmtree(proj, ignore_errors=True); shutil.rmtree(cfg, ignore_errors=True)
 
 print("test feature: the sandbox keeps writes to the project (when bwrap is installed)")

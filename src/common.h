@@ -100,6 +100,7 @@ int   write_whole_file(const char *path, const char *data, size_t len);
 int   write_whole_file_atomic(const char *path, const char *data, size_t len);
 int   mkdir_p(const char *path);
 char *expand_home(const char *path);   /* "~/x" -> "/home/u/x", malloc'd */
+char *copy_path_map(const char *p, const char *from, const char *to);   /* p under the directory from, as the same path under to (malloc'd); NULL when it is not under it */
 int   is_dir(const char *path);
 int   is_file(const char *path);
 
@@ -272,6 +273,10 @@ char *advisor_brief(cJSON *msgs, int keep, size_t budget, const char *env, bool 
 int   diff_changed_lines(const char *d);                  /* lines of a unified diff that add or remove something (not the --- +++ headers) */
 bool  tool_result_failed(const char *name, const char *result, bool error);   /* an error result, or a shell command that did not exit with 0 */
 #define ADVISOR_REVIEW_OK "LGTM"   /* what the advisor answers a review or a check with when nothing needs to change */
+int   parallel_slots(int configured, int calls);   /* sub-agents that run at once for a reply of `calls` task calls: the configured number, or automatic */
+int   parallel_parse(const char *v, bool *on, int *n);   /* the words after /effort parallel: on, off, auto, N, on N, on auto. *n: -1 keep, 0 auto, else fixed. 0 ok, -1 not understood */
+void  parallel_advice(sbuf *b);                    /* the sentence that tells the model how many sub-agents may run together (the task tool's description, the system prompt) */
+int   task_isolation(const char *task_arg, const char *agent_key);   /* a task's isolation (its argument, its agent file's key): 1 worktree (either says so), 0 none, -1 a value that is neither */
 bool  advisor_approves(const char *advice);   /* the answer is ADVISOR_REVIEW_OK and not much more */
 const char *strip_think_block(const char *s);   /* past a leading <think>…</think> */
 bool  model_same(const char *a, const char *b);   /* equal, a trailing ":latest" aside */
@@ -303,6 +308,7 @@ typedef struct {
     int   advisor_window;   /* seconds after which a request's count of consultations starts again (/advisor window, given in minutes); 0 = never */
     int   workers;       /* tasks of /orchestrate that may run at the same time (/workers); 0 = ORCH_WORKERS_DEFAULT */
     bool  parallel_tasks;/* /effort parallel on: the task calls of one reply run at the same time as sub-agents (default off) */
+    int   parallel_n;    /* how many of them at once: 0 = automatic (the size of the reply, 2 to PARALLEL_AUTO_MAX), else a fixed 1..ORCH_PARALLEL_MAX */
     char *build;         /* /plan: the command that builds the project after each layer (build=); NULL = detected from the project's build file */
     bool  show_thinking; /* print thinking tokens */
     bool  show_read, show_grep, show_list, show_fetch, show_search, show_edit, show_write;   /* show the result of read_file / grep / list_dir / web_fetch / web_search in the transcript (/config read|grep|list|fetch|search show|hide; default on; the call line stays); show_edit: the edit_file diff preview and its result line (/config edit show|hide; an edit the user is asked about shows its diff in the question); show_write: the same for write_file (/config write show|hide) */
@@ -702,7 +708,7 @@ void stream_messages(stream_st *st, cJSON *msgs, int from, const char *session_i
 char *stream_input_text(const char *line);   /* the text of one stream-json input line (malloc'd), or NULL */
 
 /* ---------- agents.c: sub-agent files (task with agent=NAME) ---------- */
-typedef struct { char *name, *description, *tools, *model, *body, *path; } agent_t;
+typedef struct { char *name, *description, *tools, *model, *skills, *isolation, *body, *path; } agent_t;   /* skills: a comma list of skills preloaded into the sub-agent's prompt; isolation: "worktree" (it writes, in a copy) */
 int   agents_load(void);                    /* the agent files of this project and of the user; returns how many */
 int   agents_count(void);
 const agent_t *agent_get(int i);
@@ -768,7 +774,10 @@ void        tools_permissions_clear(void);                /* removes the file */
 void tools_checkpoint_turn(int turn);              /* main.c: a request starts */
 void tools_checkpoint_step(int step);              /* a part of it that is looked at by itself (a task of /orchestrate); 0 = none */
 void tools_checkpoint_path(const char *path);       /* records a file's state before the program changes it outside a tool (/goal's apply) */
+void tools_shell_hold(bool on);                   /* while on, tools_shell_in() runs a command to its end (its timeout still holds): Esc is left for the caller to see (the git steps of a copy) */
 bool tools_enter(const char *root);                /* a tool call runs in root (a /goal candidate's worktree): chdir, writes stay inside it; false if it cannot */
+bool tools_enter_copy(const char *root, const char *mirror, const char *top, const char *top_to, const char *who, bool quiet);   /* the same for a sub-agent's copy: an absolute path under mirror is that path in root (else one under top is that path under top_to), a question it asks starts with [who]; quiet: a write not asked about shows nothing */
+extern void (*tools_copy_wrote)(const char *path);   /* called with the path each write_file/edit_file wrote inside a copy (main.c keeps the sub-agent's own files) */
 void tools_leave(void);                            /* back to the directory tools_enter() left */
 int  tools_shell_in(const char *dir, const char *cmd, int timeout_s, sbuf *out, bool *interrupted, const char *busy, const char *verb);   /* a shell command in dir (NULL = here), its exit code; -1 if it could not run */
 int  tools_checkpoint_diff(int turn, int step, sbuf *out);   /* what that step did to the files it wrote, as unified diffs; returns files that differ */
@@ -778,7 +787,9 @@ int  tools_checkpoint_restore(int turn);           /* put them back; returns fil
 void tools_checkpoint_clear(void);
 /* The `task` tool runs a sub-agent; main.c provides the implementation (it owns the agent
  * loop). Writes the report into out; returns 0 ok, nonzero error. */
-typedef int (*tools_subagent_fn)(const char *description, const char *prompt, const char *agent, sbuf *out);
+typedef struct { const char *description, *prompt, *agent, *skills, *isolation; } task_req;   /* a task call: skills is a comma list (NULL: none); isolation "worktree" or NULL */
+typedef int (*tools_subagent_fn)(const task_req *t, sbuf *out);
+char *tools_arg_list(cJSON *args, const char *key);   /* a string argument, or an array of strings, as one comma list (malloc'd); NULL when absent or empty */
 extern tools_subagent_fn tools_subagent;
 void tools_in_subagent(bool on);                    /* the calls made now are a sub-agent's (no sub-agent, no background command): set around a run of sub-agents */
 /* The `advisor` tool puts a question to a stronger model (/advisor); main.c provides it too, since
@@ -788,6 +799,27 @@ typedef int (*tools_advisor_fn)(const char *question, sbuf *out);
 extern tools_advisor_fn tools_advisor;   /* how many one request may make: advisor_guidance()->uses */
 extern bool tools_no_confirm;   /* while true, tools run without asking (user-typed "!cmd") */
 const char *tools_summary_line(void);   /* short list for help */
+
+/* ---------- worktree.c: git worktrees as scratch copies (/goal's candidates, sub-agents that write) ---------- */
+#define WT_ID 72   /* room for a commit or tree id: 40 hex digits, or 64 in a SHA-256 repository */
+#define WT_GIT "GIT_AUTHOR_NAME=corbienest GIT_AUTHOR_EMAIL=corbienest@localhost GIT_COMMITTER_NAME=corbienest GIT_COMMITTER_EMAIL=corbienest@localhost "   /* a shell prefix: the identity of the commits made for a copy */
+char *wt_toplevel(void);                                   /* the repository's top folder (malloc'd), NULL when this is not a git repository */
+bool  wt_ignored(const char *top, const char *prefix);    /* is the folder prefix ("sub/dir/") one the repository ignores (a copy would hold nothing of it) */
+char *wt_prefix(void);                                     /* where in it we are: "" at the top, "sub/dir/" below it (malloc'd) */
+bool  wt_snapshot(const char *top, char tree[WT_ID], char snap[WT_ID]);   /* the working tree as it is, in a commit made through a temporary index; false if it cannot */
+bool  wt_tree_of_working(const char *top, char tree[WT_ID]);              /* the tree id the working tree has now (compare with a snapshot's) */
+bool  wt_add(const char *top, const char *dir, const char *commit);       /* a detached worktree of the commit in dir */
+void  wt_remove(const char *top, const char *dir);
+void  wt_prune(const char *top);                           /* forgets worktrees whose folder is gone (a killed run) */
+bool  wt_gitdir(const char *dir, char *out, size_t n);   /* the git directory of a copy, absolute (read when it is made, before anything in it can change its .git file) */
+bool  wt_commit(const char *dir, const char *gitdir, const char *snap, bool (*keep)(const char *name, void *ctx), void *ctx, sbuf *left, char all[WT_ID], char commit[WT_ID]);
+      /* everything in the copy, committed (hooks off; gitdir NULL: the copy's own .git); HEAD's id; false when any step failed.
+       * With keep: a file new against the snapshot and the user's HEAD that keep(name) says no to is left out, its name a line
+       * of left; then all (may be NULL) is the commit of the whole copy, made first, so nothing is lost */
+int   wt_changed(const char *top, const char *snap, const char *commit, sbuf *names);   /* files that differ, one per line appended to names (may be NULL); -1 on error, or a name with a newline */
+bool  wt_apply_check(const char *top, const char *snap, const char *commit, sbuf *why); /* does the change from snap to commit fit the tree now (why: git's complaint) */
+bool  wt_apply(const char *top, const char *snap, const char *commit, sbuf *why);       /* applies it to the working tree, all or nothing */
+bool  wt_branch(const char *top, const char *name, const char *commit);
 
 /* ---------- skills.h ---------- */
 typedef struct {
@@ -868,6 +900,7 @@ extern model_info g_model_info;   /* the model in use (set by main.c) */
 #define ORCH_MAX_TASKS 24   /* the "after" set is a 32-bit mask: at most 32 */
 #define ORCH_WORKERS_DEFAULT 3   /* tasks that may run at the same time, unless /workers says otherwise */
 #define ORCH_WORKERS_MAX 8     /* /goal: candidates, and models for them */
+#define PARALLEL_AUTO_MAX 8     /* /effort parallel auto: at most this many sub-agents at once */
 #define ORCH_PARALLEL_MAX 20   /* /orchestrate: tasks that may run at the same time (/workers, workers= in the config) */
 typedef struct {
     char *title, *body;

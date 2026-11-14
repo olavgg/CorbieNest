@@ -274,6 +274,10 @@ def chunk(model, content=None, tool_calls=None, thinking=None, done=False, promp
                   "prompt_eval_duration": 200_000_000, "prompt_eval_count": prompt_tokens, "eval_count": 45})
     return json.dumps(d) + "\n"
 
+def wt_ops(prompt):
+    """The file operations a sub-agent's task lists: "WRITE path: text" and "EDIT path: old => new", separated by " ;; "."""
+    return re.findall(r"\b(WRITE|EDIT) (\S+): (.*?)(?= ;; |\n|$)", prompt or "")
+
 def script(model, messages, req):
     """Yield NDJSON chunks for the given conversation."""
     last = messages[-1]
@@ -323,6 +327,24 @@ def script(model, messages, req):
         # a prompt of 30k tokens: were it taken for the conversation's, a 32k window would look 91% full
         yield chunk(model, done=True, prompt_tokens=30_000)
         return
+    if messages[0]["role"] == "system" and "You are a sub-agent" in messages[0]["content"] and wt_ops(messages[1]["content"]):
+        # a sub-agent whose task lists file operations ("WRITE path: text ;; EDIT path: old => new"): one call per
+        # operation, in order, then a report of what each call said. Whether it may write is not the fake's business:
+        # one in a copy (isolation=worktree, "You work in a copy") is offered write_file/edit_file, another is refused.
+        ops = wt_ops(messages[1]["content"])
+        results = [m["content"] for m in messages if m["role"] == "tool"]
+        if len(results) >= len(ops):
+            copy = "in a copy" if "You work in a copy" in messages[0]["content"] else "read-only"
+            yield chunk(model, "REPORT (%s): " % copy + " | ".join((r.strip().splitlines() or [""])[0][:120] for r in results))
+        else:
+            kind, path, arg = ops[len(results)]
+            if kind == "WRITE": call = {"name": "write_file", "arguments": {"path": path, "content": arg + "\n"}}
+            else:
+                old, _, new = arg.partition(" => ")
+                call = {"name": "edit_file", "arguments": {"path": path, "old_string": old, "new_string": new}}
+            yield chunk(model, tool_calls=[{"function": call}])
+        yield chunk(model, done=True)
+        return
     if messages[0]["role"] == "system" and "You are a sub-agent" in messages[0]["content"]:
         # sub-agent: one grep round, then a report — or, for a SLEEP task, one slow command,
         # so a test can type a message while the sub-agent is in the middle of a round
@@ -343,6 +365,33 @@ def script(model, messages, req):
             yield chunk(model, done=True)
             return
         yield chunk(model, tool_calls=[{"function": {"name": "grep", "arguments": {"pattern": "needle", "path": "."}}}])
+        yield chunk(model, done=True)
+        return
+    m_wt = re.search(r"TOOL_WTASK(S2|CLASH)?\b", text)
+    if m_wt:
+        # task calls with isolation=worktree: sub-agents that write, each in a copy of the project (a git worktree).
+        # TOOL_WTASK <ops>: one task whose prompt is the operations in the message (see wt_ops); NOISO: no isolation
+        # argument, ISO=x: that value instead, AGENT=name: a sub-agent file. TOOL_WTASKS2: two tasks on different
+        # files (wt_b.txt, wt_c.txt). TOOL_WTASKCLASH: two tasks that change the same line of clash.txt differently.
+        if last["role"] == "tool":
+            res = [m["content"] for m in messages[messages.index(user_msgs[-1]):] if m["role"] == "tool"]
+            yield chunk(model, "Wtask results: " + " || ".join(r.strip().replace("\n", " ") for r in res))
+        else:
+            if m_wt.group(1) == "S2": prompts = [("writer b", "WRITE wt_b.txt: from task b"), ("writer c", "WRITE wt_c.txt: from task c")]
+            elif m_wt.group(1) == "CLASH": prompts = [("clash a", "EDIT clash.txt: line one => line ONE-A"), ("clash b", "EDIT clash.txt: line one => line ONE-B")]
+            else:
+                k = min([i for i in (text.find("WRITE "), text.find("EDIT ")) if i >= 0] or [len(text)])
+                prompts = [("writer", text[k:].strip())]
+            iso = re.search(r"\bISO=(\S*)", text)
+            agent = re.search(r"\bAGENT=(\S+)", text)
+            calls = []
+            for desc, prompt in prompts:
+                args = {"description": desc, "prompt": prompt}
+                if iso: args["isolation"] = iso.group(1)
+                elif "NOISO" not in text: args["isolation"] = "worktree"
+                if agent: args["agent"] = agent.group(1)
+                calls.append({"function": {"name": "task", "arguments": args}})
+            yield chunk(model, tool_calls=calls)
         yield chunk(model, done=True)
         return
     if "ADVISOR_PACED" in text:
@@ -386,6 +435,27 @@ def script(model, messages, req):
         results = [m for m in messages if m["role"] == "tool"]
         if len(results) >= 4 or any(m.get("tool_name") == "advisor" for m in results): yield chunk(model, "Looked at it %d times." % len(results))
         else: yield chunk(model, tool_calls=[{"function": {"name": "list_dir", "arguments": {"path": "."}}}])
+        yield chunk(model, done=True)
+        return
+    if "TOOL_TASKX" in text:   # task calls that name skills (SKILLS=a,b) and/or an agent (AGENT=name); TWICE: two of them in one reply, for a batch
+        if last["role"] == "tool": yield chunk(model, "Skill task said: " + last["content"].strip()[:200].replace("\n", " "))
+        else:
+            ms, ma = re.search(r"SKILLS=(\S+)", text), re.search(r"AGENT=(\S+)", text)
+            calls = []
+            for k in range(2 if "TWICE" in text else 1):
+                args = {"description": "skilled%d" % (k + 1), "prompt": "PAUSE sk%d: find the needle" % (k + 1)}
+                if ms: args["skills"] = ms.group(1)
+                if ma: args["agent"] = ma.group(1)
+                calls.append({"function": {"name": "task", "arguments": args}})
+            yield chunk(model, tool_calls=calls)
+        yield chunk(model, done=True)
+        return
+    mn = re.search(r"TOOL_TASKS(\d+)", text)
+    if mn:   # TOOL_TASKS6: that many task calls in one reply ("PAUSE t1: ..." to "PAUSE t6: ..."), for the number of sub-agents that run at once (/_inflight)
+        if last["role"] == "tool": yield chunk(model, "All %s reports are in." % mn.group(1))
+        else:
+            yield chunk(model, tool_calls=[{"function": {"name": "task", "arguments": {"description": "t%d" % k, "prompt": "PAUSE t%d: find the needle" % k}}}
+                                           for k in range(1, int(mn.group(1)) + 1)])
         yield chunk(model, done=True)
         return
     if "TOOL_TASKS" in text:   # two task calls in one reply: /effort parallel on runs them at the same time

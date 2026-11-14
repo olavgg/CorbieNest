@@ -548,6 +548,11 @@ static void test_tools_body(void *ud) {
         CHECK(agent_allows(&ag, "read_file") && agent_allows(&ag, "grep") && !agent_allows(&ag, "bash") && agent_has_usable_tools(&ag));
         free(ag.tools); ag.tools = xstrdup("Write, Edit");
         CHECK(!agent_has_usable_tools(&ag));
+        CHECK(agent_allows(&ag, "write_file") && agent_allows(&ag, "edit_file") && !agent_allows(&ag, "read_file"));   /* only a sub-agent in a copy is offered them */
+        free(ag.tools); ag.tools = xstrdup("MultiEdit");
+        CHECK(agent_allows(&ag, "edit_file") && !agent_allows(&ag, "write_file"));
+        free(ag.tools); ag.tools = xstrdup("Writer, Edits");   /* only whole names */
+        CHECK(!agent_allows(&ag, "write_file") && !agent_allows(&ag, "edit_file"));
         free(ag.tools); ag.tools = NULL;
         /* the model a file names: Claude Code's aliases mean the sub-agents' own model */
         ag.model = xstrdup("sonnet"); CHECK(agent_model_override(&ag) == NULL);
@@ -739,6 +744,18 @@ static void test_util(void) {
     char *e = expand_home("~/x/y"); CHECK_STR(e, "/home/tester/x/y"); free(e);
     e = expand_home("/abs"); CHECK_STR(e, "/abs"); free(e);
     e = expand_home("~"); CHECK_STR(e, "/home/tester"); free(e);
+    /* a path under a directory, as the same path under another (a sub-agent's copy): whole components only */
+    e = copy_path_map("/w/proj/src/a.c", "/w/proj", "/cfg/wt/1"); CHECK_STR(e, "/cfg/wt/1/src/a.c"); free(e);
+    e = copy_path_map("/w/proj", "/w/proj", "/cfg/wt/1"); CHECK_STR(e, "/cfg/wt/1"); free(e);   /* the directory itself */
+    e = copy_path_map("/w/proj/", "/w/proj", "/cfg/wt/1"); CHECK_STR(e, "/cfg/wt/1/"); free(e);
+    e = copy_path_map("/w/proj/x", "/w/proj/", "/cfg/wt/1/"); CHECK_STR(e, "/cfg/wt/1/x"); free(e);   /* trailing slashes ignored */
+    e = copy_path_map("/w/proj/x", "/w/proj//", "/cfg/wt/1//"); CHECK_STR(e, "/cfg/wt/1/x"); free(e);
+    e = copy_path_map("/w/proj", "/w/proj/", "/cfg"); CHECK_STR(e, "/cfg"); free(e);
+    CHECK(copy_path_map("/a/bc", "/a/b", "/c") == NULL && copy_path_map("/a/bc/d", "/a/b", "/c") == NULL);   /* a sibling with the same prefix */
+    CHECK(copy_path_map("/a", "/a/b", "/c") == NULL && copy_path_map("/x/y", "/a/b", "/c") == NULL);   /* above it, elsewhere */
+    CHECK(copy_path_map("/a/b", "/", "/c") == NULL && copy_path_map("/a/b", "//", "/c") == NULL);   /* "/" is everything: never mapped */
+    CHECK(copy_path_map("a/b", "/a", "/c") == NULL && copy_path_map("src/x", "/w/proj", "/c") == NULL);   /* a relative path is already in the copy */
+    CHECK(copy_path_map("/a/b", "a", "/c") == NULL && copy_path_map(NULL, "/a", "/c") == NULL && copy_path_map("/a", NULL, "/c") == NULL && copy_path_map("/a", "/a", NULL) == NULL);
     char dir[] = "/tmp/crowtest_u_XXXXXX"; CHECK(mkdtemp(dir) != NULL);
     char deep[300]; snprintf(deep, sizeof deep, "%s/a/b/c", dir);
     CHECK(mkdir_p(deep) == 0); CHECK(is_dir(deep));
@@ -1145,6 +1162,29 @@ static void test_skills(void) {
         if (ag) CHECK_STR(ag->description, "Ours");   /* .corbienest's file before .agents' */
         ag = agent_find("cc-only-agent"); CHECK(ag != NULL);
         if (ag) CHECK_STR(ag->description, "From ~/.agents/agents");   /* ~/.agents/agents before ~/.claude/agents */
+        /* skills: a comma list in the agent file; the task's own argument as a string or an array */
+        const char *c1 = "---\nname: skilled-agent\ndescription: Has skills\nskills: alpha, beta\n---\nR.\n";
+        CHECK(write_whole_file(".corbienest/agents/skilled-agent.md", c1, strlen(c1)) == 0);
+        agents_load();
+        ag = agent_find("skilled-agent"); CHECK(ag != NULL);
+        if (ag) CHECK_STR(ag->skills, "alpha, beta");
+        ag = agent_find("cc-shared-agent"); CHECK(ag != NULL && ag->skills == NULL);
+        /* isolation: the agent file's key (worktree: it writes, in a copy); Claude Code's Write/Edit/MultiEdit are ours */
+        const char *c2 = "---\nname: writer-agent\ndescription: Writes in a copy\nisolation: worktree\ntools: Read, Write, MultiEdit\n---\nW.\n";
+        CHECK(write_whole_file(".corbienest/agents/writer-agent.md", c2, strlen(c2)) == 0);
+        agents_load();
+        ag = agent_find("writer-agent"); CHECK(ag != NULL);
+        if (ag) {
+            CHECK_STR(ag->isolation, "worktree");
+            CHECK(task_isolation(NULL, ag->isolation) == 1);
+            CHECK(agent_allows(ag, "read_file") && agent_allows(ag, "write_file") && agent_allows(ag, "edit_file") && !agent_allows(ag, "bash"));
+        }
+        ag = agent_find("skilled-agent"); CHECK(ag != NULL && ag->isolation == NULL);
+        cJSON *ja = cJSON_Parse("{\"a\":\"x,y\",\"b\":[\"p\",\"\",\"q\"],\"c\":\"\",\"d\":3}");
+        char *l = tools_arg_list(ja, "a"); CHECK(l && !strcmp(l, "x,y")); free(l);
+        l = tools_arg_list(ja, "b"); CHECK(l && !strcmp(l, "p,q")); free(l);
+        CHECK(tools_arg_list(ja, "c") == NULL && tools_arg_list(ja, "d") == NULL && tools_arg_list(ja, "zz") == NULL && tools_arg_list(NULL, "a") == NULL);
+        cJSON_Delete(ja);
         if (oh) { setenv("HOME", oh, 1); free(oh); } else unsetenv("HOME");
         agents_load();
     }
@@ -1606,7 +1646,40 @@ static void test_advisor(void) {
         g_cfg.parallel_tasks = true;
         d = tools_definitions(); j = cJSON_PrintUnformatted(d);
         CHECK(strstr(j, "Parallel sub-agents are on") && strstr(j, "in ONE reply")); free(j); cJSON_Delete(d);
+        /* automatic: the description says up to 8, split by complexity; a fixed number says that number */
+        int old_n = g_cfg.parallel_n;
+        g_cfg.parallel_n = 0;
+        d = tools_definitions(); j = cJSON_PrintUnformatted(d);
+        CHECK(strstr(j, "Up to 8 run at once") && strstr(j, "2 to 8 sub-agents depending on how complex")); free(j); cJSON_Delete(d);
+        g_cfg.parallel_n = 5;
+        d = tools_definitions(); j = cJSON_PrintUnformatted(d);
+        CHECK(strstr(j, "Up to 5 run at once") && !strstr(j, "depending on how complex")); free(j); cJSON_Delete(d);
+        g_cfg.parallel_n = old_n;
         g_cfg.parallel_tasks = old_par;
+    }
+
+    {   /* how many sub-agents run at once, and the words after /effort parallel */
+        CHECK(parallel_slots(0, 2) == 2 && parallel_slots(0, 3) == 3 && parallel_slots(0, 8) == 8 && parallel_slots(0, 12) == 8 && parallel_slots(0, 1) == 2);   /* automatic: the reply's size, 2 to 8 */
+        CHECK(parallel_slots(5, 2) == 5 && parallel_slots(1, 9) == 1 && parallel_slots(99, 9) == ORCH_PARALLEL_MAX);   /* a fixed number is that number */
+        bool on; int n;
+        CHECK(parallel_parse("on", &on, &n) == 0 && on && n == -1);
+        CHECK(parallel_parse("off", &on, &n) == 0 && !on);
+        CHECK(parallel_parse("auto", &on, &n) == 0 && on && n == 0);
+        CHECK(parallel_parse("6", &on, &n) == 0 && on && n == 6);
+        CHECK(parallel_parse("on 4", &on, &n) == 0 && on && n == 4);
+        CHECK(parallel_parse("on auto", &on, &n) == 0 && on && n == 0);
+        CHECK(parallel_parse("  on  12 ", &on, &n) == 0 && n == 12);
+        CHECK(parallel_parse("0", &on, &n) < 0 && parallel_parse("21", &on, &n) < 0 && parallel_parse("-2", &on, &n) < 0);
+        CHECK(parallel_parse("maybe", &on, &n) < 0 && parallel_parse("off 3", &on, &n) < 0 && parallel_parse("on 3 4", &on, &n) < 0 && parallel_parse("3x", &on, &n) < 0 && parallel_parse("", &on, &n) < 0);
+        /* a task's isolation: its argument or its agent file's key; worktree from either, none/empty is none, anything else is an error */
+        CHECK(task_isolation(NULL, NULL) == 0 && task_isolation("", "") == 0 && task_isolation("none", NULL) == 0 && task_isolation(NULL, "NONE") == 0);
+        CHECK(task_isolation("worktree", NULL) == 1 && task_isolation(NULL, "worktree") == 1 && task_isolation("WorkTree", "") == 1 && task_isolation("worktree", "worktree") == 1);
+        CHECK(task_isolation("none", "worktree") == 1 && task_isolation("worktree", "none") == 1);   /* either one asks for a copy */
+        CHECK(task_isolation("copy", NULL) == -1 && task_isolation(NULL, "git") == -1 && task_isolation("worktree", "bogus") == -1 && task_isolation("bogus", "worktree") == -1);
+        CHECK(task_isolation("worktree ", NULL) == -1 && task_isolation("work", NULL) == -1);
+        /* a session that fixed the number is merged with one that turned parallel on: both survive */
+        char *m = config_merge("a=1\n", "a=1\nparallel_agents=6\n", "a=1\nparallel=on\n");
+        CHECK(strstr(m, "parallel_agents=6\n") && strstr(m, "parallel=on\n")); free(m);
     }
 
     /* the tool is on offer only while an advisor is set, and says so when called without one */
@@ -3092,6 +3165,154 @@ static void test_theme(void) {
     CHECK(!strcmp(th_bg(0x151922u), "\x1b[48;2;21;25;34m"));
 }
 
+/* ---------- worktree.c: a copy of the project in a git worktree, and what it changed brought back ---------- */
+static bool keep_wanted(const char *name, void *ctx) { (void)ctx; return !strcmp(name, "wanted.txt") || !strcmp(name, "sub/e.txt"); }   /* what its tools wrote */
+static void test_worktree(void) {
+    if (system("git --version >/dev/null 2>&1") != 0) return;   /* no git here: nothing to test */
+    char base[] = "/tmp/corbie_wt_XXXXXX";
+    if (!mkdtemp(base)) return;
+    char old[1024]; if (!getcwd(old, sizeof old)) return;
+    char cmd[2048];
+    snprintf(cmd, sizeof cmd, "cd %s && mkdir repo repo/sub && cd repo && git init -q && git config user.email t@t && git config user.name t && "
+             "echo one > a.txt && echo keep > b.txt && echo deep > sub/d.txt && git add -A && git commit -q -m first && "
+             "echo dirty >> a.txt && echo fresh > untracked.txt", base);
+    CHECK(system(cmd) == 0);
+    char repo[1100]; snprintf(repo, sizeof repo, "%s/repo", base);
+    CHECK(chdir(repo) == 0);
+    char *top = wt_toplevel(), *pre = wt_prefix();
+    char real[PATH_MAX]; CHECK(realpath(repo, real) != NULL);
+    CHECK(top && !strcmp(top, real)); CHECK(pre && pre[0] == 0);
+    char tree[WT_ID], snap[WT_ID], now[WT_ID];
+    CHECK(wt_snapshot(top, tree, snap) && strlen(tree) >= 40 && strlen(snap) >= 40);
+    CHECK(wt_tree_of_working(top, now) && !strcmp(now, tree));   /* the snapshot touched neither the files nor the index */
+    sbuf st; sb_init(&st); { bool intr = false; tools_shell_in(NULL, "git status --porcelain", 30, &st, &intr, NULL, NULL); }
+    CHECK(st.data && strstr(st.data, " M a.txt") && strstr(st.data, "?? untracked.txt") && !strstr(st.data, "A "));   /* nothing staged by it */
+    sb_free(&st);
+    char wdir[1200]; snprintf(wdir, sizeof wdir, "%s/copies/c1", base);
+    CHECK(wt_add(top, wdir, snap));
+    char path[1300];
+    snprintf(path, sizeof path, "%s/untracked.txt", wdir);
+    size_t n; char *t = read_whole_file(path, &n, 0);
+    CHECK(t && !strcmp(t, "fresh\n")); free(t);   /* an untracked file is in the copy */
+    snprintf(cmd, sizeof cmd, "cd %s && echo edited > b.txt && rm sub/d.txt && echo new > added.txt && echo ignored > /dev/null", wdir);
+    CHECK(system(cmd) == 0);
+    char commit[WT_ID];
+    CHECK(wt_commit(wdir, NULL, NULL, NULL, NULL, NULL, NULL, commit) && strlen(commit) >= 40);
+    sbuf names; sb_init(&names);
+    CHECK(wt_changed(top, snap, commit, &names) == 3);
+    CHECK(strstr(names.data, "b.txt\n") && strstr(names.data, "sub/d.txt\n") && strstr(names.data, "added.txt\n"));
+    CHECK(wt_apply_check(top, snap, commit, NULL));
+    CHECK(wt_apply(top, snap, commit, NULL));
+    t = read_whole_file("b.txt", &n, 0); CHECK(t && !strcmp(t, "edited\n")); free(t);
+    CHECK(!is_file("sub/d.txt") && is_file("added.txt"));
+    t = read_whole_file("a.txt", &n, 0); CHECK(t && !strcmp(t, "one\ndirty\n")); free(t);   /* the user's own uncommitted change is still there */
+    /* the same change does not fit twice: nothing is touched */
+    sbuf why; sb_init(&why);
+    CHECK(!wt_apply_check(top, snap, commit, &why) && why.len > 0);
+    CHECK(wt_branch(top, "corbie-sub/test", commit));
+    { sbuf o; sb_init(&o); bool intr = false; tools_shell_in(NULL, "git branch --list 'corbie-sub/*'", 30, &o, &intr, NULL, NULL); CHECK(o.data && strstr(o.data, "corbie-sub/test")); sb_free(&o); }
+    /* a copy that changed nothing */
+    char c2[WT_ID], w2[1200]; snprintf(w2, sizeof w2, "%s/copies/c2", base);
+    CHECK(wt_add(top, w2, snap) && wt_commit(w2, NULL, NULL, NULL, NULL, NULL, NULL, c2));
+    sb_clear(&names); CHECK(wt_changed(top, snap, c2, &names) == 0);
+    wt_remove(top, wdir); wt_remove(top, w2); wt_prune(top);
+    CHECK(!is_dir(wdir) && !is_dir(w2));
+
+    /* the repository's own git configuration does not reach a copy's steps: a hook that fails, no a/ b/ prefixes, colour */
+    {
+        snprintf(cmd, sizeof cmd, "mkdir -p hk && printf '#!/bin/sh\nexit 1\n' > hk/prepare-commit-msg && cp hk/prepare-commit-msg hk/post-checkout && chmod +x hk/* && "
+                 "git config core.hooksPath hk && git config diff.noprefix true && git config color.diff always && git config apply.whitespace error");
+        CHECK(system(cmd) == 0);
+        char w3[1200], c3[WT_ID], gd[1024]; snprintf(w3, sizeof w3, "%s/copies/c3", base);
+        CHECK(wt_add(top, w3, snap));                       /* post-checkout fails: not run */
+        CHECK(wt_gitdir(w3, gd, sizeof gd) && gd[0] == '/');
+        snprintf(cmd, sizeof cmd, "cd %s && echo 'trailing   ' > sub/e.txt && echo out > build.out && echo want > wanted.txt && echo formatted >> untracked.txt", w3);
+        CHECK(system(cmd) == 0);
+        sbuf left; sb_init(&left);
+        char all3[WT_ID]; CHECK(wt_commit(w3, gd, snap, keep_wanted, NULL, &left, all3, c3) && all3[0]);   /* prepare-commit-msg fails: not run either */
+        CHECK(left.data && !strcmp(left.data, "build.out\n"));          /* made by a command, not tracked in HEAD: left out */
+        sb_clear(&names); CHECK(wt_changed(top, snap, c3, &names) == 3);   /* the user's untracked file, which the snapshot had, is changed, never left out (that would delete it) */
+        CHECK(strstr(names.data, "sub/e.txt\n") && strstr(names.data, "wanted.txt\n") && strstr(names.data, "untracked.txt\n") && !strstr(names.data, "build.out"));
+        sbuf allnames; sb_init(&allnames); CHECK(wt_changed(top, snap, all3, &allnames) == 4 && strstr(allnames.data, "build.out\n")); sb_free(&allnames);   /* the whole copy is kept */
+        CHECK(wt_apply_check(top, snap, c3, NULL) && wt_apply(top, snap, c3, NULL));
+        CHECK(is_file("sub/e.txt") && !is_file("e.txt") && is_file("wanted.txt") && !is_file("build.out"));   /* in its folder, though diff.noprefix is on */
+        t = read_whole_file("untracked.txt", &n, 0); CHECK(t && !strcmp(t, "fresh\nformatted\n")); free(t);
+        wt_remove(top, w3);
+        sb_free(&left);
+        CHECK(system("git config --unset core.hooksPath && git config --unset diff.noprefix && git config --unset color.diff && git config --unset apply.whitespace") == 0);
+    }
+    /* a tracked file that matches .gitignore is in the snapshot, as it is in the working tree */
+    {
+        CHECK(system("printf 'dist/\n' > .gitignore && mkdir -p dist && echo v1 > dist/app.js && git add -f .gitignore dist/app.js && git commit -q -m dist && echo v2 > dist/app.js") == 0);
+        char t4[WT_ID], s4[WT_ID], w4[1200]; snprintf(w4, sizeof w4, "%s/copies/c4", base);
+        CHECK(wt_snapshot(top, t4, s4) && wt_add(top, w4, s4));
+        snprintf(path, sizeof path, "%s/dist/app.js", w4);
+        t = read_whole_file(path, &n, 0); CHECK(t && !strcmp(t, "v2\n")); free(t);
+        wt_remove(top, w4);
+    }
+    /* the snapshot reads the disk for a file marked skip-worktree or assume-unchanged, and git's warnings do not pass for ids */
+    {
+        CHECK(system("echo base > flagged.txt && echo base2 > flagged2.txt && git add flagged.txt flagged2.txt && git commit -q -m flagged && "
+                     "git update-index --skip-worktree flagged.txt && git update-index --assume-unchanged flagged2.txt && echo local > flagged.txt && echo local2 > flagged2.txt && "
+                     "mkdir -p nested && cd nested && git init -q && git config user.email t@t && git config user.name t && echo x > x && git add x && git commit -q -m x") == 0);
+        char t6[WT_ID], s6[WT_ID], w6[1200]; snprintf(w6, sizeof w6, "%s/copies/c6", base);
+        CHECK(wt_snapshot(top, t6, s6) && (strlen(s6) == 40 || strlen(s6) == 64));   /* "warning: adding embedded git repository" goes first */
+        CHECK(wt_add(top, w6, s6));
+        snprintf(path, sizeof path, "%s/flagged.txt", w6); t = read_whole_file(path, &n, 0); CHECK(t && !strcmp(t, "local\n")); free(t);
+        snprintf(path, sizeof path, "%s/flagged2.txt", w6); t = read_whole_file(path, &n, 0); CHECK(t && !strcmp(t, "local2\n")); free(t);
+        { sbuf o; sb_init(&o); bool intr = false; tools_shell_in(NULL, "git ls-files -v flagged.txt flagged2.txt", 30, &o, &intr, NULL, NULL);
+          CHECK(o.data && strstr(o.data, "S flagged.txt") && strstr(o.data, "h flagged2.txt")); sb_free(&o); }   /* the user's flags are theirs still */
+        wt_remove(top, w6);
+        CHECK(system("git update-index --no-skip-worktree flagged.txt && git update-index --no-assume-unchanged flagged2.txt && rm -rf nested") == 0);
+    }
+    /* a SHA-256 repository: its ids are 64 digits */
+    if (system("git init -q --object-format=sha256 /dev/null/x >/dev/null 2>&1; cd /tmp && d=$(mktemp -d) && git init -q --object-format=sha256 \"$d\" >/dev/null 2>&1; r=$?; rm -rf \"$d\"; exit $r") == 0) {
+        char r7[64]; snprintf(r7, sizeof r7, "%s/sha256", base);
+        snprintf(cmd, sizeof cmd, "git init -q --object-format=sha256 %s && cd %s && git config user.email t@t && git config user.name t && echo a > a && git add a && git commit -q -m a && echo b > b", r7, r7);
+        CHECK(system(cmd) == 0);
+        char t7[WT_ID], s7[WT_ID], w7[1200]; snprintf(w7, sizeof w7, "%s/copies/c7", base);
+        CHECK(wt_snapshot(r7, t7, s7) && strlen(t7) == 64 && strlen(s7) == 64);
+        CHECK(wt_add(r7, w7, s7));
+        snprintf(path, sizeof path, "%s/b", w7); CHECK(is_file(path));
+        wt_remove(r7, w7);
+    }
+    /* a sub-agent's writes stay in its copy: a new folder is fine; a link to nothing, its .git and a way out are not */
+    {
+        char w5[1200]; snprintf(w5, sizeof w5, "%s/copies/c5", base);
+        CHECK(wt_add(top, w5, snap));
+        char target[1300]; snprintf(target, sizeof target, "%s/outside-target.txt", base);
+        char ln[1300]; snprintf(ln, sizeof ln, "%s/dangling", w5);
+        CHECK(symlink(target, ln) == 0);
+        int mode = g_cfg.mode; g_cfg.mode = MODE_AUTO;
+        CHECK(tools_enter_copy(w5, "/nonexistent-project", NULL, NULL, "sub-agent t", true));
+        const char *bad[] = { "dangling", ".git", "../escape.txt", "new/../../escape.txt", "/nonexistent-elsewhere/x.txt", NULL };
+        for (int k = 0; bad[k]; k++) {
+            cJSON *a = cJSON_CreateObject(); cJSON_AddStringToObject(a, "path", bad[k]); cJSON_AddStringToObject(a, "content", "x\n");
+            sbuf o; sb_init(&o);
+            CHECK(tools_execute("write_file", a, &o) == TOOL_ERROR);
+            sb_free(&o); cJSON_Delete(a);
+        }
+        cJSON *a = cJSON_CreateObject(); cJSON_AddStringToObject(a, "path", "newdir/deep/x.txt"); cJSON_AddStringToObject(a, "content", "x\n");
+        sbuf o; sb_init(&o);
+        CHECK(tools_execute("write_file", a, &o) == TOOL_OK);
+        sb_free(&o); cJSON_Delete(a);
+        a = cJSON_CreateObject(); cJSON_AddStringToObject(a, "path", "/nonexistent-project/mapped.txt"); cJSON_AddStringToObject(a, "content", "m\n");
+        sb_init(&o);
+        CHECK(tools_execute("write_file", a, &o) == TOOL_OK);   /* a path of the project the copy stands for is the copy's */
+        sb_free(&o); cJSON_Delete(a);
+        tools_leave();
+        g_cfg.mode = mode;
+        snprintf(path, sizeof path, "%s/newdir/deep/x.txt", w5); CHECK(is_file(path));
+        snprintf(path, sizeof path, "%s/mapped.txt", w5); CHECK(is_file(path));
+        CHECK(!is_file(target));
+        snprintf(path, sizeof path, "%s/escape.txt", base); CHECK(!is_file(path));
+        wt_remove(top, w5); wt_prune(top);
+    }
+    sb_free(&names); sb_free(&why); free(top); free(pre);
+    CHECK(chdir(old) == 0);
+    snprintf(cmd, sizeof cmd, "rm -rf %s", base); CHECK(system(cmd) == 0);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     memset(&g_cfg, 0, sizeof g_cfg);
@@ -3101,7 +3322,7 @@ int main(void) {
         { "text_tool_calls", test_text_tool_calls }, { "tools", test_tools }, { "write preview", test_write_preview }, { "fold head", test_fold_head }, { "scrollback spill", test_sb_spill }, { "modes", test_modes },
         { "close button", test_close_x }, { "queue", test_queue }, { "skills", test_skills }, { "files", test_files }, { "http", test_http },
         { "web", test_web }, { "model_info", test_model_info }, { "transcript", test_transcript },
-        { "config merge", test_config_merge }, { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "workflow", test_workflow }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme }, { "title", test_title },
+        { "config merge", test_config_merge }, { "effort", test_effort }, { "suggest", test_suggest }, { "advisor", test_advisor }, { "provider", test_provider }, { "hosts", test_hosts }, { "base64", test_base64 }, { "gzip round trip", test_gzip_round_trip }, { "gzip verdicts", test_gzip_judge }, { "gzip setting", test_gzip_setting }, { "orchestrate", test_orchestrate }, { "workflow", test_workflow }, { "goal", test_goal }, { "agent log", test_agent_log }, { "strip", test_strip }, { "paste", test_paste }, { "paste more", test_paste_more }, { "wellformed", test_wellformed }, { "copy key", test_copy_key }, { "notcurses pure", test_nc_pure }, { "word wrap", test_wrap }, { "menu rows", test_menu_rows }, { "themes", test_theme }, { "title", test_title }, { "worktree", test_worktree },
     };
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {
         int before = g_fail;

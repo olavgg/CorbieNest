@@ -93,7 +93,7 @@ without thinking about them: the status bar, the field, and the strip.
 | `/workflow [NAME\|new [NAME]]` | the workflow `/orchestrate` would use, slot by slot (the file, the skill and the model of each), or `new` to write a starter file |
 | `/plan REQUEST` | `/orchestrate` in layers: the advisor plans the request as tasks grouped into layers (`LAYER: n`), you approve the plan, then each layer runs and the project is built before the next one starts; a failed build becomes a fix task. See [Planning in layers](#planning-in-layers-plan) |
 | `/workers [N]` | how many tasks of `/orchestrate` may run at the same time (default 3, at most 20, `1` = one after another) |
-| `/effort parallel [on\|off]` | the `task` calls of one reply run as sub-agents at the same time (off by default: one after another) |
+| `/effort parallel [on\|off\|auto\|N]` | the `task` calls of one reply run as sub-agents at the same time (off by default: one after another); `auto` (the default when on) runs 2 to 8 at once by the size of the reply, `N` a fixed number (1 to 20). See [Sub-agents](#sub-agents) |
 | `/goal "METRIC" [min\|max] [-n R] [-k K] [-m MODEL,…] GOAL` | candidates in git worktrees race to a metric, each on its model; the best score is kept and applied |
 | `/cost` | tokens, model calls, tool calls, model time and wall time of this session |
 | `/usage`, `/usage price MODEL IN OUT\|default` | tokens per model in this session — the main model, the advisor — and the **estimated cost** of the hosted ones. The providers' prompt-cache hits (`⟳ cache … read`) are priced at their cached-input rate — Anthropic's a tenth of the input price (5% or 2.5% on the newest models), OpenAI's and xAI's as their price lists give it for each model — and Anthropic's cache writes at 1.25×; they are shown on their own line, as `↑` is the input that was not from the cache. The list price per million tokens (built in, as of October 2026) or the one you set with `price`. The same estimate is on each consultation's result line (`⎿ advice · 4.2k tokens · 12s · ≈ $0.03`) and in `/cost`. An estimate: what was billed is on the provider's usage page. On a full-screen conversation `/usage` comes up as a centred window and the running request goes on underneath its output is held back until the window closes (Esc or Ctrl-C closes it); Anthropic's last reply also reports its live rate limits (`limits at its last reply: input … of … a minute`, from the `anthropic-ratelimit-*` headers). The Admin Usage & Cost API (organization totals, needs an admin key) is not used |
@@ -449,20 +449,25 @@ You review code. For each bug give the file, the line and the fix, and nothing e
   they are. At start-up Corbie Nest offers to move agents from `.corbienest/agents` (and your config
   directory's) into `.agents/agents` (see [Skills](#skills)).
 - **The frontmatter.** `name` (the file name, if left out), `description` (required: the main agent
-  reads it to choose), `tools` (a comma list; left out, the agent has every sub-agent tool), and
-  `model` (left out, or `inherit`, the sub-agents' model from `/subagent`). The body is the role,
-  added to the sub-agent's instructions.
+  reads it to choose), `tools` (a comma list; left out, the agent has every sub-agent tool),
+  `model` (left out, or `inherit`, the sub-agents' model from `/subagent`), `skills` (a comma list of
+  skills whose full text goes into the agent's instructions, as the `task` call's own `skills` argument
+  does), and `isolation` (`worktree`: the agent changes files, in a git copy of its own, see
+  [Sub-agents that write](#sub-agents-that-write); left out, or `none`, it only reads). The body is the
+  role, added to the sub-agent's instructions.
 - **Claude Code files work as they are.** Its tool names are understood (`Read`, `Grep`, `Glob` and
-  `LS` for `list_dir`, `Bash`, `WebFetch`, `WebSearch`), and its model aliases `sonnet`, `opus` and
+  `LS` for `list_dir`, `Bash`, `WebFetch`, `WebSearch`; `Write`, `Edit` and `MultiEdit` for
+  `write_file` and `edit_file`, which only an agent in a copy has), and its model aliases `sonnet`, `opus` and
   `haiku` mean the sub-agents' own model, since they are not models of your server. An agent whose
   `tools` name none of the sub-agent tools is refused when it is started, and `/agents` marks it
   `(none usable)`.
 - **An unknown name** (`task` with `agent=NAME` for no file) is an error returned to the main agent,
   with the agents that do exist; nothing falls back to a general sub-agent by itself.
 - **What an agent cannot do.** It has only the sub-agent tools (`read_file`, `list_dir`, `grep`,
-  `bash`, `web_fetch`, `web_search`): a file can name fewer of them, never more. It cannot edit files,
-  start a sub-agent or ask the advisor. Its shell commands and fetches are confirmed and checked by the
-  rules and the hooks like anyone's. A file can change what an agent is asked to do, not what it is
+  `bash`, `web_fetch`, `web_search`, and `write_file` and `edit_file` when it works in a copy): a file
+  can name fewer of them, never more. Without `isolation: worktree` it cannot edit files; it can never
+  start a sub-agent or ask the advisor. Its writes, shell commands and fetches are confirmed and checked
+  by the rules and the hooks like anyone's. A file can change what an agent is asked to do, not what it is
   allowed to do.
 - **A model of its own** is checked the way `/subagent` checks one, when the agent runs. It is a
   parameter of that run: `/subagent` and the config are not changed, and its tokens are priced as that
@@ -519,7 +524,7 @@ the filesystem. Off by default.
 | `todo_write(todos)` | none — keeps the task list of the request, shown in the transcript and saved with the session. Send the whole list each time, with each task `pending`, `in_progress` (at most one) or `completed`; an empty list clears it. For work of three or more steps; the sub-agents do not have it |
 | `web_search(query, max_results?)` | yes — shows the query and the engine; "always allow" saves the engine's **host** |
 | `web_fetch(url, offset?, timeout?)` | yes — shows the URL; "always allow" saves the **host** |
-| `task(description, prompt)` | none for the call itself — runs a **sub-agent**: a fresh, read-only agent loop (read_file, list_dir, grep, bash, web_search, web_fetch — with the usual confirmations) that investigates and returns a report as the tool result, keeping the noise out of the main context. Its tool calls are echoed as `⎿ grep(…)` lines and the report is previewed. Sub-agents cannot edit files or start further sub-agents. It runs on the model `/subagent` names, at that model's effort, and its tokens are priced as that model's |
+| `task(description, prompt, agent?, skills?, isolation?)` | none for the call itself — runs a **sub-agent**: a fresh, read-only agent loop (read_file, list_dir, grep, bash, web_search, web_fetch — with the usual confirmations) that investigates and returns a report as the tool result, keeping the noise out of the main context. Its tool calls are echoed as `⎿ grep(…)` lines and the report is previewed. Sub-agents cannot start further sub-agents, and they edit files only with `isolation=worktree`: then the sub-agent works in a git copy of the project, with write_file and edit_file, and what it changed is applied when it reports (see [Sub-agents that write](#sub-agents-that-write)). It runs on the model `/subagent` names, at that model's effort, and its tokens are priced as that model's |
 | `advisor(question?)` | none — only on offer after `/advisor MODEL`. Puts the agent's question, and the conversation so far, to a **stronger model** (local, Ollama cloud, or a hosted API) and returns its advice as the tool result; see [The advisor](#the-advisor) |
 
 Each confirmation is a small menu:
@@ -596,7 +601,8 @@ follow all of this more loosely than large ones.
 
 A sub-agent is a fresh agent loop that the model starts with the `task` tool to investigate one
 self-contained question. It has read-only tools, works in its own context, and returns one
-report, so the main conversation only sees the answer. By default it runs on the model doing the
+report, so the main conversation only sees the answer. A sub-agent can also make a change, in a
+copy of the project of its own (see [Sub-agents that write](#sub-agents-that-write)). By default it runs on the model doing the
 work. `/subagent` changes that, separately from the main model:
 
 ```
@@ -607,20 +613,24 @@ work. `/subagent` changes that, separately from the main model:
 ```
 
 `/effort parallel on` runs the sub-agents of one reply at the same time. A reply whose calls are all
-`task` calls (two or more), all on local models, starts them together, up to `/workers` at once;
-each one's model call goes out on its own thread, as `/orchestrate`'s workers do. The strip shows
+`task` calls (two or more), all on the same model, starts them together; each one's model call goes
+out on its own thread, as `/orchestrate`'s workers do. The model may be a local one or an Anthropic
+one (`anthropic:…`, an unstreamed Messages call). How many run at once is `auto` by default: as many
+as the reply has, 2 to 8, since the model split the work into the parts it judged it has.
+`/effort parallel N` fixes the number (1 to 20); the rest wait for a free place. The strip shows
 the running sub-agents, and the reports are printed when they are all in, in the order the model
-asked. A reply that mixes `task` with other tools, or a sub-agent on a hosted model, runs them one
-after another as before. Ctrl+C stops them all; each call still gets its result. It is off by
-default because a batch loads its model's requests side by side, which needs the memory for them.
+asked. A reply that mixes `task` with other tools, or whose sub-agents are on different models or on
+a hosted model that does not speak Messages, runs them one after another as before. Ctrl+C stops
+them all; each call still gets its result. It is off by default because a batch loads its model's
+requests side by side, which needs the memory for them.
 
 - A model is asked of its server when it is set (`/subagent` refuses a name the server does not
   know), and its levels are read then, so `/subagent effort` can check them.
 - Its tokens go to `/usage` under its own name, so a cheap reading model shows up as one, with
   its price.
 - The setting is saved (`subagent=` in the config), so it holds for the next session as well.
-- Sub-agents still have no edit tools and cannot start sub-agents or ask the advisor, whatever
-  model they run on.
+- Sub-agents have edit tools only in a copy of their own (`isolation=worktree`, below), and cannot
+  start sub-agents or ask the advisor, whatever model they run on.
 - **The strip** above the status bar lists the running sub-agents, as many as fit under the
   conversation. The first row is `● main` when there is room for it (a progress bar of the main
   agent's task list, when it has one). Each task is `◯`, its name, what it is doing — or its
@@ -636,6 +646,53 @@ default because a batch loads its model's requests side by side, which needs the
   head of what it returned, and the report. Esc returns to the prompt. The log is kept for the
   last 16 runs, 96 KB each, in memory only; while a sub-agent runs, its tool calls are also
   echoed live, and PgUp/the wheel scroll back to them.
+
+### Sub-agents that write
+
+A sub-agent can make a change too. It does it in a copy of the project of its own, a git worktree,
+and what it changed is applied to your working tree when it reports. With `/effort parallel on`, a
+change that falls into independent parts can go to several such sub-agents at once.
+
+- **How it is asked for.** The `task` call says `isolation=worktree`, or the agent file says
+  `isolation: worktree` (see [Sub-agent files](#sub-agent-files)). Left out (or `none`), a sub-agent
+  only reads, as before. Any other value is an error returned to the main agent.
+- **What the copy holds.** The working tree is snapshotted once per run (one `task` call, or the batch
+  of one reply): the files as they are, uncommitted and untracked ones included, in a commit made
+  through a temporary index that starts from yours, so your index and `HEAD` are not touched. Files git
+  ignores (build output, installed dependencies) are not in it; a file you track though it matches
+  `.gitignore` is, and a file you marked skip-worktree or assume-unchanged is taken as it is on disk. Each sub-agent gets a detached worktree of that snapshot under
+  the config folder (`worktrees/ID/K`, K its place among the calls), made when it starts.
+- **Kept inside it.** Its tool calls run in the copy, one at a time. `write_file` and `edit_file`
+  refuse a path outside the copy, the copy's `.git`, and a link that points nowhere; a new folder is
+  fine. An absolute path under your project is taken as the same path in the copy, and the project's
+  permission rules and hooks apply there as in your tree (a hook is told the copy's path). While a batch
+  runs, a write nobody is asked about prints nothing; the reports come at the end. `bash` is the one way out: a command can name a path outside its copy, so its commands are
+  confirmed as anyone's, as for `/goal`'s candidates.
+- **Approvals.** A question it asks starts with `[sub-agent DESCRIPTION]`, so you know whose it is.
+  An "always" given inside a copy holds for the copies only; it never carries to the main agent's
+  writes in your tree.
+- **Merging back.** When the sub-agents are done, their changes are applied in the order the model
+  asked, each all or nothing, after a check that it fits. Each file is saved first, so `/rewind` undoes
+  it. The changes are left uncommitted. The task's result names the files. A new file that a command
+  made and no `write_file` or `edit_file` wrote (a build's output, a test cache) is left out, and the
+  result names it too; the whole copy, those files included, is then kept as the branch
+  `corbie-sub/ID-K-all`. A file the snapshot had is never left out: a command's change to it is applied. The repository's hooks do not run for a copy, and your
+  diff settings do not shape the patch. A switch to plan mode before the merge keeps the change as a
+  branch instead.
+- **Kept as a branch.** A change that does not fit any more (an earlier sub-agent, or you, changed the
+  same lines), or one of a sub-agent that failed, was interrupted, or whose batch was stopped, is not
+  applied: it is kept as the branch `corbie-sub/ID-K`, and the task's result says so, with
+  `git diff SNAP BRANCH` to see it.
+- **Clean-up.** A copy is removed once what it holds is applied or on a branch, and the run's folder
+  with it, on every way out, Esc included; Esc never cuts a git step in half. A copy whose work could
+  be kept neither way is left where it is, and the result gives its path. A run holds a lock on its
+  folder while it lives; the copies of a run that was killed are removed by the next run that makes one,
+  in any session. Only the copies are removed: your own worktrees are never pruned.
+- **Limits.** It needs a git repository; outside one, or in a folder the repository ignores, the call
+  is an error. Plan mode refuses it (it is
+  read-only). A copy starts cold: no build output and no installed dependencies, so a build or a test
+  run in it starts from nothing. Two sub-agents that edit the same lines do not merge: the second is
+  kept as a branch.
 
 ## Choosing between options
 

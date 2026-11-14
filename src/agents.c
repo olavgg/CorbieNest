@@ -10,9 +10,12 @@
  *   ~/.agents/agents/NAME.md       yours too (the same convention)
  *   ~/.claude/agents/NAME.md       Claude Code's own, for every project (read last)
  * The frontmatter keys: name (the file name by default), description, tools (a comma list of sub-agent tools; the
- * default is all of them), model (a model for this agent; the default is the sub-agents' model). An agent can use only
- * the tools a sub-agent has (read_file, list_dir, grep, bash, web_fetch, web_search): it cannot be given more, and it
- * cannot start a sub-agent or ask the advisor. Its shell commands and fetches are confirmed like anyone's. */
+ * default is all of them), model (a model for this agent; the default is the sub-agents' model), skills (a comma list of
+ * skills whose full text is put into the agent's prompt, as the task's own `skills` argument does), isolation (worktree:
+ * the agent changes files, in a git worktree of its own whose changes are applied when it reports, as the task's own
+ * `isolation` argument does). An agent can use only the tools a sub-agent has (read_file, list_dir, grep, bash,
+ * web_fetch, web_search, and write_file and edit_file when it works in a copy): it cannot be given more, and it cannot
+ * start a sub-agent or ask the advisor. Its writes, shell commands and fetches are confirmed like anyone's. */
 #include "common.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -52,6 +55,8 @@ static void parse_agent(const char *text, agent_t *a) {
             else if (!strcmp(k, "description")) { free(a->description); a->description = v; v = NULL; }
             else if (!strcmp(k, "tools")) { free(a->tools); a->tools = v; v = NULL; }
             else if (!strcmp(k, "model")) { free(a->model); a->model = v; v = NULL; }
+            else if (!strcmp(k, "skills")) { free(a->skills); a->skills = v; v = NULL; }
+            else if (!strcmp(k, "isolation")) { free(a->isolation); a->isolation = v; v = NULL; }
             free(k); free(v);
         }
         if (!e) { p += n; break; }
@@ -80,7 +85,7 @@ static void read_dir(const char *dir) {
         parse_agent(text, &a);
         free(text);
         if (!a.name) a.name = xstrndup(e->d_name, n - 3);
-        if (!valid_name(a.name) || have(a.name) || !a.description || !*a.description) { free(a.name); free(a.description); free(a.tools); free(a.model); free(a.body); continue; }
+        if (!valid_name(a.name) || have(a.name) || !a.description || !*a.description) { free(a.name); free(a.description); free(a.tools); free(a.model); free(a.skills); free(a.isolation); free(a.body); continue; }
         /* the body goes into the sub-agent's system prompt, so it must be valid UTF-8 and cut on a character */
         char *fx = utf8_fix(a.body); free(a.body); a.body = fx;
         size_t bl = strlen(a.body);
@@ -93,7 +98,7 @@ static void read_dir(const char *dir) {
 
 /* (Re)reads the agent files of this project and of the user. Returns how many there are. */
 int agents_load(void) {
-    for (int i = 0; i < g_nagent; i++) { free(g_agent[i].name); free(g_agent[i].description); free(g_agent[i].tools); free(g_agent[i].model); free(g_agent[i].body); free(g_agent[i].path); }
+    for (int i = 0; i < g_nagent; i++) { free(g_agent[i].name); free(g_agent[i].description); free(g_agent[i].tools); free(g_agent[i].model); free(g_agent[i].skills); free(g_agent[i].isolation); free(g_agent[i].body); free(g_agent[i].path); }
     g_nagent = 0;
     char cwd[1024], p[1200];
     if (getcwd(cwd, sizeof cwd)) {
@@ -116,7 +121,8 @@ const agent_t *agent_find(const char *name) {
 /* Claude Code's names for the same tools (its agent files say "tools: Read, Grep, Bash"): the name corbienest gives it, or NULL. */
 static const char *tool_alias(const char *s, size_t n) {
     static const char *map[][2] = { {"Read", "read_file"}, {"Grep", "grep"}, {"Glob", "list_dir"}, {"LS", "list_dir"},
-        {"Bash", "bash"}, {"WebFetch", "web_fetch"}, {"WebSearch", "web_search"} };
+        {"Bash", "bash"}, {"WebFetch", "web_fetch"}, {"WebSearch", "web_search"},
+        {"Write", "write_file"}, {"Edit", "edit_file"}, {"MultiEdit", "edit_file"} };   /* the last three: only a sub-agent in a copy writes */
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (strlen(map[i][0]) == n && !strncmp(s, map[i][0], n)) return map[i][1];
     return NULL;
@@ -145,6 +151,7 @@ bool agent_has_usable_tools(const agent_t *a) {
     static const char *base[] = { "read_file", "list_dir", "grep", "bash", "web_fetch", "web_search" };
     if (!a->tools || !*a->tools) return true;
     for (size_t k = 0; k < sizeof base / sizeof *base; k++) if (agent_allows(a, base[k])) return true;
+    if (task_isolation(NULL, a->isolation) == 1 && (agent_allows(a, "write_file") || agent_allows(a, "edit_file"))) return true;   /* it works in a copy: writing is its use */
     return false;
 }
 /* The model a file names for its sub-agent runs, or NULL for the sub-agents' own model: a file without one, "inherit",
