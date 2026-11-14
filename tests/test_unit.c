@@ -3267,7 +3267,7 @@ static void test_worktree(void) {
     }
     /* a SHA-256 repository: its ids are 64 digits */
     if (system("git init -q --object-format=sha256 /dev/null/x >/dev/null 2>&1; cd /tmp && d=$(mktemp -d) && git init -q --object-format=sha256 \"$d\" >/dev/null 2>&1; r=$?; rm -rf \"$d\"; exit $r") == 0) {
-        char r7[1200]; snprintf(r7, sizeof r7, "%s/sha256", base);
+        char r7[64]; snprintf(r7, sizeof r7, "%s/sha256", base);
         snprintf(cmd, sizeof cmd, "git init -q --object-format=sha256 %s && cd %s && git config user.email t@t && git config user.name t && echo a > a && git add a && git commit -q -m a && echo b > b", r7, r7);
         CHECK(system(cmd) == 0);
         char t7[WT_ID], s7[WT_ID], w7[1200]; snprintf(w7, sizeof w7, "%s/copies/c7", base);
